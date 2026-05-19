@@ -1,0 +1,215 @@
+[build-system]
+requires = [
+    "hatchling",
+    "hatch-rs>=0.1.4",
+]
+build-backend = "hatchling.build"
+
+[project]
+name = "polars-io-tools"
+authors = [
+    {name = "Point72, L.P.", email = "OpenSource@point72.com"},
+]
+description = "Custom parsing extensions for lazy polars"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+version = "0.1.0"
+requires-python = ">=3.11"
+keywords = []
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+dependencies = [
+    "arrow_odbc",
+    "boto3",
+    "cloudpickle",
+    "deltalake",
+    "duckdb",
+    "narwhals",
+    "numpy",
+    "orjson",
+    "packaging",
+    "pandas",
+    "polars",
+    "portion",
+    "pyarrow",
+    "pyodbc",
+    "pydantic",
+    "ray",
+    "requests",
+    "sqlglot",
+    "tqdm"
+]
+
+[project.optional-dependencies]
+develop = [
+    "build",
+    "bump-my-version",
+    "check-dist",
+    "cibuildwheel",
+    "codespell",
+    "hatch-rs",
+    "hatchling",
+    "mdformat",
+    "mdformat-tables>=1",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "twine",
+    "ty",
+    "uv",
+    "wheel",
+    # tests
+]
+
+[project.scripts]
+
+[project.urls]
+Repository = "https://github.com/Point72/polars-io-tools"
+Homepage = "https://github.com/Point72/polars-io-tools"
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+tag = true
+commit_args = "-s"
+
+[[tool.bumpversion.files]]
+filename = "polars_io_tools/__init__.py"
+search = '__version__ = "{current_version}"'
+replace = '__version__ = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "rust/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[tool.cibuildwheel]
+build = "cp311-*"
+test-command = "pytest -vvv {project}/polars_io_tools/tests"
+test-extras = "develop"
+
+[tool.cibuildwheel.linux]
+before-all = """
+curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=stable --profile=minimal -y
+rustup target add aarch64-unknown-linux-gnu
+rustup target add x86_64-unknown-linux-gnu
+rustup show
+"""
+environment = {PATH="$HOME/.cargo/bin:$PATH", CARGO_TERM_COLOR="always"}
+skip = "*i686* *musllinux*"
+
+[tool.cibuildwheel.macos]
+environment = {PATH="$HOME/.cargo/bin:$PATH", CARGO_TERM_COLOR="always", MACOS_DEPLOYMENT_TARGET=11.0}
+archs = "arm64"
+
+[tool.cibuildwheel.windows]
+environment = {PATH="$UserProfile\\.cargo\bin;$PATH", CARGO_TERM_COLOR="always"}
+skip = "*win32 *arm_64"
+
+[tool.coverage.run]
+branch = true
+omit = [
+    "polars_io_tools/tests/integration/",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "@(abc\\.)?abstractmethod",
+]
+ignore_errors = true
+fail_under = 50
+
+[tool.hatch.build]
+artifacts = [
+    "project/*.dll",
+    "project/*.dylib",
+    "project/*.so",
+]
+
+[tool.hatch.build.sources]
+src = "/"
+
+[tool.hatch.build.hooks.hatch-rs]
+verbose = true
+abi3 = true
+module = "polars_io_tools"
+path = "."
+
+[tool.hatch.build.targets.sdist]
+packages = [
+    "polars_io_tools",
+    "rust",
+    "Cargo.toml",
+    "Cargo.lock",
+]
+exclude = [
+    "rust/Makefile",
+    "target",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "polars_io_tools",
+]
+exclude = [
+    "rust",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "-vvv",
+    "--junitxml=junit.xml",
+]
+testpaths = "polars_io_tools/tests"
+
+[tool.ruff]
+line-length = 150
+
+[tool.ruff.lint]
+extend-select = [
+    "I",
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+default-section = "third-party"
+known-first-party = [
+    "polars_io_tools",
+]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = [
+    "F401",
+    "F403",
+]

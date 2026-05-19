@@ -1,0 +1,18 @@
+[package]
+name = "polars_io_tools_py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "polars_io_tools"
+path = "rust/python/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+polars_io_tools = { path = "./rust", version = "*" }
+pyo3 = { version = "0.28.2", features = ["abi3", "extension-module", "multiple-pymethods"] }
+
+[profile.release]
+panic = 'abort'
+lto = true

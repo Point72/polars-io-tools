@@ -1,0 +1,20 @@
+[package]
+name = "polars_io_tools"
+version = "0.1.0"
+authors = ["Point72, L.P. <OpenSource@point72.com>"]
+edition = "2021"
+license = "Apache-2.0"
+readme = "../README.md"
+repository = "https://github.com/Point72/polars io tools"
+description = "Custom parsing extensions for lazy polars"
+
+[lib]
+name = "polars_io_tools"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+
+[profile.test.junit]
+path = "junit.xml"
+

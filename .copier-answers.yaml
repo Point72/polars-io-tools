@@ -1,0 +1,12 @@
+# Changes here will be overwritten by Copier
+_commit: 71014c6
+_src_path: https://github.com/python-project-templates/base.git
+add_docs: false
+add_extension: rust
+add_wiki: true
+email: OpenSource@point72.com
+github: Point72
+project_description: Custom parsing extensions for lazy polars
+project_name: polars io tools
+python_version_primary: '3.11'
+team: Point72, L.P.
