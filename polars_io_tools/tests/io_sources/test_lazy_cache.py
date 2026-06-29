@@ -207,7 +207,7 @@ SCENARIOS = [
         filter=pl.col("p2"),
         select=pl.col("x2").max(),
         counts={"x2": 1, "p2": 1},
-        cache_size=2,
+        cache_size=3,
         complete_counts={"y2": 1},
         complete_cache_size=6,
     ),
@@ -241,7 +241,7 @@ SCENARIOS = [
         select=pl.col("x2").max(),
         partition_cols=("p",),
         counts={"x2": 1},
-        cache_size=2,
+        cache_size=3,
         complete_counts={"x2": 1, "y2": 2, "p2": 2},
         complete_cache_size=12,
     ),
@@ -282,7 +282,7 @@ def test_scenarios(source, df, cache_mode, scenario):
     3. Third call to collect all data completes the cache
     """
     cache = {}
-    df_cache = df.piot.cache(cache, partition_cols=scenario.partition_cols, cache_mode=cache_mode)
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=scenario.partition_cols, cache_mode=cache_mode)
 
     # First call
     out_cached = df_cache.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
@@ -303,7 +303,7 @@ def test_scenarios(source, df, cache_mode, scenario):
 
     # Re-create df_cache (but using the same `cache`) to prove there is no state in df_cache that's not captured by `cache`
     # We also reverse the partition cols here to make sure that doesn't impact things
-    df_cache = df.piot.cache(cache, partition_cols=list(reversed(scenario.partition_cols)), cache_mode=cache_mode)
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=list(reversed(scenario.partition_cols)), cache_mode=cache_mode)
     out_cached2 = df_cache.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
 
     if cache_mode == "cache":
@@ -336,13 +336,13 @@ def test_df_partitioned(source, df):
     """Test partitioning scenarios with single partition column."""
     cache = {}
     # Get x2 on y=a
-    df_cache = df.piot.cache(cache, partition_cols=("y",))
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",))
     out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 1  # x2 fetched once
     assert counts.get("y2", 0) == 0  # y2 not fetched
     assert counts.get("p2", 0) == 0  # p2 not fetched
-    assert len(cache) == 2  # x2 and y (partition col) for partition y=a
+    assert len(cache) == 3  # x2, y (partition col), x (order_by) for partition y=a
 
     source.reset()
     out = df.filter(pl.col("y") == "a").select("x2").collect()
@@ -405,13 +405,13 @@ def test_df_multi_partitioned(source, df):
     """Test partitioning scenarios with multiple partition columns."""
     cache = {}
     # Get x2 on y=a (covers 2 partitions: y=a/p=True and y=a/p=False)
-    df_cache = df.piot.cache(cache, partition_cols=("y", "p"))
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y", "p"))
     out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 1
     assert counts.get("y2", 0) == 0
     assert counts.get("p2", 0) == 0
-    assert len(cache) == 6  # x2, y, p for 2 partitions (y=a, p=True) and (y=a, p=False)
+    assert len(cache) == 8  # x2, y, p, x (order_by) for 2 partitions (y=a, p=True) and (y=a, p=False)
 
     source.reset()
     out = df.filter(pl.col("y") == "a").select("x2").collect()
@@ -422,7 +422,7 @@ def test_df_multi_partitioned(source, df):
     out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) >= 0  # May or may not need to query depending on cache state
-    assert len(cache) == 6
+    assert len(cache) == 8
 
     source.reset()
     out = df.filter(pl.col("y") == "a").select("x2").collect()
@@ -482,13 +482,13 @@ def test_df_multi_partitioned_contradiction(source, df):
     """Test partitioning with multiple partition columns and contradiction detection."""
     cache = {}
     # Get x2 on y=a, p=True (single partition)
-    df_cache = df.piot.cache(cache, partition_cols=("y", "p"))
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y", "p"))
     out_cached = df_cache.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 1
     assert counts.get("y2", 0) == 0
     assert counts.get("p2", 0) == 0
-    assert len(cache) == 3  # x2, y, p for single partition (y=a, p=True)
+    assert len(cache) == 4  # x2, y, p, x (order_by) for single partition (y=a, p=True)
 
     source.reset()
     out = df.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
@@ -499,7 +499,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     out_cached = df_cache.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 0  # Cache hit
-    assert len(cache) == 3
+    assert len(cache) == 4
 
     source.reset()
     out = df.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
@@ -512,7 +512,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     assert counts.get("x2", 0) == 1  # New partition
     assert counts.get("y2", 0) == 0
     assert counts.get("p2", 0) == 0
-    assert len(cache) == 6
+    assert len(cache) == 8
 
     source.reset()
     out = df.filter(pl.col("y") == "b", pl.col("p") == pl.lit(False)).select("x2").collect()
@@ -525,7 +525,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     assert counts.get("x2", 0) == 1  # New partition
     assert counts.get("y2", 0) == 0
     assert counts.get("p2", 0) == 0
-    assert len(cache) == 9
+    assert len(cache) == 12
 
     source.reset()
     out = df.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
@@ -536,7 +536,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 0  # Cache hit
-    assert len(cache) == 9
+    assert len(cache) == 12
 
     source.reset()
     out = df.filter(pl.col("y") == "b", pl.col("p").eq(True)).select("x2").collect()
@@ -549,7 +549,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     assert counts.get("x2", 0) == 1  # Need y=c/p=True partition
     assert counts.get("y2", 0) == 0
     assert counts.get("p2", 0) == 0
-    assert len(cache) == 12
+    assert len(cache) == 16
 
     source.reset()
     out = df.filter(pl.col("p").eq(True)).select("x2").collect()
@@ -561,7 +561,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     out_cached = df_cache.filter(filter_expr).select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 0  # All needed partitions cached
-    assert len(cache) == 12
+    assert len(cache) == 16
 
     source.reset()
     out = df.filter(filter_expr).select("x2").collect()
@@ -575,7 +575,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     assert counts.get("x2", 0) == 1  # Need y=a/p=False partition
     assert counts.get("y2", 0) == 0
     assert counts.get("p2", 0) == 0
-    assert len(cache) == 15
+    assert len(cache) == 20
 
     source.reset()
     out = df.filter(filter_expr).select("x2").collect()
@@ -587,7 +587,7 @@ def test_df_multi_partitioned_contradiction(source, df):
     out_cached = df_cache.filter(filter_expr).select("x2").collect()
     counts = source.get_column_counts()
     assert counts.get("x2", 0) == 0  # All partitions cached
-    assert len(cache) == 15
+    assert len(cache) == 20
 
     source.reset()
     out = df.filter(filter_expr).select("x2").collect()
@@ -596,7 +596,7 @@ def test_df_multi_partitioned_contradiction(source, df):
 
 def test_streaming(df):
     cache = {}
-    df_cache = df.piot.cache(cache)
+    df_cache = df.piot.cache(cache, order_by="x")
     assert_frame_equal(df.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
 
     with pl.Config() as cfg:
@@ -612,7 +612,7 @@ def test_cache_types(cache_arg, source, df, tmp_path):
         diskcache = pytest.importorskip("diskcache")
         cache = diskcache.Cache(tmp_path / "cache")
 
-    df_cache = df.piot.cache(cache)
+    df_cache = df.piot.cache(cache, order_by="x")
     df_cache.select("x2").collect()
     first_call_count = len(source.calls)
     assert first_call_count == 1
@@ -626,7 +626,7 @@ def test_cache_types(cache_arg, source, df, tmp_path):
     source.reset()
 
     # Re-create df_cache with same cache - should still hit cache
-    df_cache = df.piot.cache(cache)
+    df_cache = df.piot.cache(cache, order_by="x")
     df_cache.select("x2").collect()
     assert len(source.calls) == 0  # No new source calls
 
@@ -929,17 +929,12 @@ def test_pickle(df):
     assert hasattr(df.piot, "cache")
 
 
-def test_nondeterministic_source_produces_misaligned_columns():
-    """
-    Demonstrates that cacherelies on the source LazyFrame having consistent ordering.
+def test_nondeterministic_source_stays_aligned_with_order_by():
+    """A non-deterministic (row-shuffling) source stays aligned when order_by is given.
 
-    Since cachecaches columns independently, if the source LazyFrame does not
-    produce deterministic row ordering across collects, different columns may be cached
-    with different row orderings. When these columns are later combined, the rows will
-    be misaligned.
-
-    This test uses a custom IO source that explicitly shuffles rows on each collect
-    to demonstrate the issue.
+    Columns are cached independently, so a source that emits a different row order on each
+    collect could previously misalign cached columns. Passing a unique ``order_by`` forces
+    every cached block into the same canonical order, guaranteeing correct recombination.
     """
 
     def create_nondeterministic_source(data: pl.DataFrame) -> pl.LazyFrame:
@@ -984,12 +979,12 @@ def test_nondeterministic_source_produces_misaligned_columns():
     lf = create_nondeterministic_source(data)
 
     cache = {}
-    df_cached = lf.piot.cache(cache)
+    df_cached = lf.piot.cache(cache, order_by="key")
 
-    # First collect: cache only left_val and key
+    # First collect: cache only left_val (key co-fetched for ordering)
     _ = df_cached.select(["key", "left_val"]).collect()
 
-    # Second collect: cache only right_val and key (will shuffle differently!)
+    # Second collect: cache only right_val (source shuffles differently!)
     _ = df_cached.select(["key", "right_val"]).collect()
 
     # Third collect: get all columns together from cache
@@ -998,14 +993,12 @@ def test_nondeterministic_source_produces_misaligned_columns():
     # Verify alignment: right_val should be left_val + 1000000 if rows are aligned
     misaligned = result.filter(pl.col("right_val") != (pl.col("left_val") + 1000000))
 
-    # With a non-deterministic source, we expect misalignment
-    assert not misaligned.is_empty(), (
-        "Expected misaligned rows due to non-deterministic ordering. This test demonstrates why cacherequires consistent ordering from the source."
-    )
+    # With a unique order_by, the canonical ordering keeps the columns aligned
+    assert misaligned.is_empty(), "Columns must stay aligned once a unique order_by is provided."
 
 
-def test_piot_cache_emits_warning():
-    """Test that cacheemits a warning about ordering requirements."""
+def test_piot_cache_no_warning():
+    """cache() no longer emits an ordering warning now that order_by guarantees alignment."""
     import warnings
 
     df = pl.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]}).lazy()
@@ -1013,6 +1006,48 @@ def test_piot_cache_emits_warning():
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        _ = df.piot.cache(cache).collect()
+        _ = df.piot.cache(cache, order_by="x").collect()
 
-        assert any("consistent row ordering" in str(warning.message) for warning in w), "Expected warning about consistent row ordering"
+    assert not any("consistent row ordering" in str(warning.message) for warning in w), "No ordering warning should be emitted."
+
+
+def test_piot_cache_non_unique_order_by_raises():
+    """A non-unique order_by is rejected because it cannot guarantee a total order."""
+    df = pl.DataFrame({"k": [1, 1, 2], "v": [10, 20, 30]}).lazy()
+    with pytest.raises(pl.exceptions.ComputeError, match="does not uniquely identify rows"):
+        df.piot.cache({}, order_by="k").select(["k", "v"]).collect()
+
+
+def test_piot_cache_validate_false_skips_uniqueness_check():
+    """validate=False bypasses the uniqueness check for callers that guarantee it themselves."""
+    df = pl.DataFrame({"k": [1, 1, 2], "v": [10, 20, 30]}).lazy()
+    out = df.piot.cache({}, order_by="k", validate=False).select(["v"]).collect()
+    assert out.height == 3
+
+
+def test_piot_cache_order_by_not_in_schema_raises():
+    """An order_by column missing from the schema fails fast at definition time."""
+    df = pl.DataFrame({"x": [1, 2, 3]}).lazy()
+    with pytest.raises(ValueError, match="order_by columns not found"):
+        df.piot.cache({}, order_by="missing")
+
+
+def test_piot_cache_shared_cache_different_partition_cols():
+    """A shared cache reused with different partition_cols must not collide/crash.
+
+    The partition layout is part of the cache key, so coarse- and fine-grained partitionings
+    of the same frame live in separate namespaces instead of reading each other's keys.
+    """
+    df = pl.DataFrame(
+        {
+            "p": ["a", "a", "b", "b"],
+            "q": [1, 2, 1, 2],
+            "x": [1, 2, 3, 4],
+            "v": [10, 20, 30, 40],
+        }
+    ).lazy()
+    cache = {}
+    fine = df.piot.cache(cache, order_by="x", partition_cols=("p", "q")).select("v").collect()
+    coarse = df.piot.cache(cache, order_by="x", partition_cols=("p",)).select("v").collect()
+    assert sorted(fine["v"].to_list()) == [10, 20, 30, 40]
+    assert sorted(coarse["v"].to_list()) == [10, 20, 30, 40]

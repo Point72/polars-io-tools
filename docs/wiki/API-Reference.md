@@ -16,14 +16,17 @@ The signatures below show the namespace form where one exists.
 ### `cache`
 
 ```python
-lf.piot.cache(cache=None, *, partition_cols=(), cache_mode="cache", log_explain=False, **kwargs)
+lf.piot.cache(cache=None, *, order_by, partition_cols=(), cache_mode="cache", validate=True, log_explain=False, **kwargs)
 ```
 
 Maintain an intermediate, per-column cache of the LazyFrame, optionally partitioned by
 `partition_cols`. Predicates on partition columns restrict which partitions are cached.
 `cache` defaults to a global in-memory dict; pass a custom mapping (such as
 `diskcache.Cache`) to persist across sessions. `cache_mode` is `"cache"`, `"rebuild"`, or
-`"ignore"`. Relies on the source producing consistent row ordering across collects.
+`"ignore"`. `order_by` is required and must uniquely identify each row (within each
+partition when `partition_cols` is used): columns are cached sorted by it so that
+independently cached columns stay aligned regardless of source ordering. Uniqueness is
+verified unless `validate=False`.
 
 ### `cache_parquet`
 
