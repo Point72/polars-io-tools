@@ -2,6 +2,7 @@ import datetime
 import functools
 import logging
 import operator
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -72,8 +73,21 @@ def _prepare_lf_for_sink_from_io_source(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 # Constants
 
-_MAX_PARTITIONED_SINK_PARTITIONS = 64
+# Polars' default cap on how many partition sinks may be open at once (the
+# POLARS_MAX_OPEN_SINKS default). Writes are checked against this cap.
+_DEFAULT_MAX_OPEN_SINKS = 128
 _MAX_ENUMERATED_SCAN_PATHS = 64
+
+
+def _max_open_sinks() -> int:
+    """Return the open-sink cap polars will enforce (POLARS_MAX_OPEN_SINKS, or the default)."""
+    raw = os.environ.get("POLARS_MAX_OPEN_SINKS")
+    if raw is None:
+        return _DEFAULT_MAX_OPEN_SINKS
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_OPEN_SINKS
 
 
 def _dataframe_write_parquet_kwargs(
@@ -94,42 +108,6 @@ def _dataframe_write_parquet_kwargs(
     if credential_provider:
         parquet_kwargs["credential_provider"] = credential_provider
     return parquet_kwargs
-
-
-def _write_partitioned_lf_sequentially(
-    lf: pl.LazyFrame,
-    *,
-    key_exprs: List[pl.Expr],
-    key_names: List[str],
-    time_unit_dir: str,
-    metadata: dict[str, str],
-    storage_options: dict,
-    credential_provider: Optional[pl.CredentialProviderAWS],
-    write_kwargs: dict,
-) -> set[str]:
-    df = lf.with_columns(key_exprs).collect()
-    if df.is_empty():
-        return set()
-
-    parquet_kwargs = _dataframe_write_parquet_kwargs(
-        write_kwargs=write_kwargs,
-        metadata=metadata,
-        storage_options=storage_options,
-        credential_provider=credential_provider,
-    )
-
-    written_keys: set[str] = set()
-    groups = df.partition_by(key_names, maintain_order=True, include_key=True, as_dict=True)
-    for key_tuple, group in groups.items():
-        key_values = [unquote(str(v)) for v in key_tuple]
-        key_path = "/".join(key_values)
-        written_keys.add(key_path)
-
-        path_parts = key_values[:-1]
-        path_parts.append(f"{key_values[-1]}.parquet")
-        group.drop(key_names).write_parquet(f"{time_unit_dir}/{'/'.join(path_parts)}", **parquet_kwargs)
-
-    return written_keys
 
 
 def _write_empty_parquet_files_sequentially(
@@ -1565,6 +1543,11 @@ def cache_parquet(
           instead of a glob, reducing metadata scans. Falls back to glob when enumeration isn't possible.
         - Partition completeness assumption: if a partition has any data in cache, it's assumed complete
           for the purpose of unbounded queries.
+        - Open-sink cap: a single write opens one streaming sink per partition. Polars caps the number
+          of simultaneously open sinks (``POLARS_MAX_OPEN_SINKS``, default 128); exceeding it would
+          silently drop rows, so ``cache_parquet`` raises instead. To write more partitions in one call,
+          set ``POLARS_MAX_OPEN_SINKS`` above the partition count *before the process starts*, or reduce
+          the partition count per call (e.g. a coarser ``time_unit`` or chunked date ranges).
     """
     if cache_mode == CacheMode.IGNORE:
         return self_or_fn() if callable(self_or_fn) else self_or_fn
@@ -1740,19 +1723,6 @@ def cache_parquet(
                 if bounding_pred is not None:
                     lf_to_write = lf_to_write.filter(bounding_pred)
 
-            key_parts = [pl.col("keys").struct.field(f"__piot_key_{c}__").cast(pl.Utf8) for c in _extra_cols]
-            if DATE_KEY_ALIAS is not None:
-                key_parts.append(pl.col("keys").struct.field(DATE_KEY_ALIAS).cast(pl.Utf8))
-
-            key_names = [f"__piot_key_{c}__" for c in _extra_cols]
-            if DATE_KEY_ALIAS is not None:
-                key_names.append(DATE_KEY_ALIAS)
-
-            # Handle single partition case - add the dummy key we created earlier
-            if not key_parts and not _extra_cols and date_column is None:
-                key_parts.append(pl.col("keys").struct.field("__piot_key_single__").cast(pl.Utf8))
-                key_names.append("__piot_key_single__")
-
             # Track written partition keys via file_path callback
             tracked_keys: set[str] = set()
 
@@ -1760,7 +1730,20 @@ def cache_parquet(
                 """Generate file path for each partition and track written keys."""
                 # Handle API differences between PartitionBy (new) and PartitionByKey (old)
                 if hasattr(ctx, "partition_keys"):
-                    # PartitionBy: ctx.partition_keys is a single-row DataFrame
+                    # index_in_partition > 0 means polars reopened this sink after
+                    # eviction; the reopened sink would overwrite the partition's
+                    # earlier file, so fail here instead of losing rows. Raise (not
+                    # assert) so it survives `python -O`.
+                    if ctx.index_in_partition != 0:
+                        raise RuntimeError(
+                            "cache_parquet: polars reopened a partition sink "
+                            f"(index_in_partition={ctx.index_in_partition}) for key "
+                            f"{ctx.partition_keys.row(0)!r}. The open-sink cap "
+                            f"({_max_open_sinks()}) was exceeded and rows would be "
+                            "silently dropped. Set POLARS_MAX_OPEN_SINKS above the "
+                            "partition count before the process starts, or write fewer "
+                            "partitions per call."
+                        )
                     key_values = [unquote(str(v)) for v in ctx.partition_keys.row(0)]
                 else:
                     # PartitionByKey: ctx.keys is a list of key objects with .str_value
@@ -1783,6 +1766,10 @@ def cache_parquet(
                     key=key_exprs,
                     file_path_provider=_file_path_callback,
                     include_key=False,
+                    # Disable size-based splitting so each partition is one file
+                    # (index_in_partition stays 0); otherwise a large partition could be
+                    # split, breaking the one-file-per-partition layout the reader expects.
+                    approximate_bytes_per_file=None,
                 )
             else:
                 partition_obj = pl.PartitionByKey(
@@ -1798,36 +1785,34 @@ def cache_parquet(
                 extra_cols=_extra_cols,
                 user_metadata=write_kwargs.get("metadata"),
             )
-            if len(partitions_to_write_df) > _MAX_PARTITIONED_SINK_PARTITIONS:
-                log.debug(
-                    "Writing partitions sequentially because %d partition(s) exceed limit %d",
-                    len(partitions_to_write_df),
-                    _MAX_PARTITIONED_SINK_PARTITIONS,
+            # Above the open-sink cap, polars evicts and reopens partition sinks, and the
+            # custom file_path_provider's reopened sink overwrites the partition's earlier
+            # file, silently dropping rows. Reject here when the partition count is known
+            # up front; the callback's index_in_partition check is the runtime backstop for
+            # cases (e.g. unbounded queries) where it isn't.
+            n_partitions = len(partitions_to_write_df)
+            max_open_sinks = _max_open_sinks()
+            if n_partitions > max_open_sinks:
+                raise ValueError(
+                    f"cache_parquet would write {n_partitions} partitions in a single "
+                    f"streaming sink, exceeding the polars open-sink cap of "
+                    f"{max_open_sinks}. Exceeding the cap silently drops rows. Set the "
+                    "POLARS_MAX_OPEN_SINKS environment variable above the partition "
+                    "count BEFORE the process starts, or write fewer partitions per "
+                    "call (e.g. a coarser time_unit or chunked date ranges)."
                 )
-                tracked_keys.update(
-                    _write_partitioned_lf_sequentially(
-                        lf_to_write,
-                        key_exprs=key_exprs,
-                        key_names=key_names,
-                        time_unit_dir=time_unit_dir,
-                        metadata=cache_metadata,
-                        storage_options=polars_opts,
-                        credential_provider=credential_provider,
-                        write_kwargs=write_kwargs,
-                    )
-                )
-            else:
-                sink_write_kwargs = dict(write_kwargs)
-                sink_write_kwargs.pop("metadata", None)
-                _prepare_lf_for_sink_from_io_source(lf_to_write).sink_parquet(  # type: ignore[call-overload]
-                    partition_obj,
-                    maintain_order=True,
-                    mkdir=True,
-                    metadata=cache_metadata,
-                    storage_options=polars_opts,
-                    **({"credential_provider": credential_provider} if credential_provider else {}),
-                    **sink_write_kwargs,
-                )
+
+            sink_write_kwargs = dict(write_kwargs)
+            sink_write_kwargs.pop("metadata", None)
+            _prepare_lf_for_sink_from_io_source(lf_to_write).sink_parquet(  # type: ignore[call-overload]
+                partition_obj,
+                maintain_order=True,
+                mkdir=True,
+                metadata=cache_metadata,
+                storage_options=polars_opts,
+                **({"credential_provider": credential_provider} if credential_provider else {}),
+                **sink_write_kwargs,
+            )
 
             # Update written_parts from tracked keys
             written_parts.update(tracked_keys)

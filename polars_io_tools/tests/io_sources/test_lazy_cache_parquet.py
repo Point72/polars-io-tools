@@ -1183,11 +1183,14 @@ def test_push_and_parse_exclusions_to_custom_io_source(tmp_path):
     )  # we have data for "NA" cached, so shouldnt query
 
 
-def test_large_partition_query(tmp_path):
+def test_large_partition_query(tmp_path, monkeypatch):
     """
     Test that we correctly write empty partitions for daily partitions when
     extra partition columns are specified, and there is a gap.
     """
+    # More partitions than the default open-sink cap (128); raise it so the streaming
+    # sink can keep every partition open at once.
+    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "8192")
     df = pl.LazyFrame(
         {
             "date": pl.date_range(datetime.date(2020, 1, 1), datetime.date(2026, 1, 1), eager=True),
@@ -1228,10 +1231,15 @@ def test_large_partition_query(tmp_path):
     assert missing_expected.is_empty(), "missing expected rows in the result"
 
 
-def test_huge_partition_query(tmp_path, caplog):
+def test_huge_partition_query(tmp_path, caplog, monkeypatch):
     """
     Test a large partition query that spans multiple years. We have partial data in the cache, and if we submitted each requested partition as a combination of OR's, we would end up with a very large query that could segfault.
     """
+    # This query writes far more partitions than the default open-sink cap (128). Raise
+    # the cap so the streaming partitioned sink keeps every partition open at once; the
+    # cache adapter refuses to exceed whatever cap is in effect rather than silently
+    # dropping rows.
+    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "8192")
     df = pl.LazyFrame(
         {
             "date": pl.date_range(datetime.date(2020, 1, 1), datetime.date(2026, 1, 1), eager=True),
@@ -1280,9 +1288,21 @@ def test_huge_partition_query(tmp_path, caplog):
     assert_frame_equal(res2.sort("date", "region"), expected.sort("date", "region"))
     # Huge bounded queries avoid very large explicit path lists on Windows.
     logs = caplog.text
-    assert "Writing partitions sequentially" in logs
-    assert "exceeding limit" in logs
     assert "Cache scan uses glob" in logs
+
+
+def test_partition_count_exceeds_open_sinks_raises(tmp_path, monkeypatch):
+    """Writing more partitions than the open-sink cap fails loud instead of dropping rows."""
+    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "4")
+    df = pl.LazyFrame(
+        {
+            "date": pl.date_range(datetime.date(2020, 1, 1), datetime.date(2020, 1, 10), eager=True),
+            "value": range(10),
+        }
+    )
+    pred = pl.col.date.is_between(datetime.date(2020, 1, 1), datetime.date(2020, 1, 10))
+    with pytest.raises(Exception, match="open-sink cap"):
+        df.piot.cache_parquet(cache_path=tmp_path, date_column="date", time_unit="daily").filter(pred).collect()
 
 
 def test_get_fs_path_directory_info_strips_trailing_slash_s3():
