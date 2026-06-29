@@ -233,6 +233,29 @@ class TestMultiSourceBasic:
         # With maintain_order="left", row order should be preserved
         assert_frame_equal(result, expected)
 
+    def test_dt_date_filter_prunes_datetime_source(self):
+        """A ``.dt.date()`` window on a Datetime source prunes upstream (no full scan) and stays correct.
+
+        ``.dt.date()`` floors to day granularity (order-preserving, like ``cast(pl.Date)``), so the temporal range
+        must still be extracted and pushed down rather than collapsing to the universe interval.
+        """
+        ts = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(90)]
+        df = pl.DataFrame({"ts": ts, "val": list(range(90))})
+        tracker = PredicateTracker(df)
+
+        lf = multi_source(
+            sources={"data": (tracker.lazy_frame, {"ts": FilterSpec()})},
+            combine=lambda s: s["data"],
+        )
+
+        start, end = date(2024, 1, 1), date(2024, 1, 31)
+        result = lf.filter((pl.col("ts").dt.date() >= start) & (pl.col("ts").dt.date() <= end)).collect()
+
+        # Range was extracted, so the source received a constraining predicate (not a silent full scan).
+        assert tracker.last_predicate is not None
+        assert result.height == 31
+        assert result["ts"].max() == datetime(2024, 1, 31)
+
     def test_simple_equality_filter(self):
         """Equality filter propagates correctly."""
         left = pl.LazyFrame({"id": ["A", "B", "C"], "val": [1, 2, 3]})
