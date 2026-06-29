@@ -79,6 +79,13 @@ def test_extract_column_name():
     expr = pl.col("b").cast(pl.Int64).alias("first").alias("second")
     assert "b" == extract_column_name(get_parsed_expr(expr))
 
+    # .dt.date() floors a Datetime column to day granularity (order-preserving, like cast(pl.Date)) and should
+    # resolve to the underlying column so temporal predicates push down.
+    expr = pl.col("ts").dt.date()
+    assert "ts" == extract_column_name(get_parsed_expr(expr))
+    expr = pl.col("ts").dt.date().alias("d")
+    assert "ts" == extract_column_name(get_parsed_expr(expr))
+
 
 def test_parse_simple_column():
     """Test parsing a simple column reference."""

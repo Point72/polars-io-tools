@@ -15,6 +15,7 @@ from .enum import (
     FunctionType,
     GenericFunctionType,
     OperatorType,
+    TemporalFunctionType,
     TimeUnit,
     get_function_enum,
 )
@@ -1101,6 +1102,10 @@ def extract_column_name(node: BaseExprNode) -> Optional[str]:
             return col_names[0]
         elif isinstance(cur, (AliasNode, CastNode)):
             cur = cur.input
+        elif isinstance(cur, FunctionNode) and cur.function_type == TemporalFunctionType.DATE and len(cur.inputs) == 1:
+            # ``col.dt.date()`` floors a Datetime to day granularity: order- and domain-preserving, hence equivalent
+            # to ``col.cast(pl.Date)`` (unwrapped above). Treat it identically so it resolves wherever a cast would.
+            cur = cur.inputs[0]
         else:
             return None
 
