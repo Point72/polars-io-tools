@@ -148,7 +148,7 @@ class TestpiotCachePickle:
         df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         source_lf = df.lazy()
 
-        lf = source_lf.piot.cache()
+        lf = source_lf.piot.cache(order_by="a")
         lf_unpickled = _pickle_roundtrip(lf)
 
         result = lf_unpickled.collect()

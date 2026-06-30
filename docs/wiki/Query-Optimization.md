@@ -143,7 +143,7 @@ collects reuse already-computed columns:
 df = (
     pl.LazyFrame({"x": [1, 2, 3]})
     .with_columns((pl.col("x") * 2).alias("slow"))
-    .piot.cache()
+    .piot.cache(order_by="x")
 )
 
 df.select(pl.col("slow").max()).collect()   # computes and caches "slow"
@@ -152,7 +152,8 @@ df.select(pl.col("slow").min()).collect()   # reuses the cached column
 
 Pass a custom mapping (for example `diskcache.Cache(...)`) to persist across sessions,
 and `partition_cols=` so that filters on partition columns restrict which partitions are
-cached. `cache` relies on the source producing consistent row ordering across collects.
+cached. `order_by` must uniquely identify each row (within each partition when partitioning)
+so that columns cached in separate collects stay aligned.
 
 ## Cache to partitioned Parquet on disk or S3
 

@@ -1,8 +1,7 @@
 import hashlib
 import logging
-import warnings
 from collections.abc import MutableMapping
-from typing import Any, Dict, Hashable, Iterator, List, Literal, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Hashable, Iterator, List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
 
 import polars as pl
 
@@ -30,9 +29,10 @@ class _CacheKey(NamedTuple):
 _CACHE: Dict[_CacheKey, pl.Series] = {}
 
 
-def _df_key(df: pl.LazyFrame) -> str:
-    """Return a unique key for the given dataframe."""
-    return hashlib.md5(df.serialize()).hexdigest()
+def _df_key(df: pl.LazyFrame, order_by: Tuple[str, ...] = (), partition_cols: Tuple[str, ...] = ()) -> str:
+    """Return a unique key for the given dataframe, ordering key and partition layout."""
+    payload = df.serialize() + repr((tuple(order_by), tuple(partition_cols))).encode()
+    return hashlib.md5(payload).hexdigest()
 
 
 def _partition_key(partition_values: Dict[str, Hashable]) -> _PartitionKey:
@@ -114,12 +114,30 @@ def _extract_filter_from_df(df: pl.DataFrame) -> Optional[pl.Expr]:
     return pl.Expr.and_(*row_exprs)
 
 
+def _validate_order_by_unique(frame: pl.DataFrame, order_by: Tuple[str, ...]) -> None:
+    """Raise if ``order_by`` does not uniquely identify the rows of ``frame``.
+
+    Operates on a frame already collected for the cache fill, so it adds no extra pass
+    over the source.
+    """
+    if frame.height and frame.select(list(order_by)).is_duplicated().any():
+        raise ValueError(
+            f"order_by={order_by} does not uniquely identify rows (duplicate keys found). "
+            "A unique total order is required so that independently cached columns remain "
+            "aligned. When partition_cols is used, order_by must be unique within each "
+            "partition. Pass validate=False to skip this check if you are certain the "
+            "ordering is unique."
+        )
+
+
 def cache(
     self: pl.LazyFrame,
     cache: Optional[MutableMapping[_CacheKey, pl.Series]] = None,
     *,
+    order_by: Union[str, Sequence[str]],
     partition_cols: Tuple[str, ...] = (),
     cache_mode: Literal["cache", "ignore", "rebuild"] = "cache",
+    validate: bool = True,
     log_explain: bool = False,
     **kwargs,
 ) -> pl.LazyFrame:
@@ -141,9 +159,21 @@ def cache(
     Args:
         self: The input data frame to cache columns of.
         cache: An optional implementation of a cache backend. Defaults to a global in-memory cache.
+        order_by: One or more columns that uniquely identify each row (a unique total order) —
+            typically the frame's natural row identity, such as a primary key or ``date`` + ``symbol``.
+            Every cached column is collected and sorted by these columns so that independently cached
+            columns share one row order and stay aligned when recombined. ``partition_cols`` is not a
+            substitute: a partition normally holds many rows, so ``order_by`` must be unique *within*
+            each partition. Uniqueness is verified (see ``validate``). Output rows are returned
+            sorted by ``order_by`` (within each partition when ``partition_cols`` is set).
         partition_cols: An optional set of columns to partition the cache by. It is recommended that queries to the underlying frame for the partition cols are fast,
-            i.e. they correspond to the parquet partition columns. Ordering of the result is not guaranteed when using partition columns.
+            i.e. they correspond to the parquet partition columns.
         cache_mode: The caching mode; use "cache" for regular caching, "rebuild" to overwrite existing elements of the cache (i.e. to force a refresh), or "ignore" to not use the cache at all.
+        validate: If True (default), verify that ``order_by`` uniquely identifies rows of each
+            collected block, raising at ``collect`` time otherwise (Polars surfaces this as a
+            ``ComputeError`` wrapping the validation ``ValueError``). The check runs on data already
+            collected for the cache fill, so it adds no extra pass over the source. Set to False to
+            skip it on hot paths where uniqueness is already guaranteed.
         log_explain: If True, logs the query plan when defining the function.
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
@@ -152,26 +182,19 @@ def cache(
           It means that if a persistent cache implementation is provided, the cache can remain valid between sessions.
         - The cache will be invalidated if the input LazyFrame is changed in any way (i.e. by adding a new column, or changing the underlying data source).
           It also means that the act of generating the column_cache will change the key for downstream caches,
-          i.e. `df.piot.cache().select(expr_1).piot.cache()` will have a different cache from `df.select(expr_1).piot.cache()`,
+          i.e. `df.piot.cache(order_by="id").select(expr_1).piot.cache(order_by="id")` will have a different cache from `df.select(expr_1).piot.cache(order_by="id")`,
           even though they return the same result.
         - Turn on debug level logging for more info about the cache hits and misses.
-
-        .. warning::
-
-           **Ordering Requirement**: This function relies on the source LazyFrame producing
-           consistent row ordering across multiple collects. Since columns are cached independently,
-           if the source LazyFrame does not guarantee deterministic ordering, different columns
-           may be cached with different row orderings, leading to misaligned data when combined.
 
     Examples:
         Simple usage example:
             >>> import polars_io_tools.io_sources  # registers .piot namespace
             >>> df = pl.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]}).lazy()
             >>> cache = {}  # or use a persistent cache like diskcache.Cache("./polars_cache")
-            >>> _ = df.piot.cache(cache).select("x").head(1).collect()
+            >>> _ = df.piot.cache(cache, order_by="x").select("x").head(1).collect()
             >>> len(cache) > 0
             True
-            >>> _ = df.piot.cache(cache).select(["x", "y"]).collect()  # x will be pulled from the cache
+            >>> _ = df.piot.cache(cache, order_by="x").select(["x", "y"]).collect()  # x will be pulled from the cache
             >>> len(cache) > 1  # y was added to the cache
             True
 
@@ -181,7 +204,7 @@ def cache(
             ...     (pl.col("x") * 2).alias("slow"),
             ...     (pl.col("x") * 3).alias("very_slow"),
             ... ])
-            >>> df = df.piot.cache()
+            >>> df = df.piot.cache(order_by="x")
 
         This first call evaluates the "slow" column (and stores it in the cache):
             >>> result = df.select(pl.col("slow").max()).collect()
@@ -197,14 +220,13 @@ def cache(
     """
     if cache_mode not in ("cache", "ignore", "rebuild"):
         raise ValueError(f"Invalid cache mode: {cache_mode}")
+
+    order_by = (order_by,) if isinstance(order_by, str) else tuple(order_by)
+    if not order_by:
+        raise ValueError("order_by must specify at least one column")
+
     if cache_mode == "ignore":
         return self
-
-    warnings.warn(
-        "cacherelies on the source LazyFrame having consistent row ordering. "
-        "If the source uses non-deterministic operations (e.g., joins without maintain_order), "
-        "cached columns may have misaligned rows."
-    )
 
     if cache is None:
         cache = _CACHE
@@ -214,11 +236,17 @@ def cache(
     # Note: This may be slow. Also, make sure to call this *before* generating _df_key.
     schema = self.collect_schema()
 
+    missing = [col for col in order_by if col not in schema]
+    if missing:
+        raise ValueError(f"order_by columns not found in frame schema: {missing}")
+
     # Generate the schema of the partition columns, as we'll need to apply the partition predicate to a frame with this schema
     partition_schema = {p_col: schema[p_col] for p_col in partition_cols}
 
-    # Create a key for the dataframe as part of the cache keys
-    df_key = _df_key(self)
+    # Create a key for the dataframe as part of the cache keys. The ordering key and partition
+    # layout are folded in so that caches built with a different order_by or different
+    # partition_cols never collide.
+    df_key = _df_key(self, order_by, partition_cols)
     if log_explain:
         log.debug(str(self.explain()))
 
@@ -305,8 +333,10 @@ def cache(
                 filtered_df = self.filter(selected_predicate)
             else:
                 filtered_df = self
+            # Include the ordering key so the block can be sorted into the canonical order.
+            cols_with_order = cols_to_collect + [c for c in order_by if c not in cols_to_collect]
             # This frame corresponds to more columns needed for a known partition key
-            frames_to_collect[partition_key] = filtered_df.select(cols_to_collect)
+            frames_to_collect[partition_key] = filtered_df.select(cols_with_order).sort(list(order_by))
 
         # Lastly, query all columns for all partitions that are not in the cache.
         # We don't know the partition key, so need to include the partition columns in the query,
@@ -317,6 +347,10 @@ def cache(
             # Make sure to include the partition columns in the query
             for p in set(partition_cols).difference(cols_to_collect):
                 cols_to_collect.append(p)
+            # Make sure to include the ordering key so the block can be sorted canonically.
+            for c in order_by:
+                if c not in cols_to_collect:
+                    cols_to_collect.append(c)
             can_skip_query = False
             if query_predicate is not None and filtered_partition_dfs:
                 # We already filtered the frame containing our partition information with our predicate.
@@ -346,7 +380,9 @@ def cache(
             if not can_skip_query:
                 log.debug("Querying for data without a fixed partition key... %s", query_predicate)
                 frames_to_collect[None] = (
-                    self.filter(query_predicate).select(cols_to_collect) if query_predicate is not None else self.select(cols_to_collect)
+                    self.filter(query_predicate).select(cols_to_collect).sort(list(order_by))
+                    if query_predicate is not None
+                    else self.select(cols_to_collect).sort(list(order_by))
                 )
 
         # Collect all the frames together in a single call for efficiency
@@ -369,6 +405,8 @@ def cache(
                     frame_iter = [((), frame)]
 
                 for partition_values, partition_frame in frame_iter:
+                    if validate and all(c in partition_frame.columns for c in order_by):
+                        _validate_order_by_unique(partition_frame, order_by)
                     partition_key = _partition_key(dict(zip(partition_cols, partition_values)))
                     for col in partition_frame.columns:
                         cache_key = _CacheKey(col=col, df_key=df_key, partition_key=partition_key)
@@ -376,6 +414,8 @@ def cache(
                         cache[cache_key] = partition_frame[col]
                         data.setdefault(partition_key, {})[col] = partition_frame[col]
             else:
+                if validate and all(c in frame.columns for c in order_by):
+                    _validate_order_by_unique(frame, order_by)
                 for col in frame.columns:
                     cache_key = _CacheKey(col=col, df_key=df_key, partition_key=partition_key)
                     log.debug("Caching new partition:  %s", cache_key)

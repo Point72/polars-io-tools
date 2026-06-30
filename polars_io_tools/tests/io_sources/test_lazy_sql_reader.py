@@ -728,7 +728,7 @@ def test_piot_cache_integration(monkeypatch, range_dates):
     FROM EmployeeTbl
     """
     partition_cols = ["test_date", "name"]
-    emp_lf = cpl.scan_db(base_query, "fake_connection_string").piot.cache(partition_cols=partition_cols)
+    emp_lf = cpl.scan_db(base_query, "fake_connection_string").piot.cache(order_by="id", partition_cols=partition_cols)
 
     def apply_filters(lf: pl.LazyFrame, start: date = date(2022, 1, 1), end: date = date(2022, 1, 2)) -> pl.LazyFrame:
         if range_dates:

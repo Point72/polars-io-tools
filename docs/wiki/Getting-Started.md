@@ -131,7 +131,7 @@ columns (optionally per partition) so later collects reuse them instead of recom
 df = (
     pl.LazyFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
     .with_columns((pl.col("x") * 2).alias("slow"))
-    .piot.cache()
+    .piot.cache(order_by="x")
 )
 
 # First collect computes "slow" and stores it in the cache.
@@ -142,7 +142,8 @@ df.select(pl.col("slow").min()).collect()
 ```
 
 By default the cache is an in-memory dictionary; pass your own mapping (for example a
-`diskcache.Cache`) to persist results across sessions.
+`diskcache.Cache`) to persist results across sessions. `order_by` is a column (or columns)
+that uniquely identifies each row, so columns cached in separate collects stay aligned.
 
 ## What you built
 
