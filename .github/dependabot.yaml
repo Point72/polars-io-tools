@@ -1,29 +1,3 @@
-<<<<<<< before updating
-# version: 2
-# updates:
-#   - package-ecosystem: "github-actions"
-#     directory: "/"
-#     schedule:
-#       interval: "weekly"
-#     labels:
-#       - "part: github_actions"
-
-#   - package-ecosystem: "pip"
-#     directory: "/"
-#     schedule:
-#       interval: "monthly"
-#     labels:
-#       - "lang: python"
-#       - "part: dependencies"
-
-#   - package-ecosystem: "cargo"
-#     directory: "/"
-#     schedule:
-#       interval: "monthly"
-#     labels:
-#       - "lang: rust"
-#       - "part: dependencies"
-=======
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -52,5 +26,3 @@ updates:
     labels:
       - "lang: rust"
       - "part: dependencies"
->>>>>>> after updating
-
