@@ -1,3 +1,4 @@
+<<<<<<< before updating
 # version: 2
 # updates:
 #   - package-ecosystem: "github-actions"
@@ -22,4 +23,34 @@
 #     labels:
 #       - "lang: rust"
 #       - "part: dependencies"
+=======
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "part: github_actions"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    labels:
+      - "lang: python"
+      - "part: dependencies"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    labels:
+      - "lang: rust"
+      - "part: dependencies"
+>>>>>>> after updating
 

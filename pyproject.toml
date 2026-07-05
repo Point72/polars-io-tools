@@ -145,9 +145,9 @@ fail_under = 50
 
 [tool.hatch.build]
 artifacts = [
-    "project/*.dll",
-    "project/*.dylib",
-    "project/*.so",
+    "polars_io_tools/*.dll",
+    "polars_io_tools/*.dylib",
+    "polars_io_tools/*.so",
 ]
 
 [tool.hatch.build.sources]
