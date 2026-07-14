@@ -41,7 +41,7 @@ dependencies = [
     "orjson",
     "packaging",
     "pandas",
-    "polars",
+    "polars>=1.8",
     "portion",
     "pyarrow",
     "pyodbc",

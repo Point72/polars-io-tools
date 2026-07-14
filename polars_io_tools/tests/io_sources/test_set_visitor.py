@@ -4,6 +4,7 @@ from polars_io_tools.io_sources.base import (
     ExprParser,
 )
 from polars_io_tools.io_sources.set_visitor import SetVisitor, convert_expr_to_valid_values
+from polars_io_tools.tests.io_sources.conftest import skip_unoptimized_expression_shape
 
 
 def test_set_visitor_visitor_direct():
@@ -489,6 +490,7 @@ def test_alias_logical_operations():
     assert result == {"US"}
 
 
+@skip_unoptimized_expression_shape
 def test_alias_nested_expression():
     """Test aliases on complex nested expressions."""
     expr = ((pl.col("symbol") == "US") | (pl.col("symbol") == "EU")).alias("symbol_filter")

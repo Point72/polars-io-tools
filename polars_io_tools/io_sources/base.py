@@ -1,12 +1,18 @@
 import datetime
 import logging
+import os
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
+from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import orjson
 import polars as pl
 from packaging import version
+
+try:
+    from polars._plr import _expr_nodes as en  # polars >= 1.32
+except ImportError:
+    from polars.polars import _expr_nodes as en  # polars < 1.32
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, model_validator
 
 from .enum import (
@@ -1055,6 +1061,253 @@ class ExprParser:
         return AnonymousFunctionNode(expr=expr, input=input_node)
 
 
+# ---------------------------------------------------------------------------
+# NodeTraverser-based parser
+#
+# Built on polars' private ``NodeTraverser`` API (``LazyFrame._ldf.visit()`` plus ``add_expressions`` and ``view_expression``). The traverser exposes
+# a typed view of expression nodes after polars' DSL→IR conversion, which is exactly the shape that arrives at a custom IO source plugin via
+# ``polars.io.plugins.register_io_source``. Structural traversal is driven by ``expr.meta.pop()`` so each sub-node receives an accurate ``pl.Expr``
+# (downstream visitors rely on ``node.expr.meta.root_names()`` and ``~node.expr``); the traverser is used purely for typed dispatch and for direct
+# access to ``Operator``, function-category enums, ``Literal.value``/``dtype`` and ``Cast.dtype``. This is the default parser; the legacy
+# JSON-serialization based :class:`ExprParser` above remains reachable for one release via the ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER`` env var.
+# ---------------------------------------------------------------------------
+
+_OPERATOR_NAME_MAP: Dict[str, OperatorType] = {op.value: op for op in OperatorType}
+
+# (polars typed enum class, category key consumed by `get_function_enum`). Order does not matter; lookup is by isinstance on the head of
+# `Function.function_data`. Some classes (e.g. `StructFunction`, added in polars 1.31) may be absent on older supported polars versions;
+# `getattr` keeps the table compatible across the supported range and the missing categories fall through to `UNKNOWN`.
+_FUNCTION_CATEGORY_MAP: List[Tuple[type, str]] = [
+    (cls, key)
+    for cls, key in [
+        (getattr(en, "BooleanFunction", None), "Boolean"),
+        (getattr(en, "StringFunction", None), "StringExpr"),
+        (getattr(en, "TemporalFunction", None), "TemporalExpr"),
+        (getattr(en, "StructFunction", None), "StructExpr"),
+    ]
+    if cls is not None
+]
+
+# NodeTraverser returns lowercase `closed` strings; downstream visitors (range_visitor, dnf_visitor, sql_utils, translated_source) expect
+# capitalized variants matching the legacy JSON parser's output.
+_CLOSED_MAP = {"both": "Both", "left": "Left", "right": "Right", "none": "None"}
+
+
+class NodeTraverserParser:
+    """Parse a :class:`pl.Expr` into a :class:`BaseExprNode` tree using polars' ``NodeTraverser`` for typed dispatch and ``expr.meta.pop()``
+    for sub-expression attribution.
+
+    Mirrors the structure of :class:`ExprParser` above (dispatch via a class-keyed parser map, one ``_parse_<kind>`` method per node type) so
+    that the eventual Phase B swap is a near-mechanical replacement.
+    """
+
+    def __init__(self) -> None:
+        # Dispatch on the polars typed-view class, mirroring ExprParser._parser_map.
+        self._parser_map: Dict[type, Any] = {
+            en.Column: self._parse_column,
+            en.Literal: self._parse_literal,
+            en.Len: self._parse_len,
+            en.Cast: self._parse_cast,
+            en.Alias: self._parse_alias,
+            en.Sort: self._parse_sort,
+            en.BinaryExpr: self._parse_binary_expr,
+            en.Filter: self._parse_filter,
+            en.Gather: self._parse_gather,
+            en.SortBy: self._parse_sort_by,
+            en.Ternary: self._parse_ternary,
+            en.Slice: self._parse_slice,
+            en.Function: self._parse_function_expr,
+        }
+
+    def parse(self, expr: pl.Expr) -> BaseExprNode:
+        """Parse a Polars expression into structured node types via the NodeTraverser API."""
+        try:
+            visitor = self._build_visitor(expr)
+            return self._parse(expr, visitor)
+        except Exception as e:
+            log.warning("NodeTraverserParser unexpected failure: %s", e, exc_info=True)
+            return ErrorNode(expr=expr, error=str(e))
+
+    def _build_visitor(self, expr: pl.Expr) -> Any:
+        schema = {name: pl.Null for name in expr.meta.root_names()}
+        return pl.LazyFrame(schema=schema)._ldf.visit()
+
+    def _view(self, visitor: Any, expr: pl.Expr) -> Optional[Any]:
+        """Add ``expr`` to the traverser and return its typed view. Returns ``None`` if polars refuses or hasn't implemented the node — caller
+        falls back to :class:`UnknownNode`.
+        """
+        try:
+            [node_id], _ = visitor.add_expressions([expr._pyexpr])
+        except Exception:
+            return None
+        try:
+            return visitor.view_expression(node_id)
+        except NotImplementedError:
+            return None
+
+    def _parse(self, expr: pl.Expr, visitor: Any) -> BaseExprNode:
+        """Parse a single expression node by dispatching on the polars typed view's class.
+
+        Per-subtree errors are isolated here (matching the legacy ``ExprParser``'s per-method try/except behavior): a failure in one
+        ``_parse_<kind>`` method collapses that subtree to an :class:`ErrorNode` rather than the whole top-level expression.
+        """
+        obj = self._view(visitor, expr)
+        if obj is None:
+            # polars' NodeTraverser has no typed view for a few IR nodes that can appear in a pushed-down
+            # predicate -- notably list functions (``col.list.*``) and array functions (``col.arr.*``), which
+            # raise ``NotImplementedError`` from ``view_expression``. Those subtrees degrade to ``UnknownNode``
+            # here, so predicates containing them are not pushed down under this parser (the legacy parser, via
+            # ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER=1``, still handles them). Recovering them requires polars to
+            # expose ``ListFunction`` / ``ArrayFunction`` typed views *and* a matching entry in
+            # ``_FUNCTION_CATEGORY_MAP`` here; it will not resolve automatically from the polars change alone.
+            return UnknownNode(expr=expr, data={"reason": "node_traverser_refused"})
+        handler = self._parser_map.get(type(obj))
+        if handler is None:
+            return UnknownNode(expr=expr, data={"node_type": type(obj).__name__})
+        try:
+            return handler(expr, obj, visitor)
+        except Exception as e:
+            return ErrorNode(expr=expr, error=str(e))
+
+    # Leaves
+    def _parse_column(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        return ColumnNode(expr=expr, name=obj.name)
+
+    def _parse_literal(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        return LiteralNode(expr=expr)
+
+    def _parse_len(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        return LenNode(expr=expr)
+
+    # Single-input wrappers
+    def _parse_cast(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        (input_expr,) = expr.meta.pop()
+        return CastNode(expr=expr, input=self._parse(input_expr, visitor), dtype=obj.dtype)
+
+    def _parse_alias(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        (input_expr,) = expr.meta.pop()
+        return AliasNode(expr=expr, input=self._parse(input_expr, visitor), name=obj.name)
+
+    def _parse_sort(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        (input_expr,) = expr.meta.pop()
+        return SortNode(expr=expr, input=self._parse(input_expr, visitor), options={"options": obj.options})
+
+    # Two-input
+    def _parse_binary_expr(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        children = list(reversed(expr.meta.pop()))
+        if len(children) != 2:
+            return ErrorNode(expr=expr, error=f"BinaryExpr expected 2 children, got {len(children)}")
+        op_name = repr(obj.op).rsplit(".", 1)[-1]
+        op = _OPERATOR_NAME_MAP.get(op_name)
+        if op is None:
+            return UnknownNode(expr=expr, data={"unknown_op": op_name})
+        return BinaryExprNode(expr=expr, left=self._parse(children[0], visitor), op=op, right=self._parse(children[1], visitor))
+
+    def _parse_filter(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        children = list(expr.meta.pop())
+        if len(children) < 2:
+            return ErrorNode(expr=expr, error="Filter expected 2 children")
+        return FilterNode(expr=expr, input=self._parse(children[0], visitor), by=self._parse(children[1], visitor))
+
+    def _parse_gather(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        children = list(expr.meta.pop())
+        if len(children) < 2:
+            return ErrorNode(expr=expr, error="Gather expected 2 children")
+        return GatherNode(
+            expr=expr,
+            input=self._parse(children[0], visitor),
+            idx=self._parse(children[1], visitor),
+            returns_scalar=bool(obj.scalar),
+        )
+
+    def _parse_sort_by(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        children = list(expr.meta.pop())
+        if len(children) < 2:
+            return ErrorNode(expr=expr, error="SortBy expected >=2 children")
+        return SortByNode(
+            expr=expr,
+            input=self._parse(children[0], visitor),
+            by=[self._parse(c, visitor) for c in children[1:]],
+            options={"sort_options": obj.sort_options},
+        )
+
+    # Three-input
+    def _parse_ternary(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        children = list(expr.meta.pop())
+        if len(children) != 3:
+            return ErrorNode(expr=expr, error="Ternary expected 3 children")
+        predicate_expr, falsy_expr, truthy_expr = children
+        return TernaryNode(
+            expr=expr,
+            predicate=self._parse(predicate_expr, visitor),
+            truthy=self._parse(truthy_expr, visitor),
+            falsy=self._parse(falsy_expr, visitor),
+        )
+
+    def _parse_slice(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        children = list(expr.meta.pop())
+        if len(children) != 3:
+            return ErrorNode(expr=expr, error="Slice expected 3 children")
+        return SliceNode(
+            expr=expr,
+            input=self._parse(children[0], visitor),
+            offset=self._parse(children[1], visitor),
+            length=self._parse(children[2], visitor),
+        )
+
+    # Variadic
+    def _parse_function_expr(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
+        child_exprs = list(reversed(expr.meta.pop()))
+        fn_enum, options = self._function_type_and_options(obj.function_data)
+        return FunctionNode(
+            expr=expr,
+            function_type=fn_enum,
+            inputs=[self._parse(c, visitor) for c in child_exprs],
+            options=options,
+        )
+
+    def _function_type_and_options(self, function_data: Tuple[Any, ...]) -> Tuple[FunctionType, Dict[str, Any]]:
+        """Resolve a ``Function.function_data`` tuple to ``(our function-type enum, options dict)``.
+
+        Only the option keys that downstream consumers actually inspect are populated. In production these are ``closed`` (range/dnf/sql)
+        and ``literal`` (sql); ``nulls_equal`` and ``strict`` are emitted for parity with one unmarked test assertion. Everything else
+        collapses to ``{}`` — the legacy parser's broader option dict is dead code on the predicate-pushdown path.
+        """
+        if not function_data:
+            return GenericFunctionType.UNKNOWN, {}
+        head, args = function_data[0], function_data[1:]
+        for polars_cls, category in _FUNCTION_CATEGORY_MAP:
+            if isinstance(head, polars_cls):
+                name = repr(head).rsplit(".", 1)[-1]
+                fn_enum = get_function_enum(category, name) or GenericFunctionType.UNKNOWN
+                return fn_enum, _named_function_options(category, name, args)
+        if isinstance(head, str):
+            name_pascal = "".join(part.capitalize() for part in head.split("_"))
+            try:
+                return GenericFunctionType(name_pascal), {}
+            except ValueError:
+                return GenericFunctionType.UNKNOWN, {}
+        return GenericFunctionType.UNKNOWN, {}
+
+
+def _named_function_options(category: str, name: str, args: Tuple[Any, ...]) -> Dict[str, Any]:
+    if not args:
+        return {}
+    if category == "Boolean" and name == "IsBetween":
+        closed = args[0]
+        if isinstance(closed, str):
+            closed = _CLOSED_MAP.get(closed, closed)
+        return {"closed": closed}
+    if category == "Boolean" and name == "IsIn":
+        return {"nulls_equal": args[0]}
+    if category == "StringExpr" and name == "Contains":
+        out: Dict[str, Any] = {"literal": args[0]}
+        if len(args) >= 2:
+            out["strict"] = args[1]
+        return out
+    return {}
+
+
 def get_literal_value(expr: pl.Expr) -> Any:
     """Extract the value from a Polars expression as a python object. This does not neccessarily have to be a polars literal expression itself.
 
@@ -1111,10 +1364,16 @@ def extract_column_name(node: BaseExprNode) -> Optional[str]:
 
 
 def get_parsed_expr(expr_or_node: Union[pl.Expr, BaseExprNode]) -> Optional[BaseExprNode]:
-    """Parse a Polars expression or return the node if it's already parsed. This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars window functions or aggregations."""
+    """Parse a Polars expression or return the node if it's already parsed. This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars window functions or aggregations.
+
+    Set ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER=1`` to fall back to the legacy parser if you hit a problem with the default.
+    """
     if isinstance(expr_or_node, BaseExprNode):
         return expr_or_node
-    return ExprParser().parse(expr_or_node)
+
+    if os.environ.get("POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER") == "1":
+        return ExprParser().parse(expr_or_node)
+    return NodeTraverserParser().parse(expr_or_node)
 
 
 def convert_datetime_to_polars(dt_val: datetime.datetime, schema_cast: Optional[Any] = None) -> pl.Expr:

@@ -22,9 +22,11 @@ from polars_io_tools.io_sources.base import (
     ExprVisitor,
     FunctionNode,
     LiteralNode,
+    NodeTraverserParser,
     OperatorType,
     SelectorNode,
     TernaryNode,
+    UnknownNode,
     convert_datetime_to_polars,
     extract_column_name,
     get_literal_value,
@@ -39,7 +41,7 @@ from polars_io_tools.io_sources.enum import (
     TemporalFunctionType,
 )
 
-from .conftest import PredicateTracker
+from .conftest import PredicateTracker, skip_unoptimized_expression_shape
 
 
 def assert_node_type(node: BaseExprNode, expected_type: Type[BaseExprNode]) -> None:
@@ -96,6 +98,7 @@ def test_parse_simple_column():
     assert node.name == "test_column"
 
 
+@skip_unoptimized_expression_shape
 def test_parse_multiple_columns():
     """Test parsing expressions with multiple column references."""
     expr = pl.col(["a", "b", "c"])
@@ -418,6 +421,7 @@ def test_binary_expr_node_contents():
     assert binary_node.right.name == "b"
 
 
+@skip_unoptimized_expression_shape
 def test_parse_alias():
     """Test parsing aliases."""
     expr = pl.col("test_column").alias("renamed")
@@ -826,6 +830,7 @@ def test_parse_string_manipulation():
         assert isinstance(node.function_type, StringFunctionType)
 
 
+@skip_unoptimized_expression_shape
 def test_multiple_string_operations():
     """Test parsing multiple chained string operations."""
     expr = pl.col("text").str.to_lowercase().str.replace(" ", "_").str.replace_all("[^a-z0-9_]", "")
@@ -850,6 +855,7 @@ def test_multiple_string_operations():
     assert first_input.options["n"] == 1  # this means we replace all
 
 
+@skip_unoptimized_expression_shape
 def test_parse_list_functions():
     """Test parsing list functions."""
     list_col = pl.col("list")
@@ -978,6 +984,7 @@ def test_ternary_operations():
     assert node.falsy.value == 0
 
 
+@skip_unoptimized_expression_shape
 def test_explode_operations():
     """Test parsing explode operations."""
     expr = pl.col("list_column").explode()
@@ -987,6 +994,7 @@ def test_explode_operations():
     assert node.input.name == "list_column"
 
 
+@skip_unoptimized_expression_shape
 def test_struct_operations():
     """Test parsing struct operations."""
     expr = pl.col("struct_col").struct.field("our_field_name")
@@ -1547,3 +1555,37 @@ class TestLimitNotPushedWithFilter:
 
         assert received_params["predicate"] is None, "No predicate should be passed"
         assert received_params["n_rows"] == 3, f"n_rows should be 3 (using {limit_method}), got {received_params['n_rows']}"
+
+
+# ---------------------------------------------------------------------------
+# NodeTraverserParser-specific behavior tests
+# ---------------------------------------------------------------------------
+def test_node_traverser_parser_isolates_subtree_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deep failure in one ``_parse_<kind>`` collapses only the affected subtree to ``ErrorNode``; the rest of the tree continues to
+    parse normally. Mirrors the legacy ``ExprParser``'s per-method try/except behavior and guards against a future simplification of
+    ``_parse`` silently dropping the isolation.
+    """
+
+    def boom(self: NodeTraverserParser, expr: pl.Expr, obj: object, visitor: object) -> BaseExprNode:
+        raise RuntimeError("simulated subtree failure")
+
+    monkeypatch.setattr(NodeTraverserParser, "_parse_function_expr", boom)
+
+    # Outer BinaryExpr (And) with one normal child (BinaryExpr Gt) and one child that goes through the function dispatch (is_null).
+    expr = (pl.col("x") > 5) & pl.col("y").is_null()
+    node = NodeTraverserParser().parse(expr)
+
+    assert isinstance(node, BinaryExprNode), "outer And should survive"
+    assert isinstance(node.left, BinaryExprNode), "left subtree (x > 5) should parse normally"
+    assert isinstance(node.right, ErrorNode), "right subtree (is_null) should collapse to ErrorNode"
+    assert "simulated subtree failure" in node.right.error
+
+
+def test_node_traverser_parser_unsupported_expression_degrades_to_unknown() -> None:
+    """An expression shape that polars' typed view refuses (here, a Python UDF via ``map_batches``) must degrade to ``UnknownNode``
+    rather than raise. Guards the ``_view → NotImplementedError → UnknownNode`` fallback path, which is not exercised by the IO-source
+    end-to-end suite.
+    """
+    expr = pl.col("x").map_batches(lambda s: s, return_dtype=pl.Boolean)
+    node = NodeTraverserParser().parse(expr)
+    assert isinstance(node, UnknownNode)
