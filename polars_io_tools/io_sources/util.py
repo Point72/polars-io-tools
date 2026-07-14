@@ -45,7 +45,7 @@ def collect_lf_in_io_source(
     The fallback is *not* memory-equivalent to ``collect_batches``: it materializes the inner LazyFrame in full before yielding the first batch,
     whereas ``collect_batches`` only holds one batch live at a time. The fallback's peak extra memory is therefore the size of the fully materialized
     inner frame; ``collect_batches``' peak is roughly ``batch_size`` rows. The regression is only meaningful when the inner frame is much larger than
-    ``batch_size``; for typical io_sources whose upstream already streams in row-bounded chunks (e.g. tickstore returns ~100k-row gRPC messages) the
+    ``batch_size``; for typical io_sources whose upstream already streams in row-bounded chunks the
     inner frame is comparable to ``batch_size`` and the difference is negligible.
 
     Note that the ``thread_pool_size() > 1`` gate is necessary but not provably sufficient: with multiple concurrent io_source callbacks the pool can
@@ -68,18 +68,6 @@ class StorageOptions(NamedTuple):
     credential_provider: Optional[pl.CredentialProviderAWS]
 
 
-# On-prem object store endpoints that should have their hostnames resolved to IP addresses.
-# This is done to avoid overloading DNS servers at scale when many workers connect simultaneously.
-# When running large-scale distributed workloads, the DNS servers can become a bottleneck,
-# so we resolve the hostname once and use the IP address directly.
-_ONPREM_ENDPOINTS_TO_RESOLVE = frozenset(
-    {
-        "http://gridprodobs.saccap.int.:9020",
-        "http://gridprodobs:9020",
-    }
-)
-
-
 @functools.lru_cache(maxsize=16)
 def _resolve_endpoint_hostname(endpoint: str) -> str:
     """Resolve the hostname in an endpoint URL to an IP address.
@@ -89,7 +77,7 @@ def _resolve_endpoint_hostname(endpoint: str) -> str:
     to avoid repeated DNS lookups.
 
     Args:
-        endpoint (str): The endpoint URL, e.g. "http://gridprodobs:9020"
+        endpoint (str): The endpoint URL, e.g. "http://grid:9020"
 
     Returns:
         str: The endpoint URL with the hostname replaced by its IP address,
@@ -174,11 +162,6 @@ def _storage_options_for(cache_uri: str, aws_profile: str | None = None) -> Stor
     if endpoint is None and hasattr(credential_provider, "_storage_update_options"):
         cred_opts = credential_provider._storage_update_options()
         endpoint = cred_opts.get("endpoint_url")
-
-    # For on-prem object stores, resolve hostname to IP address to avoid overloading DNS
-    # when many workers connect simultaneously at scale
-    if endpoint in _ONPREM_ENDPOINTS_TO_RESOLVE:
-        endpoint = _resolve_endpoint_hostname(endpoint)
 
     # Set endpoint in both option dicts with appropriate keys
     if endpoint:
@@ -506,7 +489,7 @@ def _convert_interval_to_slices(
 
 
 def _extend_interval(interval: portion.Interval, column_type: pl.DataType) -> portion.Interval:
-    """Extend closed intervals based on the polars DataType. Since TickStore slice bounds are exclusive, if we want to be inclusive of the end, we must over-subscribe the smallest interval we are able to."""
+    """Extend closed intervals based on the polars DataType. Since slice bounds are exclusive, if we want to be inclusive of the end, we must over-subscribe the smallest interval we are able to."""
 
     def _internal_apply(atomic_interval: portion.Interval) -> portion.Interval:
         if atomic_interval.right != portion.CLOSED or atomic_interval.upper == portion.inf:

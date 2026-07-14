@@ -25,18 +25,6 @@ def pytest_addoption(parser):
         default=None,
         help="Databricks token for integration tests",
     )
-    parser.addoption(
-        "--tickstore-group",
-        action="store",
-        default=None,
-        help="TickStore group name for integration tests (e.g., 'Trading_piot')",
-    )
-    parser.addoption(
-        "--tickstore-conn-str",
-        action="store",
-        default="DRIVER={ODBC Driver 17 for SQL Server};SERVER=RESEARCHSQL;Trusted_connection=yes;DATABASE=OneFeed",
-        help="ODBC connection string for TickStore credential lookup",
-    )
     parser.addoption("--clickhouse-url", action="store", default=None, help="URL for the ClickhouseDB http connection")
     parser.addoption("--clickhouse-user", action="store", default=None, help="Username for ClickhouseDB connection")
     parser.addoption("--clickhouse-password", action="store", default=None, help="Password for ClickhouseDB connection")
@@ -48,10 +36,6 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "aws_profile_required: mark test that requires --aws-profile",
-    )
-    config.addinivalue_line(
-        "markers",
-        "tickstore_required: mark test that requires --tickstore-group",
     )
     config.addinivalue_line(
         "markers",
@@ -69,17 +53,6 @@ def aws_profile(pytestconfig):
 def databricks_token(pytestconfig):
     # May be None; only tests marked as requiring it will enforce presence
     return pytestconfig.getoption("--databricks-token") or None
-
-
-@pytest.fixture(scope="session")
-def tickstore_group(pytestconfig):
-    # May be None; only tests marked as requiring it will enforce presence
-    return pytestconfig.getoption("--tickstore-group") or None
-
-
-@pytest.fixture(scope="session")
-def tickstore_conn_str(pytestconfig):
-    return pytestconfig.getoption("--tickstore-conn-str")
 
 
 @pytest.fixture(scope="session")
@@ -170,14 +143,6 @@ def pytest_collection_modifyitems(config, items):
         skip_marker = pytest.mark.skip(reason="requires --databricks-token for this test")
         for item in items:
             if "databricks_auth_required" in item.keywords:
-                item.add_marker(skip_marker)
-
-    # Skip tests marked as tickstore_required if no group provided
-    tickstore_group = config.getoption("--tickstore-group")
-    if not tickstore_group:
-        skip_marker = pytest.mark.skip(reason="requires --tickstore-group for this test")
-        for item in items:
-            if "tickstore_required" in item.keywords:
                 item.add_marker(skip_marker)
 
     # Skip tests marked as clickhouse_required if url, user, or password not provided

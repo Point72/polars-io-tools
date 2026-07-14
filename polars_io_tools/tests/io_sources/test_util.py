@@ -10,7 +10,6 @@ from polars.exceptions import ColumnNotFoundError, SchemaError
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.util import (
-    _ONPREM_ENDPOINTS_TO_RESOLVE,
     _resolve_endpoint_hostname,
     _storage_options_for,
     register_io_source_with_is_pure,
@@ -1077,7 +1076,7 @@ class TestResolveEndpointHostname:
         """Test resolving hostname to IP when endpoint has a port."""
         monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.1.2.3")
 
-        result = _resolve_endpoint_hostname("http://gridprodobs:9020")
+        result = _resolve_endpoint_hostname("http://:9020")
 
         assert result == "http://10.1.2.3:9020"
 
@@ -1085,7 +1084,7 @@ class TestResolveEndpointHostname:
         """Test resolving fully qualified domain name to IP."""
         monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.4.5.6")
 
-        result = _resolve_endpoint_hostname("http://gridprodobs.saccap.int.:9020")
+        result = _resolve_endpoint_hostname("http://.myhost.int.:9020")
 
         assert result == "http://10.4.5.6:9020"
 
@@ -1109,7 +1108,7 @@ class TestResolveEndpointHostname:
         """Test that paths are preserved in the resolved URL."""
         monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.1.2.3")
 
-        result = _resolve_endpoint_hostname("http://gridprodobs:9020/some/path")
+        result = _resolve_endpoint_hostname("http://:9020/some/path")
 
         assert result == "http://10.1.2.3:9020/some/path"
 
@@ -1144,9 +1143,9 @@ class TestResolveEndpointHostname:
 
         monkeypatch.setattr("socket.gethostbyname", capture_gethostbyname)
 
-        _resolve_endpoint_hostname("http://gridprodobs.saccap.int.:9020")
+        _resolve_endpoint_hostname("http://.myhost.int.:9020")
 
-        assert captured_hostname["value"] == "gridprodobs.saccap.int."
+        assert captured_hostname["value"] == ".myhost.int."
 
     def test_gethostbyname_called_with_short_hostname(self, monkeypatch):
         """Verify that socket.gethostbyname is called with short hostname."""
@@ -1158,131 +1157,9 @@ class TestResolveEndpointHostname:
 
         monkeypatch.setattr("socket.gethostbyname", capture_gethostbyname)
 
-        _resolve_endpoint_hostname("http://gridprodobs:9020")
+        _resolve_endpoint_hostname("http://:9020")
 
-        assert captured_hostname["value"] == "gridprodobs"
-
-
-class TestOnpremEndpointResolutionIntegration:
-    """Tests for on-prem endpoint hostname resolution integration in `_storage_options_for`."""
-
-    @pytest.fixture(autouse=True)
-    def clear_cache(self):
-        """Clear the LRU cache before each test to ensure isolation."""
-        _resolve_endpoint_hostname.cache_clear()
-
-    def test_onprem_endpoint_constants_exist(self):
-        """Verify the on-prem endpoints set contains the expected values."""
-        assert "http://gridprodobs.saccap.int.:9020" in _ONPREM_ENDPOINTS_TO_RESOLVE
-        assert "http://gridprodobs:9020" in _ONPREM_ENDPOINTS_TO_RESOLVE
-
-    def test_storage_options_resolves_onprem_endpoint_fqdn(self, monkeypatch):
-        """Test that _storage_options_for resolves the FQDN on-prem endpoint to IP."""
-
-        class FakeCreds:
-            access_key = "AKIA_TEST"
-            secret_key = "SECRET_TEST"
-            token = None
-
-        class FakeSession:
-            def __init__(self, profile_name=None):
-                self.region_name = "us-east-1"
-
-            def get_credentials(self):
-                return FakeCreds()
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.100.200.1")
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://gridprodobs.saccap.int.:9020")
-
-        opts = _storage_options_for("s3://bucket/path")
-
-        # Endpoint should be resolved to IP
-        assert opts.pyarrow["endpoint_override"] == "http://10.100.200.1:9020"
-        assert opts.polars["endpoint_url"] == "http://10.100.200.1:9020"
-        assert opts.polars["allow_http"] == "true"
-
-    def test_storage_options_resolves_onprem_endpoint_short(self, monkeypatch):
-        """Test that _storage_options_for resolves the short on-prem endpoint to IP."""
-
-        class FakeCreds:
-            access_key = "AKIA_TEST"
-            secret_key = "SECRET_TEST"
-            token = None
-
-        class FakeSession:
-            def __init__(self, profile_name=None):
-                self.region_name = "us-east-1"
-
-            def get_credentials(self):
-                return FakeCreds()
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.50.60.70")
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://gridprodobs:9020")
-
-        opts = _storage_options_for("s3://bucket/path")
-
-        # Endpoint should be resolved to IP
-        assert opts.pyarrow["endpoint_override"] == "http://10.50.60.70:9020"
-        assert opts.polars["endpoint_url"] == "http://10.50.60.70:9020"
-
-    def test_storage_options_does_not_resolve_non_onprem_endpoint(self, monkeypatch):
-        """Test that _storage_options_for does NOT resolve non-on-prem endpoints."""
-
-        class FakeCreds:
-            access_key = "AKIA_TEST"
-            secret_key = "SECRET_TEST"
-            token = None
-
-        class FakeSession:
-            def __init__(self, profile_name=None):
-                self.region_name = "us-east-1"
-
-            def get_credentials(self):
-                return FakeCreds()
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        gethostbyname_called = {"called": False}
-
-        def track_gethostbyname(hostname):
-            gethostbyname_called["called"] = True
-            return "10.0.0.1"
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        monkeypatch.setattr("socket.gethostbyname", track_gethostbyname)
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "https://s3.amazonaws.com")
-
-        opts = _storage_options_for("s3://bucket/path")
-
-        # Endpoint should NOT be resolved - should stay as original
-        assert opts.pyarrow["endpoint_override"] == "https://s3.amazonaws.com"
-        assert opts.polars["endpoint_url"] == "https://s3.amazonaws.com"
-        # gethostbyname should not have been called
-        assert not gethostbyname_called["called"]
+        assert captured_hostname["value"] == ""
 
     def test_storage_options_resolution_failure_keeps_original(self, monkeypatch, caplog):
         """Test that DNS resolution failure in _storage_options_for keeps the original endpoint."""
@@ -1313,46 +1190,11 @@ class TestOnpremEndpointResolutionIntegration:
         monkeypatch.setattr("boto3.Session", FakeSession)
         monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
         monkeypatch.setattr("socket.gethostbyname", failing_gethostbyname)
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://gridprodobs:9020")
+        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://:9020")
 
         opts = _storage_options_for("s3://bucket/path")
 
         # Endpoint should be kept as original due to resolution failure
-        assert opts.pyarrow["endpoint_override"] == "http://gridprodobs:9020"
-        assert opts.polars["endpoint_url"] == "http://gridprodobs:9020"
+        assert opts.pyarrow["endpoint_override"] == "http://:9020"
+        assert opts.polars["endpoint_url"] == "http://:9020"
         assert "Failed to resolve hostname" in caplog.text
-
-    def test_storage_options_via_query_param_resolves_onprem(self, monkeypatch):
-        """Test that on-prem endpoint specified via query param is also resolved."""
-
-        class FakeCreds:
-            access_key = "AKIA_TEST"
-            secret_key = "SECRET_TEST"
-            token = None
-
-        class FakeSession:
-            def __init__(self, profile_name=None):
-                self.region_name = "us-east-1"
-
-            def get_credentials(self):
-                return FakeCreds()
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.11.12.13")
-        monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-        monkeypatch.delenv("AWS_S3_ENDPOINT", raising=False)
-
-        uri = "s3://bucket/path?endpoint_override=http://gridprodobs.saccap.int.:9020"
-        opts = _storage_options_for(uri)
-
-        # Endpoint should be resolved to IP
-        assert opts.pyarrow["endpoint_override"] == "http://10.11.12.13:9020"
-        assert opts.polars["endpoint_url"] == "http://10.11.12.13:9020"

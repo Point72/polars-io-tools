@@ -75,7 +75,7 @@ def _trim_partition_specs(
     Both the start and end of each partition are tightened to the
     intersection.  Since ``_execute_partition`` uses ``col < end`` (open
     upper), any closed upper bound is converted to open via
-    ``_extend_interval`` (the same logic used by the tickstore reader).
+    ``_extend_interval``.
     """
     trimmed: List[Tuple[datetime, datetime]] = []
     for start, end in specs:
