@@ -163,6 +163,9 @@ def _storage_options_for(cache_uri: str, aws_profile: str | None = None) -> Stor
         cred_opts = credential_provider._storage_update_options()
         endpoint = cred_opts.get("endpoint_url")
 
+    if endpoint:
+        endpoint = _resolve_endpoint_hostname(endpoint)
+
     # Set endpoint in both option dicts with appropriate keys
     if endpoint:
         pyarrow_opts["endpoint_override"] = endpoint

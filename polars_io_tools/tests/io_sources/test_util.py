@@ -1076,7 +1076,7 @@ class TestResolveEndpointHostname:
         """Test resolving hostname to IP when endpoint has a port."""
         monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.1.2.3")
 
-        result = _resolve_endpoint_hostname("http://:9020")
+        result = _resolve_endpoint_hostname("http://grid:9020")
 
         assert result == "http://10.1.2.3:9020"
 
@@ -1108,7 +1108,7 @@ class TestResolveEndpointHostname:
         """Test that paths are preserved in the resolved URL."""
         monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.1.2.3")
 
-        result = _resolve_endpoint_hostname("http://:9020/some/path")
+        result = _resolve_endpoint_hostname("http://grid:9020/some/path")
 
         assert result == "http://10.1.2.3:9020/some/path"
 
@@ -1157,9 +1157,9 @@ class TestResolveEndpointHostname:
 
         monkeypatch.setattr("socket.gethostbyname", capture_gethostbyname)
 
-        _resolve_endpoint_hostname("http://:9020")
+        _resolve_endpoint_hostname("http://grid:9020")
 
-        assert captured_hostname["value"] == ""
+        assert captured_hostname["value"] == "grid"
 
     def test_storage_options_resolution_failure_keeps_original(self, monkeypatch, caplog):
         """Test that DNS resolution failure in _storage_options_for keeps the original endpoint."""
@@ -1190,11 +1190,11 @@ class TestResolveEndpointHostname:
         monkeypatch.setattr("boto3.Session", FakeSession)
         monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
         monkeypatch.setattr("socket.gethostbyname", failing_gethostbyname)
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://:9020")
+        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://grid:9020")
 
         opts = _storage_options_for("s3://bucket/path")
 
         # Endpoint should be kept as original due to resolution failure
-        assert opts.pyarrow["endpoint_override"] == "http://:9020"
-        assert opts.polars["endpoint_url"] == "http://:9020"
+        assert opts.pyarrow["endpoint_override"] == "http://grid:9020"
+        assert opts.polars["endpoint_url"] == "http://grid:9020"
         assert "Failed to resolve hostname" in caplog.text
