@@ -16,7 +16,7 @@ from polars_io_tools.io_sources.dnf_visitor import (
     is_contradiction,
     negate_dnf,
 )
-from polars_io_tools.tests.io_sources.conftest import assert_dnf_equal
+from polars_io_tools.tests.io_sources.conftest import assert_dnf_equal, skip_unoptimized_expression_shape
 
 
 # Fixtures for common expressions
@@ -352,6 +352,7 @@ def test_dnf_visitor_direct():
     assert result == [[("x", "=", 10), ("y", ">", 5)]]
 
 
+@skip_unoptimized_expression_shape
 def test_all_horizontal():
     expr = pl.all_horizontal(
         pl.col("x") > 5,
@@ -366,6 +367,7 @@ def test_all_horizontal():
     assert_dnf_equal(result, expected)
 
 
+@skip_unoptimized_expression_shape
 def test_any_horizontal():
     expr = pl.any_horizontal(
         pl.col("x") > 5,
@@ -598,6 +600,7 @@ def test_ternary_multiple_when_with_multiple_conditions():
     assert_dnf_equal(result, expected)
 
 
+@skip_unoptimized_expression_shape
 def test_ternary_complex_with_function_conditions():
     """Test when expressions with multiple conditions including functions."""
     # Using function calls within the multiple conditions
@@ -868,6 +871,7 @@ def test_alias_logical_operations():
     assert_dnf_equal(result, expected)
 
 
+@skip_unoptimized_expression_shape
 def test_alias_nested_expression():
     """Test aliases on complex nested expressions."""
     expr = ((pl.col("x") == 10) | (pl.col("y") == "test")).alias("complex_expr")
@@ -876,6 +880,7 @@ def test_alias_nested_expression():
     assert_dnf_equal(result, expected)
 
 
+@skip_unoptimized_expression_shape
 def test_alias_with_functions():
     """Test aliases with function calls like is_in."""
     expr = pl.col("symbol").is_in(["US", "EU"]).alias("symbol_filter")

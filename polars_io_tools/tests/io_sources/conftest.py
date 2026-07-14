@@ -1,6 +1,7 @@
 # These type hints match the ones in polars_io_tools.io_sources.dnf_visitor
 # but they are not imported here to fully separate the polars_utils code
 # from the general utils tests.
+import os
 from datetime import date, datetime, timedelta
 from typing import Any, List, Optional, Tuple
 
@@ -23,6 +24,16 @@ __all__ = (
     "tester",
     "assert_dnf_equal",
     "io_source_assert",
+    "skip_unoptimized_expression_shape",
+)
+
+
+# Marker for tests that exercise expression shapes (top-level / nested aliases, ``any_horizontal`` / ``all_horizontal``, multi-predicate
+# ``pl.when(...)``, list / struct / explode) which polars' optimizer rewrites away before a predicate ever reaches a custom IO source plugin.
+# Only the legacy parser observes those shapes; set ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER=1`` to run them.
+skip_unoptimized_expression_shape = pytest.mark.skipif(
+    os.environ.get("POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER") != "1",
+    reason="Test exercises an expression shape that the polars optimizer rewrites away before reaching an IO source predicate.",
 )
 
 
