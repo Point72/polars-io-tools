@@ -1,6 +1,7 @@
 import io
+from collections.abc import Iterator
 from datetime import datetime, timedelta
-from typing import Iterator, List, Literal, Optional, Tuple, Union
+from typing import Literal
 
 import cloudpickle
 import polars as pl
@@ -28,7 +29,7 @@ def _partition_specs(
     date_min: datetime,
     date_max: datetime,
     unit: Literal["daily", "monthly", "yearly"],
-) -> List[Tuple[datetime, datetime]]:
+) -> list[tuple[datetime, datetime]]:
     """
     Returns a list of (start, end) tuples that cover the
     range. Each `end` is exclusive, i.e. [start, end).
@@ -36,7 +37,7 @@ def _partition_specs(
     if date_min is None or date_max is None:
         return []
 
-    specs: List[Tuple[datetime, datetime]] = []
+    specs: list[tuple[datetime, datetime]] = []
 
     if unit == "daily":
         cur = date_min.date()
@@ -47,27 +48,27 @@ def _partition_specs(
             cur = nxt
 
     elif unit == "monthly":
-        cur = datetime(date_min.year, date_min.month, 1)
-        end = datetime(date_max.year, date_max.month, 1)
+        cur = datetime(date_min.year, date_min.month, 1)  # noqa: DTZ001 -- naive-UTC by design; bounds normalized via ValidatedDatetime
+        end = datetime(date_max.year, date_max.month, 1)  # noqa: DTZ001 -- naive-UTC by design; bounds normalized via ValidatedDatetime
         while cur <= end:
-            nxt = datetime(cur.year + 1, 1, 1) if cur.month == 12 else datetime(cur.year, cur.month + 1, 1)
+            nxt = datetime(cur.year + 1, 1, 1) if cur.month == 12 else datetime(cur.year, cur.month + 1, 1)  # noqa: DTZ001 -- naive-UTC by design; bounds normalized via ValidatedDatetime
             specs.append((cur, nxt))
             cur = nxt
 
     elif unit == "yearly":
         for yr in range(date_min.year, date_max.year + 1):
-            start = datetime(yr, 1, 1)
-            end = datetime(yr + 1, 1, 1)
+            start = datetime(yr, 1, 1)  # noqa: DTZ001 -- naive-UTC by design; bounds normalized via ValidatedDatetime
+            end = datetime(yr + 1, 1, 1)  # noqa: DTZ001 -- naive-UTC by design; bounds normalized via ValidatedDatetime
             specs.append((start, end))
 
     return specs
 
 
 def _trim_partition_specs(
-    specs: List[Tuple[datetime, datetime]],
+    specs: list[tuple[datetime, datetime]],
     date_interval: "portion.Interval",
     column_type: pl.DataType,
-) -> List[Tuple[datetime, datetime]]:
+) -> list[tuple[datetime, datetime]]:
     """
     Intersect each [start, end) partition with the user's temporal interval
     and return only those with non-empty overlap.
@@ -77,7 +78,7 @@ def _trim_partition_specs(
     upper), any closed upper bound is converted to open via
     ``_extend_interval``.
     """
-    trimmed: List[Tuple[datetime, datetime]] = []
+    trimmed: list[tuple[datetime, datetime]] = []
     for start, end in specs:
         intersection = portion.closedopen(start, end) & date_interval
         if not intersection.empty:
@@ -88,7 +89,7 @@ def _trim_partition_specs(
 
 @ray.remote
 def _execute_partition(
-    plan_bytes_or_ref: Union[bytes, ray.ObjectRef],
+    plan_bytes_or_ref: bytes | ray.ObjectRef,
     date_col: str,
     start: datetime,
     end: datetime,
@@ -128,8 +129,8 @@ def execute_on_ray(
     date_column: str,
     time_unit: Literal["daily", "monthly", "yearly"],
     return_as: Literal["arrow", "ipc", "parquet"] = "arrow",
-    remote_options: Optional[dict] = None,
-    max_concurrency: Optional[int] = 100,
+    remote_options: dict | None = None,
+    max_concurrency: int | None = 100,
 ) -> pl.LazyFrame:
     """
     Execute a Polars LazyFrame on an *already initialised* Ray cluster,
@@ -174,10 +175,10 @@ def execute_on_ray(
     original_lf = self
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         lf = original_lf
 

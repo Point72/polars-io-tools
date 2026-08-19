@@ -9,8 +9,6 @@ minimal reproducer.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import polars as pl
 
 from polars_io_tools.testing import PredicateTracker
@@ -20,10 +18,10 @@ def _check(
     tracker: PredicateTracker,
     lf: pl.LazyFrame,
     *,
-    predicate_pushed: Optional[bool] = None,
-    projection_pushed: Optional[bool] = None,
-    pushed_columns: Optional[set[str]] = None,
-    call_count: Optional[int] = None,
+    predicate_pushed: bool | None = None,
+    projection_pushed: bool | None = None,
+    pushed_columns: set[str] | None = None,
+    call_count: int | None = None,
 ) -> None:
     """Collect ``lf`` and assert pushdown observations on ``tracker``.
 

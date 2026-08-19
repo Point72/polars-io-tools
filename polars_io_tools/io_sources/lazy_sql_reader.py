@@ -1,6 +1,6 @@
 import logging
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import polars as pl
 from sqlglot import exp, parse_one
@@ -21,10 +21,10 @@ log = logging.getLogger(__name__)
 
 
 @lru_cache(None)
-def get_sqlglot_dialect_odbc(conn_string: str) -> Optional[Union[str, type[Dialect]]]:
+def get_sqlglot_dialect_odbc(conn_string: str) -> str | type[Dialect] | None:
     import pyodbc
 
-    DIALECT_MAP: dict[str, Union[str, type[Dialect]]] = {
+    DIALECT_MAP: dict[str, str | type[Dialect]] = {
         "microsoft sql server": MSSQL,
         "postgresql": "postgres",
         "oracle": "oracle",
@@ -36,17 +36,17 @@ def get_sqlglot_dialect_odbc(conn_string: str) -> Optional[Union[str, type[Diale
     with pyodbc.connect(conn_string) as conn:
         try:
             return DIALECT_MAP[conn.getinfo(pyodbc.SQL_DBMS_NAME).lower()]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             log.warning(f"Got exception when trying to find dialect: {e}")
             return None
 
 
 def get_schema_from_query_odbc(
     query: exp.Expression,
-    connection: Union[str, Any],
-    dialect: Optional[Union[str, type[Dialect]]],
+    connection: str | Any,
+    dialect: str | type[Dialect] | None,
     **kwargs: Any,
-) -> Dict[str, pl.DataType]:
+) -> dict[str, pl.DataType]:
     """
     Get the schema for a SQL query using arrow-odbc.
 
@@ -116,7 +116,7 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, **kwargs) -> p
     def _fetch_info_needing_connection() -> tuple[
         dict[str, pl.DataType],
         exp.Expression,
-        Optional[Union[str, type[Dialect]]],
+        str | type[Dialect] | None,
     ]:
         # Figure out what dialect of SQL we're using
         dialect = get_sqlglot_dialect_odbc(conn_string=connection)
@@ -134,10 +134,10 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, **kwargs) -> p
 
     # Create the generator function for our custom IO source
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ):
         # Short-circuit: if the caller already knows zero rows are needed
         # (e.g. from head(0) on a contradictory filter), skip the query entirely.
@@ -178,7 +178,7 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, **kwargs) -> p
             def select_cols(df) -> pl.DataFrame:
                 if with_columns is not None:
                     with_cols_set = set(with_columns)
-                    return df.select(col for col in schema.keys() if col in with_cols_set)
+                    return df.select(col for col in schema if col in with_cols_set)
                 return df
 
             for record_batch in batch_reader:

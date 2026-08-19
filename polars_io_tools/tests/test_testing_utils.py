@@ -578,7 +578,7 @@ class TestIoSourceAssert:
             analyzer = PredicateAnalyzer(pred)
             temporal = analyzer.find_temporal_filter("date")
             assert temporal is not None
-            lower, upper = analyzer.extract_temporal_bounds(temporal)
+            lower, _upper = analyzer.extract_temporal_bounds(temporal)
             assert lower == date(2024, 1, 3)
 
         lf = io_source_assert(df, check_temporal_filter)

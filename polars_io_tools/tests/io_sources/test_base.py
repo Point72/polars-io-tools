@@ -1,6 +1,5 @@
 import math
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Dict, List, Type
+from datetime import UTC, date, datetime, time, timedelta
 
 import orjson
 import polars as pl
@@ -44,12 +43,12 @@ from polars_io_tools.io_sources.enum import (
 from .conftest import PredicateTracker, skip_unoptimized_expression_shape
 
 
-def assert_node_type(node: BaseExprNode, expected_type: Type[BaseExprNode]) -> None:
+def assert_node_type(node: BaseExprNode, expected_type: type[BaseExprNode]) -> None:
     """Assert that a node is of the expected type."""
     assert isinstance(node, expected_type), f"Expected {expected_type.__name__}, got {type(node).__name__}"
 
 
-def check_binary_expression(node: BinaryExprNode, left_type: Type[BaseExprNode], op: OperatorType, right_type: Type[BaseExprNode]) -> None:
+def check_binary_expression(node: BinaryExprNode, left_type: type[BaseExprNode], op: OperatorType, right_type: type[BaseExprNode]) -> None:
     """Check the structure of a binary expression."""
     assert isinstance(node.left, left_type), f"Expected left to be {left_type.__name__}, got {type(node.left).__name__}"
     assert node.op == op, f"Expected op to be {op}, got {node.op}"
@@ -187,7 +186,7 @@ def test_date_time_literals_parsed():
     else:
         assert_node_type(node, CastNode)
         # Polars casts this to UTC automatically
-        assert node.input.value == dt.replace(tzinfo=timezone.utc)
+        assert node.input.value == dt.replace(tzinfo=UTC)
 
     # Test date
     d = date(2023, 1, 1)
@@ -879,7 +878,7 @@ def test_parse_list_functions():
         assert isinstance(node.function_type, ListFunctionType)
 
 
-class ExampleTestVisitor(ExprVisitor[List[str]]):
+class ExampleTestVisitor(ExprVisitor[list[str]]):
     """Visitor that collects node type names during traversal."""
 
     def __init__(self):
@@ -917,7 +916,7 @@ def test_visitor_pattern():
     assert "Column(b)" in result
 
 
-class CountingVisitor(ExprVisitor[Dict[str, int]]):
+class CountingVisitor(ExprVisitor[dict[str, int]]):
     """Visitor that counts node types."""
 
     def __init__(self):

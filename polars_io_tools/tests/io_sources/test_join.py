@@ -167,7 +167,7 @@ def test_filtered_join_multiple_columns():
             elif col_expr.meta == pl.col("foo2"):
                 assert sorted(get_literal_value(input_expr.inputs[1].expr)) == [1, 2, 3]
             else:
-                assert False, f"Unexpected column: {str(col_expr)}"
+                assert False, f"Unexpected column: {col_expr!s}"
 
     res = (
         df.lazy()
@@ -313,7 +313,7 @@ def test_filtered_join_with_various_data_types():
                 assert len(dates) == 3
                 assert all(isinstance(d, date) for d in dates)
             else:
-                assert False, f"Unexpected column: {str(col_expr)}"
+                assert False, f"Unexpected column: {col_expr!s}"
 
     res = (
         df.lazy()
@@ -505,7 +505,7 @@ def test_filtered_join_complex_workflow(how):
                 assert input_expr.left.expr.meta == pl.col("multiplier")
                 assert get_literal_value(input_expr.right.expr) == 4
             else:
-                assert False, f"Unexpected expr: {str(predicate)}"
+                assert False, f"Unexpected expr: {predicate!s}"
 
     # Complex workflow: join, calculate, filter, aggregate
     res = (
@@ -634,9 +634,9 @@ def test_filtered_join_asof_basic_backward(include_id, filters, on_same_column, 
         if filter_right_binary:
             filter_left_value = parsed_filter.left.right.value
             filter_right_value = parsed_filter.right.right.value
-            filter_values = set([filter_left_value, filter_right_value])
+            filter_values = {filter_left_value, filter_right_value}
         else:
-            filter_values = set([parsed_filter.right.value])
+            filter_values = {parsed_filter.right.value}
 
         if include_id and filter_right_binary:
             expr_left_value = parsed_expr.left.right.value
@@ -653,7 +653,7 @@ def test_filtered_join_asof_basic_backward(include_id, filters, on_same_column, 
             filter_right_value = parsed_filter.right.right.value
 
             # Order does not matter, so we use set to compare
-            assert set([filter_left_value, filter_right_value]) == set([expr_left_value, expr_right_value])
+            assert {filter_left_value, filter_right_value} == {expr_left_value, expr_right_value}
             return
         # If we only have 1 filter, we should have 1 value pushed down.
         parsed_value = parsed_expr.right.value
@@ -673,22 +673,22 @@ def test_filtered_join_asof_basic_backward(include_id, filters, on_same_column, 
     right_lf = io_source_assert(df_right, assert_func)
 
     # Perform filtered as-of join with 3-minute tolerance
-    kwargs = dict(
-        on=on,
-        left_on=left_on,
-        right_on=right_on,
-        strategy=strategy,
-        tolerance=tolerance,
-        coalesce=coalesce,
-    )
+    kwargs = {
+        "on": on,
+        "left_on": left_on,
+        "right_on": right_on,
+        "strategy": strategy,
+        "tolerance": tolerance,
+        "coalesce": coalesce,
+    }
 
     if include_id:
         kwargs.update(
-            dict(
-                by_left="trade_id",
-                by_right="quote_id",
-                check_sortedness=False,
-            )
+            {
+                "by_left": "trade_id",
+                "by_right": "quote_id",
+                "check_sortedness": False,
+            }
         )
 
     result = df_left.lazy().clone().piot.filtered_join_asof(right_lf, **kwargs)

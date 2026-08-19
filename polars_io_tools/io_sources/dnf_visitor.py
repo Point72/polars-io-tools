@@ -2,7 +2,7 @@ import itertools
 import logging
 import re
 from datetime import timedelta
-from typing import Any, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Literal
 
 import polars as pl
 import portion as P
@@ -52,16 +52,16 @@ DNFOperator = Literal[
     "is not",
 ]
 
-DNFTuple = Tuple[str, DNFOperator, Any]  # (column, op, value)
-DNFClause = List[DNFTuple]  # A single conjunction
-DNF = List[DNFClause]  # Full DNF expression
+DNFTuple = tuple[str, DNFOperator, Any]  # (column, op, value)
+DNFClause = list[DNFTuple]  # A single conjunction
+DNF = list[DNFClause]  # Full DNF expression
 
 
 __all__ = (
-    "DNFVisitor",
     "DNF",
     "DNFClause",
     "DNFTuple",
+    "DNFVisitor",
     "convert_expr_to_dnf",
     "is_contradiction",  # Add new function to __all__
 )
@@ -71,12 +71,12 @@ class ColumnConstraintAnalyzer:
     def __init__(self, column_name: str):
         self.column_name = column_name
         # Core constraints
-        self.min_bound: Optional[Tuple[Any, bool]] = None  # (value, is_inclusive)
-        self.max_bound: Optional[Tuple[Any, bool]] = None  # (value, is_inclusive)
-        self.exact_values: Set[Any] = set()
-        self.inclusion_set: Optional[Set[Any]] = None  # From IN operators
-        self.exclusion_values: Set[Any] = set()  # From != and NOT IN
-        self.is_null: Optional[bool] = None  # True=IS NULL, False=IS NOT NULL
+        self.min_bound: tuple[Any, bool] | None = None  # (value, is_inclusive)
+        self.max_bound: tuple[Any, bool] | None = None  # (value, is_inclusive)
+        self.exact_values: set[Any] = set()
+        self.inclusion_set: set[Any] | None = None  # From IN operators
+        self.exclusion_values: set[Any] = set()  # From != and NOT IN
+        self.is_null: bool | None = None  # True=IS NULL, False=IS NOT NULL
         self.contradiction_found = False
 
     def update_from_predicate(self, op: str, value: Any) -> None:
@@ -169,9 +169,7 @@ class ColumnConstraintAnalyzer:
             min_val, min_inclusive = self.min_bound
             max_val, max_inclusive = self.max_bound
             try:
-                if min_val > max_val:
-                    self.contradiction_found = True
-                elif min_val == max_val and not (min_inclusive and max_inclusive):
+                if min_val > max_val or min_val == max_val and not (min_inclusive and max_inclusive):
                     self.contradiction_found = True
             except TypeError:
                 pass  # Skip type incompatibility check
@@ -215,7 +213,7 @@ class ColumnConstraintAnalyzer:
 
         return True
 
-    def has_contradiction(self, schema: Optional[pl.Schema] = None) -> bool:
+    def has_contradiction(self, schema: pl.Schema | None = None) -> bool:
         """Check if the constraints are contradictory."""
         # Check if contradiction was found during updates
         if self.contradiction_found:
@@ -273,7 +271,7 @@ class ColumnConstraintAnalyzer:
         return False
 
 
-def is_contradiction(clause: DNFClause, schema: Optional[pl.Schema] = None) -> bool:
+def is_contradiction(clause: DNFClause, schema: pl.Schema | None = None) -> bool:
     """Check if a DNF clause contains a contradiction.
 
     Args:
@@ -306,16 +304,16 @@ def is_contradiction(clause: DNFClause, schema: Optional[pl.Schema] = None) -> b
     return False
 
 
-class DNFVisitor(ExprVisitor[Optional[DNF]]):
+class DNFVisitor(ExprVisitor[DNF | None]):
     """
     Visitor that converts expressions to DNF format.
     """
 
     def __init__(self):
         # Initialize state
-        self.result_dnf: Optional[DNF] = None
+        self.result_dnf: DNF | None = None
 
-    def default_result(self) -> Optional[DNF]:
+    def default_result(self) -> DNF | None:
         """Default result is None."""
         return None
 
@@ -421,7 +419,7 @@ class DNFVisitor(ExprVisitor[Optional[DNF]]):
 
         # Handle ANY_HORIZONTAL function (ORing all inputs)
         elif node.function_type == BooleanFunctionType.ANY_HORIZONTAL:
-            combined_dnf: Optional[DNF] = None
+            combined_dnf: DNF | None = None
             for input_node in node.inputs:
                 inner_visitor = DNFVisitor()
                 inner_visitor.visit(input_node)
@@ -431,21 +429,20 @@ class DNFVisitor(ExprVisitor[Optional[DNF]]):
             self.result_dnf = combined_dnf
 
         # Handle string functions
-        elif isinstance(node.function_type, StringFunctionType):
-            if len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
-                column = extract_column_name(node.inputs[0])
-                if column is not None:
-                    pattern = node.inputs[1].value
+        elif isinstance(node.function_type, StringFunctionType) and len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
+            column = extract_column_name(node.inputs[0])
+            if column is not None:
+                pattern = node.inputs[1].value
 
-                    if node.function_type == StringFunctionType.STARTS_WITH:
-                        regex_pattern = f"^{re.escape(pattern)}"
-                        self.result_dnf = [[(column, "~", regex_pattern)]]
-                    elif node.function_type == StringFunctionType.ENDS_WITH:
-                        regex_pattern = f"{re.escape(pattern)}$"
-                        self.result_dnf = [[(column, "~", regex_pattern)]]
-                    elif node.function_type == StringFunctionType.CONTAINS:
-                        regex_pattern = f".*{re.escape(pattern)}.*"
-                        self.result_dnf = [[(column, "~", regex_pattern)]]
+                if node.function_type == StringFunctionType.STARTS_WITH:
+                    regex_pattern = f"^{re.escape(pattern)}"
+                    self.result_dnf = [[(column, "~", regex_pattern)]]
+                elif node.function_type == StringFunctionType.ENDS_WITH:
+                    regex_pattern = f"{re.escape(pattern)}$"
+                    self.result_dnf = [[(column, "~", regex_pattern)]]
+                elif node.function_type == StringFunctionType.CONTAINS:
+                    regex_pattern = f".*{re.escape(pattern)}.*"
+                    self.result_dnf = [[(column, "~", regex_pattern)]]
 
     def visit_ternary(self, node: TernaryNode) -> None:
         """Visit ternary node"""
@@ -486,12 +483,12 @@ class DNFVisitor(ExprVisitor[Optional[DNF]]):
         """Handle alias expressions by visiting the underlying input."""
         self.visit(node.input)
 
-    def process_results(self) -> Optional[DNF]:
+    def process_results(self) -> DNF | None:
         """Return the accumulated DNF result."""
         return self.result_dnf
 
 
-def combine_and_dnf(left_dnf: Optional[DNF], right_dnf: Optional[DNF]) -> Optional[DNF]:
+def combine_and_dnf(left_dnf: DNF | None, right_dnf: DNF | None) -> DNF | None:
     """Combine two DNFs with AND logic."""
     if left_dnf is None and right_dnf is None:
         return None
@@ -507,7 +504,7 @@ def combine_and_dnf(left_dnf: Optional[DNF], right_dnf: Optional[DNF]) -> Option
     return result
 
 
-def combine_or_dnf(left_dnf: Optional[DNF], right_dnf: Optional[DNF]) -> Optional[DNF]:
+def combine_or_dnf(left_dnf: DNF | None, right_dnf: DNF | None) -> DNF | None:
     """Combine two DNFs with OR logic."""
     if left_dnf is None or right_dnf is None:
         return None
@@ -560,7 +557,7 @@ def negate_dnf(dnf: DNF) -> DNF:
 
 
 ## public API
-def convert_expr_to_dnf(expr_or_node: Union[pl.Expr, BaseExprNode]) -> Optional[DNF]:
+def convert_expr_to_dnf(expr_or_node: pl.Expr | BaseExprNode) -> DNF | None:
     """
     Convert a Polars expression tree to DNF format.
     Returns the expression in DNF format, or None if conversion fails.
@@ -575,7 +572,7 @@ def convert_expr_to_dnf(expr_or_node: Union[pl.Expr, BaseExprNode]) -> Optional[
         return None  # Conversion failed
 
 
-def _is_contradiction(expr: pl.Expr, schema: Optional[pl.Schema] = None) -> bool:
+def _is_contradiction(expr: pl.Expr, schema: pl.Schema | None = None) -> bool:
     """Evaluates whether a  Polars expression is a contradiction.
     We perform this ourselves manually, as polars doesn't short-circuit
     if a set of filters is impossible. A full scan is performed.

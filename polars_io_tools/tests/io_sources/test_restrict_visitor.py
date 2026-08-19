@@ -1,5 +1,3 @@
-from typing import Optional
-
 import polars as pl
 from packaging import version
 
@@ -8,7 +6,7 @@ from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.restrict_visitor import RestrictPredicateVisitor, restrict_expr_to_columns
 
 
-def assert_expr_equal(a: Optional[pl.Expr], b: Optional[pl.Expr]):
+def assert_expr_equal(a: pl.Expr | None, b: pl.Expr | None):
     """Assert that two polars expressions are equal"""
     if a is None:
         assert b is None
@@ -389,7 +387,7 @@ def test_ternary_with_complex_expressions():
     # Ternary with complex expressions in all parts
     expr = (
         pl.when((pl.col("region") == "US") | (pl.col("region") == "EU"))
-        .then(((pl.col("price") * pl.col("volume")).alias("value") > 100))
+        .then((pl.col("price") * pl.col("volume")).alias("value") > 100)
         .otherwise((pl.col("price") - pl.col("discount")) > 5)
     )
 
@@ -475,7 +473,7 @@ def test_not_pred_valid_pred_invalid():
 
 
 def test_when_then_otherwise_with_definitive_exclusions():
-    expr = pl.when((pl.col("B") > 5)).then((pl.col("A") < 20) & (pl.col("C") > 0)).otherwise(pl.col("A").mod(3) > 0)
+    expr = pl.when(pl.col("B") > 5).then((pl.col("A") < 20) & (pl.col("C") > 0)).otherwise(pl.col("A").mod(3) > 0)
 
     result = restrict_expr_to_columns(expr, {"A"})
 

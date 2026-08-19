@@ -1,7 +1,7 @@
 import datetime
 import logging
 from functools import partial
-from typing import Annotated, Union
+from typing import Annotated
 
 import polars as pl
 import portion
@@ -20,14 +20,14 @@ log = logging.getLogger(__name__)
 
 # Export only what's needed publicly
 __all__ = [
-    "convert_expr_to_range",
     "convert_expr_to_datetime_range",
+    "convert_expr_to_range",
 ]
 
 # Type definition for validated datetime
 ValidatedDatetime = Annotated[
     datetime.datetime,
-    AfterValidator(lambda v: v if v.tzinfo is None else v.astimezone(datetime.timezone.utc).replace(tzinfo=None)),
+    AfterValidator(lambda v: v if v.tzinfo is None else v.astimezone(datetime.UTC).replace(tzinfo=None)),
     Field(description="Validated datetime object, timezone-naive but interpreted as UTC"),
 ]
 
@@ -148,7 +148,7 @@ class IntervalVisitor(ExprVisitor[Interval]):
                     lte_interval = Interval.from_atomic(Bound.CLOSED, -portion.inf, value, Bound.CLOSED)
                     self.constraints &= lte_interval
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                 log.info(f"Failed to create comparison constraint for value {value}: {e}")
 
         elif node.op in [OperatorType.AND, OperatorType.LOGICAL_AND]:
@@ -220,7 +220,7 @@ class IntervalVisitor(ExprVisitor[Interval]):
                     # Apply constraint via intersection
                     self.constraints &= between_interval
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                 log.info(f"Failed to create BETWEEN constraint: {e}")
 
         elif node.function_type == BooleanFunctionType.IS_IN:
@@ -247,7 +247,7 @@ class IntervalVisitor(ExprVisitor[Interval]):
                     # Use create_point to handle date expansion when needed
                     point_interval = self.create_point(value)
                     in_interval |= point_interval
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                     log.info(f"Failed to add IN value {value}: {e}")
 
             # Apply constraint by intersection
@@ -285,7 +285,7 @@ class IntervalVisitor(ExprVisitor[Interval]):
 
 
 # Public facing functions
-def convert_expr_to_range(expr_or_node: Union[pl.Expr, BaseExprNode], column_name: str, create_point_func=None, validate_value_func=None) -> Interval:
+def convert_expr_to_range(expr_or_node: pl.Expr | BaseExprNode, column_name: str, create_point_func=None, validate_value_func=None) -> Interval:
     """
     Extract valid ranges for a specific column from filters.
 
@@ -308,7 +308,7 @@ def convert_expr_to_range(expr_or_node: Union[pl.Expr, BaseExprNode], column_nam
 
 
 def convert_expr_to_datetime_range(
-    expr_or_node: Union[pl.Expr, BaseExprNode],
+    expr_or_node: pl.Expr | BaseExprNode,
     column_name: str,
     coerce_date_to_datetime: bool = True,
     get_enclosure: bool = True,

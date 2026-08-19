@@ -4,7 +4,6 @@ from typing import Optional
 import polars as pl
 
 __all__ = [
-    "get_function_enum",
     "ArrayFunctionType",
     "BinaryFunctionType",
     "BitwiseFunctionType",
@@ -19,6 +18,7 @@ __all__ = [
     "TemporalFunctionType",
     "TimeUnit",
     "TrigonometricFunctionType",
+    "get_function_enum",
 ]
 
 
@@ -179,8 +179,6 @@ class OperatorType(str, Enum):
 
 class FunctionType(str, Enum):
     """Base class for function type enums."""
-
-    ...
 
 
 class GenericFunctionType(FunctionType):
@@ -606,7 +604,7 @@ class TimeUnit(str, Enum):
                 return "ms"
 
     @classmethod
-    def from_string(cls, unit: Optional[str]) -> Optional["TimeUnit"]:
+    def from_string(cls, unit: str | None) -> Optional["TimeUnit"]:
         """
         Map a Polars time unit string ("ns", "us", "ms") to a TimeUnit enum.
 
@@ -623,7 +621,7 @@ class TimeUnit(str, Enum):
                 return None
 
 
-def get_function_enum(category_key: str, function_name: str) -> Optional[FunctionType]:
+def get_function_enum(category_key: str, function_name: str) -> FunctionType | None:
     """
     Get the appropriate function enum instance based on a category key and function name.
 

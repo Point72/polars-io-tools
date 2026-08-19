@@ -1,17 +1,16 @@
 import datetime
-from typing import Optional, Tuple
 
 import polars as pl
 
-import polars_io_tools as cpl  # noqa
+import polars_io_tools as cpl
 from polars_io_tools.io_sources.util import _storage_options_for
 
 
 def exercise_daily_cache_parquet(
     cache_root: str,
-    aws_profile: Optional[str] = None,
-    partition_format: Optional[str] = "theYear=$year/theMonth=$month/theDay=$day",
-) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    aws_profile: str | None = None,
+    partition_format: str | None = "theYear=$year/theMonth=$month/theDay=$day",
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """
     Shared test logic for daily cache_parquet behavior.
 

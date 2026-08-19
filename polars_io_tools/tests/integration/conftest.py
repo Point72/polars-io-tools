@@ -80,7 +80,6 @@ def aws_profile_via_env(aws_profile, monkeypatch):
     """
     if aws_profile:
         monkeypatch.setenv("AWS_PROFILE", aws_profile)
-    return None
 
 
 @pytest.fixture(scope="session")
