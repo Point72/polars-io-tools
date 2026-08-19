@@ -3,7 +3,7 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Generic, TypeVar
 
 import orjson
 import polars as pl
@@ -68,12 +68,10 @@ class BaseExprNode(BaseModel, ABC):
     @abstractmethod
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         """Accept a visitor by dispatching to the appropriate visit method."""
-        pass
 
     @abstractmethod
-    def get_children(self) -> List["BaseExprNode"]:
+    def get_children(self) -> list["BaseExprNode"]:
         """Get all child nodes."""
-        pass
 
     def visit_children(self, visitor: "ExprVisitor[T]") -> None:
         """Visit all child nodes with the given visitor."""
@@ -91,7 +89,7 @@ class ExtractableLiteralNode(BaseExprNode):
     def validate_can_extact_literal(self):
         # If we can extract a literal from this node
         # all([]) == True
-        if all(map(lambda x: x.can_extract_literal, self.get_children())):
+        if all(x.can_extract_literal for x in self.get_children()):
             self.can_extract_literal = True
         return self
 
@@ -116,7 +114,7 @@ class AnonymousFunctionNode(ExtractableLiteralNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_anon_function(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         return [self.input]
 
 
@@ -124,12 +122,12 @@ class AliasNode(ExtractableLiteralNode):
     """Node representing an alias expression."""
 
     input: BaseExprNode
-    name: Optional[str] = None
+    name: str | None = None
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_alias(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input node."""
         return [self.input]
 
@@ -144,7 +142,7 @@ class BinaryExprNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_binary_expr(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the left and right nodes."""
         return [self.left, self.right]
 
@@ -159,7 +157,7 @@ class CastNode(ExtractableLiteralNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_cast(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input node."""
         return [self.input]
 
@@ -172,7 +170,7 @@ class ColumnNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_column(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -180,12 +178,12 @@ class ColumnNode(BaseExprNode):
 class ColumnsNode(BaseExprNode):
     """Node representing multiple column references."""
 
-    names: List[str]
+    names: list[str]
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_columns(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -198,7 +196,7 @@ class ErrorNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_error(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -207,12 +205,12 @@ class ExcludeNode(BaseExprNode):
     """Node representing an exclude operation."""
 
     input: BaseExprNode
-    exclude: List[Union[str, pl.DataType]]
+    exclude: list[str | pl.DataType]
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_exclude(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input node."""
         return [self.input]
 
@@ -225,7 +223,7 @@ class ExplodeNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_explode(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input node."""
         return [self.input]
 
@@ -233,12 +231,12 @@ class ExplodeNode(BaseExprNode):
 class FieldNode(BaseExprNode):
     """Node representing field access in a struct."""
 
-    fields: List[str]
+    fields: list[str]
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_field(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -252,7 +250,7 @@ class FilterNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_filter(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input and by nodes."""
         return [self.input, self.by]
 
@@ -260,14 +258,14 @@ class FilterNode(BaseExprNode):
 class FunctionNode(ExtractableLiteralNode):
     """Node representing a general function call."""
 
-    inputs: List[BaseExprNode]
+    inputs: list[BaseExprNode]
     function_type: FunctionType
-    options: Dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_function(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get all input nodes."""
         return self.inputs
 
@@ -282,7 +280,7 @@ class GatherNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_gather(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input and idx nodes."""
         return [self.input, self.idx]
 
@@ -295,7 +293,7 @@ class KeepNameNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_keep_name(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input node."""
         return [self.input]
 
@@ -306,7 +304,7 @@ class LenNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_len(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -319,7 +317,7 @@ class LiteralNode(ExtractableLiteralNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_literal(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -332,7 +330,7 @@ class NthNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_nth(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -342,14 +340,14 @@ class SelectorNode(BaseExprNode):
 
     # The definition of the different values Selector takes are here:
     # https://github.com/pola-rs/polars/blob/main/crates/polars-plan/src/dsl/selector.rs
-    strict: Optional[bool] = None
-    names: List[str] = []
-    indices: List[int] = []
+    strict: bool | None = None
+    names: list[str] = []
+    indices: list[int] = []
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_selector(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -364,7 +362,7 @@ class SliceNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_slice(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input, offset, and length nodes."""
         return [self.input, self.offset, self.length]
 
@@ -373,13 +371,13 @@ class SortByNode(BaseExprNode):
     """Node representing a sort_by operation."""
 
     input: BaseExprNode
-    by: List[BaseExprNode]
-    options: Dict[str, Any] = Field(default_factory=dict)
+    by: list[BaseExprNode]
+    options: dict[str, Any] = Field(default_factory=dict)
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_sort_by(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input and by nodes."""
         return [self.input] + self.by
 
@@ -388,12 +386,12 @@ class SortNode(BaseExprNode):
     """Node representing a sort operation."""
 
     input: BaseExprNode
-    options: Dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_sort(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the input node."""
         return [self.input]
 
@@ -408,7 +406,7 @@ class TernaryNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_ternary(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """Get the predicate, truthy, and falsy nodes."""
         return [self.predicate, self.truthy, self.falsy]
 
@@ -416,12 +414,12 @@ class TernaryNode(BaseExprNode):
 class UnknownNode(BaseExprNode):
     """Node representing an unrecognized expression type."""
 
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_unknown(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -432,7 +430,7 @@ class WildcardNode(BaseExprNode):
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_wildcard(self)
 
-    def get_children(self) -> List[BaseExprNode]:
+    def get_children(self) -> list[BaseExprNode]:
         """No children to get."""
         return []
 
@@ -462,7 +460,6 @@ class ExprVisitor(Generic[T]):
 
     def default_visit(self, node: BaseExprNode) -> None:
         """Default visit method."""
-        pass
 
     def visit_alias(self, node: AliasNode) -> None:
         self.default_visit(node)
@@ -605,27 +602,27 @@ class ExprParser:
             return ErrorNode(expr=expr, error=str(e))
 
     # Simple parser methods
-    def _parse_column(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_column(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a column expression."""
         return ColumnNode(expr=expr, name=expr_dict["Column"])
 
-    def _parse_columns(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_columns(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a columns expression."""
         return ColumnsNode(expr=expr, names=expr_dict["Columns"])
 
-    def _parse_literal(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_literal(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a literal expression."""
         return LiteralNode(expr=expr)
 
-    def _parse_len(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_len(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a len expression."""
         return LenNode(expr=expr)
 
-    def _parse_wildcard(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_wildcard(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a wildcard expression."""
         return WildcardNode(expr=expr)
 
-    def _parse_selector(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_selector(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         core_dict = expr_dict.pop(Expr.Selector.name)
         if "ByName" in core_dict:
             vals = core_dict["ByName"]
@@ -640,7 +637,7 @@ class ExprParser:
         else:
             raise ValueError(f"Unhandled selector {expr = } with serialization {expr_dict}")
 
-    def _parse_binary_expr(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_binary_expr(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse binary expressions (comparisons, arithmetic, and logical operators)."""
         try:
             binary_expr = expr_dict.get("BinaryExpr", {})
@@ -669,11 +666,11 @@ class ExprParser:
             # Create a proper BinaryExprNode
             return BinaryExprNode(expr=expr, left=left_node, op=op, right=right_node)
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             log.warning(f"Error parsing binary expression: {e}")
-            return ErrorNode(expr=expr, error=f"Binary expression parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Binary expression parsing error: {e!s}")
 
-    def _parse_alias(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_alias(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse an alias expression."""
         # Extract the alias name
         alias_info = expr_dict.get("Alias", {})
@@ -696,7 +693,7 @@ class ExprParser:
 
         return AliasNode(expr=expr, input=inner_node, name=alias_name)
 
-    def _parse_function_expr(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_function_expr(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse function expressions using a simplified approach with a single function node type."""
         try:
             func_dict = expr_dict.get("Function", {})
@@ -766,7 +763,7 @@ class ExprParser:
             log.warning(f"Error parsing function expression: {e}", exc_info=True)
             return ErrorNode(expr=expr, error=str(e))
 
-    def _parse_cast(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_cast(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a cast expression."""
         try:
             cast_info = expr_dict.get("Cast", {})
@@ -792,7 +789,7 @@ class ExprParser:
                     return ErrorNode(expr=expr, error="DataTypeExpr not handled yet.")
 
             if isinstance(dtype, str):
-                dtype, pos_args = dtype, None
+                pos_args = None
             elif isinstance(dtype, dict):
                 dtype, pos_args = next(iter(dtype.items()))
             else:
@@ -816,9 +813,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Cast expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Cast parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Cast parsing error: {e!s}")
 
-    def _parse_sort(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_sort(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a sort expression."""
         try:
             sort_info = expr_dict.get("Sort", {})
@@ -840,9 +837,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Sort expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Sort parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Sort parsing error: {e!s}")
 
-    def _parse_gather(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_gather(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a gather expression."""
         try:
             gather_info = expr_dict.get("Gather", {})
@@ -867,9 +864,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Gather expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Gather parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Gather parsing error: {e!s}")
 
-    def _parse_sort_by(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_sort_by(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a sort_by expression."""
         try:
             sort_by_info = expr_dict.get("SortBy", {})
@@ -895,9 +892,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing SortBy expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"SortBy parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"SortBy parsing error: {e!s}")
 
-    def _parse_ternary(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_ternary(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a ternary expression."""
         try:
             # Get all three inputs: predicate, truthy, falsy
@@ -915,11 +912,11 @@ class ExprParser:
 
             return TernaryNode(expr=expr, predicate=predicate_node, truthy=truthy_node, falsy=falsy_node)
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             log.warning(f"Error parsing Ternary expression: {e}")
-            return ErrorNode(expr=expr, error=f"Ternary parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Ternary parsing error: {e!s}")
 
-    def _parse_explode(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_explode(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse an explode expression."""
         try:
             # Get the input expression
@@ -934,9 +931,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Explode expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Explode parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Explode parsing error: {e!s}")
 
-    def _parse_filter(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_filter(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a filter expression."""
         try:
             # Get the input expressions
@@ -954,9 +951,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Filter expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Filter parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Filter parsing error: {e!s}")
 
-    def _parse_slice(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_slice(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a slice expression."""
         try:
             # Get the input expressions
@@ -976,9 +973,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Slice expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Slice parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Slice parsing error: {e!s}")
 
-    def _parse_exclude(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_exclude(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse an exclude expression."""
         try:
             # Get the input expression
@@ -996,7 +993,7 @@ class ExprParser:
                 try:
                     exclude_val = get_literal_value(inputs[i])
                     exclude_items.append(exclude_val)
-                except Exception:
+                except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                     # If we can't get a literal, try parsing as a expression
                     exclude_node = self.parse(inputs[i])
                     if isinstance(exclude_node, LiteralNode):
@@ -1009,9 +1006,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Exclude expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Exclude parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Exclude parsing error: {e!s}")
 
-    def _parse_keep_name(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_keep_name(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a keep_name expression."""
         try:
             # Get the input expression
@@ -1026,9 +1023,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing KeepName expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"KeepName parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"KeepName parsing error: {e!s}")
 
-    def _parse_nth(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_nth(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse an nth expression."""
         try:
             nth_info = expr_dict.get("Nth")
@@ -1040,9 +1037,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Nth expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Nth parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Nth parsing error: {e!s}")
 
-    def _parse_field(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_field(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         """Parse a field expression."""
         try:
             field_info = expr_dict.get("Field")
@@ -1054,9 +1051,9 @@ class ExprParser:
 
         except Exception as e:
             log.warning(f"Error parsing Field expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Field parsing error: {str(e)}")
+            return ErrorNode(expr=expr, error=f"Field parsing error: {e!s}")
 
-    def _parse_anon_function(self, expr: pl.Expr, expr_dict: Dict) -> BaseExprNode:
+    def _parse_anon_function(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
         input_node = self.parse(expr.meta.pop()[0])
         return AnonymousFunctionNode(expr=expr, input=input_node)
 
@@ -1072,12 +1069,12 @@ class ExprParser:
 # JSON-serialization based :class:`ExprParser` above remains reachable for one release via the ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER`` env var.
 # ---------------------------------------------------------------------------
 
-_OPERATOR_NAME_MAP: Dict[str, OperatorType] = {op.value: op for op in OperatorType}
+_OPERATOR_NAME_MAP: dict[str, OperatorType] = {op.value: op for op in OperatorType}
 
 # (polars typed enum class, category key consumed by `get_function_enum`). Order does not matter; lookup is by isinstance on the head of
 # `Function.function_data`. Some classes (e.g. `StructFunction`, added in polars 1.31) may be absent on older supported polars versions;
 # `getattr` keeps the table compatible across the supported range and the missing categories fall through to `UNKNOWN`.
-_FUNCTION_CATEGORY_MAP: List[Tuple[type, str]] = [
+_FUNCTION_CATEGORY_MAP: list[tuple[type, str]] = [
     (cls, key)
     for cls, key in [
         (getattr(en, "BooleanFunction", None), "Boolean"),
@@ -1103,7 +1100,7 @@ class NodeTraverserParser:
 
     def __init__(self) -> None:
         # Dispatch on the polars typed-view class, mirroring ExprParser._parser_map.
-        self._parser_map: Dict[type, Any] = {
+        self._parser_map: dict[type, Any] = {
             en.Column: self._parse_column,
             en.Literal: self._parse_literal,
             en.Len: self._parse_len,
@@ -1132,13 +1129,13 @@ class NodeTraverserParser:
         schema = {name: pl.Null for name in expr.meta.root_names()}
         return pl.LazyFrame(schema=schema)._ldf.visit()
 
-    def _view(self, visitor: Any, expr: pl.Expr) -> Optional[Any]:
+    def _view(self, visitor: Any, expr: pl.Expr) -> Any | None:
         """Add ``expr`` to the traverser and return its typed view. Returns ``None`` if polars refuses or hasn't implemented the node — caller
         falls back to :class:`UnknownNode`.
         """
         try:
             [node_id], _ = visitor.add_expressions([expr._pyexpr])
-        except Exception:
+        except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             return None
         try:
             return visitor.view_expression(node_id)
@@ -1166,7 +1163,7 @@ class NodeTraverserParser:
             return UnknownNode(expr=expr, data={"node_type": type(obj).__name__})
         try:
             return handler(expr, obj, visitor)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             return ErrorNode(expr=expr, error=str(e))
 
     # Leaves
@@ -1266,7 +1263,7 @@ class NodeTraverserParser:
             options=options,
         )
 
-    def _function_type_and_options(self, function_data: Tuple[Any, ...]) -> Tuple[FunctionType, Dict[str, Any]]:
+    def _function_type_and_options(self, function_data: tuple[Any, ...]) -> tuple[FunctionType, dict[str, Any]]:
         """Resolve a ``Function.function_data`` tuple to ``(our function-type enum, options dict)``.
 
         Only the option keys that downstream consumers actually inspect are populated. In production these are ``closed`` (range/dnf/sql)
@@ -1290,7 +1287,7 @@ class NodeTraverserParser:
         return GenericFunctionType.UNKNOWN, {}
 
 
-def _named_function_options(category: str, name: str, args: Tuple[Any, ...]) -> Dict[str, Any]:
+def _named_function_options(category: str, name: str, args: tuple[Any, ...]) -> dict[str, Any]:
     if not args:
         return {}
     if category == "Boolean" and name == "IsBetween":
@@ -1301,7 +1298,7 @@ def _named_function_options(category: str, name: str, args: Tuple[Any, ...]) -> 
     if category == "Boolean" and name == "IsIn":
         return {"nulls_equal": args[0]}
     if category == "StringExpr" and name == "Contains":
-        out: Dict[str, Any] = {"literal": args[0]}
+        out: dict[str, Any] = {"literal": args[0]}
         if len(args) >= 2:
             out["strict"] = args[1]
         return out
@@ -1325,12 +1322,12 @@ def get_literal_value(expr: pl.Expr) -> Any:
         if len(res) != 1:
             return res
         return res[0]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
         log.warning(f"Error getting literal value: {e}")
         return FAILED_LITERAL_RESULT  # Use a sentinel to indicate failure
 
 
-def extract_column_name(node: BaseExprNode) -> Optional[str]:
+def extract_column_name(node: BaseExprNode) -> str | None:
     """Extract column name from a node, handling aliases and casts.
 
     This is useful for visitors that need to identify column references
@@ -1363,7 +1360,7 @@ def extract_column_name(node: BaseExprNode) -> Optional[str]:
             return None
 
 
-def get_parsed_expr(expr_or_node: Union[pl.Expr, BaseExprNode]) -> Optional[BaseExprNode]:
+def get_parsed_expr(expr_or_node: pl.Expr | BaseExprNode) -> BaseExprNode | None:
     """Parse a Polars expression or return the node if it's already parsed. This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars window functions or aggregations.
 
     Set ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER=1`` to fall back to the legacy parser if you hit a problem with the default.
@@ -1376,7 +1373,7 @@ def get_parsed_expr(expr_or_node: Union[pl.Expr, BaseExprNode]) -> Optional[Base
     return NodeTraverserParser().parse(expr_or_node)
 
 
-def convert_datetime_to_polars(dt_val: datetime.datetime, schema_cast: Optional[Any] = None) -> pl.Expr:
+def convert_datetime_to_polars(dt_val: datetime.datetime, schema_cast: Any | None = None) -> pl.Expr:
     """Helper function to convert a datetime value to a Polars expression that is eligible for predicate pushdown. This is only needed for polars<1.28"""
     if version.parse(pl.__version__) > version.parse("1.28"):
         new_expr = pl.lit(dt_val, dtype=pl.Datetime(time_unit="ns"))

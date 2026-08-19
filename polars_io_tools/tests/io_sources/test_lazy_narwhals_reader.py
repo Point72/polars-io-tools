@@ -1,6 +1,5 @@
 import re
 from datetime import date, datetime
-from typing import List, Optional
 
 import narwhals as nw
 import narwhals.stable.v1 as nw_stable
@@ -156,17 +155,17 @@ def test_from_narwhals_custom_batch_size():
 def test_narwhals_wrapping_polars():
     def my_scan(df: pl.LazyFrame) -> pl.LazyFrame:
         schema = df.collect_schema()
-        expected_set = set([1])
+        expected_set = {1}
 
         expected_lower = portion.closed(lower=-portion.inf, upper=datetime(2023, 10, 1))
         expected_upper = portion.openclosed(lower=datetime(2023, 10, 8), upper=portion.inf)
         expected_interval = expected_lower | expected_upper
 
         def source_generator(
-            with_columns: Optional[List[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ):
             assert convert_expr_to_valid_values(predicate, "a") == expected_set
             assert convert_expr_to_datetime_range(predicate, "date", get_enclosure=False) == expected_interval
@@ -328,10 +327,10 @@ def test_alias_filter_predicate_pushdown_to_original_column():
         schema = df.collect_schema()
 
         def source_generator(
-            with_columns: Optional[List[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ):
             # Capture the predicate that was pushed down
             captured_predicates.append(predicate)
@@ -416,10 +415,10 @@ def test_sql_lazy_frame():
         schema = df.collect_schema()
 
         def source_generator(
-            with_columns: Optional[List[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ):
             assert predicate is not None
             print(str(predicate))

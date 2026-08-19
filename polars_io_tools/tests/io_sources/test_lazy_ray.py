@@ -1,15 +1,15 @@
-import datetime  # noqa: E402
-import random  # noqa: E402
-import time  # noqa: E402
+import datetime
+import random
+import time
 
-import polars as pl  # noqa: E402
-import pytest  # noqa: E402
-from polars.testing import assert_frame_equal  # noqa: E402
+import polars as pl
+import pytest
+from polars.testing import assert_frame_equal
 
 ray = pytest.importorskip("ray", exc_type=ImportError)
 
-import polars_io_tools as cpl  # noqa: E402,F401
-import polars_io_tools.io_sources.lazy_ray  # noqa: E402  # explicit import needed if using pytest-xdist
+import polars_io_tools as cpl
+import polars_io_tools.io_sources.lazy_ray  # explicit import needed if using pytest-xdist
 
 
 @pytest.fixture(scope="session", autouse=True)

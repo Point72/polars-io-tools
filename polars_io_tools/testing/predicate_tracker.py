@@ -10,9 +10,10 @@ This module provides tools for:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Callable, Iterable, Iterator, Optional, Union
+from typing import Any
 
 import polars as pl
 from polars.io.plugins import register_io_source
@@ -21,12 +22,12 @@ from polars.testing import assert_frame_equal
 from polars_io_tools.io_sources.base import BinaryExprNode, FunctionNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
 
-__all__ = ("PredicateTracker", "PredicateAnalyzer", "io_source_assert")
+__all__ = ("PredicateAnalyzer", "PredicateTracker", "io_source_assert")
 
 
 def _materialize_columns(
-    columns: Union[str, Iterable[str], pl.Expr, Iterable[pl.Expr]],
-) -> Union[str, pl.Expr, list]:
+    columns: str | Iterable[str] | pl.Expr | Iterable[pl.Expr],
+) -> str | pl.Expr | list:
     """Normalize a ``columns`` argument so it can be iterated more than once.
 
     A single string or ``pl.Expr`` is returned as-is; any other iterable is
@@ -72,10 +73,10 @@ class PredicateTracker:
     """
 
     df: pl.DataFrame
-    last_predicate: Optional[pl.Expr] = field(default=None, init=False)
-    last_with_columns: Optional[list[str]] = field(default=None, init=False)
+    last_predicate: pl.Expr | None = field(default=None, init=False)
+    last_with_columns: list[str] | None = field(default=None, init=False)
     call_count: int = field(default=0, init=False)
-    _lazy_frame: Optional[pl.LazyFrame] = field(default=None, init=False, repr=False)
+    _lazy_frame: pl.LazyFrame | None = field(default=None, init=False, repr=False)
 
     @property
     def lazy_frame(self) -> pl.LazyFrame:
@@ -89,10 +90,10 @@ class PredicateTracker:
         tracker = self  # Capture self for the closure
 
         def source_generator(
-            with_columns: Optional[list[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
             tracker.last_predicate = predicate
             tracker.last_with_columns = with_columns
@@ -181,7 +182,7 @@ class PredicateTracker:
     def assert_predicate_pushed_down(
         self,
         expr: pl.Expr,
-        assert_expr_predicate: Optional[Callable[[pl.Expr, Optional[pl.Expr]], None]] = None,
+        assert_expr_predicate: Callable[[pl.Expr, pl.Expr | None], None] | None = None,
         expected_pushed_down: bool = True,
     ) -> None:
         """
@@ -254,7 +255,7 @@ class PredicateTracker:
                 check_row_order=False,
             )
 
-    def source_select(self, columns: Union[str, Iterable[str], pl.Expr, Iterable[pl.Expr]]) -> pl.DataFrame:
+    def source_select(self, columns: str | Iterable[str] | pl.Expr | Iterable[pl.Expr]) -> pl.DataFrame:
         """
         Apply a column selection through the IO source.
 
@@ -272,8 +273,8 @@ class PredicateTracker:
 
     def assert_projection_pushed_down(
         self,
-        columns: Union[str, Iterable[str], pl.Expr, Iterable[pl.Expr]],
-        expected_columns: Optional[Iterable[str]] = None,
+        columns: str | Iterable[str] | pl.Expr | Iterable[pl.Expr],
+        expected_columns: Iterable[str] | None = None,
         expected_pushed_down: bool = True,
     ) -> None:
         """
@@ -315,12 +316,12 @@ class PredicateTracker:
     def assert_pushed_down(
         self,
         *,
-        predicate: Optional[pl.Expr] = None,
-        projection: Optional[Union[str, Iterable[str], pl.Expr, Iterable[pl.Expr]]] = None,
-        expected_predicate_pushed: Optional[bool] = None,
-        expected_projection_pushed: Optional[bool] = None,
-        expected_columns: Optional[Iterable[str]] = None,
-        assert_expr_predicate: Optional[Callable[[pl.Expr, Optional[pl.Expr]], None]] = None,
+        predicate: pl.Expr | None = None,
+        projection: str | Iterable[str] | pl.Expr | Iterable[pl.Expr] | None = None,
+        expected_predicate_pushed: bool | None = None,
+        expected_projection_pushed: bool | None = None,
+        expected_columns: Iterable[str] | None = None,
+        assert_expr_predicate: Callable[[pl.Expr, pl.Expr | None], None] | None = None,
     ) -> None:
         """
         Assert combined predicate and projection pushdown behavior.
@@ -717,7 +718,7 @@ class PredicateAnalyzer:
         return len(self.find_temporal_filters(col_name)) + len(self.find_discrete_filters(col_name))
 
 
-def io_source_assert(df: pl.DataFrame, assert_func: Callable[[Optional[pl.Expr]], None]) -> pl.LazyFrame:
+def io_source_assert(df: pl.DataFrame, assert_func: Callable[[pl.Expr | None], None]) -> pl.LazyFrame:
     """
     Create a LazyFrame that runs assertions on predicates pushed down to the source.
 
@@ -753,10 +754,10 @@ def io_source_assert(df: pl.DataFrame, assert_func: Callable[[Optional[pl.Expr]]
     """
 
     def source_generator(
-        with_columns: Optional[list[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         # Run the assertion on the pushed predicate
         assert_func(predicate)

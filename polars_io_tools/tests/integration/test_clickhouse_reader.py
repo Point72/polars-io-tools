@@ -82,10 +82,7 @@ def test_filter_equality(ch_params):
     ORDER BY instrument, run_session_id, avg_mid
     """
     result_polars = (
-        cpl.scan_clickhouse(sql_base, url, params)
-        .filter(pl.col("active") == True)  # noqa: E712
-        .select(["instrument", "run_session_id", "avg_mid"])
-        .collect()
+        cpl.scan_clickhouse(sql_base, url, params).filter(pl.col("active") == True).select(["instrument", "run_session_id", "avg_mid"]).collect()
     )
 
     # Verify each approach individually
@@ -150,10 +147,7 @@ def test_filter_and(ch_params):
     ORDER BY instrument, run_session_id, avg_mid
     """
     result_polars = (
-        cpl.scan_clickhouse(sql_base, url, params)
-        .filter((pl.col("active") == True) & (pl.col("avg_mid") > 0))  # noqa: E712
-        .select(select_cols)
-        .collect()
+        cpl.scan_clickhouse(sql_base, url, params).filter((pl.col("active") == True) & (pl.col("avg_mid") > 0)).select(select_cols).collect()
     )
 
     # Verify each approach individually
@@ -252,11 +246,7 @@ def test_complex_filter(ch_params):
     """
     result_polars = (
         cpl.scan_clickhouse(sql_base, url, params)
-        .filter(
-            (pl.col("active") == True)  # noqa: E712
-            & (pl.col("avg_mid") > 0)
-            & (pl.col("count_mid_changes") >= 0)
-        )
+        .filter((pl.col("active") == True) & (pl.col("avg_mid") > 0) & (pl.col("count_mid_changes") >= 0))
         .select(select_cols)
         .collect()
     )
@@ -508,6 +498,6 @@ def test_predicate_pushdown_logged(ch_params, caplog):
     FROM {QUOTE_BAR_TABLE}
     LIMIT 100
     """
-    cpl.scan_clickhouse(sql_query, url, params).filter(pl.col("active") == True).collect()  # noqa: E712
+    cpl.scan_clickhouse(sql_query, url, params).filter(pl.col("active") == True).collect()
 
     assert any("Executing SQL with pushdown" in record.message and "active" in record.message for record in caplog.records)

@@ -4,12 +4,13 @@ import logging
 import operator
 import os
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import Enum, auto
 from pathlib import Path, PureWindowsPath
 from string import Template
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Literal, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
@@ -34,7 +35,7 @@ from .util import _storage_options_for, collect_lf_in_io_source, register_io_sou
 @dataclass(frozen=True)
 class WritePlan:
     should_write: bool
-    filter_predicate: Optional[pl.Expr]
+    filter_predicate: pl.Expr | None
     write_empty_missing: bool
 
 
@@ -45,7 +46,7 @@ class ReadPlan:
     use_paths: Explicit list of cache file paths to read, or None to use glob pattern.
     """
 
-    use_paths: Optional[list[str]]
+    use_paths: list[str] | None
 
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ log = logging.getLogger(__name__)
 __all__ = ["CacheMode", "cache_parquet"]
 
 
-def _path_as_file_uri(path: Union[Path, PureWindowsPath]) -> str:
+def _path_as_file_uri(path: Path | PureWindowsPath) -> str:
     path_str = str(path)
     if len(path_str) >= 3 and path_str[1] == ":" and path_str[2] in {"/", "\\"}:
         return PureWindowsPath(path_str).as_uri()
@@ -95,7 +96,7 @@ def _dataframe_write_parquet_kwargs(
     write_kwargs: dict,
     metadata: dict[str, str],
     storage_options: dict,
-    credential_provider: Optional[pl.CredentialProviderAWS],
+    credential_provider: pl.CredentialProviderAWS | None,
 ) -> dict:
     parquet_kwargs = dict(write_kwargs)
     parquet_kwargs.pop("metadata", None)
@@ -111,12 +112,12 @@ def _dataframe_write_parquet_kwargs(
 
 
 def _write_empty_parquet_files_sequentially(
-    paths: List[str],
+    paths: list[str],
     *,
     schema: pl.Schema,
     metadata: dict[str, str],
     storage_options: dict,
-    credential_provider: Optional[pl.CredentialProviderAWS],
+    credential_provider: pl.CredentialProviderAWS | None,
     write_kwargs: dict,
 ) -> None:
     empty_df = pl.DataFrame(schema=schema)
@@ -213,7 +214,7 @@ class PartitionInfo:
     existing_parts_df: pl.DataFrame
     enumerability: Enumerability
     # For unbounded queries, this holds the expected partitions clipped to existing data bounds
-    clipped_expected_parts_df: Optional[pl.DataFrame] = None
+    clipped_expected_parts_df: pl.DataFrame | None = None
 
 
 def _is_all_null_row(df: pl.DataFrame) -> bool:
@@ -224,7 +225,7 @@ def _is_all_null_row(df: pl.DataFrame) -> bool:
     return all(v is None for v in row.values())
 
 
-def _classify_enumerability(expected_parts_df: pl.DataFrame, date_column: Optional[str]) -> Enumerability:
+def _classify_enumerability(expected_parts_df: pl.DataFrame, date_column: str | None) -> Enumerability:
     """Classify the expected partitions enumerability given the date column context."""
     if date_column and expected_parts_df.is_empty():
         # With a date column, empty expected set implies unbounded/one-sided
@@ -238,11 +239,11 @@ def _build_partition_info(
     *,
     expected_parts_df: pl.DataFrame,
     existing_parts_df: pl.DataFrame,
-    date_column: Optional[str],
+    date_column: str | None,
     extra_cols: list[str],
-    predicate: Optional[pl.Expr] = None,
-    time_unit: Optional[Literal["daily", "monthly", "yearly"]] = None,
-    schema: Optional[pl.Schema] = None,
+    predicate: pl.Expr | None = None,
+    time_unit: Literal["daily", "monthly", "yearly"] | None = None,
+    schema: pl.Schema | None = None,
 ) -> PartitionInfo:
     """Create a PartitionInfo snapshot to drive downstream planning decisions."""
     join_cols = extra_cols + ([date_column] if date_column else [])
@@ -299,11 +300,11 @@ def _strftime_from_template(tmpl: str) -> str:
 def _build_scan_paths(
     parts_df: pl.DataFrame,
     time_unit_dir: str,
-    template_for_metadata: Optional[str],
+    template_for_metadata: str | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
-    date_column: Optional[str],
-    extra_cols: List[str],
-) -> List[str]:
+    date_column: str | None,
+    extra_cols: list[str],
+) -> list[str]:
     """Build explicit cache file paths from an expected partitions DataFrame.
 
     - Returns [] if `parts_df` is empty or any join column has None (cannot enumerate).
@@ -332,9 +333,9 @@ def _build_scan_paths(
     # Ensure deterministic path order
     parts_sorted = parts_df.sort(join_cols) if join_cols else parts_df
 
-    paths: List[str] = []
+    paths: list[str] = []
     for row in parts_sorted.to_dicts():
-        components: List[str] = []
+        components: list[str] = []
         for c in extra_cols:
             components.append(str(row[c]))
         if date_column:
@@ -348,7 +349,7 @@ def _build_scan_paths(
 def _build_not_existing_partitions_pred(
     existing_parts_df: pl.DataFrame,
     join_cols: list[str],
-) -> Optional[pl.Expr]:
+) -> pl.Expr | None:
     """Build a predicate that excludes existing partition combinations.
 
     Returns an expression equivalent to NOT(OR(AND(col==val ...))) across rows in `existing_parts_df[join_cols]`.
@@ -399,7 +400,7 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
         if S3FileSystem is not None and isinstance(fs, S3FileSystem):
             try:
                 fs.create_dir(fs_path_prefix + "/")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                 log.debug(f"Failed to create S3 directory {fs_path_prefix}: {e}")
 
         try:
@@ -407,7 +408,7 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
                 if info.type == pa_fs.FileType.File and info.path.endswith(".parquet"):
                     rel = Path(info.path[len(fs_path_prefix) + 1 :])
                     existing_parts.add(rel.with_suffix("").as_posix())
-        except Exception:
+        except Exception:  # noqa: BLE001,S110 -- intentional broad catch; best-effort cleanup, failure is non-fatal
             # Directory doesn't exist yet
             pass
 
@@ -415,9 +416,9 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
 
 
 def _is_custom_partition_format(
-    template_for_metadata: Optional[str],
-    time_unit: Optional[Literal["daily", "monthly", "yearly"]],
-    date_column: Optional[str],
+    template_for_metadata: str | None,
+    time_unit: Literal["daily", "monthly", "yearly"] | None,
+    date_column: str | None,
 ) -> bool:
     """Return True if a non-default partition template is used.
 
@@ -433,7 +434,7 @@ def _is_custom_partition_format(
 
 def _parse_custom_partition_files(
     existing_files: set[str],
-    all_partition_cols: List[str],
+    all_partition_cols: list[str],
     date_column: str,
     partition_schema_dict: dict,
 ) -> pl.DataFrame:
@@ -512,10 +513,10 @@ def _parse_custom_partition_files(
 def _construct_partitions_df_from_existing(
     existing_files: set[str],
     schema: pl.Schema,
-    all_partition_cols: List[str],
-    template_for_metadata: Optional[str],
-    date_column: Optional[str] = None,
-    time_unit: Optional[Literal["daily", "monthly", "yearly"]] = None,
+    all_partition_cols: list[str],
+    template_for_metadata: str | None,
+    date_column: str | None = None,
+    time_unit: Literal["daily", "monthly", "yearly"] | None = None,
 ) -> pl.DataFrame:
     """Construct a partitions DataFrame from existing keys and optional templates.
 
@@ -550,9 +551,9 @@ def _construct_partitions_df_from_existing(
 
 
 def _get_expected_partitions_df(
-    pred: Optional[pl.Expr],
-    date_column: Optional[str],
-    extra_cols: List[str],
+    pred: pl.Expr | None,
+    date_column: str | None,
+    extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly", "null"],
     schema: pl.Schema,
 ) -> pl.DataFrame:
@@ -589,8 +590,8 @@ def _get_expected_partitions_df(
 
 def _enumerate_partitions_from_dnf(
     pred: pl.Expr,
-    date_column: Optional[str],
-    extra_cols: List[str],
+    date_column: str | None,
+    extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
 ) -> pl.DataFrame:
@@ -617,7 +618,7 @@ def _enumerate_partitions_from_dnf(
         # Union all clause results and deduplicate
         return pl.concat(clause_dfs).unique()
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
         log.debug(f"DNF enumeration failed: {e}, returning unconstrained placeholder")
         # Even on failure, return a DataFrame with None placeholders rather than failing
         return pl.DataFrame([dict.fromkeys(all_partition_cols)], schema=partition_schema)
@@ -625,11 +626,11 @@ def _enumerate_partitions_from_dnf(
 
 def _process_dnf_clause_to_partitions(
     clause: DNFClause,
-    date_column: Optional[str],
-    extra_cols: List[str],
+    date_column: str | None,
+    extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
-) -> Optional[pl.DataFrame]:
+) -> pl.DataFrame | None:
     """Process a single DNF clause, using None for unconstrained columns."""
     all_partition_cols = extra_cols + ([date_column] if date_column else [])
     partition_schema = {c: schema[c] for c in all_partition_cols}
@@ -679,7 +680,7 @@ def _process_dnf_clause_to_partitions(
 
 
 def _get_date_partitions_from_constraints(
-    constraints: List[tuple[str, Any]],
+    constraints: list[tuple[str, Any]],
     date_column: str,
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
@@ -706,7 +707,7 @@ def _get_date_partitions_from_constraints(
 
 
 def _get_column_values_from_constraints(
-    constraints: List[tuple[str, Any]],
+    constraints: list[tuple[str, Any]],
     column: str,
     schema: pl.Schema,
 ) -> pl.DataFrame:
@@ -731,7 +732,7 @@ def _get_column_values_from_constraints(
 def _extract_and_widen_dates(
     analyzer: ColumnConstraintAnalyzer,
     time_unit: Literal["daily", "monthly", "yearly"],
-) -> List[date]:
+) -> list[date]:
     """Extract valid dates from analyzer and apply time unit widening."""
     dates = set()
 
@@ -764,7 +765,7 @@ def _extract_and_widen_dates(
     return sorted(dates)
 
 
-def _convert_to_date(val: Any) -> Optional[date]:
+def _convert_to_date(val: Any) -> date | None:
     """Convert various date-like values to date objects."""
     if isinstance(val, datetime.datetime):
         return val.date()
@@ -788,8 +789,8 @@ def _widen_date(date_val: date, time_unit: Literal["daily", "monthly", "yearly"]
 def _enumerate_date_range(
     analyzer: ColumnConstraintAnalyzer,
     time_unit: Literal["daily", "monthly", "yearly"],
-    max_partitions: Optional[int] = None,
-) -> Set[date]:
+    max_partitions: int | None = None,
+) -> set[date]:
     """Enumerate date range from bounds, applying widening."""
     dates = set()
 
@@ -840,7 +841,7 @@ def _extract_finite_values(
     analyzer: ColumnConstraintAnalyzer,
     column: str,
     schema: pl.Schema,
-) -> Optional[Set[Any]]:
+) -> set[Any] | None:
     """Extract finite set of valid values, or None if not possible."""
     if analyzer.exact_values:
         return analyzer.exact_values - analyzer.exclusion_values
@@ -857,7 +858,7 @@ def _extract_finite_values(
     return None
 
 
-def _enumerate_integer_range(analyzer: ColumnConstraintAnalyzer, max_size: Optional[int] = None) -> Optional[Set[int]]:
+def _enumerate_integer_range(analyzer: ColumnConstraintAnalyzer, max_size: int | None = None) -> set[int] | None:
     """Enumerate integer range if it's small enough."""
     if not analyzer.min_bound or not analyzer.max_bound:
         return None
@@ -880,10 +881,10 @@ def _compute_clipped_expected_partitions(
     predicate_interval: Interval,
     existing_parts_df: pl.DataFrame,
     date_column: str,
-    extra_cols: List[str],
+    extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
-) -> Optional[pl.DataFrame]:
+) -> pl.DataFrame | None:
     """Compute expected partitions for unbounded queries, clipped to existing data bounds.
 
     Uses the predicate's interval (from convert_expr_to_datetime_range) to determine bounds.
@@ -949,7 +950,7 @@ def _compute_clipped_expected_partitions(
         return None
 
     # Enumerate the clipped date range
-    dates: Set[date] = set()
+    dates: set[date] = set()
     current = clipped_min
     while current <= clipped_max:
         dates.add(current)
@@ -981,10 +982,10 @@ def _compute_clipped_expected_partitions(
 
 def _generate_write_predicate_from_partitions_df(
     partitions_df: pl.DataFrame,
-    date_column: Optional[str],
-    extra_cols: List[str],
+    date_column: str | None,
+    extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly", "null"],
-) -> Optional[pl.Expr]:
+) -> pl.Expr | None:
     """Generate a predicate that efficiently covers all partitions in the DataFrame.
     There is an inherent trade-off here:
     - If we list the partitions explicitly and we have many, we may end up with a very predicate that might segfault or cause poor performance.
@@ -1028,7 +1029,7 @@ def _generate_write_predicate_from_partitions_df(
             return functools.reduce(operator.or_, all_extra_predicates)
 
     # Step 1: Convert each partition row to an interval and collect associated partition values
-    partition_intervals: List[tuple[Interval, dict[str, Any]]] = []
+    partition_intervals: list[tuple[Interval, dict[str, Any]]] = []
     for row_dict in partitions_df.to_dicts():
         date_val = row_dict.get(date_column)
         if date_val is None:
@@ -1065,7 +1066,7 @@ def _generate_write_predicate_from_partitions_df(
 
     # Step 2: Group partitions by overlapping/adjacent intervals
     # We'll merge intervals and collect all partition values that fall within each merged interval
-    merged_groups: List[tuple[Interval, List[dict[str, Any]]]] = []
+    merged_groups: list[tuple[Interval, list[dict[str, Any]]]] = []
 
     # Sort by interval start for merging
     partition_intervals.sort(key=lambda x: (x[0].lower, x[0].upper))
@@ -1136,9 +1137,9 @@ def _generate_write_predicate_from_partitions_df(
 
 def _schema_from_cache(
     cache_path: str,
-    storage_opts: Optional[dict],
-    credential_provider: Optional[pl.CredentialProviderAWS],
-) -> Optional[pl.Schema]:
+    storage_opts: dict | None,
+    credential_provider: pl.CredentialProviderAWS | None,
+) -> pl.Schema | None:
     """Get the schema from an existing cache."""
     uri = f"{cache_path.rstrip('/')}/**/*.parquet"
     try:
@@ -1148,7 +1149,7 @@ def _schema_from_cache(
 
         lf = pl.scan_parquet(uri, n_rows=0, **kwargs)
         return lf.collect_schema()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
         log.debug("Could not infer schema from cache; this is the first write")
         return None
 
@@ -1195,8 +1196,8 @@ def _build_write_plan(
     *,
     cache_mode: CacheMode,
     partition_info: PartitionInfo,
-    date_column: Optional[str],
-    predicate: Optional[pl.Expr],
+    date_column: str | None,
+    predicate: pl.Expr | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
 ) -> WritePlan:
     """Construct a write plan based on cache mode and enumerability.
@@ -1204,7 +1205,7 @@ def _build_write_plan(
     Consolidates special-case logic for one-sided/unbounded queries and unconstrained cases.
     """
     need_write = cache_mode in {CacheMode.CACHE, CacheMode.REBUILD}
-    filter_predicate: Optional[pl.Expr] = None
+    filter_predicate: pl.Expr | None = None
 
     if not need_write:
         return WritePlan(False, None, False)
@@ -1312,10 +1313,10 @@ def _get_fs_path_directory_info(
 def _build_read_plan(
     *,
     partition_info: PartitionInfo,
-    date_column: Optional[str],
-    predicate: Optional[pl.Expr],
+    date_column: str | None,
+    predicate: pl.Expr | None,
     time_unit_dir: str,
-    template_for_metadata: Optional[str],
+    template_for_metadata: str | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
 ) -> ReadPlan:
     """Construct a read plan for reading from cache.
@@ -1329,7 +1330,7 @@ def _build_read_plan(
     join_cols = partition_info.join_cols
     extra_cols = [c for c in join_cols if c != (date_column or "")]
 
-    def build_cache_paths(parts_df: pl.DataFrame) -> Optional[list[str]]:
+    def build_cache_paths(parts_df: pl.DataFrame) -> list[str] | None:
         return _build_scan_paths(
             parts_df=parts_df,
             time_unit_dir=time_unit_dir,
@@ -1375,9 +1376,9 @@ def _compute_partitions_to_write(part_info: PartitionInfo, existing_parts_df: pl
 
 def _build_final_scan(
     cache_scan: pl.LazyFrame,
-    predicate: Optional[pl.Expr],
-    with_columns: Optional[List[str]],
-    n_rows: Optional[int],
+    predicate: pl.Expr | None,
+    with_columns: list[str] | None,
+    n_rows: int | None,
 ) -> pl.LazyFrame:
     """Build the final scan LazyFrame from cache."""
     scan = cache_scan
@@ -1392,9 +1393,9 @@ def _build_final_scan(
 
 def _build_cache_metadata(
     effective_time_unit: str,
-    template_for_metadata: Optional[str],
-    extra_cols: List[str],
-    user_metadata: Optional[dict] = None,
+    template_for_metadata: str | None,
+    extra_cols: list[str],
+    user_metadata: dict | None = None,
 ) -> dict[str, str]:
     """Build metadata dictionary for cache parquet files."""
     metadata = {
@@ -1415,19 +1416,19 @@ def _build_cache_metadata(
 
 
 def cache_parquet(
-    self_or_fn: Union[pl.LazyFrame, Callable[[], pl.LazyFrame]],
-    cache_path: Union[str, Path],
-    date_column: Optional[str] = None,
+    self_or_fn: pl.LazyFrame | Callable[[], pl.LazyFrame],
+    cache_path: str | Path,
+    date_column: str | None = None,
     *,
     time_unit: Literal["daily", "monthly", "yearly"] = "monthly",
-    partition_format: Optional[str] = None,
+    partition_format: str | None = None,
     cache_mode: CacheMode = CacheMode.CACHE,
-    aws_profile: Optional[str] = None,
-    write_kwargs: Optional[dict] = None,
-    read_kwargs: Optional[dict] = None,
-    extra_partition_cols: Optional[Union[str, List[str]]] = None,
-    schema: Optional[pl.Schema] = None,
-    write_bounding_columns: Optional[List[str]] = None,
+    aws_profile: str | None = None,
+    write_kwargs: dict | None = None,
+    read_kwargs: dict | None = None,
+    extra_partition_cols: str | list[str] | None = None,
+    schema: pl.Schema | None = None,
+    write_bounding_columns: list[str] | None = None,
 ) -> pl.LazyFrame:
     """
     Cache a LazyFrame to Parquet files with optional date-based partitioning. Supports daily, monthly, or yearly
@@ -1580,7 +1581,7 @@ def cache_parquet(
         fs = pa_fs.LocalFileSystem()
 
     # Lazily materialize source once (if callable) and reuse
-    source_lf: Optional[pl.LazyFrame]
+    source_lf: pl.LazyFrame | None
     if isinstance(self_or_fn, pl.LazyFrame):
         source_lf = self_or_fn
     else:
@@ -1643,10 +1644,10 @@ def cache_parquet(
         key_exprs = [pl.lit("data").alias("__piot_key_single__")]
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         log.debug("Running with %s against location %s with columns '%s' and predicate: '%s'", cache_mode, time_unit_dir, with_columns, predicate)
 
@@ -1842,7 +1843,7 @@ def cache_parquet(
                 # since we do not accept Nulls in partition keys
                 nulls_dropped_expected_df = source_expected_df.drop_nulls()
                 if not nulls_dropped_expected_df.is_empty():
-                    expected_keys = set([unquote(p) for p in nulls_dropped_expected_df.select(pl.concat_str(key_exprs, separator="/")).to_series()])
+                    expected_keys = {unquote(p) for p in nulls_dropped_expected_df.select(pl.concat_str(key_exprs, separator="/")).to_series()}
                     # For REBUILD mode, don't subtract existing_parts - we want to overwrite
                     # For CACHE mode, skip partitions that already exist
                     if cache_mode == CacheMode.REBUILD:

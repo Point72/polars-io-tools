@@ -1,6 +1,6 @@
 import datetime
 import logging
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 import polars as pl
 
@@ -14,14 +14,14 @@ log = logging.getLogger(__name__)
 
 def ts_with_columns(
     self: pl.LazyFrame,
-    *exprs: pl.Expr | List[pl.Expr] | Callable[[pl.LazyFrame], pl.LazyFrame],
-    index_col: str = None,
-    linked_cols: Optional[List[str]] = None,
-    lookback: Optional[datetime.timedelta] = None,
-    lookahead: Optional[datetime.timedelta] = None,
+    *exprs: pl.Expr | list[pl.Expr] | Callable[[pl.LazyFrame], pl.LazyFrame],
+    index_col: str | None = None,
+    linked_cols: list[str] | None = None,
+    lookback: datetime.timedelta | None = None,
+    lookahead: datetime.timedelta | None = None,
     log_explain: bool = False,
     _disable_optimizations: bool = False,
-    expressions: List[pl.Expr] | Callable[[pl.LazyFrame], pl.LazyFrame] = None,
+    expressions: list[pl.Expr] | Callable[[pl.LazyFrame], pl.LazyFrame] | None = None,
 ) -> pl.LazyFrame:
     """
     Apply expressions to a time series LazyFrame with optimized date-based predicate pushdown.

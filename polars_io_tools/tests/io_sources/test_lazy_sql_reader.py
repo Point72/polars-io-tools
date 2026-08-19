@@ -3,7 +3,6 @@ import logging
 import sys
 from datetime import date
 from types import SimpleNamespace
-from typing import Optional
 
 import duckdb
 import polars as pl
@@ -116,7 +115,7 @@ def get_employee_df() -> pl.DataFrame:
 
 
 # Module-level variable to store the connection
-_duckdb_conn: Optional[duckdb.DuckDBPyConnection] = None
+_duckdb_conn: duckdb.DuckDBPyConnection | None = None
 
 
 @pytest.fixture(scope="module")
@@ -2202,7 +2201,7 @@ class TestSubqueryWrappingHoisting:
         from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
 
         parsed = parse_one("SELECT cb.region, cb.amount FROM Sales cb ORDER BY cb.amount DESC")
-        inner, order_to_hoist, _ = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
+        _inner, order_to_hoist, _ = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
 
         assert order_to_hoist is not None
         order_sql = order_to_hoist.sql()

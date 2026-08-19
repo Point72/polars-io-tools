@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Literal, Optional
+from typing import Literal
 
 import orjson
 import polars as pl
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 __all__ = ["TranslatedPredicateVisitor", "translate_polars_predicate"]
 
 
-def _to_target_expr(col: pl.Expr, m: Optional[pl.DataType]) -> pl.Expr:
+def _to_target_expr(col: pl.Expr, m: pl.DataType | None) -> pl.Expr:
     if m is None:
         return col
     # Cast mapped columns to their target logical dtype; layering of any
@@ -49,7 +49,7 @@ def _to_target_expr(col: pl.Expr, m: Optional[pl.DataType]) -> pl.Expr:
     return col
 
 
-class TranslatedPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
+class TranslatedPredicateVisitor(ExprVisitor[pl.Expr | None]):
     """Visitor that rewrites predicates to operate on underlying storage types.
 
     Produces a new pl.Expr (or None if cannot be rewritten) by walking the AST.
@@ -57,14 +57,14 @@ class TranslatedPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
 
     def __init__(self, mapping: dict[str, pl.DataType]):
         self.mapping = mapping
-        self._result: Optional[pl.Expr] = None
+        self._result: pl.Expr | None = None
 
     # Utilities
-    def _eval(self, node: BaseExprNode) -> Optional[pl.Expr]:
+    def _eval(self, node: BaseExprNode) -> pl.Expr | None:
         node.accept(self)
         return self._result
 
-    def process_results(self) -> Optional[pl.Expr]:
+    def process_results(self) -> pl.Expr | None:
         return self._result
 
     def default_visit(self, node: BaseExprNode) -> None:
@@ -98,7 +98,7 @@ class TranslatedPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
     def visit_literal(self, node: LiteralNode) -> None:
         self._result = pl.lit(node.value)
 
-    def visit_column(self, node: "BaseExprNode") -> None:  # ColumnNode
+    def visit_column(self, node: BaseExprNode) -> None:  # ColumnNode
         # type: ignore[override]
         # Cast mapped columns to their target logical dtype inside predicate
         name = getattr(node, "name", None)
@@ -125,8 +125,8 @@ class TranslatedPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
         # the requested dtype, preserving the layering.
         try:
             self._result = base.cast(node.dtype, strict=False)
-        except Exception as e:
-            log.warning(f"Recevied error {str(e)} when applying a cast on {str(base)}")
+        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
+            log.warning(f"Recevied error {e!s} when applying a cast on {base!s}")
             self._result = node.expr
 
     # Binary expressions
@@ -245,7 +245,7 @@ class TranslatedPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
         self._result = node.expr
 
 
-def translate_polars_predicate(predicate: Optional[pl.Expr], mapping: dict[str, pl.DataType]) -> Optional[pl.Expr]:
+def translate_polars_predicate(predicate: pl.Expr | None, mapping: dict[str, pl.DataType]) -> pl.Expr | None:
     if predicate is None:
         return None
     node = get_parsed_expr(predicate)
@@ -261,17 +261,17 @@ LOGICAL_MAPPING_META_KEY = b"cpl.logical_mapping.v1"
 
 class LogicalSpec(BaseModel):
     dtype: DataType
-    unit: Optional[TimeUnit] = None
-    time_zone: Optional[str] = None
+    unit: TimeUnit | None = None
+    time_zone: str | None = None
 
 
 class LogicalMappingMetadata(BaseModel):
     version: int = 1
-    columns: Dict[str, LogicalSpec]
+    columns: dict[str, LogicalSpec]
 
 
 def mapping_to_metadata(mapping: dict[str, pl.DataType]) -> bytes:
-    cols: Dict[str, LogicalSpec] = {}
+    cols: dict[str, LogicalSpec] = {}
     for name, dt in mapping.items():
         ed = DataType.from_polars_dtype(dt)
         unit = TimeUnit.from_string(getattr(dt, "time_unit", None))

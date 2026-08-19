@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 from polars.testing import assert_frame_equal
 
-import polars_io_tools as cpl  # noqa
+import polars_io_tools as cpl
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _get_expected_partitions_df, cache_parquet
 from polars_io_tools.tests.helpers.cache_parquet_shared import exercise_daily_cache_parquet
 
@@ -160,7 +160,7 @@ class TestGetExpectedPartitionsDFBehavior:
         result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
 
         dates = set(result["date"].to_list())
-        assert dates == set([datetime.date(2024, 9, 1), datetime.date(2024, 10, 1)])
+        assert dates == {datetime.date(2024, 9, 1), datetime.date(2024, 10, 1)}
 
     def test_or_with_extra_columns_creates_all_combinations(self, comprehensive_schema):
         """Test OR conditions with extra columns create exact cartesian product of all valid combinations."""
@@ -473,7 +473,7 @@ def test_complex(tmp_path):
 
     assert len(os.listdir(tmp_path / "monthly")) == 3
 
-    from_cache = [pl.read_parquet(f"{str(tmp_path)}/monthly/2024-{month}.parquet") for month in ["10", "11", "12"]]
+    from_cache = [pl.read_parquet(f"{tmp_path!s}/monthly/2024-{month}.parquet") for month in ["10", "11", "12"]]
     assert from_cache[0].shape == (31, 4)
     assert from_cache[1].shape == (30, 4)
     assert from_cache[2].shape == (31, 4)
@@ -736,7 +736,7 @@ def test_between_pred_uses_existing_partitions(tmp_path, monkeypatch):
     Test that contradiction detection works on an `is_between`
     call preceded by two individual daily partitions.
     """
-    import datetime as datetime
+    import datetime
 
     import polars as pl
 
@@ -1171,14 +1171,14 @@ def test_push_and_parse_exclusions_to_custom_io_source(tmp_path):
     assert pred_recorded is not None, "predicate was not recorded"
     pred_og_inputs = pred2.meta.pop()
     new_pred_inputs = pred_recorded.meta.pop()
-    pred_seri = set([e.meta.serialize(format="json") for e in pred_og_inputs])
-    pred_recorded_seri = set([e.meta.serialize(format="json") for e in new_pred_inputs])
+    pred_seri = {e.meta.serialize(format="json") for e in pred_og_inputs}
+    pred_recorded_seri = {e.meta.serialize(format="json") for e in new_pred_inputs}
     assert pred_seri != pred_recorded_seri, "recorded predicate matches original predicate; expected exclusion"
     raw_date_info = convert_expr_to_datetime_range(pred_recorded, "date", get_enclosure=False)
     valid_values = convert_expr_to_valid_values(pred_recorded, "region")
 
     assert raw_date_info.lower == datetime.datetime(2024, 5, 10, 0, 0)
-    assert valid_values == set(["EU"]), (
+    assert valid_values == {"EU"}, (
         f"Received {valid_values = } expected just to have EU since we cached NA for 2024-05-10"
     )  # we have data for "NA" cached, so shouldnt query
 

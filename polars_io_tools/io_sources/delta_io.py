@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal
 
 import polars as pl
 
@@ -32,11 +32,11 @@ log = logging.getLogger(__name__)
 
 
 def _read_mapping_from_delta_configuration(
-    source: Union[str, Path, Any],
+    source: str | Path | Any,
     *,
-    storage_options: Optional[Dict[str, Any]] = None,
-    version: Optional[Union[int, str, datetime]] = None,
-) -> Optional[Dict[str, pl.DataType]]:
+    storage_options: dict[str, Any] | None = None,
+    version: int | str | datetime | None = None,
+) -> dict[str, pl.DataType] | None:
     from deltalake import DeltaTable  # type: ignore
 
     # Accept pre-constructed DeltaTable
@@ -50,7 +50,7 @@ def _read_mapping_from_delta_configuration(
     if meta is None:
         return None
     # Prefer description-embedded mapping
-    desc = getattr(meta, "description", None) or getattr(meta, "configuration", dict()).get("description")
+    desc = getattr(meta, "description", None) or getattr(meta, "configuration", {}).get("description")
     meta_bytes = None
     if isinstance(desc, str):
         # Extensible block syntax only: [MAPPING_BLOCK_TAG:begin] ... [MAPPING_BLOCK_TAG:end]
@@ -65,8 +65,8 @@ def _read_mapping_from_delta_configuration(
 
 def _compute_exposed_schema_from_dt(
     dt: Any,
-    mapping: Optional[Dict[str, pl.DataType]],
-) -> Dict[str, pl.DataType]:
+    mapping: dict[str, pl.DataType] | None,
+) -> dict[str, pl.DataType]:
     """Derive exposed schema from a `DeltaTable` using optional logical-type mapping."""
     exposed: dict[str, pl.DataType] = {}
     base_schema = pl.Schema(dt.schema())
@@ -76,12 +76,12 @@ def _compute_exposed_schema_from_dt(
 
 
 def _scan_parquet_with_delta_uris(
-    dt: "DeltaTable",
+    dt: DeltaTable,
     file_uris: list[str],
     *,
-    storage_options: Dict[str, Any],
-    credential_provider: Optional[Union[str, Any]],
-    rechunk: Optional[bool],
+    storage_options: dict[str, Any],
+    credential_provider: str | Any | None,
+    rechunk: bool | None,
 ) -> pl.LazyFrame:
     """Build a partition-aware Parquet scan using Delta table metadata and provided URIs.
 
@@ -98,8 +98,8 @@ def _scan_parquet_with_delta_uris(
 
     # Split schema names into main vs hive (partition) columns
     # Split into main schema (non-partition columns) and hive schema (partition columns)
-    main_schema: Dict[str, pl.DataType] = {}
-    hive_schema: Dict[str, pl.DataType] = {}
+    main_schema: dict[str, pl.DataType] = {}
+    hive_schema: dict[str, pl.DataType] = {}
     if partition_columns:
         for name, dtype in polars_schema.items():
             if name in partition_columns:
@@ -125,7 +125,7 @@ def _scan_parquet_with_delta_uris(
     )
 
 
-def _convert_literal_for_partition(value: Any, dtype: Optional[pl.DataType]) -> Any:
+def _convert_literal_for_partition(value: Any, dtype: pl.DataType | None) -> Any:
     """Convert a Python literal to the underlying partition value representation.
 
     - None → None (Delta `file_uris` expects None to match null partitions)
@@ -151,7 +151,7 @@ def _convert_literal_for_partition(value: Any, dtype: Optional[pl.DataType]) -> 
         if (dtype == pl.Time) or isinstance(dtype, pl.Time):
             s = pl.Series([value], dtype=pl.Time)
             return s.cast(pl.Int64).to_list()[0]
-    except Exception:
+    except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
         # Fallback: return original if conversion fails
         return value
     return value
@@ -159,8 +159,8 @@ def _convert_literal_for_partition(value: Any, dtype: Optional[pl.DataType]) -> 
 
 def _restrict_and_normalize_partition_filters(
     dt: Any,
-    predicate: Optional[pl.Expr],
-    mapping: Optional[Dict[str, pl.DataType]],
+    predicate: pl.Expr | None,
+    mapping: dict[str, pl.DataType] | None,
 ) -> list[list[tuple[str, str, Any]]] | None:
     """Restrict DNF to Delta partition columns and normalize operators/values.
 
@@ -236,7 +236,7 @@ def _restrict_and_normalize_partition_filters(
     return normalized or None
 
 
-def _get_partition_uris(dt: Any, predicate: Optional[pl.Expr], mapping: Optional[Dict[str, pl.DataType]]) -> list[str]:
+def _get_partition_uris(dt: Any, predicate: pl.Expr | None, mapping: dict[str, pl.DataType] | None) -> list[str]:
     """Retrieve data file URIs from Delta by translating a predicate into DNF,
     restricting to partition columns and converting literal types as needed.
 
@@ -289,7 +289,7 @@ def _get_partition_uris(dt: Any, predicate: Optional[pl.Expr], mapping: Optional
     return res
 
 
-def infer_logical_mapping(schema: Dict[str, pl.DataType]) -> Dict[str, pl.DataType]:
+def infer_logical_mapping(schema: dict[str, pl.DataType]) -> dict[str, pl.DataType]:
     """Construct a logical-type mapping from a Polars schema.
 
     For temporal types (Datetime, Duration, Time) in the provided schema,
@@ -298,7 +298,7 @@ def infer_logical_mapping(schema: Dict[str, pl.DataType]) -> Dict[str, pl.DataTy
 
     Non-temporal types are omitted.
     """
-    mapping: Dict[str, pl.DataType] = {}
+    mapping: dict[str, pl.DataType] = {}
     for name, dt in schema.items():
         base = DataType.from_polars_dtype(dt)
         if base == DataType.DATETIME:
@@ -317,8 +317,8 @@ def infer_logical_mapping(schema: Dict[str, pl.DataType]) -> Dict[str, pl.DataTy
 
 
 def build_delta_write_exprs(
-    schema: Dict[str, pl.DataType],
-    mapping: Optional[Dict[str, pl.DataType]] = None,
+    schema: dict[str, pl.DataType],
+    mapping: dict[str, pl.DataType] | None = None,
 ) -> list[pl.Expr]:
     """Build per-column expressions to convert logical temporal types to
     Delta-compatible underlying integers for writing.
@@ -329,7 +329,7 @@ def build_delta_write_exprs(
     - Other columns → passthrough or cast to provided dtype
     """
     exprs: list[pl.Expr] = []
-    for name_ in schema.keys():
+    for name_ in schema:
         if not mapping:
             exprs.append(pl.col(name_))
             continue
@@ -357,7 +357,7 @@ def build_delta_write_exprs(
     return exprs
 
 
-def with_mapping_description(opts: Dict[str, Any], mapping: Optional[Dict[str, pl.DataType]]) -> Dict[str, Any]:
+def with_mapping_description(opts: dict[str, Any], mapping: dict[str, pl.DataType] | None) -> dict[str, Any]:
     """Return a copy of delta write options with our logical mapping description injected.
 
     If mapping is None or empty, returns the original options unchanged.
@@ -376,13 +376,13 @@ def sink_delta(
     *,
     mode: Literal["error", "append", "overwrite", "ignore", "merge"] = "error",
     overwrite_schema: bool | None = None,
-    storage_options: Optional[Dict[str, str]] = None,
-    credential_provider: Optional[str] = "auto",
-    delta_write_options: Optional[Dict[str, Any]] = None,
-    delta_merge_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, str] | None = None,
+    credential_provider: str | None = "auto",
+    delta_write_options: dict[str, Any] | None = None,
+    delta_merge_options: dict[str, Any] | None = None,
     translate_logical_types: bool = True,
     chunk_size: int | None = None,
-    aws_profile: Optional[str] = None,
+    aws_profile: str | None = None,
 ) -> Any:
     """
     Write a LazyFrame to a Delta table with logical type translation.
@@ -489,7 +489,7 @@ def sink_delta(
         scan_delta : Read a Delta table with logical type translation.
     """
     # Use Polars logical dtypes only for mapping; no adapters
-    mapping: Optional[Dict[str, pl.DataType]]
+    mapping: dict[str, pl.DataType] | None
     schema = lf.collect_schema()
     mapping = infer_logical_mapping(schema) if translate_logical_types else None
 
@@ -505,7 +505,7 @@ def sink_delta(
     polars_opts = {**discovered, **(storage_options or {})}
 
     # Ensure table directory exists if local; write_delta will manage logs/files for local paths
-    if not (target_str.startswith("s3://") or target_str.startswith("s3a://")):
+    if not (target_str.startswith(("s3://", "s3a://"))):
         os.makedirs(target_str, exist_ok=True)
 
     prepared_lf = lf.select(exprs)
@@ -567,16 +567,16 @@ def sink_delta(
 
 
 def scan_delta(
-    source: Union[str, Path, Any],
+    source: str | Path | Any,
     *,
-    version: Optional[Union[int, str, datetime]] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
-    credential_provider: Optional[Union[Literal["auto"], Any]] = "auto",
-    delta_table_options: Optional[Dict[str, Any]] = None,
+    version: int | str | datetime | None = None,
+    storage_options: dict[str, Any] | None = None,
+    credential_provider: Literal["auto"] | Any | None = "auto",
+    delta_table_options: dict[str, Any] | None = None,
     use_pyarrow: bool = False,
-    pyarrow_options: Optional[Dict[str, Any]] = None,
-    rechunk: Optional[bool] = None,
-    aws_profile: Optional[str] = None,
+    pyarrow_options: dict[str, Any] | None = None,
+    rechunk: bool | None = None,
+    aws_profile: str | None = None,
     pushdown_predicate_deltalake: bool = True,
 ) -> pl.LazyFrame:
     """
@@ -684,8 +684,8 @@ def scan_delta(
 
     # Build DeltaTable to derive mapping + schema, but don't capture it in the closure
     # (DeltaTable contains RawDeltaTable which is not pickleable)
-    mapping: Optional[Dict[str, pl.DataType]]
-    exposed_schema: Dict[str, pl.DataType]
+    mapping: dict[str, pl.DataType] | None
+    exposed_schema: dict[str, pl.DataType]
     from deltalake import DeltaTable  # type: ignore
 
     # DeltaTable only accepts int version; str/datetime handled via load_as_of
@@ -705,10 +705,10 @@ def scan_delta(
     # Don't capture 'dt' in closure - it's not pickleable. Instead capture only
     # pickleable parameters and recreate DeltaTable inside the generator.
     def source_generator(
-        with_columns: Optional[list[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ):
         # Try Delta partition pruning path
         # There is an open issue for polars to support this natively:
@@ -754,7 +754,7 @@ def scan_delta(
             # Rewrite predicate for logical mapping
             pred_rewritten = translate_polars_predicate(predicate, mapping)
             if pred_rewritten is not None:
-                log.debug(f"Applying translated predicate: {str(pred_rewritten)}")
+                log.debug(f"Applying translated predicate: {pred_rewritten!s}")
                 lf = lf.filter(pred_rewritten)
 
             # Projection and casting of mapped columns
