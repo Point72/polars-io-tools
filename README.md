@@ -5,7 +5,6 @@
   </picture>
 </a>
 
-
 Custom parsing extensions for lazy polars
 
 [![Build Status](https://github.com/Point72/polars-io-tools/actions/workflows/build.yaml/badge.svg?branch=main&event=push)](https://github.com/Point72/polars-io-tools/actions/workflows/build.yaml)
