@@ -36,10 +36,10 @@ T = TypeVar("T")
 FAILED_LITERAL_RESULT = object()
 
 # Define public exports
-__all__ = [
+__all__ = (
     "convert_datetime_to_polars",
     "extract_column_name",
-]
+)
 
 
 if version.parse(pl.__version__) < version.parse("1.28.0"):

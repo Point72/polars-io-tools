@@ -7,7 +7,7 @@ import requests
 
 from .._compat import POLARS_HAS_COLLECT_BATCHES
 
-__all__ = ["sink_clickhouse"]
+__all__ = ("sink_clickhouse",)
 
 
 # Configure logging

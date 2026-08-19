@@ -3,7 +3,7 @@ from typing import Optional
 
 import polars as pl
 
-__all__ = [
+__all__ = (
     "ArrayFunctionType",
     "BinaryFunctionType",
     "BitwiseFunctionType",
@@ -19,7 +19,7 @@ __all__ = [
     "TimeUnit",
     "TrigonometricFunctionType",
     "get_function_enum",
-]
+)
 
 
 class Expr(str, Enum):

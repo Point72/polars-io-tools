@@ -15,7 +15,7 @@ from .base import AliasNode, BaseExprNode, BinaryExprNode, CastNode, ColumnNode,
 from .enum import BooleanFunctionType, OperatorType
 from .util import collect_lf_in_io_source, register_io_source_with_is_pure
 
-__all__ = ["from_narwhals"]
+__all__ = ("from_narwhals",)
 
 log = logging.getLogger(__name__)
 

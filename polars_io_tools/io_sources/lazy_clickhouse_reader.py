@@ -11,7 +11,7 @@ from .sql_utils import (
 )
 from .util import register_io_source_with_is_pure
 
-__all__ = ["scan_clickhouse"]
+__all__ = ("scan_clickhouse",)
 
 
 # Configure logging

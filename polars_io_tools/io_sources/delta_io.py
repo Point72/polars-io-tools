@@ -23,10 +23,10 @@ if TYPE_CHECKING:
 # The mapping is stored as base64-encoded JSON between [tag:begin] and [tag:end] markers.
 _MAPPING_BLOCK_TAG = "cpl.mapping"
 
-__all__ = [
+__all__ = (
     "scan_delta",
     "sink_delta",
-]
+)
 
 log = logging.getLogger(__name__)
 

@@ -12,7 +12,7 @@ from .util import register_io_source_with_is_pure
 log = logging.getLogger(__name__)
 
 
-__all__ = ["cache"]
+__all__ = ("cache",)
 
 
 _PartitionKey = tuple[tuple[str, Any], ...]

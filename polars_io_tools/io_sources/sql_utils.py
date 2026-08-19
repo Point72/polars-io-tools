@@ -10,13 +10,13 @@ from .base import AliasNode, BinaryExprNode, CastNode, ColumnNode, ExprVisitor, 
 from .enum import ArrayFunctionType, BooleanFunctionType, ListFunctionType, OperatorType, StringFunctionType, TemporalFunctionType
 from .sql_dialects import MSSQL
 
-__all__ = [
+__all__ = (
     "SQLExpressionVisitor",
     "apply_polars_io_source_exprs",
     "convert_predicate_to_sql",
     "create_sqlglot_literal",
     "fix_three_part_identifiers",
-]
+)
 
 
 # Configure logging
