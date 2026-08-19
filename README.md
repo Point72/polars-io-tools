@@ -1,4 +1,10 @@
-# polars io tools
+<a href="https://github.com/point72/polars-io-tools">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/point72/polars-io-tools/raw/main/docs/img/logo-dark.png?raw=true">
+    <img alt="polars-io-tools logo, an igloo made of blocks in different blue shades" src="https://github.com/point72/polars-io-tools/raw/main/docs/img/logo-light.png?raw=true" width="400">
+  </picture>
+</a>
+
 
 Custom parsing extensions for lazy polars
 
