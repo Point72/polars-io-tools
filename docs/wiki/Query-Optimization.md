@@ -126,6 +126,42 @@ concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter(
 ).collect()
 ```
 
+## Reshape without losing pushdown
+
+Polars' lazy `pivot` and `unpivot` block optimizations that are logically sound: a
+downstream selection of a few pivoted columns, or a filter on the `unpivot` `variable`
+column, cannot be turned back into an upstream row filter or column projection.
+`pushdown_pivot` and `pushdown_unpivot` re-expose the reshape output as registered IO
+sources so the optimizer pushes those projections and predicates into the source.
+
+```python
+from polars_io_tools import pushdown_unpivot
+
+wide = pl.LazyFrame({"id": [1, 2, 3], "A": [10, 20, 30], "B": [100, 200, 300]})
+
+# filter(variable == "A") becomes an upstream projection of just [id, A].
+pushdown_unpivot(wide, index="id").filter(pl.col("variable") == "A").collect()
+```
+
+```python
+from polars_io_tools import pushdown_pivot
+
+long = pl.LazyFrame({
+    "name": ["A", "A", "B", "B"],
+    "subject": ["m", "p", "m", "p"],
+    "score": [1, 2, 3, 4],
+})
+
+# Selecting [name, m] pushes the row filter `subject == "m"` into the source.
+pushdown_pivot(
+    long, "subject", on_columns=["m", "p"], index="name", values="score",
+).select(["name", "m"]).collect()
+```
+
+`on_columns` pins the output schema. By default `pushdown_pivot` stays correct on sparse
+data by recovering index values the synthesized filter would drop; pass `dense_on=True` to
+skip that recovery scan when every index value is known to be present for every `on` value.
+
 ## Apply rolling windows without losing pushdown
 
 `ts_with_columns` lets window, cumulative, and forward-fill expressions keep filter
