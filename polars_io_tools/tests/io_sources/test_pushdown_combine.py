@@ -1,7 +1,7 @@
 """
-Tests for the multi_source function and FilterSpec class.
+Tests for the pushdown_combine function and FilterSpec class.
 
-This module tests the coordinated filter pushdown capabilities of multi_source,
+This module tests the coordinated filter pushdown capabilities of pushdown_combine,
 including:
 - Basic filter propagation
 - Lookback/lookahead temporal expansion
@@ -19,12 +19,12 @@ from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import BinaryExprNode, FunctionNode
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
-from polars_io_tools.io_sources.multi_source import (
+from polars_io_tools.io_sources.pushdown_combine import (
     FilterSpec,
     _apply_value_mapping,
     _compute_output_schema,
     _get_source_col,
-    multi_source,
+    pushdown_combine,
 )
 from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker
 
@@ -188,15 +188,15 @@ class TestComputeOutputSchema:
         assert set(schema.keys()) == {"a", "b"}
 
 
-class TestMultiSourceBasic:
-    """Test basic multi_source functionality."""
+class TestPushdownCombineBasic:
+    """Test basic pushdown_combine functionality."""
 
     def test_no_filters(self):
-        """multi_source works without any filters applied."""
+        """pushdown_combine works without any filters applied."""
         left = pl.LazyFrame({"id": [1, 2], "val": [10, 20]})
         right = pl.LazyFrame({"id": [1, 2], "other": [100, 200]})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left, {}),
                 "right": (right, {}),
@@ -214,7 +214,7 @@ class TestMultiSourceBasic:
         left = pl.LazyFrame({"date": dates, "val": list(range(10))})
         right = pl.LazyFrame({"date": dates, "other": list(range(10, 20))})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left, {"date": FilterSpec()}),
                 "right": (right, {"date": FilterSpec()}),
@@ -243,7 +243,7 @@ class TestMultiSourceBasic:
         df = pl.DataFrame({"ts": ts, "val": list(range(90))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"ts": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -261,7 +261,7 @@ class TestMultiSourceBasic:
         left = pl.LazyFrame({"id": ["A", "B", "C"], "val": [1, 2, 3]})
         right = pl.LazyFrame({"id": ["A", "B", "C"], "other": [10, 20, 30]})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left, {"id": FilterSpec()}),
                 "right": (right, {"id": FilterSpec()}),
@@ -278,7 +278,7 @@ class TestMultiSourceBasic:
         left = pl.LazyFrame({"id": ["A", "B", "C", "D"], "val": [1, 2, 3, 4]})
         right = pl.LazyFrame({"id": ["A", "B", "C", "D"], "other": [10, 20, 30, 40]})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left, {"id": FilterSpec()}),
                 "right": (right, {"id": FilterSpec()}),
@@ -291,8 +291,8 @@ class TestMultiSourceBasic:
         assert_frame_equal(result, expected, check_row_order=False)
 
 
-class TestMultiSourceLookback:
-    """Test lookback functionality in multi_source."""
+class TestPushdownCombineLookback:
+    """Test lookback functionality in pushdown_combine."""
 
     def test_lookback_with_date_equality(self):
         """Lookback works correctly with date equality filter (date == specific_date)."""
@@ -306,7 +306,7 @@ class TestMultiSourceLookback:
         def combine_with_lag(s):
             return s["data"].with_columns(pl.col("val").shift(3).alias("val_lag3"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
             combine=combine_with_lag,
         )
@@ -330,7 +330,7 @@ class TestMultiSourceLookback:
         def combine_with_lead(s):
             return s["data"].with_columns(pl.col("val").shift(-3).alias("val_lead3"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookahead=timedelta(days=4))})},
             combine=combine_with_lead,
         )
@@ -357,7 +357,7 @@ class TestMultiSourceLookback:
                 pl.col("val").shift(-2).alias("val_lead2"),
             )
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -384,7 +384,7 @@ class TestMultiSourceLookback:
 
         right = pl.LazyFrame({"date": dates, "other": list(range(10))})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))}),
                 "right": (right, {"date": FilterSpec()}),
@@ -420,7 +420,7 @@ class TestMultiSourceLookback:
         def combine_with_rolling(s: dict[str, pl.LazyFrame]) -> pl.LazyFrame:
             return s["data"].sort("date").with_columns(pl.col("val").rolling_sum(window_size=3, min_samples=1).alias("rolling_sum"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (data, {"date": FilterSpec(lookback=timedelta(days=3))}),
             },
@@ -439,8 +439,8 @@ class TestMultiSourceLookback:
         assert_frame_equal(result, expected)
 
 
-class TestMultiSourceLookahead:
-    """Test lookahead functionality in multi_source."""
+class TestPushdownCombineLookahead:
+    """Test lookahead functionality in pushdown_combine."""
 
     def test_lookahead_expands_date_range(self):
         """Lookahead expands the upper date range for the source."""
@@ -450,7 +450,7 @@ class TestMultiSourceLookahead:
         df = pl.DataFrame({"date": dates, "val": values})
         left_tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left_tracker.lazy_frame, {"date": FilterSpec(lookahead=timedelta(days=2))}),
             },
@@ -477,7 +477,7 @@ class TestMultiSourceLookahead:
         df = pl.DataFrame({"date": dates, "val": values})
         left_tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (
                     left_tracker.lazy_frame,
@@ -501,8 +501,8 @@ class TestMultiSourceLookahead:
         assert_frame_equal(result, expected)
 
 
-class TestMultiSourceValueMapping:
-    """Test value mapping functionality in multi_source."""
+class TestPushdownCombineValueMapping:
+    """Test value mapping functionality in pushdown_combine."""
 
     def test_dict_value_mapping(self):
         """Dict value mapping transforms filter values."""
@@ -521,7 +521,7 @@ class TestMultiSourceValueMapping:
         REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
         CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE"}  # Reverse mapping for combine
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -549,7 +549,7 @@ class TestMultiSourceValueMapping:
         tracker = PredicateTracker(source_df)
 
         # Output uses uppercase names, source uses lowercase
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -577,7 +577,7 @@ class TestMultiSourceValueMapping:
         REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU", "ASIA_PACIFIC": "APAC"}
         CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC"}
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -612,7 +612,7 @@ class TestMultiSourceValueMapping:
         REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
         CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC", "LATAM": "LATIN_AMERICA"}
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -646,7 +646,7 @@ class TestMultiSourceValueMapping:
         REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
         CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC", "LATAM": "LATIN_AMERICA"}
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -666,7 +666,7 @@ class TestMultiSourceValueMapping:
         assert_frame_equal(result, expected, check_row_order=False)
 
 
-class TestMultiSourceColumnRemapping:
+class TestPushdownCombineColumnRemapping:
     """Test source column name remapping."""
 
     def test_different_source_column_name(self):
@@ -679,7 +679,7 @@ class TestMultiSourceColumnRemapping:
         )
         tracker = PredicateTracker(source_df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -694,8 +694,8 @@ class TestMultiSourceColumnRemapping:
         assert_frame_equal(result, expected)
 
 
-class TestMultiSourceMultipleSources:
-    """Test multi_source with multiple sources having different specs."""
+class TestPushdownCombineMultipleSources:
+    """Test pushdown_combine with multiple sources having different specs."""
 
     def test_different_lookback_per_source(self):
         """Different sources can have different lookback values."""
@@ -707,7 +707,7 @@ class TestMultiSourceMultipleSources:
         source1_tracker = PredicateTracker(df1)
         source2_tracker = PredicateTracker(df2)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "source1": (source1_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=5))}),
                 "source2": (source2_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=2))}),
@@ -750,7 +750,7 @@ class TestMultiSourceMultipleSources:
         source1_tracker = PredicateTracker(df1)
         source2_tracker = PredicateTracker(df2)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "source1": (
                     source1_tracker.lazy_frame,
@@ -788,14 +788,14 @@ class TestMultiSourceMultipleSources:
         assert_frame_equal(result, expected)
 
 
-class TestMultiSourceEdgeCases:
+class TestPushdownCombineEdgeCases:
     """Test edge cases and error handling."""
 
     def test_empty_result(self):
-        """multi_source handles filters that result in empty output."""
+        """pushdown_combine handles filters that result in empty output."""
         left = pl.LazyFrame({"date": [date(2024, 1, 1)], "val": [1]})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"left": (left, {"date": FilterSpec()})},
             combine=lambda s: s["left"],
         )
@@ -805,10 +805,10 @@ class TestMultiSourceEdgeCases:
         assert len(result) == 0
 
     def test_no_filter_specs(self):
-        """multi_source works when no FilterSpecs are provided."""
+        """pushdown_combine works when no FilterSpecs are provided."""
         left = pl.LazyFrame({"id": [1, 2], "val": [10, 20]})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"left": (left, {})},
             combine=lambda s: s["left"],
         )
@@ -820,7 +820,7 @@ class TestMultiSourceEdgeCases:
         """Gracefully handle when source_col doesn't exist in source schema."""
         left = pl.LazyFrame({"id": [1, 2], "val": [10, 20]})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (
                     left,
@@ -845,7 +845,7 @@ class TestMultiSourceEdgeCases:
             }
         )
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (
                     left,
@@ -869,7 +869,7 @@ class TestMultiSourceEdgeCases:
         datetimes = [datetime(2024, 1, 1, i) for i in range(24)]
         left = pl.LazyFrame({"ts": datetimes, "val": list(range(24))})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"left": (left, {"ts": FilterSpec(lookback=timedelta(hours=3))})},
             combine=lambda s: s["left"],
         )
@@ -889,7 +889,7 @@ class TestMultiSourceEdgeCases:
             }
         )
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"left": (left, {"date": FilterSpec()})},
             combine=lambda s: s["left"],
         )
@@ -903,7 +903,7 @@ class TestMultiSourceEdgeCases:
         dates = [date(2024, 1, i) for i in range(1, 11)]
         left = pl.LazyFrame({"date": dates, "val": list(range(10))})
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"left": (left, {"date": FilterSpec()})},
             combine=lambda s: s["left"],
         )
@@ -912,10 +912,10 @@ class TestMultiSourceEdgeCases:
         assert len(result) == 3
 
 
-class TestMultiSourceComplexJoinUseCase:
-    """Test multi_source with a complex multi-source join scenario."""
+class TestPushdownCombineComplexJoinUseCase:
+    """Test pushdown_combine with a complex multi-source join scenario."""
 
-    def test_multi_source_join_with_mapping_and_lookback(self):
+    def test_pushdown_combine_join_with_mapping_and_lookback(self):
         """
         Test a complex join pattern where:
         - Multiple sources are joined
@@ -963,7 +963,7 @@ class TestMultiSourceComplexJoinUseCase:
 
             return df
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "primary": (
                     primary_data,
@@ -1010,7 +1010,7 @@ class TestFilterPushdownVerification:
         df = pl.DataFrame({"date": dates, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1038,7 +1038,7 @@ class TestFilterPushdownVerification:
         df = pl.DataFrame({"date": dates, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1068,7 +1068,7 @@ class TestFilterPushdownVerification:
         df = pl.DataFrame({"date": dates, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))})},
             combine=lambda s: s["data"],
         )
@@ -1105,7 +1105,7 @@ class TestFilterPushdownVerification:
             # Add a column that shows the value from 3 days ago
             return s["data"].with_columns(pl.col("val").shift(3).alias("val_lag3"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
             combine=combine_with_lag,
         )
@@ -1149,7 +1149,7 @@ class TestFilterPushdownVerification:
         def combine_with_lag(s):
             return s["data"].with_columns(pl.col("val").shift(3).alias("val_lag3"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
             combine=combine_with_lag,
         )
@@ -1195,7 +1195,7 @@ class TestFilterPushdownVerification:
         tracker = PredicateTracker(df)
 
         # Identity combine - Polars can optimize through this
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
             combine=lambda s: s["data"],
         )
@@ -1227,7 +1227,7 @@ class TestFilterPushdownVerification:
         df = pl.DataFrame({"date": dates, "val": list(range(14))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookahead=timedelta(days=3))})},
             combine=lambda s: s["data"],
         )
@@ -1256,7 +1256,7 @@ class TestFilterPushdownVerification:
         df = pl.DataFrame({"group": ["A", "B", "C"], "val": [1, 2, 3]})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"group": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1284,7 +1284,7 @@ class TestFilterPushdownVerification:
         df = pl.DataFrame({"group": ["A", "B", "C", "D"], "val": [1, 2, 3, 4]})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"group": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1319,7 +1319,7 @@ class TestFilterPushdownVerification:
 
         CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE"}
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -1366,7 +1366,7 @@ class TestFilterPushdownVerification:
         CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC"}
         REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU", "ASIA_PACIFIC": "APAC"}
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -1410,7 +1410,7 @@ class TestFilterPushdownVerification:
         )
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -1448,7 +1448,7 @@ class TestFilterPushdownVerification:
         source1_tracker = PredicateTracker(df1)
         source2_tracker = PredicateTracker(df2)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "source1": (source1_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=5))}),
                 "source2": (source2_tracker.lazy_frame, {"date": FilterSpec()}),  # No lookback
@@ -1481,7 +1481,7 @@ class TestFilterPushdownVerification:
         assert lower2 == date(2024, 1, 7), f"Source2 should have no lookback (Jan 7), got {lower2}"
 
 
-class TestMultiSourceRobustness:
+class TestPushdownCombineRobustness:
     """Additional tests for edge cases and robustness."""
 
     def test_filter_on_column_without_spec(self):
@@ -1495,7 +1495,7 @@ class TestMultiSourceRobustness:
         )
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},  # Only date has FilterSpec
             combine=lambda s: s["data"],
         )
@@ -1513,7 +1513,7 @@ class TestMultiSourceRobustness:
         df = pl.DataFrame({"date": dates, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1531,7 +1531,7 @@ class TestMultiSourceRobustness:
         df = pl.DataFrame({"date": dates, "group": groups, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -1561,7 +1561,7 @@ class TestMultiSourceRobustness:
         )
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1579,7 +1579,7 @@ class TestMultiSourceRobustness:
         df = pl.DataFrame({"date": dates, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1601,7 +1601,7 @@ class TestMultiSourceRobustness:
         df = pl.DataFrame({"date": [], "val": []}, schema={"date": pl.Date, "val": pl.Int64})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
         )
@@ -1615,7 +1615,7 @@ class TestMultiSourceRobustness:
         df = pl.DataFrame({"date": dates, "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=365))})  # 1 year
             },
@@ -1640,7 +1640,7 @@ class TestMultiSourceRobustness:
                 pl.lit("constant").alias("const_col"),
             )
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=combine_with_computed,
         )
@@ -1663,7 +1663,7 @@ class TestMultiSourceRobustness:
         )
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"].drop("drop_col"),
         )
@@ -1687,7 +1687,7 @@ class TestCombineKwargs:
         def combine_with_multiplier(sources, multiplier):
             return sources["data"].with_columns((pl.col("val") * multiplier).alias("scaled_val"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=combine_with_multiplier,
             combine_kwargs={"multiplier": 10},
@@ -1716,7 +1716,7 @@ class TestCombineKwargs:
         def combine_with_mapping(sources, code_to_region):
             return sources["data"].with_columns(pl.col("code").replace(code_to_region).alias("region"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=combine_with_mapping,
             combine_kwargs={"code_to_region": CODE_TO_REGION},
@@ -1741,7 +1741,7 @@ class TestCombineKwargs:
                 pl.lit(constant).alias("const_col"),
             )
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=combine_with_multiple_args,
             combine_kwargs={"multiplier": 2, "suffix": "doubled", "constant": "hello"},
@@ -1761,7 +1761,7 @@ class TestCombineKwargs:
         tracker = PredicateTracker(df)
 
         # Lambda that takes only sources dict (no kwargs)
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
             combine_kwargs=None,  # Explicit None
@@ -1776,7 +1776,7 @@ class TestCombineKwargs:
         df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=lambda s: s["data"],
             combine_kwargs={},  # Empty dict
@@ -1799,7 +1799,7 @@ class TestCombineKwargs:
             return sources["left"].join(sources["right"], on="key", how=join_how)
 
         # Test with inner join
-        lf_inner = multi_source(
+        lf_inner = pushdown_combine(
             sources={
                 "left": (left_tracker.lazy_frame, {"date": FilterSpec()}),
                 "right": (right_tracker.lazy_frame, {}),
@@ -1812,7 +1812,7 @@ class TestCombineKwargs:
         assert len(result_inner) == 3  # Only A, C, E match
 
         # Test with left join
-        lf_left = multi_source(
+        lf_left = pushdown_combine(
             sources={
                 "left": (left_tracker.lazy_frame, {"date": FilterSpec()}),
                 "right": (right_tracker.lazy_frame, {}),
@@ -1859,7 +1859,7 @@ class TestCombineKwargs:
             # Join with reference on date and category_code
             return primary_with_code.join(sources["reference"], on=["date", "category_code"], how="left")
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "primary": (
                     primary_tracker.lazy_frame,
@@ -1905,7 +1905,7 @@ class TestSourcesAsKwargs:
         def combine(left, right):
             return left.join(right, on="date")
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "left": (left_tracker.lazy_frame, {"date": FilterSpec()}),
                 "right": (right_tracker.lazy_frame, {"date": FilterSpec()}),
@@ -1930,7 +1930,7 @@ class TestSourcesAsKwargs:
         def combine(data, multiplier, suffix):
             return data.with_columns((pl.col("val") * multiplier).alias(f"scaled_{suffix}"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=combine,
             combine_kwargs={"multiplier": 10, "suffix": "x10"},
@@ -1953,7 +1953,7 @@ class TestSourcesAsKwargs:
         def combine(data):
             return data.with_columns(pl.col("val").shift(3).alias("val_lag3"))
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
             combine=combine,
             sources_as_kwargs=True,
@@ -1979,7 +1979,7 @@ class TestSourcesAsKwargs:
         def combine(prices, volumes, metadata):
             return prices.join(volumes, on="date").join(metadata, on="date")
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "prices": (prices_tracker.lazy_frame, {"date": FilterSpec()}),
                 "volumes": (volumes_tracker.lazy_frame, {"date": FilterSpec()}),
@@ -2004,7 +2004,7 @@ class TestSourcesAsKwargs:
         def combine(sources):
             return sources["data"]
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
             combine=combine,
             # sources_as_kwargs not specified, should default to False
@@ -2030,7 +2030,7 @@ class TestSourcesAsKwargs:
         def combine(data):
             return data.with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code")
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "data": (
                     tracker.lazy_frame,
@@ -2063,7 +2063,7 @@ class TestSourcesAsKwargs:
             primary_with_code = primary.with_columns(pl.col("category").replace(category_mapping).alias("category_code"))
             return primary_with_code.join(reference, on=["date", "category_code"], how="left")
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "primary": (primary_tracker.lazy_frame, {"date": FilterSpec(), "category": FilterSpec()}),
                 "reference": (
@@ -2120,7 +2120,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
             combine=self._combine,
         )
@@ -2133,7 +2133,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "main": (
                     tracker.lazy_frame,
@@ -2168,7 +2168,7 @@ class TestDateFilterOnDatetimeSource:
         )
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={
                 "main": (
                     tracker.lazy_frame,
@@ -2196,7 +2196,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
             combine=self._combine,
         )
@@ -2209,7 +2209,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
             combine=self._combine,
         )
@@ -2222,7 +2222,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
             combine=self._combine,
         )
@@ -2235,7 +2235,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
             combine=self._combine,
         )
@@ -2248,7 +2248,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
             combine=self._combine,
         )
@@ -2261,7 +2261,7 @@ class TestDateFilterOnDatetimeSource:
         df = self._make_intraday_df()
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"main": (tracker.lazy_frame, {"timestamp": FilterSpec()})},
             combine=lambda s: s["main"],
         )

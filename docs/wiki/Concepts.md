@@ -76,7 +76,7 @@ it cannot see in advance. Three common cases motivate most of this library:
 
 In each case the trick is the same: intercept the predicate at a custom source, transform
 it into something that is safe to apply earlier, and re-apply the exact original filter at
-the end so the result is identical to the naive version. [`multi_source`](Query-Optimization#combine-sources-with-coordinated-filter-pushdown)
+the end so the result is identical to the naive version. [`pushdown_combine`](Query-Optimization#combine-sources-with-coordinated-filter-pushdown)
 generalises this to arbitrary compositions, with a per-source `FilterSpec` describing how
 each output filter maps onto each source.
 

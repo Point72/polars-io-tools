@@ -46,13 +46,13 @@ class PredicateTracker:
     A utility class that creates an IO source which tracks pushed-down predicates.
 
     This is useful for testing that filters are correctly pushed down to sources
-    in multi_source or other IO source implementations.
+    in pushdown_combine or other IO source implementations.
 
     Args:
         df (pl.DataFrame): The DataFrame to use as the underlying data source.
 
     Attributes:
-        lazy_frame (pl.LazyFrame): The LazyFrame that can be used in multi_source or other operations.
+        lazy_frame (pl.LazyFrame): The LazyFrame that can be used in pushdown_combine or other operations.
         last_predicate (pl.Expr | None): The last predicate that was pushed down during collection.
         last_with_columns (list[str] | None): The last column projection that was pushed down.
         call_count (int): Number of times the source has been called.
@@ -61,7 +61,7 @@ class PredicateTracker:
         ::
 
             tracker = PredicateTracker(df)
-            lf = multi_source(
+            lf = pushdown_combine(
                 sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
                 combine=lambda s: s["data"],
             )

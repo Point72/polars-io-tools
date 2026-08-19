@@ -9,7 +9,7 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from polars_io_tools.io_sources.multi_source import FilterSpec, multi_source
+from polars_io_tools.io_sources.pushdown_combine import FilterSpec, pushdown_combine
 from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker, io_source_assert
 
 
@@ -204,7 +204,7 @@ class TestPredicateAnalyzerPluralMethods:
         df = pl.DataFrame({"date": [date(2024, 1, i) for i in range(1, 11)], "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))})},
             combine=lambda s: s["data"],
         )
@@ -252,7 +252,7 @@ class TestPredicateAnalyzerPluralMethods:
         df = pl.DataFrame({"date": [date(2024, 1, i) for i in range(1, 11)], "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))})},
             combine=lambda s: s["data"],
         )
@@ -285,7 +285,7 @@ class TestPredicateAnalyzerPluralMethods:
         df = pl.DataFrame({"date": [date(2024, 1, i) for i in range(1, 11)], "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))})},
             combine=lambda s: s["data"],
         )
@@ -303,15 +303,15 @@ class TestPredicateAnalyzerPluralMethods:
         assert single is plural[0]
 
 
-class TestIntegrationWithMultiSource:
-    """Integration tests with multi_source."""
+class TestIntegrationWithPushdownCombine:
+    """Integration tests with pushdown_combine."""
 
-    def test_tracker_with_multi_source(self):
-        """PredicateTracker works with multi_source."""
+    def test_tracker_with_pushdown_combine(self):
+        """PredicateTracker works with pushdown_combine."""
         df = pl.DataFrame({"date": [date(2024, 1, i) for i in range(1, 11)], "val": list(range(10))})
         tracker = PredicateTracker(df)
 
-        lf = multi_source(
+        lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))})},
             combine=lambda s: s["data"],
         )
@@ -329,11 +329,11 @@ class TestIntegrationWithMultiSource:
         assert date(2024, 1, 5) in lower_bounds  # Original filter
 
     def test_tracker_with_discrete_filter(self):
-        """PredicateTracker works with discrete filters in multi_source."""
+        """PredicateTracker works with discrete filters in pushdown_combine."""
         df = pl.DataFrame({"category": ["A", "B", "C", "A", "B"], "val": [1, 2, 3, 4, 5]})
         tracker = PredicateTracker(df)
 
-        result_lf = multi_source(
+        result_lf = pushdown_combine(
             sources={"data": (tracker.lazy_frame, {"category": FilterSpec()})},
             combine=lambda s: s["data"],
         )

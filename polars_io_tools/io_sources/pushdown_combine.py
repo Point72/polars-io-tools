@@ -1,16 +1,16 @@
 """
-Multi-source LazyFrame composition with coordinated filter pushdown.
+Coordinated filter pushdown across a user-defined combine of multiple sources.
 
-This module provides the ``multi_source`` function for creating LazyFrames that
+This module provides the ``pushdown_combine`` function for creating LazyFrames that
 combine multiple data sources while automatically propagating and transforming
 filters to each source appropriately.
 
 Example usage::
 
     import polars_io_tools as cpl
-    from polars_io_tools import multi_source, FilterSpec
+    from polars_io_tools import pushdown_combine, FilterSpec
 
-    lf = multi_source(
+    lf = pushdown_combine(
         sources={
             "left": (left_lf, {
                 "date": FilterSpec(),
@@ -52,7 +52,7 @@ from .range_visitor import (
 from .set_visitor import convert_expr_to_valid_values
 from .util import collect_lf_in_io_source, register_io_source_with_is_pure
 
-__all__ = ("FilterSpec", "multi_source")
+__all__ = ("FilterSpec", "pushdown_combine")
 
 log = logging.getLogger(__name__)
 
@@ -204,7 +204,7 @@ def _is_temporal_dtype(dtype: pl.DataType) -> bool:
     return dtype in (pl.Date, pl.Datetime) or isinstance(dtype, pl.Datetime)
 
 
-def multi_source(
+def pushdown_combine(
     sources: dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec]]],
     combine: Callable[..., pl.LazyFrame],
     *,
@@ -303,7 +303,7 @@ def multi_source(
     Examples:
         Basic usage with lookback::
 
-            lf = multi_source(
+            lf = pushdown_combine(
                 sources={
                     "prices": (prices_lf, {
                         "date": FilterSpec(lookback=timedelta(days=5)),
@@ -332,7 +332,7 @@ def multi_source(
 
             REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
 
-            lf = multi_source(
+            lf = pushdown_combine(
                 sources={
                     "primary": (primary_lf, {"date": FilterSpec(), "region": FilterSpec()}),
                     "reference": (reference_lf, {"date": FilterSpec(lookback=timedelta(days=5))}),
@@ -344,7 +344,7 @@ def multi_source(
     # Compute output schema for the IO source.
     # Wrap in a lambda so that the schema (and the per-source `lf.collect_schema()`
     # calls it requires) is only resolved when Polars actually needs it (i.e. at
-    # collect time), rather than eagerly when `multi_source` is constructed.
+    # collect time), rather than eagerly when `pushdown_combine` is constructed.
     output_schema = lambda: _compute_output_schema(sources, combine, combine_kwargs, sources_as_kwargs)
 
     # Collect all output columns that have FilterSpecs across all sources
@@ -389,7 +389,7 @@ def multi_source(
         log.debug(f"Extracted values: {extracted_values}")
 
         # Get source schemas for dtype checking. Resolved lazily here (at
-        # collect time) rather than eagerly at multi_source construction so
+        # collect time) rather than eagerly at pushdown_combine construction so
         # we don't force schema resolution on each source until we actually
         # need it.
         source_schemas: dict[str, dict[str, pl.DataType]] = {name: lf.collect_schema() for name, (lf, _) in sources.items()}
@@ -529,7 +529,7 @@ def multi_source(
         try:
             yield from collect_lf_in_io_source(result_lf, batch_size)
         except Exception as e:
-            err_msg = f"Failed during collection in multi_source.\nPolars plan:\n{result_lf.explain()}\nError: {e.__class__.__name__}: {e}"
+            err_msg = f"Failed during collection in pushdown_combine.\nPolars plan:\n{result_lf.explain()}\nError: {e.__class__.__name__}: {e}"
             raise RuntimeError(err_msg) from e
 
     return register_io_source_with_is_pure(source_generator, schema=output_schema)
