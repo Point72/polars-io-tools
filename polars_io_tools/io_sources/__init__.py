@@ -18,7 +18,7 @@ from .lazy_debug import debug, debug as _lazy_debug
 from .lazy_iter_rows import *
 from .lazy_narwhals_reader import *
 from .lazy_sql_reader import *
-from .multi_source import *
+from .pushdown_combine import *
 from .pushdown_pivot import *
 from .pushdown_unpivot import *
 from .sql_dialects import *
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
     from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
     from .lazy_iter_rows import iter_rows  # noqa: TC004
-    from .multi_source import FilterSpec, multi_source
+    from .pushdown_combine import FilterSpec, pushdown_combine
     from .pushdown_pivot import pushdown_pivot
     from .pushdown_unpivot import pushdown_unpivot
     from .ts import ts_with_columns  # noqa: TC004

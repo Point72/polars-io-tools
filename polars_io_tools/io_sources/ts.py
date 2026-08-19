@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import polars as pl
 
-from .multi_source import FilterSpec, multi_source
+from .pushdown_combine import FilterSpec, pushdown_combine
 
 __all__ = ("ts_with_columns",)
 
@@ -141,7 +141,7 @@ def ts_with_columns(
                 lf = lf.with_columns(expressions)
         return lf
 
-    return multi_source(
+    return pushdown_combine(
         sources={"main": (self, filter_specs)},
         combine=combine,
         log_explain=log_explain,

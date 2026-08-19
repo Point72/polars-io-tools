@@ -79,16 +79,16 @@ For overlapping intervals where each match should produce a row, use Polars'
 
 ## Combine sources with coordinated filter pushdown
 
-`multi_source` builds a single `LazyFrame` from several named sources plus a `combine`
+`pushdown_combine` builds a single `LazyFrame` from several named sources plus a `combine`
 function. When the result is filtered, each source receives a *transformed* version of
 the filter described by its `FilterSpec` — a renamed column, an expanded date range, or
 a remapped value — and the original filter is re-applied after `combine` runs.
 
 ```python
 from datetime import timedelta
-from polars_io_tools import multi_source, FilterSpec
+from polars_io_tools import pushdown_combine, FilterSpec
 
-lf = multi_source(
+lf = pushdown_combine(
     sources={
         "prices": (prices_lf, {"date": FilterSpec(), "id": FilterSpec()}),
         "signals": (signals_lf, {

@@ -13,8 +13,8 @@ Example usage::
     df = pl.DataFrame({"date": dates, "val": values})
     tracker = PredicateTracker(df)
 
-    # Use the LazyFrame in your multi_source or IO source
-    lf = multi_source(
+    # Use the LazyFrame in your pushdown_combine or IO source
+    lf = pushdown_combine(
         sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
         combine=lambda s: s["data"],
     )

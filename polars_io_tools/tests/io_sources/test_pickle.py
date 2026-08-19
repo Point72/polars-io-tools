@@ -192,11 +192,11 @@ class TestConcatNamedPickle:
         assert_frame_equal(result, expected)
 
 
-class TestMultiSourcePickle:
-    """Tests for multi_source pickle support."""
+class TestPushdownCombinePickle:
+    """Tests for pushdown_combine pickle support."""
 
-    def test_multi_source_pickle_basic(self):
-        """multi_source LazyFrames can be pickled and unpickled."""
+    def test_pushdown_combine_pickle_basic(self):
+        """pushdown_combine LazyFrames can be pickled and unpickled."""
         left_df = pl.DataFrame(
             {
                 "date": [date(2025, 1, 1), date(2025, 1, 2)],
@@ -212,7 +212,7 @@ class TestMultiSourcePickle:
             }
         )
 
-        lf = cpl.multi_source(
+        lf = cpl.pushdown_combine(
             sources={
                 "left": (left_df.lazy(), {"date": cpl.FilterSpec(), "id": cpl.FilterSpec()}),
                 "right": (right_df.lazy(), {"date": cpl.FilterSpec(), "id": cpl.FilterSpec()}),

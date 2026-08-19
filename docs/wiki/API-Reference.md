@@ -1,7 +1,7 @@
 # API reference
 
 The public surface of `polars-io-tools`. Importing the package (`import polars_io_tools`) registers the `piot` namespace and re-exports the functions below at
-the top level (`from polars_io_tools import scan_db, multi_source, ...`).
+the top level (`from polars_io_tools import scan_db, pushdown_combine, ...`).
 
 Most operations are available two ways:
 
@@ -253,10 +253,10 @@ Top-level form of `lf.piot.sink_clickhouse`; see the namespace entry above.
 
 ## Composing frames
 
-### `multi_source`
+### `pushdown_combine`
 
 ```python
-multi_source(sources, combine, *, combine_kwargs=None, sources_as_kwargs=False,
+pushdown_combine(sources, combine, *, combine_kwargs=None, sources_as_kwargs=False,
              log_explain=False) -> pl.LazyFrame
 ```
 

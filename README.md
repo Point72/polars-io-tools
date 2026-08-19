@@ -79,7 +79,7 @@ For a guided walkthrough, start with the
   Delta Lake or ClickHouse, including streaming/chunked writes and transparent handling
   of types the target store cannot represent natively.
 - **Pushdown-preserving query building** — `filtered_join`, `filtered_join_asof`,
-  `join_between`, `multi_source`, `concat_named`, and `ts_with_columns` express joins,
+  `join_between`, `pushdown_combine`, `concat_named`, and `ts_with_columns` express joins,
   multi-source composition, and rolling/lookback time-series logic without blocking the
   filter pushdown that those operations normally defeat.
 - **Caching** — `cache` keeps an in-memory, column- and partition-level cache for

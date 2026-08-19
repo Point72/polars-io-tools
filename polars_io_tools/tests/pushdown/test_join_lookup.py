@@ -14,7 +14,7 @@ form *does* push (see baseline test below), confirming the rewrite target
 is achievable.
 
 This is the natural alternative to user-side workarounds like cubist's
-``multi_source(value_mapping=...)`` for many-to-one mappings expressed as
+``pushdown_combine(value_mapping=...)`` for many-to-one mappings expressed as
 a small dataframe.
 """
 
