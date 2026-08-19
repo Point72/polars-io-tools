@@ -204,6 +204,35 @@ Convert a Narwhals `DataFrame` or `LazyFrame` (wrapping pandas, Dask, DuckDB, Py
 etc.) into the equivalent Polars object; lazy inputs are backed by a custom source so
 filters bridge to the underlying engine.
 
+### `scan_synthetic_regression`
+
+```python
+scan_synthetic_regression(*, n_samples, n_features, n_responses=1, use_weights=False,
+                          weights_low=0.5, weights_high=1.5, betas=None, epsilon_loc=0.0,
+                          epsilon_scale=1.0, chunk_key=None, n_chunks=None, seed=None,
+                          fetch_size=10_000) -> pl.LazyFrame
+```
+
+Lazy source of synthetic linear-regression data `Y = X @ B + E` with Gaussian noise.
+Emits `x0..x{n_features-1}` and `y0..y{n_responses-1}`; with `use_weights=True` a `weight`
+column is added and noise is scaled so a WLS fit recovers `betas`. Row values are
+batch-independent for a fixed `seed`, and predicate/projection/`head` pushdowns apply.
+
+### `scan_synthetic_panel`
+
+```python
+scan_synthetic_panel(*, start_date, end_date, freq="1D", n_symbols=1, n_features,
+                     n_responses=1, betas=None, use_weights=False, weights_low=0.5,
+                     weights_high=1.5, categories=None, group_by=None, epsilon_loc=0.0,
+                     epsilon_scale=1.0, seed=None, fetch_size=10_000) -> pl.LazyFrame
+```
+
+Lazy source of synthetic panel data on a `(date, symbol)` grid, one row per pair over the
+business days in `[start_date, end_date]`. Same regression model as
+`scan_synthetic_regression`, plus optional decorative `categories` and per-group
+coefficients via `group_by=(name, values)`. Rows are yielded date-by-date so
+`.set_sorted("date").group_by("date")` streams cleanly.
+
 ## Writing sinks
 
 ### `sink_delta` (function)
