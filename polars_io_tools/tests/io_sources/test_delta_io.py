@@ -582,7 +582,7 @@ def _run_delta_ns_precision_common(cache_root: str, aws_profile: str | None) -> 
     # Build underlying data as Datetime[ns] with nanosecond offsets around a base timestamp
     import datetime as _dt
 
-    base_dt = _dt.datetime(2025, 1, 1, tzinfo=_dt.timezone.utc)
+    base_dt = _dt.datetime(2025, 1, 1, tzinfo=_dt.UTC)
     base_ns = int(base_dt.timestamp() * 1_000_000_000)
 
     df_inner = (

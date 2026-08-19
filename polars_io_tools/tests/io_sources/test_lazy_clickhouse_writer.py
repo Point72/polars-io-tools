@@ -1,5 +1,4 @@
 from datetime import date
-from typing import Optional
 
 import duckdb
 import polars as pl
@@ -35,7 +34,7 @@ def get_employee_df() -> pl.DataFrame:
     )
 
 
-_duckdb_conn: Optional[duckdb.DuckDBPyConnection] = None
+_duckdb_conn: duckdb.DuckDBPyConnection | None = None
 
 
 @pytest.fixture(scope="module")

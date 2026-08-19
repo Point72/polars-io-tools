@@ -1,7 +1,8 @@
 import pickle
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
+from typing import NamedTuple
 
 import polars as pl
 import pytest
@@ -12,7 +13,7 @@ from polars_io_tools.io_sources.lazy_cache import _is_contradiction
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
 
 
-def assert_expr_equal(a: Optional[pl.Expr], b: Optional[pl.Expr]):
+def assert_expr_equal(a: pl.Expr | None, b: pl.Expr | None):
     """Assert that two polars expressions are equal"""
     if a is None:
         assert b is None
@@ -26,9 +27,9 @@ def assert_expr_equal(a: Optional[pl.Expr], b: Optional[pl.Expr]):
 class CallRecord:
     """Record of a single call to the IO source."""
 
-    with_columns: Optional[List[str]]
-    predicate_str: Optional[str]
-    n_rows: Optional[int]
+    with_columns: list[str] | None
+    predicate_str: str | None
+    n_rows: int | None
 
 
 @dataclass
@@ -42,20 +43,20 @@ class TrackableSource:
     """
 
     data: pl.DataFrame
-    calls: List[CallRecord] = field(default_factory=list)
+    calls: list[CallRecord] = field(default_factory=list)
 
     def reset(self):
         """Clear all recorded calls."""
         self.calls.clear()
 
-    def get_column_counts(self) -> Dict[str, int]:
+    def get_column_counts(self) -> dict[str, int]:
         """
         Count how many times each column was requested.
 
         Returns a dict mapping column name to request count.
         If with_columns was None (all columns), counts all columns.
         """
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for call in self.calls:
             cols = call.with_columns or list(self.data.columns)
             for col in cols:
@@ -69,10 +70,10 @@ class TrackableSource:
         base_data = self.data
 
         def source_generator(
-            with_columns: Optional[List[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
             # Record the call - use `is not None` to avoid Expr truthiness issues
             tracker.calls.append(
@@ -129,15 +130,15 @@ def df(source):
 class Scenario(NamedTuple):
     filter: pl.Expr = pl.lit(True)
     select: pl.Expr = pl.all()
-    head: Optional[int] = None
-    partition_cols: Tuple[str, ...] = ()
+    head: int | None = None
+    partition_cols: tuple[str, ...] = ()
 
     # Results to test against
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     cache_size: int = 0
 
     # For partitioned data, we "complete" the cache by collecting the frame for all columns and no filters
-    complete_counts: Dict[str, int] = {}
+    complete_counts: dict[str, int] = {}
     complete_cache_size: int = 0
 
 
@@ -861,7 +862,7 @@ expr_with_schema = [
         (
             (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
         ),
-        pl.Schema(dict(x=pl.Int32)),
+        pl.Schema({"x": pl.Int32}),
         True,  # we can iterate through the bounds because we have an int type.
     ),
     (
@@ -869,7 +870,7 @@ expr_with_schema = [
         (
             (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
         ),
-        pl.Schema(dict(x=pl.Float64)),
+        pl.Schema({"x": pl.Float64}),
         False,  # we cannot iterate through the bounds with a float.
     ),
     (
@@ -879,7 +880,7 @@ expr_with_schema = [
             & pl.col.x.ne(datetime(2024, 1, 1))
             & pl.col.x.ne(datetime(2024, 1, 2))  # x != 5 and x != 6
         ),
-        pl.Schema(dict(x=pl.Datetime())),
+        pl.Schema({"x": pl.Datetime()}),
         False,  # we cannot iterate through the bounds with a Datetime.
     ),
     (
@@ -889,7 +890,7 @@ expr_with_schema = [
             & pl.col.x.ne(date(2024, 1, 1))
             & pl.col.x.ne(date(2024, 1, 2))  # x != 5 and x != 6
         ),
-        pl.Schema(dict(x=pl.Date())),
+        pl.Schema({"x": pl.Date()}),
         True,  # we can iterate through the bounds with a Date.
     ),
     (
@@ -900,7 +901,7 @@ expr_with_schema = [
             & pl.col.x.ne(date(2024, 1, 2))
             & pl.col.x.ne(date(2024, 1, 3))  # x != 5 and x != 6
         ),
-        pl.Schema(dict(x=pl.Date())),
+        pl.Schema({"x": pl.Date()}),
         True,  # we can iterate through the bounds with a Date.
     ),
     (
@@ -911,7 +912,7 @@ expr_with_schema = [
             & pl.col.x.ne(date(2024, 1, 2))
             & pl.col.x.ne(date(2024, 1, 3))  # x != 5 and x != 6
         ),
-        pl.Schema(dict(x=pl.Date())),
+        pl.Schema({"x": pl.Date()}),
         False,  # we can iterate through the bounds with a Date, but 2024-01-04 is included in the filter so we don't have a contradiction.
     ),
 ]
@@ -943,10 +944,10 @@ def test_nondeterministic_source_stays_aligned_with_order_by():
         base_data = data
 
         def source_generator(
-            with_columns: Optional[List[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
             # Shuffle the data each time - this simulates non-deterministic ordering
             shuffled = base_data.sample(fraction=1.0, shuffle=True)

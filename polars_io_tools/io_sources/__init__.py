@@ -25,15 +25,19 @@ from .ts import *
 from .util import *
 
 if TYPE_CHECKING:
-    from .delta_io import sink_delta as sink_delta
-    from .join import filtered_join, filtered_join_asof
+    # These names are provided at runtime by the `from .X import *` star imports above.
+    # This block re-declares them so static analysis can resolve the targets passed to
+    # `@functools.wraps(...)` on the PIOTOperations methods below. TC004 is suppressed
+    # because ruff cannot see that the star imports already satisfy the runtime use.
+    from .delta_io import sink_delta as sink_delta  # noqa: TC004
+    from .join import filtered_join, filtered_join_asof  # noqa: TC004
     from .lazy_clickhouse_reader import scan_clickhouse
-    from .lazy_clickhouse_writer import sink_clickhouse
-    from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
-    from .lazy_iter_rows import iter_rows
+    from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
+    from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression  # noqa: TC004
+    from .lazy_iter_rows import iter_rows  # noqa: TC004
     from .multi_source import FilterSpec, multi_source
-    from .ts import ts_with_columns
-    from .util import filter_no_pushdown, with_columns_topo
+    from .ts import ts_with_columns  # noqa: TC004
+    from .util import filter_no_pushdown, with_columns_topo  # noqa: TC004
 
 if TYPE_CHECKING:
     # We don't want to import `execute_on_ray` at the top level; however
@@ -72,9 +76,9 @@ class PIOTOperations:
             return self._lf.join(*args, **kwargs)
         return filtered_join(self._lf, *args, **kwargs)
 
-    @functools.wraps(cache_parquet)  # noqa: F405
+    @functools.wraps(cache_parquet)
     def cache_parquet(self, *args, **kwargs) -> pl.LazyFrame:
-        return cache_parquet(self._lf, *args, **kwargs)  # noqa: F405
+        return cache_parquet(self._lf, *args, **kwargs)
 
     @functools.wraps(_execute_on_ray_proto)
     def execute_on_ray(self, *args, **kwargs) -> pl.LazyFrame:

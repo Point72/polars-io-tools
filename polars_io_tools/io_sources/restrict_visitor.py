@@ -1,6 +1,5 @@
 import logging
-from collections.abc import Iterable
-from typing import AbstractSet, Optional, Union
+from collections.abc import Iterable, Set as AbstractSet
 
 import polars as pl
 
@@ -32,7 +31,7 @@ def _is_relevant(expr: pl.Expr, columns: AbstractSet[str]) -> bool:
     return set(expr.meta.root_names()).issubset(columns)
 
 
-def _combine_and(expr1: Optional[pl.Expr], expr2: Optional[pl.Expr]) -> Optional[pl.Expr]:
+def _combine_and(expr1: pl.Expr | None, expr2: pl.Expr | None) -> pl.Expr | None:
     """
     Combine two expressions with AND logic.
     If either expression is None, return the other expression.
@@ -45,7 +44,7 @@ def _combine_and(expr1: Optional[pl.Expr], expr2: Optional[pl.Expr]) -> Optional
     return expr1 & expr2
 
 
-def _combine_or(expr1: Optional[pl.Expr], expr2: Optional[pl.Expr]) -> Optional[pl.Expr]:
+def _combine_or(expr1: pl.Expr | None, expr2: pl.Expr | None) -> pl.Expr | None:
     """
     Combine two expressions with OR logic.
     Both must be not None to create a valid expression.
@@ -55,7 +54,7 @@ def _combine_or(expr1: Optional[pl.Expr], expr2: Optional[pl.Expr]) -> Optional[
     return expr1 | expr2
 
 
-def _combine_all(exprs: list[pl.Expr]) -> Optional[pl.Expr]:
+def _combine_all(exprs: list[pl.Expr]) -> pl.Expr | None:
     """Combine list of expressions with AND (all_horizontal). Returns None if empty."""
     if not exprs:
         return None
@@ -64,7 +63,7 @@ def _combine_all(exprs: list[pl.Expr]) -> Optional[pl.Expr]:
     return pl.all_horizontal(*exprs)
 
 
-def _combine_any(exprs: list[pl.Expr]) -> Optional[pl.Expr]:
+def _combine_any(exprs: list[pl.Expr]) -> pl.Expr | None:
     """Combine list of expressions with OR (any_horizontal). Returns None if empty."""
     if not exprs:
         return None
@@ -73,7 +72,7 @@ def _combine_any(exprs: list[pl.Expr]) -> Optional[pl.Expr]:
     return pl.any_horizontal(*exprs)
 
 
-class RestrictPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
+class RestrictPredicateVisitor(ExprVisitor[pl.Expr | None]):
     """
     Visitor that restricts a predicate to only reference a specific set of columns.
     It tries to create a less restrictive predicate that only involves the specified columns,
@@ -230,12 +229,12 @@ class RestrictPredicateVisitor(ExprVisitor[Optional[pl.Expr]]):
             # If not casting to boolean, we cannot restrict the expression to the current columns.
             self.result = None
 
-    def process_results(self) -> Optional[pl.Expr]:
+    def process_results(self) -> pl.Expr | None:
         """Get the final restricted predicate or None if not possible"""
         return self.result
 
 
-def restrict_expr_to_columns(expr_or_node: Union[pl.Expr, BaseExprNode], columns: Iterable[str]) -> Optional[pl.Expr]:
+def restrict_expr_to_columns(expr_or_node: pl.Expr | BaseExprNode, columns: Iterable[str]) -> pl.Expr | None:
     """
     Given a predicate expression involving many columns, try to find a less restrictive
     predicate that only involves the provided columns.
@@ -280,10 +279,9 @@ def restrict_expr_to_columns(expr_or_node: Union[pl.Expr, BaseExprNode], columns
         else:
             expr = expr_or_node.expr
 
-        if isinstance(expr, pl.Expr):
-            # If expression already only involves the specified columns, return it as is
-            if _is_relevant(expr, columns_set):
-                return expr
+        # If expression already only involves the specified columns, return it as is
+        if isinstance(expr, pl.Expr) and _is_relevant(expr, columns_set):
+            return expr
 
         # Parse the expression if needed
         node = get_parsed_expr(expr_or_node)
@@ -294,6 +292,6 @@ def restrict_expr_to_columns(expr_or_node: Union[pl.Expr, BaseExprNode], columns
         visitor = RestrictPredicateVisitor(columns_set)
         visitor.visit(node)
         return visitor.process_results()
-    except Exception as e:
-        log.exception(f"Failed to restrict predicate: {e}")
+    except Exception:
+        log.exception("Failed to restrict predicate")
         return None

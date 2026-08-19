@@ -3,7 +3,7 @@
 # from the general utils tests.
 import os
 from datetime import date, datetime, timedelta
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -18,13 +18,13 @@ from polars_io_tools.testing import (
 
 # Re-export for convenient imports in tests
 __all__ = (
-    "PredicateTracker",
     "PredicateAnalyzer",
-    "create_sample_data",
-    "tester",
+    "PredicateTracker",
     "assert_dnf_equal",
+    "create_sample_data",
     "io_source_assert",
     "skip_unoptimized_expression_shape",
+    "tester",
 )
 
 
@@ -76,7 +76,7 @@ def tester():
     return PredicateTracker(create_sample_data())
 
 
-def assert_dnf_equal(result: Optional[List[List[Tuple[str, str, Any]]]], expected: Optional[List[List[Tuple[str, str, Any]]]], msg: str = None):
+def assert_dnf_equal(result: list[list[tuple[str, str, Any]]] | None, expected: list[list[tuple[str, str, Any]]] | None, msg: str | None = None):
     """
     Assert that two DNF expressions are equivalent regardless of predicate order.
     This ignores ordering within each clause (inner list) but preserves clause order.
@@ -109,7 +109,7 @@ def assert_dnf_equal(result: Optional[List[List[Tuple[str, str, Any]]]], expecte
         pytest.fail(error_msg)
 
 
-def sort_clause(clause: List[Tuple[str, str, Any]]) -> List[Tuple[str, str, Any]]:
+def sort_clause(clause: list[tuple[str, str, Any]]) -> list[tuple[str, str, Any]]:
     """
     Sort a clause by its column names and operators for consistent comparison.
     Since we can't hash the entire tuple if some values are unhashable,
@@ -118,7 +118,7 @@ def sort_clause(clause: List[Tuple[str, str, Any]]) -> List[Tuple[str, str, Any]
     return sorted(clause, key=lambda x: (x[0], x[1]))
 
 
-def clause_in_list(clause: List[Tuple[str, str, Any]], clause_list: List[List[Tuple[str, str, Any]]]) -> bool:
+def clause_in_list(clause: list[tuple[str, str, Any]], clause_list: list[list[tuple[str, str, Any]]]) -> bool:
     """
     Check if a clause appears in a list of clauses, with deep comparison for values.
     """
@@ -133,7 +133,7 @@ def clause_in_list(clause: List[Tuple[str, str, Any]], clause_list: List[List[Tu
     return False
 
 
-def tuples_equal(a: Tuple[str, str, Any], b: Tuple[str, str, Any]) -> bool:
+def tuples_equal(a: tuple[str, str, Any], b: tuple[str, str, Any]) -> bool:
     """
     Compare two predicate tuples, handling special cases for collections and None values.
     """

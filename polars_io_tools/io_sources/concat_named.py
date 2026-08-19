@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from collections.abc import Iterator
+from typing import Any
 
 import polars as pl
 
@@ -13,8 +14,8 @@ log = logging.getLogger(__name__)
 
 
 def concat_named(
-    lf_dict: Dict[Any, pl.LazyFrame],
-    identifier_cols: List[Union[str, Tuple[str, pl.DataType]]],
+    lf_dict: dict[Any, pl.LazyFrame],
+    identifier_cols: list[str | tuple[str, pl.DataType]],
     *,
     log_explain: bool = False,
     **kwargs: Any,
@@ -147,10 +148,10 @@ def concat_named(
     index_df = pl.DataFrame(index_lf)
 
     def source_gen(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         restricted_predicate = restrict_expr_to_columns(predicate, col_names) if predicate is not None else None
         true_lf: pl.LazyFrame
@@ -168,7 +169,7 @@ def concat_named(
         if n_rows is not None:
             true_lf = true_lf.limit(n_rows)
         if log_explain:
-            log.debug(f"concat_named: LazyFrame plan:\n{str(true_lf.explain())}")
+            log.debug(f"concat_named: LazyFrame plan:\n{true_lf.explain()!s}")
         try:
             yield from collect_lf_in_io_source(true_lf, batch_size)
         except Exception as e:

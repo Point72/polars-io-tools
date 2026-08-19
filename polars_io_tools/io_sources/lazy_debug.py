@@ -1,5 +1,5 @@
 import logging
-from typing import Iterator, List, Optional
+from collections.abc import Iterator
 
 import polars as pl
 
@@ -13,7 +13,7 @@ __all__ = ("debug",)
 
 def debug(
     self: pl.LazyFrame,
-    log_level: Optional[int] = None,
+    log_level: int | None = None,
 ) -> pl.LazyFrame:
     """
     A very simple pass-through lazy frame source to help with debugging experimentation of polars io sources and lazy frame behavior.
@@ -25,13 +25,13 @@ def debug(
     schema = self.collect_schema()
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         """A generator that returns a dataframe from the cache."""
-        msg = f"debug called with `with_columns={with_columns}`, `predicate={predicate}`, `n_rows={n_rows}`, `batch_size={batch_size}` on lazy frame {repr(self)} with optimized plan:\n{self.explain()}."
+        msg = f"debug called with `with_columns={with_columns}`, `predicate={predicate}`, `n_rows={n_rows}`, `batch_size={batch_size}` on lazy frame {self!r} with optimized plan:\n{self.explain()}."
         if log_level is not None:
             log.log(log_level, msg)
         else:

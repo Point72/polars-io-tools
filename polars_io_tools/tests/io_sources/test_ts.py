@@ -1,5 +1,5 @@
+from collections.abc import Iterator
 from datetime import date, datetime, timedelta
-from typing import Dict, Iterator, List, Optional, Tuple
 
 import polars as pl
 import pytest
@@ -38,15 +38,15 @@ def _assert_date_between_predicate_if_pushed(last_predicate, expected_lower: dat
     assert upper_date == expected_upper
 
 
-def generate_lazy_frame_and_container_with_pushed_predicate(df: pl.DataFrame) -> Tuple[pl.LazyFrame, Dict[str, pl.Expr]]:
+def generate_lazy_frame_and_container_with_pushed_predicate(df: pl.DataFrame) -> tuple[pl.LazyFrame, dict[str, pl.Expr]]:
     container = {}
 
     def my_scan(df):
         def source_generator(
-            with_columns: Optional[List[str]],
-            predicate: Optional[pl.Expr],
-            n_rows: Optional[int],
-            batch_size: Optional[int],
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
             # Capture the predicate
             container["last_predicate"] = predicate
@@ -201,7 +201,7 @@ def test_ts_ffill(lookback, index_col_typ):
         .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
         .collect()
     )
-    expected_schema = {**df.collect_schema(), **{"ForwardFill": pl.Int64}}
+    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Int64}
     expected_schema.pop("DummyValue")  # DummyValue is not in the result
 
     # We look back 3 rows, but we need our lookback to contain the only non-null value in our table.
@@ -256,7 +256,7 @@ def test_ts_ffill_no_indexed_column(lookback, index_col_typ):
         .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
         .collect()
     )
-    expected_schema = {**df.collect_schema(), **{"ForwardFill": pl.Int64}}
+    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Int64}
     expected_schema.pop("DummyValue")  # DummyValue is not in the result
 
     # We look back 3 rows, but we need our lookback to contain the only non-null value in our table.
@@ -293,7 +293,7 @@ def test_ts_ffill_multiple_filters(expr):
         .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
         .collect()
     )
-    expected_schema = {**df.collect_schema(), **{"ForwardFill": pl.Float64}}
+    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Float64}
     expected_schema.pop("DummyValue")  # DummyValue is not in the result
 
     # Now, in either case we get the forward fill, because even though our filter on "Date" filters out the first row,
@@ -336,11 +336,11 @@ def test_ts_rolling_mean():
 
 def test_ts_with_columns_args():
     df = _generate_df(pl.Date).lazy()
-    kwargs = dict(
-        index_col="Date",
-        lookback=timedelta(days=3),
-        linked_cols=["EventDate"],
-    )
+    kwargs = {
+        "index_col": "Date",
+        "lookback": timedelta(days=3),
+        "linked_cols": ["EventDate"],
+    }
     res = [
         # Just pass list as first args.
         df.piot.ts_with_columns(
@@ -399,7 +399,7 @@ def test_ts_with_columns_callable_expression():
         .collect()
     )
 
-    expected_schema = {**df.collect_schema(), **{"ForwardFill": pl.Float64}}
+    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Float64}
     expected_schema.pop("DummyValue")
     assert result.collect_schema() == expected_schema
     expected = pl.DataFrame(

@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional, Set, Union
+from typing import Any
 
 import polars as pl
 
@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 __all__ = ("convert_expr_to_valid_values",)
 
 
-class SetVisitor(ExprVisitor[Optional[Set[Any]]]):
+class SetVisitor(ExprVisitor[set[Any] | None]):
     """
     Visitor that extracts valid values for a specific column.
     Each method updates internal state rather than returning values.
@@ -29,20 +29,19 @@ class SetVisitor(ExprVisitor[Optional[Set[Any]]]):
         if node.op.is_comparison():
             # Handle comparison operators (=, !=, etc.)
             column = extract_column_name(node.left)
-            if column == self.target_column:
+            if column == self.target_column and node.right.can_extract_literal:
                 # Try to extract value from right side
-                if node.right.can_extract_literal:
-                    value = node.right.value
+                value = node.right.value
 
-                    if node.op in [OperatorType.EQ, OperatorType.EQ_VALIDITY]:
-                        # Equality: add to inclusions (create new set for consistency)
-                        if self.inclusions is None:
-                            self.inclusions = {value}
-                        else:
-                            self.inclusions = self.inclusions.union({value})
-                    elif node.op in [OperatorType.NOT_EQ, OperatorType.NOT_EQ_VALIDITY]:
-                        # Inequality: add to exclusions
-                        self.exclusions.add(value)
+                if node.op in [OperatorType.EQ, OperatorType.EQ_VALIDITY]:
+                    # Equality: add to inclusions (create new set for consistency)
+                    if self.inclusions is None:
+                        self.inclusions = {value}
+                    else:
+                        self.inclusions = self.inclusions.union({value})
+                elif node.op in [OperatorType.NOT_EQ, OperatorType.NOT_EQ_VALIDITY]:
+                    # Inequality: add to exclusions
+                    self.exclusions.add(value)
 
         elif node.op.is_bitwise_or_logical():
             # Handle logical operations (AND, OR)
@@ -131,24 +130,23 @@ class SetVisitor(ExprVisitor[Optional[Set[Any]]]):
                         pass
 
         # Handle NOT function
-        elif node.function_type == BooleanFunctionType.NOT:
-            if len(node.inputs) > 0:
-                # Create a sub-visitor for the inner expression
-                inner_visitor = SetVisitor(self.target_column)
-                inner_visitor.visit(node.inputs[0])
+        elif node.function_type == BooleanFunctionType.NOT and len(node.inputs) > 0:
+            # Create a sub-visitor for the inner expression
+            inner_visitor = SetVisitor(self.target_column)
+            inner_visitor.visit(node.inputs[0])
 
-                # Invert the results
-                if inner_visitor.inclusions is not None:
-                    for val in inner_visitor.inclusions:
-                        self.exclusions.add(val)
+            # Invert the results
+            if inner_visitor.inclusions is not None:
+                for val in inner_visitor.inclusions:
+                    self.exclusions.add(val)
 
-                    # If we have our own inclusions, remove these exclusions
-                    if self.inclusions is not None:
-                        self.inclusions = self.inclusions - inner_visitor.inclusions
-
-                # For exclusions, we might be able to add what was excluded
+                # If we have our own inclusions, remove these exclusions
                 if self.inclusions is not None:
-                    self.inclusions = self.inclusions.union(inner_visitor.exclusions)
+                    self.inclusions = self.inclusions - inner_visitor.inclusions
+
+            # For exclusions, we might be able to add what was excluded
+            if self.inclusions is not None:
+                self.inclusions = self.inclusions.union(inner_visitor.exclusions)
 
     def visit_cast(self, node: CastNode) -> None:
         """Handle cast expressions."""
@@ -162,7 +160,7 @@ class SetVisitor(ExprVisitor[Optional[Set[Any]]]):
         """Handle alias expressions by visiting the underlying input."""
         self.visit(node.input)
 
-    def process_results(self) -> Optional[Set[Any]]:
+    def process_results(self) -> set[Any] | None:
         """Get the final set of valid values based on tracked state."""
         # If we have inclusions, apply exclusions
         if self.inclusions is not None:
@@ -171,7 +169,7 @@ class SetVisitor(ExprVisitor[Optional[Set[Any]]]):
         return None
 
 
-def convert_expr_to_valid_values(expr_or_node: Union[pl.Expr, BaseExprNode], column: str) -> Optional[Set[Any]]:
+def convert_expr_to_valid_values(expr_or_node: pl.Expr | BaseExprNode, column: str) -> set[Any] | None:
     """
     Extract valid values for a column from an expression or DNF.
 

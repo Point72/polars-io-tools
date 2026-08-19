@@ -1,6 +1,6 @@
 import datetime
 import warnings
-from typing import Iterator, List, Optional
+from collections.abc import Iterator
 
 import polars as pl
 import portion
@@ -8,10 +8,10 @@ import portion
 from .range_visitor import convert_expr_to_datetime_range
 from .util import _convert_interval_to_slices, register_io_source_with_is_pure
 
-__all__ = ["scan_datadog", "metric_query"]
+__all__ = ["metric_query", "scan_datadog"]
 
 
-def metric_query(query: str, start: int, end: int, api_key: str, app_key: str, interval: Optional[int] = None) -> dict:
+def metric_query(query: str, start: int, end: int, api_key: str, app_key: str, interval: int | None = None) -> dict:
     """
     This functions queries Datadog metrics. This function replicates
     the call to `api.Metric.query`, where `api` is an initalized Python
@@ -49,9 +49,9 @@ def scan_datadog(
     query: str,
     api_key: str,
     app_key: str,
-    max_chunk_duration_seconds: Optional[int] = 60 * 60 * 24,  # Default to 1 day chunks
-    dd_interval: Optional[int] = None,
-    additional_schema: Optional[dict] = {},
+    max_chunk_duration_seconds: int | None = 60 * 60 * 24,  # Default to 1 day chunks
+    dd_interval: int | None = None,
+    additional_schema: dict | None = None,
     overwrite_schema: bool = False,
 ) -> pl.LazyFrame:
     """
@@ -100,6 +100,8 @@ def scan_datadog(
         ValueError: If the time range for the query cannot be determined from predicates
             on the 'timestamp' column.
     """
+    if additional_schema is None:
+        additional_schema = {}
     schema = {
         "timestamp": pl.Datetime,
         "value": pl.Float64,
@@ -128,10 +130,10 @@ def scan_datadog(
         schema = schema | additional_schema
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int] = 100_000,
-        batch_size: Optional[int] = 100_000,
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None = 100_000,
+        batch_size: int | None = 100_000,
     ) -> Iterator[pl.DataFrame]:
         import requests
 
@@ -243,7 +245,7 @@ def scan_datadog(
 
                     row_data = series_base_info.copy()
                     if "timestamp" in must_have_cols:
-                        row_data["timestamp"] = datetime.datetime.fromtimestamp(ts_milliseconds / 1000.0, tz=datetime.timezone.utc)
+                        row_data["timestamp"] = datetime.datetime.fromtimestamp(ts_milliseconds / 1000.0, tz=datetime.UTC)
                     if "value" in must_have_cols:
                         row_data["value"] = point_value
 

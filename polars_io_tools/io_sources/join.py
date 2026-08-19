@@ -1,6 +1,7 @@
 import datetime
 import logging
-from typing import Iterator, List, Literal, Optional, Tuple, Union
+from collections.abc import Iterator
+from typing import Literal
 
 import polars as pl
 from packaging import version
@@ -28,10 +29,10 @@ _POLARS_PUSHDOWN_FILTERS_JOIN_COLUMNS = version.parse(pl.__version__) > version.
 
 
 def _normalize_join_columns(
-    on: Optional[Union[str, List[str]]],
-    left_on: Optional[Union[str, List[str]]],
-    right_on: Optional[Union[str, List[str]]],
-) -> Tuple[List[str], List[str]]:
+    on: str | list[str] | None,
+    left_on: str | list[str] | None,
+    right_on: str | list[str] | None,
+) -> tuple[list[str], list[str]]:
     """Normalize join column specifications to lists for our optimization logic."""
     if on is not None:
         if left_on is not None or right_on is not None:
@@ -49,10 +50,10 @@ def _normalize_join_columns(
 
 def _rename_columns_in_filters(
     left_predicate: pl.Expr,
-    left_on: List[str],
-    right_on: List[str],
+    left_on: list[str],
+    right_on: list[str],
     right_schema: dict,
-) -> Optional[pl.Expr]:
+) -> pl.Expr | None:
     """
     Convert left_predicate to a predicate on a LazyFrame with 'right_schema' where
     we map left_on columns to right_on columns, in order.
@@ -69,10 +70,10 @@ def _rename_columns_in_filters(
     schema = {k: v for k, v in right_schema.items() if k in right_on}
 
     def _dummy_source(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         container["predicate"] = predicate
         df = pl.DataFrame({}, schema=schema)
@@ -98,11 +99,11 @@ def _rename_columns_in_filters(
 def filtered_join(
     lf1: pl.LazyFrame,
     lf2: pl.LazyFrame,
-    on: Optional[Union[str, List[str]]] = None,
+    on: str | list[str] | None = None,
     how: Literal["inner", "left"] = "inner",
     *,
-    left_on: Optional[Union[str, List[str]]] = None,
-    right_on: Optional[Union[str, List[str]]] = None,
+    left_on: str | list[str] | None = None,
+    right_on: str | list[str] | None = None,
     nulls_equal: bool = False,
     log_explain: bool = False,
     **join_kwargs,
@@ -135,8 +136,8 @@ def filtered_join(
     left_on, right_on = _normalize_join_columns(on, left_on, right_on)
 
     if log_explain:
-        log.debug(f"filtered_join: Left LazyFrame plan:\n{str(lf1.explain())}")
-        log.debug(f"filtered_join: Right LazyFrame plan:\n{str(lf2.explain())}")
+        log.debug(f"filtered_join: Left LazyFrame plan:\n{lf1.explain()!s}")
+        log.debug(f"filtered_join: Right LazyFrame plan:\n{lf2.explain()!s}")
 
     l1_schema = lf1.collect_schema()
     l2_schema = lf2.collect_schema()
@@ -157,10 +158,10 @@ def filtered_join(
     )
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         left_columns = l1_schema.keys()
         left_predicate = None
@@ -175,7 +176,7 @@ def filtered_join(
         # need to request them all. We can just request the columns polars
         # wants from us, and the left_on columns for the join.
         if with_columns is not None:
-            all_columns = set([*with_columns, *left_on])
+            all_columns = {*with_columns, *left_on}
             # If with_columns includes suffixed columns (e.g. "quantity_previous"),
             # include the base column (e.g. "quantity") so a name conflict occurs
             # and the suffix gets applied to the right side.
@@ -187,12 +188,12 @@ def filtered_join(
             left_lf = left_lf.select(true_left_columns)
 
         if log_explain:
-            log.debug(f"filtered_join: Left LazyFrame plan:\n{str(left_lf.explain())}")
+            log.debug(f"filtered_join: Left LazyFrame plan:\n{left_lf.explain()!s}")
         try:
             left_df = left_lf.collect()
         except Exception as e:
             raise RuntimeError(
-                f"Failed to collect left LazyFrame for filtered join with plan: \n{str(left_lf.explain())}\n\nWhile running the above, {e}"
+                f"Failed to collect left LazyFrame for filtered join with plan: \n{left_lf.explain()!s}\n\nWhile running the above, {e}"
             ) from e
         # If left_df is empty here, we can just return an empty dataframe
         with_columns_set = set(with_columns) if with_columns is not None else None
@@ -230,7 +231,7 @@ def filtered_join(
             df = df.filter(predicate)
 
         if with_columns_set is not None:
-            df = df.select([col for col in schema.keys() if col in with_columns_set])
+            df = df.select([col for col in schema if col in with_columns_set])
         else:
             df = df.select(schema.keys())
 
@@ -238,11 +239,11 @@ def filtered_join(
             df = df.head(n_rows)
 
         if log_explain:
-            log.debug(f"filtered_join: LazyFrame plan:\n{str(df.explain())}")
+            log.debug(f"filtered_join: LazyFrame plan:\n{df.explain()!s}")
         try:
             yield from collect_lf_in_io_source(df, batch_size)
         except Exception as e:
-            err_msg = f"Failed during collection for filtered join. Plan: \n{str(df.explain())}"
+            err_msg = f"Failed during collection for filtered join. Plan: \n{df.explain()!s}"
             err_msg += f"\n\nError: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
@@ -253,14 +254,14 @@ def filtered_join_asof(
     lf1: pl.LazyFrame,
     lf2: pl.LazyFrame,
     *,  # this matches Polars behavior for pl.join_asof
-    left_on: Optional[Union[str, List[str]]] = None,
-    right_on: Optional[Union[str, List[str]]] = None,
-    on: Optional[Union[str, List[str]]] = None,
-    by: Optional[Union[str, List[str]]] = None,
-    by_left: Optional[Union[str, List[str]]] = None,
-    by_right: Optional[Union[str, List[str]]] = None,
+    left_on: str | list[str] | None = None,
+    right_on: str | list[str] | None = None,
+    on: str | list[str] | None = None,
+    by: str | list[str] | None = None,
+    by_left: str | list[str] | None = None,
+    by_right: str | list[str] | None = None,
     strategy: Literal["backward", "forward", "nearest"] = "backward",
-    tolerance: Optional[Union[str, int, float, datetime.timedelta]] = None,  # TODO: Only timedelta is supported for now
+    tolerance: str | float | datetime.timedelta | None = None,  # TODO: Only timedelta is supported for now
     log_explain: bool = True,
     **join_kwargs,
 ) -> pl.LazyFrame:
@@ -347,8 +348,8 @@ def filtered_join_asof(
         by_left, by_right = _normalize_join_columns(by, by_left, by_right)
 
     if log_explain:
-        log.debug(f"filtered_join_asof: Left LazyFrame plan:\n{str(lf1.explain())}")
-        log.debug(f"filtered_join_asof: Right LazyFrame plan:\n{str(lf2.explain())}")
+        log.debug(f"filtered_join_asof: Left LazyFrame plan:\n{lf1.explain()!s}")
+        log.debug(f"filtered_join_asof: Right LazyFrame plan:\n{lf2.explain()!s}")
 
     l1_schema = lf1.collect_schema()
     l2_schema = lf2.collect_schema()
@@ -374,10 +375,10 @@ def filtered_join_asof(
     )
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         nonlocal lf1
         nonlocal lf2
@@ -488,7 +489,7 @@ def filtered_join_asof(
         # TODO: Remove when this does not interfere with parquet. Should be
         # release >1.30.0
         if with_columns_set is not None:
-            lf_joined = lf_joined.select([col for col in schema.keys() if col in with_columns_set])
+            lf_joined = lf_joined.select([col for col in schema if col in with_columns_set])
         else:
             lf_joined = lf_joined.select(schema.keys())
 
@@ -496,11 +497,11 @@ def filtered_join_asof(
             lf_joined = lf_joined.head(n_rows)
 
         if log_explain:
-            log.debug(f"filtered_join_asof: LazyFrame plan:\n{str(lf_joined.explain())}")
+            log.debug(f"filtered_join_asof: LazyFrame plan:\n{lf_joined.explain()!s}")
         try:
             yield from collect_lf_in_io_source(lf_joined, batch_size)
         except Exception as e:
-            err_msg = f"Failed during collection for filtered join_asof. Plan: \n{str(lf_joined.explain())}"
+            err_msg = f"Failed during collection for filtered join_asof. Plan: \n{lf_joined.explain()!s}"
             err_msg += f"\n\nError: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
@@ -513,7 +514,7 @@ def join_between(
     left_on: str,
     right_on_start: str,
     right_on_end: str,
-    by: Union[str, List[str], None] = None,
+    by: str | list[str] | None = None,
     how: Literal["left", "inner"] = "left",
 ) -> pl.LazyFrame:
     """Join left table to right table where left_on is between right_on_start and right_on_end.

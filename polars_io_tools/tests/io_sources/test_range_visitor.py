@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -258,13 +258,13 @@ class TestAdvancedMixedDateTimeRanges:
 
     def test_different_timezone_ranges(self):
         """Test ranges with datetimes in different timezones."""
-        utc_dt = datetime(2023, 5, 15, 12, 0, tzinfo=timezone.utc)
+        utc_dt = datetime(2023, 5, 15, 12, 0, tzinfo=UTC)
         est_dt = datetime(2023, 5, 15, 8, 0, tzinfo=timezone(timedelta(hours=-4)))  # EST, same time as UTC 12:00
 
         # Test with equivalent times in different zones
         expr = (pl.col("timestamp") >= utc_dt) & (pl.col("timestamp") < est_dt)
         result = convert_expr_to_range(
-            expr, "timestamp", validate_value_func=lambda dt: dt if dt.tzinfo is None else dt.astimezone(timezone.utc).replace(tzinfo=None)
+            expr, "timestamp", validate_value_func=lambda dt: dt if dt.tzinfo is None else dt.astimezone(UTC).replace(tzinfo=None)
         )
 
         # The result should be an empty interval as they represent the same time when normalized
@@ -683,8 +683,8 @@ class TestDatetimeRangeExtractor:
     def test_datetime_comparisons_with_timezone(self):
         """Test comparisons with timezone-aware datetimes."""
         # Create timezone-aware datetimes
-        dt1 = datetime(2023, 5, 15, 9, 0, tzinfo=timezone.utc)
-        dt2 = datetime(2023, 5, 15, 17, 0, tzinfo=timezone.utc)
+        dt1 = datetime(2023, 5, 15, 9, 0, tzinfo=UTC)
+        dt2 = datetime(2023, 5, 15, 17, 0, tzinfo=UTC)
 
         expr = (pl.col("timestamp") >= dt1) & (pl.col("timestamp") <= dt2)
         result = convert_expr_to_datetime_range(expr, "timestamp")
@@ -1061,7 +1061,7 @@ class TestCastWithDatetimeRanges:
     def test_cast_with_time_unit_and_timezone(self):
         """Test casting with time unit and timezone specifications."""
         # Cast with specific time unit and timezone
-        expr = pl.col("date_col").cast(pl.Datetime(time_unit="ms", time_zone="UTC")) >= datetime(2023, 1, 1, tzinfo=timezone.utc)
+        expr = pl.col("date_col").cast(pl.Datetime(time_unit="ms", time_zone="UTC")) >= datetime(2023, 1, 1, tzinfo=UTC)
         result = convert_expr_to_datetime_range(expr, "date_col")
         assert result.atomic
         assert result.lower == datetime(2023, 1, 1)

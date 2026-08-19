@@ -1,7 +1,7 @@
 import hashlib
 import logging
-from collections.abc import MutableMapping
-from typing import Any, Dict, Hashable, Iterator, List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
+from collections.abc import Hashable, Iterator, MutableMapping, Sequence
+from typing import Any, Literal, NamedTuple
 
 import polars as pl
 
@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 __all__ = ["cache"]
 
 
-_PartitionKey = Tuple[Tuple[str, Any], ...]
+_PartitionKey = tuple[tuple[str, Any], ...]
 
 
 class _CacheKey(NamedTuple):
@@ -26,16 +26,16 @@ class _CacheKey(NamedTuple):
     partition_key: _PartitionKey
 
 
-_CACHE: Dict[_CacheKey, pl.Series] = {}
+_CACHE: dict[_CacheKey, pl.Series] = {}
 
 
-def _df_key(df: pl.LazyFrame, order_by: Tuple[str, ...] = (), partition_cols: Tuple[str, ...] = ()) -> str:
+def _df_key(df: pl.LazyFrame, order_by: tuple[str, ...] = (), partition_cols: tuple[str, ...] = ()) -> str:
     """Return a unique key for the given dataframe, ordering key and partition layout."""
     payload = df.serialize() + repr((tuple(order_by), tuple(partition_cols))).encode()
     return hashlib.md5(payload).hexdigest()
 
 
-def _partition_key(partition_values: Dict[str, Hashable]) -> _PartitionKey:
+def _partition_key(partition_values: dict[str, Hashable]) -> _PartitionKey:
     return tuple(sorted(partition_values.items()))
 
 
@@ -86,13 +86,13 @@ def _repeated_grouping(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def _extract_filter_from_df(df: pl.DataFrame) -> Optional[pl.Expr]:
+def _extract_filter_from_df(df: pl.DataFrame) -> pl.Expr | None:
     """Extract filters from a DataFrame, returning a list of expressions."""
     if df.is_empty():
         return None
     schema = df.schema
     if len(schema) == 1:
-        col_name, dtyp = next(iter(schema.items()))
+        col_name, _dtyp = next(iter(schema.items()))
         vals = df.select(col_name).to_series().to_list()
         if len(vals) == 1:
             inner_vals = vals[0]
@@ -114,7 +114,7 @@ def _extract_filter_from_df(df: pl.DataFrame) -> Optional[pl.Expr]:
     return pl.Expr.and_(*row_exprs)
 
 
-def _validate_order_by_unique(frame: pl.DataFrame, order_by: Tuple[str, ...]) -> None:
+def _validate_order_by_unique(frame: pl.DataFrame, order_by: tuple[str, ...]) -> None:
     """Raise if ``order_by`` does not uniquely identify the rows of ``frame``.
 
     Operates on a frame already collected for the cache fill, so it adds no extra pass
@@ -132,10 +132,10 @@ def _validate_order_by_unique(frame: pl.DataFrame, order_by: Tuple[str, ...]) ->
 
 def cache(
     self: pl.LazyFrame,
-    cache: Optional[MutableMapping[_CacheKey, pl.Series]] = None,
+    cache: MutableMapping[_CacheKey, pl.Series] | None = None,
     *,
-    order_by: Union[str, Sequence[str]],
-    partition_cols: Tuple[str, ...] = (),
+    order_by: str | Sequence[str],
+    partition_cols: tuple[str, ...] = (),
     cache_mode: Literal["cache", "ignore", "rebuild"] = "cache",
     validate: bool = True,
     log_explain: bool = False,
@@ -251,10 +251,10 @@ def cache(
         log.debug(str(self.explain()))
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         """A generator that returns a dataframe from the cache."""
         # Get the set of columns to select
@@ -267,7 +267,7 @@ def cache(
 
         # For each column, define a list of partitions we can find in the cache
         # Later, we will filter these partitions based on relevancy - for now we grab everything
-        cached_partitions: Dict[str, List[Dict[str, Any]]] = {col: [] for col in columns_to_select}
+        cached_partitions: dict[str, list[dict[str, Any]]] = {col: [] for col in columns_to_select}
         if cache_mode == "cache":
             if partition_cols:
                 # Traverse all cache keys once (might be slow, as we don't index the cache keys by (col, df_key)
@@ -291,7 +291,7 @@ def cache(
             raise NotImplementedError
 
         # Set up a variable to store the data that goes into the final result, keyed by partition
-        data: Dict[_PartitionKey, Dict[str, pl.Series]] = {}
+        data: dict[_PartitionKey, dict[str, pl.Series]] = {}
 
         # Build a frame of the partition values we have, and apply the partition_predicate to select relevant partitions
         filtered_partition_dfs = []
@@ -370,7 +370,7 @@ def cache(
                     # We can skip the query if our filters form a contradiction
                     try:
                         can_skip_query = _is_contradiction(query_predicate, schema=schema)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                         log.warning(
                             f"Failed to check if the query predicate is a contradiction, this may be due to a large number of partition columns: {e}",
                         )

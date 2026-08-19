@@ -2,9 +2,10 @@ import functools
 import logging
 import os
 import socket
+from collections.abc import Iterator
 from datetime import date, datetime, timedelta
 from graphlib import TopologicalSorter
-from typing import Iterator, List, NamedTuple, Optional, Tuple, Union
+from typing import NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 import polars as pl
@@ -17,18 +18,18 @@ log = logging.getLogger(__name__)
 
 __all__ = (
     "collect_lf_in_io_source",
-    "filter_no_pushdown",
     "extract_description_block",
+    "filter_no_pushdown",
     "inject_description_block",
     "register_io_source_with_is_pure",
-    "wrap_io_source_with_error_catching",
     "with_columns_topo",
+    "wrap_io_source_with_error_catching",
 )
 
 
 def collect_lf_in_io_source(
     lf: pl.LazyFrame,
-    batch_size: Optional[int],
+    batch_size: int | None,
 ) -> Iterator[pl.DataFrame]:
     """Collect a LazyFrame from inside a ``register_io_source`` callback.
 
@@ -65,7 +66,7 @@ class StorageOptions(NamedTuple):
 
     pyarrow: dict
     polars: dict
-    credential_provider: Optional[pl.CredentialProviderAWS]
+    credential_provider: pl.CredentialProviderAWS | None
 
 
 @functools.lru_cache(maxsize=16)
@@ -313,7 +314,7 @@ def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
 Function: {io_source_name}
 Identifier: {identifier}
 Error Type: {type(e).__name__}
-Error Message: {str(e)}
+Error Message: {e!s}
 
 Call Arguments:
   args: {args_str}
@@ -325,7 +326,7 @@ Full Stack Trace:
 """
 
             # Re-raise with enhanced context (no logging to avoid unsuppressible error logs)
-            raise RuntimeError(f"IO Source '{io_source_name}' failed: {str(e)} with detailed error information:\n{error_msg}") from e
+            raise RuntimeError(f"IO Source '{io_source_name}' failed: {e!s} with detailed error information:\n{error_msg}") from e
 
     return error_catching_io_source
 
@@ -430,7 +431,7 @@ def with_columns_topo(lf: pl.LazyFrame, exprs: list[pl.Expr]) -> pl.LazyFrame:
 
     for expr in exprs:
         if expr.meta.has_multiple_outputs():
-            raise ValueError(f"with_columns_topo does not support multi-output expressions, received: {str(expr)}")
+            raise ValueError(f"with_columns_topo does not support multi-output expressions, received: {expr!s}")
         name = expr.meta.output_name()
         name_to_expr[name] = expr
         feature_names.add(name)
@@ -454,8 +455,8 @@ def with_columns_topo(lf: pl.LazyFrame, exprs: list[pl.Expr]) -> pl.LazyFrame:
 
 
 def _convert_interval_to_slices(
-    interval: portion.Interval, max_duration: Optional[timedelta] = None
-) -> List[Union[date, datetime, Tuple[datetime, datetime]]]:
+    interval: portion.Interval, max_duration: timedelta | None = None
+) -> list[date | datetime | tuple[datetime, datetime]]:
     """Convert a portion interval to a list of slices each spanning at most a day
 
     Args:
