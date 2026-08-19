@@ -114,7 +114,7 @@ def pushdown_pivot(
     # Defer all `collect_schema()` walks (the source schema, the full pivot output schema, and the per-`on`-value pivot
     # schemas used for the output→on-value mapping) until Polars actually needs them — typically when it asks for the
     # registered schema at collect time. This avoids forcing schema resolution on the input LazyFrame eagerly when the
-    # wrapper is constructed (the convention documented on `register_io_source_with_is_pure` and used by `multi_source`).
+    # wrapper is constructed (the convention documented on `register_io_source_with_is_pure` and used by `pushdown_combine`).
     _resolved: dict[str, Any] = {}
 
     def _resolve() -> dict[str, Any]:
