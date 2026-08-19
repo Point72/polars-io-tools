@@ -68,7 +68,7 @@ def pushdown_unpivot(
     # Defer all `collect_schema()` walks (the source schema, the resolved on-columns list, and the declared unpivot output
     # schema) until Polars actually needs them — typically when it asks for the registered schema at collect time. This
     # avoids forcing schema resolution on the input LazyFrame eagerly when the wrapper is constructed (the convention
-    # documented on `register_io_source_with_is_pure` and used by `multi_source`).
+    # documented on `register_io_source_with_is_pure` and used by `pushdown_combine`).
     _resolved: dict[str, Any] = {}
 
     def _resolve() -> dict[str, Any]:
