@@ -8,7 +8,7 @@ import portion
 from .range_visitor import convert_expr_to_datetime_range
 from .util import _convert_interval_to_slices, register_io_source_with_is_pure
 
-__all__ = ["metric_query", "scan_datadog"]
+__all__ = ("metric_query", "scan_datadog")
 
 
 def metric_query(query: str, start: int, end: int, api_key: str, app_key: str, interval: int | None = None) -> dict:

@@ -13,7 +13,7 @@ from .sql_utils import (
 )
 from .util import register_io_source_with_is_pure
 
-__all__ = ["scan_db"]
+__all__ = ("scan_db",)
 
 
 # Configure logging

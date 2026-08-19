@@ -19,10 +19,10 @@ from .enum import (
 log = logging.getLogger(__name__)
 
 # Export only what's needed publicly
-__all__ = [
+__all__ = (
     "convert_expr_to_datetime_range",
     "convert_expr_to_range",
-]
+)
 
 # Type definition for validated datetime
 ValidatedDatetime = Annotated[

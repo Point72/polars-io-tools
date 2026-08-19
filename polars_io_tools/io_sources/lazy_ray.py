@@ -22,7 +22,7 @@ from .util import register_io_source_with_is_pure
 # As we did in the `lazy_parquet_cache` module, we expose the function to users, in case
 # they want to use it directly or though Polars' `.pipe()` syntax; however, the canonical
 # useage is to call the function as a method on the `LazyFrame`'s `piot` namespace.
-__all__ = ["execute_on_ray"]
+__all__ = ("execute_on_ray",)
 
 
 def _partition_specs(

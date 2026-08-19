@@ -51,7 +51,7 @@ class ReadPlan:
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CacheMode", "cache_parquet"]
+__all__ = ("CacheMode", "cache_parquet")
 
 
 def _path_as_file_uri(path: Path | PureWindowsPath) -> str:

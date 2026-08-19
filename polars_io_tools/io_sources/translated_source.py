@@ -27,7 +27,7 @@ from .base import get_parsed_expr
 
 log = logging.getLogger(__name__)
 
-__all__ = ["TranslatedPredicateVisitor", "translate_polars_predicate"]
+__all__ = ("TranslatedPredicateVisitor", "translate_polars_predicate")
 
 
 def _to_target_expr(col: pl.Expr, m: pl.DataType | None) -> pl.Expr:
