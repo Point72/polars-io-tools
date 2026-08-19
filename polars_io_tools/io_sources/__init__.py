@@ -12,6 +12,7 @@ from .lazy_cache import cache, cache as _lazy_cache
 from .lazy_cache_parquet import *
 from .lazy_clickhouse_reader import *
 from .lazy_clickhouse_writer import *
+from .lazy_data_generator import *
 from .lazy_datadog_reader import *
 from .lazy_debug import debug, debug as _lazy_debug
 from .lazy_iter_rows import *
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from .join import filtered_join, filtered_join_asof  # noqa: TC004
     from .lazy_clickhouse_reader import scan_clickhouse
     from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
+    from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
     from .lazy_iter_rows import iter_rows  # noqa: TC004
     from .multi_source import FilterSpec, multi_source
     from .pushdown_pivot import pushdown_pivot
