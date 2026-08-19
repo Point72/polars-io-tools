@@ -265,6 +265,36 @@ Match each `left_on` value to the right-side row whose `[right_on_start, right_o
 interval contains it, optionally with an equi-join on `by`. Returns at most one match per
 left row (non-overlapping intervals).
 
+## Reshaping
+
+### `pushdown_pivot`
+
+```python
+pushdown_pivot(source, on, on_columns, *, index, values, aggregate_function=None,
+               maintain_order=False, separator="_", column_naming="auto",
+               is_pure=True, dense_on=False) -> pl.LazyFrame
+```
+
+Pushdown-friendly `LazyFrame.pivot`. The output is identical to
+`source.pivot(on, on_columns=on_columns, ...)`, but downstream projections and predicates
+are pushed into the wrapper: selecting a subset of pivoted columns becomes an upstream
+`on`-value row filter, and index/pivoted-column predicates flow through. `on_columns` pins
+the output schema. `dense_on=True` skips the index-recovery scan (roughly 2x faster) when
+every `index` value is known to have a row for every `on` value; it silently drops rows on
+sparse data. `aggregate_function` is not yet supported.
+
+### `pushdown_unpivot`
+
+```python
+pushdown_unpivot(source, *, index, on=None, variable_name="variable",
+                 value_name="value", is_pure=True) -> pl.LazyFrame
+```
+
+Pushdown-friendly `LazyFrame.unpivot`. The output is identical to
+`source.unpivot(index=index, on=on, ...)`, but a filter on `variable` (for example
+`variable == "A"` or `variable.is_in([...])`) is rewritten as an upstream column
+projection, and filters on `index` flow through. `on` defaults to all non-`index` columns.
+
 ## Caching
 
 ### `CacheMode`
