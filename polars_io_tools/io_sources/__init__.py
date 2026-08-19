@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from .join import filtered_join, filtered_join_asof  # noqa: TC004
     from .lazy_clickhouse_reader import scan_clickhouse
     from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
-    from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression  # noqa: TC004
+    from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
     from .lazy_iter_rows import iter_rows  # noqa: TC004
     from .multi_source import FilterSpec, multi_source
     from .ts import ts_with_columns  # noqa: TC004
