@@ -31,9 +31,10 @@ Example usage::
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Callable, Iterator, Optional
+from typing import Any
 
 import polars as pl
 import portion
@@ -344,18 +345,18 @@ def multi_source(
     # Wrap in a lambda so that the schema (and the per-source `lf.collect_schema()`
     # calls it requires) is only resolved when Polars actually needs it (i.e. at
     # collect time), rather than eagerly when `multi_source` is constructed.
-    output_schema = lambda: _compute_output_schema(sources, combine, combine_kwargs, sources_as_kwargs)  # noqa: E731
+    output_schema = lambda: _compute_output_schema(sources, combine, combine_kwargs, sources_as_kwargs)
 
     # Collect all output columns that have FilterSpecs across all sources
     all_output_cols: set[str] = set()
-    for _, (_, specs) in sources.items():
+    for _, specs in sources.values():
         all_output_cols.update(specs.keys())
 
     def source_generator(
-        with_columns: Optional[list[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         # Parse predicate to extract filter information
         parsed_predicate = get_parsed_expr(predicate) if predicate is not None else None
@@ -373,7 +374,7 @@ def multi_source(
                     # Only store if it's constraining (not the full universe)
                     if date_range != portion.closed(-portion.inf, portion.inf):
                         extracted_ranges[col] = date_range
-                except Exception:
+                except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                     log.debug(f"Failed to extract date range for column {col}")
 
                 # Try to extract discrete values
@@ -381,7 +382,7 @@ def multi_source(
                     discrete_values = convert_expr_to_valid_values(parsed_predicate, col)
                     if discrete_values is not None:
                         extracted_values[col] = discrete_values
-                except Exception:
+                except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                     log.debug(f"Failed to extract discrete values for column {col}")
 
         log.debug(f"Extracted ranges: {extracted_ranges}")

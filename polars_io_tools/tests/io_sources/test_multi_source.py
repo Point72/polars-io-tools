@@ -1029,7 +1029,7 @@ class TestFilterPushdownVerification:
         temporal_filter = analyzer.find_temporal_filter("date")
         assert temporal_filter is not None, "Should find a temporal filter on 'date'"
 
-        lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
+        lower, _upper = analyzer.extract_temporal_bounds(temporal_filter)
         assert lower == date(2024, 1, 5), f"Lower bound should be Jan 5, got {lower}"
 
     def test_date_between_filter_structure(self):
@@ -1089,7 +1089,7 @@ class TestFilterPushdownVerification:
         temporal_filter = analyzer.find_temporal_filter("date")
         assert temporal_filter is not None
 
-        lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
+        lower, _upper = analyzer.extract_temporal_bounds(temporal_filter)
         # The pushed value should be Jan 2 (3-day lookback from Jan 5)
         assert lower == date(2024, 1, 2), f"Expected Jan 2 (with lookback), got {lower}"
 
@@ -1247,7 +1247,7 @@ class TestFilterPushdownVerification:
         temporal_filter = analyzer.find_temporal_filter("date")
         assert temporal_filter is not None
 
-        lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
+        _lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
         # The pushed value should be Jan 10 (3-day lookahead from Jan 7)
         assert upper == date(2024, 1, 10), f"Expected Jan 10 (with lookahead), got {upper}"
 

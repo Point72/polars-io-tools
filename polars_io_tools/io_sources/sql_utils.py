@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Any, List, Optional, Union, cast
+from typing import Any, cast
 
 import polars as pl
 import sqlglot
@@ -11,11 +11,11 @@ from .enum import ArrayFunctionType, BooleanFunctionType, ListFunctionType, Oper
 from .sql_dialects import MSSQL
 
 __all__ = [
-    "fix_three_part_identifiers",
-    "convert_predicate_to_sql",
-    "apply_polars_io_source_exprs",
-    "create_sqlglot_literal",
     "SQLExpressionVisitor",
+    "apply_polars_io_source_exprs",
+    "convert_predicate_to_sql",
+    "create_sqlglot_literal",
+    "fix_three_part_identifiers",
 ]
 
 
@@ -81,12 +81,12 @@ def _is_malformed_three_part_identifier(identifier):
     )
 
 
-class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
+class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
     """
     Visitor that converts Polars expressions to SQLGlot expressions.
     """
 
-    def __init__(self, dialect: Union[str, Dialects, type[Dialect], None] = Dialects.TSQL):
+    def __init__(self, dialect: str | Dialects | type[Dialect] | None = Dialects.TSQL):
         # Normalize to ``Dialects`` enum so internal checks use
         # ``self.dialect == Dialects.TSQL`` instead of raw strings.
         if dialect is None or dialect is MSSQL:
@@ -101,9 +101,9 @@ class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
                 self.dialect = Dialects.DIALECT  # unknown → generic
         else:
             self.dialect = Dialects.TSQL
-        self.result: Optional[sqlglot.exp.Expression] = None
+        self.result: sqlglot.exp.Expression | None = None
 
-    def default_result(self) -> Optional[sqlglot.exp.Expression]:
+    def default_result(self) -> sqlglot.exp.Expression | None:
         """Default result is None."""
         return self.result
 
@@ -199,13 +199,13 @@ class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
             self._handle_string_function(node, input_exprs)
         elif isinstance(node.function_type, TemporalFunctionType):
             self._handle_temporal_function(node, input_exprs)
-        elif isinstance(node.function_type, ListFunctionType) or isinstance(node.function_type, ArrayFunctionType):
+        elif isinstance(node.function_type, (ListFunctionType, ArrayFunctionType)):
             self._handle_list_function(node, input_exprs)
         else:
             log.warning(f"Unsupported function type in SQL conversion: {node.function_type}")
             self.result = None
 
-    def _handle_boolean_function(self, node: FunctionNode, input_exprs: List[sqlglot.exp.Expression]) -> None:
+    def _handle_boolean_function(self, node: FunctionNode, input_exprs: list[sqlglot.exp.Expression]) -> None:
         """Handle boolean functions."""
         if not input_exprs:
             self.result = None
@@ -254,7 +254,7 @@ class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
         gen_class = type(sqlglot.Dialect.get_or_raise(self.dialect).generator())
         return sqlglot.exp.RegexpLike in gen_class.TRANSFORMS
 
-    def _handle_string_function(self, node: FunctionNode, input_exprs: List[sqlglot.exp.Expression]) -> None:
+    def _handle_string_function(self, node: FunctionNode, input_exprs: list[sqlglot.exp.Expression]) -> None:
         """Handle string functions."""
         if not input_exprs:
             self.result = None
@@ -300,7 +300,7 @@ class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
             log.warning(f"Unsupported string function: {node.function_type}")
             self.result = None
 
-    def _handle_temporal_function(self, node: FunctionNode, input_exprs: List[sqlglot.exp.Expression]) -> None:
+    def _handle_temporal_function(self, node: FunctionNode, input_exprs: list[sqlglot.exp.Expression]) -> None:
         """Handle temporal functions."""
         # Map of temporal functions to SQL functions
         # This is dialect-specific and may need adjustments
@@ -356,7 +356,7 @@ class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
             log.warning(f"Unsupported temporal function: {node.function_type}")
             self.result = None
 
-    def _handle_list_function(self, node: FunctionNode, input_exprs: List[sqlglot.exp.Expression]) -> None:
+    def _handle_list_function(self, node: FunctionNode, input_exprs: list[sqlglot.exp.Expression]) -> None:
         """Handle list/array functions."""
         # Most list functions don't have direct SQL equivalents
         # We'll implement a few common ones
@@ -478,7 +478,7 @@ class SQLExpressionVisitor(ExprVisitor[Optional[sqlglot.exp.Expression]]):
             self.result = None
 
 
-def convert_predicate_to_sql(predicate: pl.Expr, dialect: Union[str, type[Dialect], None] = "tsql") -> Optional[sqlglot.exp.Expression]:
+def convert_predicate_to_sql(predicate: pl.Expr, dialect: str | type[Dialect] | None = "tsql") -> sqlglot.exp.Expression | None:
     """
     Convert a Polars predicate expression to a SQLGlot expression.
 
@@ -496,8 +496,8 @@ def convert_predicate_to_sql(predicate: pl.Expr, dialect: Union[str, type[Dialec
         visitor = SQLExpressionVisitor(dialect)
         visitor.visit(node)
         return visitor.process_results()
-    except Exception as e:
-        log.exception(f"Error converting predicate to SQL: {e}")
+    except Exception:
+        log.exception("Error converting predicate to SQL")
         return None
 
 
@@ -519,12 +519,12 @@ def _strip_table_qualifier(node: sqlglot.exp.Expression) -> sqlglot.exp.Expressi
     return node
 
 
-def _is_mssql_dialect(dialect: Optional[Union[str, type[Dialect]]]) -> bool:
+def _is_mssql_dialect(dialect: str | type[Dialect] | None) -> bool:
     """Check whether the dialect is MSSQL."""
     return dialect is MSSQL
 
 
-def _get_query_output_columns(query: sqlglot.exp.Expression) -> Optional[list[str]]:
+def _get_query_output_columns(query: sqlglot.exp.Expression) -> list[str] | None:
     """Extract unqualified output column names from a SELECT's projection list.
 
     Returns None if names cannot be determined statically (e.g. SELECT *,
@@ -547,8 +547,8 @@ def _get_query_output_columns(query: sqlglot.exp.Expression) -> Optional[list[st
 
 def _prepare_inner_for_subquery(
     parsed_query: sqlglot.exp.Expression,
-    dialect: Optional[Union[str, type[Dialect]]] = None,
-) -> tuple[sqlglot.exp.Expression, Optional[sqlglot.exp.Order], list[sqlglot.exp.Expression]]:
+    dialect: str | type[Dialect] | None = None,
+) -> tuple[sqlglot.exp.Expression, sqlglot.exp.Order | None, list[sqlglot.exp.Expression]]:
     """Prepare a query for subquery wrapping by extracting clauses that must be hoisted.
 
     Hoisting is **MSSQL-specific**.  Other dialects silently ignore ORDER BY in
@@ -582,7 +582,7 @@ def _prepare_inner_for_subquery(
     # Non-MSSQL dialects: ORDER BY is harmlessly ignored in subqueries, so we
     # leave it in place — this avoids the ordinal-shift and column-not-in-SELECT
     # edge cases entirely.
-    order_to_hoist: Optional[sqlglot.exp.Order] = None
+    order_to_hoist: sqlglot.exp.Order | None = None
     # OPTION hints
     # MSSQL requires OPTION(...) at statement level, not inside subqueries.
     # Other dialects don't use OPTION hints, so this is a no-op for them.
@@ -605,11 +605,11 @@ def _prepare_inner_for_subquery(
 
 def apply_polars_io_source_exprs(
     query: sqlglot.exp.Expression,
-    dialect: Optional[Union[str, type[Dialect]]],
-    with_columns: Optional[List[str]],
-    predicate: Optional[pl.Expr],
-    n_rows: Optional[int],
-    batch_size: Optional[int],
+    dialect: str | type[Dialect] | None,
+    with_columns: list[str] | None,
+    predicate: pl.Expr | None,
+    n_rows: int | None,
+    batch_size: int | None,
 ) -> sqlglot.exp.Expression:
     """Apply Polars IO source expressions using subquery wrapping.
 

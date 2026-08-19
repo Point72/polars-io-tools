@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union, cast, overload
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any, cast, overload
 
 import narwhals as nw
 import polars as pl
@@ -57,7 +58,7 @@ def get_polars_to_narwhals_type_map() -> dict[pl.DataType, nw.dtypes.DType]:
     return type_map
 
 
-class _NWBuilder(ExprVisitor[Optional[Any]]):
+class _NWBuilder(ExprVisitor[Any | None]):
     """
     Walk the parsed node tree and build a Narwhals expression.
 
@@ -65,7 +66,7 @@ class _NWBuilder(ExprVisitor[Optional[Any]]):
     """
 
     def __init__(self):
-        self.expr: Optional[Any] = None
+        self.expr: Any | None = None
 
     def default_result(self):
         return self.expr
@@ -110,7 +111,7 @@ class _NWBuilder(ExprVisitor[Optional[Any]]):
                 self.expr = left | right
             else:
                 self.expr = None
-        except Exception:  # We do this because we want to keep the pushdown safe
+        except Exception:  # We do this because we want to keep the pushdown safe  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             self.expr = None
 
     def visit_cast(self, node: CastNode):
@@ -125,7 +126,7 @@ class _NWBuilder(ExprVisitor[Optional[Any]]):
 
     def visit_function(self, node: FunctionNode):
         ft = node.function_type
-        valid_function_types = set([BooleanFunctionType.IS_NULL, BooleanFunctionType.IS_NOT_NULL, BooleanFunctionType.IS_IN])
+        valid_function_types = {BooleanFunctionType.IS_NULL, BooleanFunctionType.IS_NOT_NULL, BooleanFunctionType.IS_IN}
 
         if ft in valid_function_types:
             # We only care about the first argument (the column)
@@ -150,7 +151,7 @@ class _NWBuilder(ExprVisitor[Optional[Any]]):
             self.expr = None
 
 
-def polars_to_nw(pred: pl.Expr) -> Optional[nw.Expr]:
+def polars_to_nw(pred: pl.Expr) -> nw.Expr | None:
     """
     Try to translate `pred` to a Narwhals expression; return None on failure.
     """
@@ -187,10 +188,10 @@ def scan_narwhals(obj: Any, fetch_size: int) -> pl.LazyFrame:
         return nw_frame.collect_schema().to_polars()
 
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         # Start from the original Narwhals lazy frame
         nf = nw_frame
@@ -274,7 +275,7 @@ def from_narwhals(obj: nw.DataFrame[Any], fetch_size: int = 10_000) -> pl.DataFr
 def from_narwhals(obj: nw.LazyFrame[Any], fetch_size: int = 10_000) -> pl.LazyFrame: ...
 
 
-def from_narwhals(obj: FrameT, fetch_size: int = 10_000) -> Union[pl.DataFrame, pl.LazyFrame]:
+def from_narwhals(obj: FrameT, fetch_size: int = 10_000) -> pl.DataFrame | pl.LazyFrame:
     """
     Accept either a Narwhals `DataFrame` or `LazyFrame` and hands
     back the equivalent Polars object.
@@ -293,7 +294,7 @@ def from_narwhals(obj: FrameT, fetch_size: int = 10_000) -> Union[pl.DataFrame, 
     if obj.implementation == nw.Implementation.POLARS:
         # If the object is already a Polars object, just return it
         # to_native() on a POLARS implementation returns the underlying pl.DataFrame or pl.LazyFrame
-        return cast(Union[pl.DataFrame, pl.LazyFrame], obj.to_native())
+        return cast(pl.DataFrame | pl.LazyFrame, obj.to_native())
 
     if callable(getattr(obj, "collect", None)):
         return scan_narwhals(obj, fetch_size=fetch_size)

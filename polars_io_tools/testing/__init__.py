@@ -48,4 +48,4 @@ from .predicate_tracker import (
     io_source_assert,
 )
 
-__all__ = ("PredicateTracker", "PredicateAnalyzer", "io_source_assert")
+__all__ = ("PredicateAnalyzer", "PredicateTracker", "io_source_assert")

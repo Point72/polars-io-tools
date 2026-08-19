@@ -1,5 +1,4 @@
 import logging
-from typing import List, Optional
 
 import polars as pl
 import pyarrow as pa
@@ -45,10 +44,10 @@ def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000)
 
     # Create the generator function for our custom IO source
     def source_generator(
-        with_columns: Optional[List[str]],
-        predicate: Optional[pl.Expr],
-        n_rows: Optional[int],
-        batch_size: Optional[int],
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
     ):
         # Short-circuit: if the caller already knows zero rows are needed
         # (e.g. from head(0) on a contradictory filter), skip the query entirely.
@@ -79,7 +78,7 @@ def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000)
             def select_cols(df) -> pl.DataFrame:
                 if with_columns is not None:
                     with_cols_set = set(with_columns)
-                    return df.select(col for col in schema.keys() if col in with_cols_set)
+                    return df.select(col for col in schema if col in with_cols_set)
                 return df
 
             try:

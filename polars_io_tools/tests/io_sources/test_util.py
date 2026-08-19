@@ -1,6 +1,6 @@
 import threading
 from collections.abc import Iterator
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from graphlib import CycleError
 
 import polars as pl
@@ -33,7 +33,7 @@ def _sample_lf() -> pl.LazyFrame:
 def _complex_sample_lf() -> pl.LazyFrame:
     """Sample LazyFrame with various data types for comprehensive testing."""
     # Create timezone-aware datetimes
-    utc = timezone.utc
+    utc = UTC
     est = timezone(timedelta(hours=-5))
 
     return pl.LazyFrame(

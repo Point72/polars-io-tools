@@ -213,3 +213,21 @@ section-order = [
     "F401",
     "F403",
 ]
+# Tests deliberately construct naive datetimes (the library canonicalizes to naive-UTC),
+# use broad excepts / best-effort cleanup, and other test-only patterns. Scope those rules
+# to the test tree rather than annotating hundreds of individual sites.
+"polars_io_tools/tests/**" = [
+    "DTZ001",
+    "DTZ005",
+    "DTZ011",
+    "BLE001",
+    "S110",
+    "S112",
+    "TRY002",
+    "TRY004",
+    "RUF012",
+    "PLW0602",
+    "PLW1510",
+    "LOG015",
+    "B017",
+]
