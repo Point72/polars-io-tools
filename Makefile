@@ -112,6 +112,7 @@ coverage-rs:  ## run rust tests and collect test coverage
 
 .PHONY: test coverage tests
 test: test-py test-rs  ## run all tests
+
 coverage: coverage-py coverage-rs  ## run all tests and collect test coverage
 
 # alias
