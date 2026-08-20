@@ -69,6 +69,17 @@ class StorageOptions(NamedTuple):
     credential_provider: pl.CredentialProviderAWS | None
 
 
+# S3 endpoint URLs whose hostname should be resolved to an IP address before use.
+#
+# Empty by default. Resolving a hostname to an IP is only appropriate for endpoints
+# where it is known to be safe -- typically plain-HTTP on-prem object stores where
+# resolving up front avoids overloading DNS when many workers connect at once. It is
+# NOT safe to do unconditionally: replacing the hostname of an HTTPS endpoint with an
+# IP breaks TLS certificate validation. Deployments that want this behaviour opt in by
+# adding the relevant endpoint URLs to this set, e.g. ``ENDPOINTS_TO_RESOLVE.add(url)``.
+ENDPOINTS_TO_RESOLVE: set[str] = set()
+
+
 @functools.lru_cache(maxsize=16)
 def _resolve_endpoint_hostname(endpoint: str) -> str:
     """Resolve the hostname in an endpoint URL to an IP address.
@@ -164,7 +175,9 @@ def _storage_options_for(cache_uri: str, aws_profile: str | None = None) -> Stor
         cred_opts = credential_provider._storage_update_options()
         endpoint = cred_opts.get("endpoint_url")
 
-    if endpoint:
+    # Resolve the endpoint hostname to an IP address only for endpoints that have
+    # explicitly opted in via ``ENDPOINTS_TO_RESOLVE`` (see its definition above).
+    if endpoint in ENDPOINTS_TO_RESOLVE:
         endpoint = _resolve_endpoint_hostname(endpoint)
 
     # Set endpoint in both option dicts with appropriate keys

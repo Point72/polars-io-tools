@@ -753,6 +753,56 @@ class TestWithColumnsTopo:
         assert_frame_equal(df.select(expected.columns), expected)
 
 
+class TestEndpointResolutionOptIn:
+    """`_storage_options_for` resolves an endpoint hostname only when it opts in."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_registry(self):
+        from polars_io_tools.io_sources import util as _util
+
+        snapshot = set(_util.ENDPOINTS_TO_RESOLVE)
+        _resolve_endpoint_hostname.cache_clear()
+        yield
+        _util.ENDPOINTS_TO_RESOLVE.clear()
+        _util.ENDPOINTS_TO_RESOLVE.update(snapshot)
+        _resolve_endpoint_hostname.cache_clear()
+
+    @staticmethod
+    def _patch_no_cred_session(monkeypatch):
+        class FakeSession:
+            def __init__(self, profile_name=None):
+                self.region_name = None
+
+            def get_credentials(self):
+                return None
+
+        monkeypatch.setattr("boto3.Session", FakeSession)
+
+    def test_unregistered_endpoint_is_left_as_hostname(self, monkeypatch):
+        self._patch_no_cred_session(monkeypatch)
+        monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.9.9.9")
+
+        uri = "s3://bucket/path?endpoint_override=http://onprem-store:9020"
+        opts = _storage_options_for(uri)
+
+        # Default registry is empty, so the endpoint is passed through unchanged.
+        assert opts.polars["endpoint_url"] == "http://onprem-store:9020"
+        assert opts.pyarrow["endpoint_override"] == "http://onprem-store:9020"
+
+    def test_registered_endpoint_is_resolved_to_ip(self, monkeypatch):
+        from polars_io_tools.io_sources import util as _util
+
+        self._patch_no_cred_session(monkeypatch)
+        monkeypatch.setattr("socket.gethostbyname", lambda hostname: "10.9.9.9")
+        _util.ENDPOINTS_TO_RESOLVE.add("http://onprem-store:9020")
+
+        uri = "s3://bucket/path?endpoint_override=http://onprem-store:9020"
+        opts = _storage_options_for(uri)
+
+        assert opts.polars["endpoint_url"] == "http://10.9.9.9:9020"
+        assert opts.pyarrow["endpoint_override"] == "http://10.9.9.9:9020"
+
+
 class TestStorageOptionsFor:
     """Tests for `_storage_options_for` with thorough boto3/session mocking."""
 
@@ -1192,7 +1242,13 @@ class TestResolveEndpointHostname:
         monkeypatch.setattr("socket.gethostbyname", failing_gethostbyname)
         monkeypatch.setenv("AWS_ENDPOINT_URL", "http://grid:9020")
 
-        opts = _storage_options_for("s3://bucket/path")
+        from polars_io_tools.io_sources import util as _util
+
+        _util.ENDPOINTS_TO_RESOLVE.add("http://grid:9020")
+        try:
+            opts = _storage_options_for("s3://bucket/path")
+        finally:
+            _util.ENDPOINTS_TO_RESOLVE.discard("http://grid:9020")
 
         # Endpoint should be kept as original due to resolution failure
         assert opts.pyarrow["endpoint_override"] == "http://grid:9020"
