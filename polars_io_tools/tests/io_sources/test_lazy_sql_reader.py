@@ -16,7 +16,13 @@ from polars_io_tools import io_sources as polars_utils
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, FunctionNode, LiteralNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType, TemporalFunctionType
 from polars_io_tools.io_sources.sql_dialects import MSSQL
-from polars_io_tools.io_sources.sql_utils import SQLExpressionVisitor, convert_predicate_to_sql, create_sqlglot_literal
+from polars_io_tools.io_sources.sql_utils import (
+    SQLExpressionVisitor,
+    _stabilize_mssql_projection_aliases,
+    apply_polars_io_source_exprs,
+    convert_predicate_to_sql,
+    create_sqlglot_literal,
+)
 
 """
 This module contains tests for the lazy Polars SQL reader. We
@@ -2533,3 +2539,285 @@ def test_str_contains(filter_expr):
     actual = actual.sort("CenterID", "EventDate")
     expected = expected.sort("CenterID", "EventDate")
     assert_frame_equal(actual, expected)
+
+
+# ---------------------------------------------------------------------------
+# Identifier quoting / MSSQL projection-alias stabilization
+# ---------------------------------------------------------------------------
+
+
+def test_column_selection_quotes_metadata_names(duckdb_connection):
+    """Metadata-derived reserved and special-character names remain selectable."""
+    duckdb_connection.execute(
+        """
+        CREATE TABLE QuotedMetadataColumns AS
+        SELECT 1 AS "group", 2 AS "value with space", 3 AS ordinary
+        """
+    )
+
+    result = cpl.scan_db("SELECT * FROM QuotedMetadataColumns", "fake_connection_string", krb5=False).select(["group", "value with space"]).collect()
+
+    expected = pl.DataFrame({"group": [1], "value with space": [2]})
+    assert_frame_equal(result, expected, check_dtypes=False)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "effective_name", "expected_sql"),
+    [
+        ("postgres", "group", '"group"'),
+        ("oracle", "GROUP", '"GROUP"'),
+        ("snowflake", "GROUP", '"GROUP"'),
+    ],
+)
+def test_outer_metadata_columns_use_dialect_quoting(dialect, effective_name, expected_sql):
+    """Known dialects quote the effective names supplied by source metadata."""
+    query = parse_one("SELECT source_name FROM source_table", dialect=dialect)
+
+    result = apply_polars_io_source_exprs(
+        query,
+        dialect=dialect,
+        with_columns=[effective_name],
+        predicate=None,
+        n_rows=None,
+        batch_size=None,
+    )
+
+    assert result.selects[0].sql(dialect=dialect) == expected_sql
+
+
+def test_outer_identifiers_preserve_generic_dialect_behavior():
+    """A missing dialect leaves metadata and predicate identifiers unquoted."""
+    result = apply_polars_io_source_exprs(
+        parse_one("SELECT source_name FROM source_table"),
+        dialect=None,
+        with_columns=["CamelCase"],
+        predicate=pl.col("CamelCase") > 1,
+        n_rows=None,
+        batch_size=None,
+    )
+
+    selected_identifier = result.selects[0].this
+    predicate_column = next(result.args["where"].find_all(exp.Column))
+    assert selected_identifier == "CamelCase"
+    assert predicate_column.this == "CamelCase"
+
+
+def test_predicate_quoting_is_limited_to_outer_column_leaves():
+    """Predicate quoting does not rewrite source SQL or non-column AST nodes."""
+    query = parse_one(
+        """
+        SELECT src.value AS result, LOWER(src.label) AS normalized
+        FROM catalog.schema.source_table AS src
+        WHERE EXISTS (
+            SELECT 1
+            FROM related_table AS rel
+            WHERE rel.source_id = src.id
+        )
+        ORDER BY src.value
+        """,
+        dialect="postgres",
+    )
+
+    result = apply_polars_io_source_exprs(
+        query,
+        dialect="postgres",
+        with_columns=None,
+        predicate=(pl.col("result") > 1) & (pl.col("normalized") == "literal"),
+        n_rows=None,
+        batch_size=None,
+    )
+
+    outer_columns = list(result.args["where"].find_all(exp.Column))
+    assert [column.name for column in outer_columns] == ["result", "normalized"]
+    assert all(column.this.quoted for column in outer_columns)
+
+    inner = result.args["from_"].this.this
+    column_identifiers = [column.this for column in inner.find_all(exp.Column)]
+    tables = list(inner.find_all(exp.Table))
+    qualified_table_parts = [table.parts for table in tables]
+    projection_aliases = [projection.args["alias"] for projection in inner.selects]
+    table_aliases = [table.args["alias"].this for table in tables]
+
+    assert [identifier.name for identifier in column_identifiers] == ["value", "label", "value", "source_id", "id"]
+    assert [[identifier.name for identifier in parts] for parts in qualified_table_parts] == [
+        ["catalog", "schema", "source_table"],
+        ["related_table"],
+    ]
+    assert [identifier.name for identifier in projection_aliases] == ["result", "normalized"]
+    assert [identifier.name for identifier in table_aliases] == ["src", "rel"]
+
+    assert all(not identifier.quoted for identifier in column_identifiers)
+    assert all(not identifier.quoted for parts in qualified_table_parts for identifier in parts)
+    assert all(not identifier.quoted for identifier in projection_aliases)
+    assert all(not identifier.quoted for identifier in table_aliases)
+    assert isinstance(next(inner.find_all(exp.Lower)), exp.Lower)
+    assert [(literal.this, literal.is_string) for literal in result.args["where"].find_all(exp.Literal)] == [
+        ("1", False),
+        ("literal", True),
+    ]
+    assert inner.args["order"] is not None
+
+
+def test_reordered_full_schema_selection_preserves_shortcut():
+    """A reordered redundant selection still returns the original query shape."""
+    query = parse_one("SELECT first_name, second_name FROM source_table", dialect="postgres")
+
+    result = apply_polars_io_source_exprs(
+        query,
+        dialect="postgres",
+        with_columns=["second_name", "first_name"],
+        predicate=None,
+        n_rows=None,
+        batch_size=None,
+    )
+
+    assert result.sql(dialect="postgres") == query.sql(dialect="postgres")
+    assert [column.name for column in result.selects] == ["first_name", "second_name"]
+
+
+def test_mssql_direct_select_preserves_projection_order_and_stabilizes_supported_aliases():
+    query = parse_one(
+        "SELECT first_col, *, second_col, t.*, COUNT(*) AS total, COUNT(*), third_col FROM source_table AS t",
+        dialect=MSSQL,
+    )
+
+    result = apply_polars_io_source_exprs(
+        query,
+        dialect=MSSQL,
+        with_columns=None,
+        predicate=pl.col("first_col") > 0,
+        n_rows=None,
+        batch_size=None,
+    )
+
+    inner = result.args["from_"].this.this
+    assert [projection.sql(dialect=MSSQL) for projection in inner.selects] == [
+        "[first_col] AS [first_col]",
+        "*",
+        "[second_col] AS [second_col]",
+        "[t].*",
+        "COUNT(*) AS [total]",
+        "COUNT(*)",
+        "[third_col] AS [third_col]",
+    ]
+
+
+def test_mssql_qualified_mixed_case_column_is_quoted_in_outer_pushdowns():
+    query = parse_one("SELECT src.DataDate FROM source_table AS src", dialect=MSSQL)
+
+    result = apply_polars_io_source_exprs(
+        query,
+        dialect=MSSQL,
+        with_columns=["DataDate"],
+        predicate=pl.col("DataDate") > 1,
+        n_rows=None,
+        batch_size=None,
+    )
+
+    inner = result.args["from_"].this.this
+    assert isinstance(inner, exp.Select)
+    assert len(inner.selects) == 1
+    inner_projection = inner.selects[0]
+    assert isinstance(inner_projection, exp.Alias)
+    assert inner_projection.sql(dialect=MSSQL) == "[src].[DataDate] AS [DataDate]"
+    assert inner_projection.args["alias"].name == "DataDate"
+    assert inner_projection.args["alias"].quoted
+
+    assert len(result.selects) == 1
+    outer_projection = result.selects[0]
+    assert isinstance(outer_projection, exp.Column)
+    assert outer_projection.name == "DataDate"
+    assert outer_projection.this.quoted
+
+    predicate_columns = list(result.args["where"].find_all(exp.Column))
+    assert [column.name for column in predicate_columns] == ["DataDate"]
+    assert predicate_columns[0].this.quoted
+
+
+def test_mssql_projection_alias_stabilization_is_idempotent():
+    query = parse_one("SELECT first_col, COUNT(*) AS total, COUNT(*) FROM source_table", dialect=MSSQL)
+
+    _stabilize_mssql_projection_aliases(query)
+    first_sql = query.sql(dialect=MSSQL)
+    _stabilize_mssql_projection_aliases(query)
+
+    assert query.sql(dialect=MSSQL) == first_sql
+    assert [projection.sql(dialect=MSSQL) for projection in query.selects] == [
+        "[first_col] AS [first_col]",
+        "COUNT(*) AS [total]",
+        "COUNT(*)",
+    ]
+
+
+def test_mssql_cte_projection_stabilization_does_not_rewrite_cte_body():
+    root = parse_one(
+        "WITH cte AS (SELECT DataDate FROM source_table) SELECT DataDate FROM cte",
+        dialect=MSSQL,
+    )
+
+    assert isinstance(root, exp.Select)
+    _stabilize_mssql_projection_aliases(root)
+
+    assert len(root.selects) == 1
+    output_projection = root.selects[0]
+    assert isinstance(output_projection, exp.Alias)
+    assert output_projection.this.name == "DataDate"
+    assert output_projection.args["alias"].name == "DataDate"
+    assert output_projection.args["alias"].quoted
+
+    cte_body = root.args["with_"].expressions[0].this
+    assert isinstance(cte_body, exp.Select)
+    assert len(cte_body.selects) == 1
+    cte_projection = cte_body.selects[0]
+    assert isinstance(cte_projection, exp.Column)
+    assert cte_projection.name == "DataDate"
+    assert not cte_projection.this.quoted
+
+
+def test_mssql_parenthesized_set_operations_only_stabilize_leftmost_output_branch():
+    query = parse_one(
+        """
+        (((SELECT a, COUNT(*) AS left_count FROM table_a)
+          INTERSECT
+          (SELECT c, COUNT(*) AS intersect_count FROM table_c))
+         UNION
+         (SELECT e, COUNT(*) AS union_count FROM table_e))
+        EXCEPT
+        SELECT g, COUNT(*) AS except_count FROM table_g
+        """,
+        dialect=MSSQL,
+    )
+
+    result = apply_polars_io_source_exprs(
+        query,
+        dialect=MSSQL,
+        with_columns=["a"],
+        predicate=None,
+        n_rows=None,
+        batch_size=None,
+    )
+
+    except_root = result.args["from_"].this.this
+    union_root = except_root.this.this
+    intersect_root = union_root.this.this
+    leftmost_select = intersect_root.this.this
+    intersect_right = intersect_root.expression.this
+    union_right = union_root.expression.this
+    except_right = except_root.expression
+
+    assert [projection.sql(dialect=MSSQL) for projection in leftmost_select.selects] == [
+        "[a] AS [a]",
+        "COUNT(*) AS [left_count]",
+    ]
+    assert [projection.sql(dialect=MSSQL) for projection in intersect_right.selects] == [
+        "[c]",
+        "COUNT(*) AS intersect_count",
+    ]
+    assert [projection.sql(dialect=MSSQL) for projection in union_right.selects] == [
+        "[e]",
+        "COUNT(*) AS union_count",
+    ]
+    assert [projection.sql(dialect=MSSQL) for projection in except_right.selects] == [
+        "[g]",
+        "COUNT(*) AS except_count",
+    ]

@@ -524,6 +524,73 @@ def _is_mssql_dialect(dialect: str | type[Dialect] | None) -> bool:
     return dialect is MSSQL
 
 
+def _is_known_dialect(dialect: str | type[Dialect] | None) -> bool:
+    """Check whether SQLGlot recognizes the provided dialect."""
+    if dialect is None:
+        return False
+    try:
+        Dialect.get_or_raise(dialect)
+    except ValueError:
+        return False
+    return True
+
+
+def _quote_column_leaf_identifier(node: sqlglot.exp.Expression) -> sqlglot.exp.Expression:
+    """Quote only the leaf identifier of a column expression."""
+    if isinstance(node, sqlglot.exp.Column) and not node.is_star:
+        identifier = node.this
+        if isinstance(identifier, sqlglot.exp.Identifier):
+            identifier.set("quoted", True)
+        elif isinstance(identifier, str):
+            node.set("this", sqlglot.exp.Identifier(this=identifier, quoted=True))
+    return node
+
+
+def _leftmost_output_select(query: sqlglot.exp.Expression) -> sqlglot.exp.Select | None:
+    """Follow output-defining left branches to the leftmost SELECT."""
+    current = query
+    while True:
+        if isinstance(current, sqlglot.exp.Select):
+            return current
+        if isinstance(current, sqlglot.exp.SetOperation):
+            current = current.this
+            continue
+        if isinstance(current, (sqlglot.exp.Paren, sqlglot.exp.Subquery)):
+            current = current.this
+            continue
+        return None
+
+
+def _stabilize_mssql_projection_aliases(query: sqlglot.exp.Expression) -> None:
+    """Quote explicit aliases and name simple columns in the output-defining SELECT."""
+    output_select = _leftmost_output_select(query)
+    if output_select is None:
+        return
+
+    projections = []
+    for projection in output_select.selects:
+        if projection.is_star:
+            projections.append(projection)
+            continue
+        if isinstance(projection, sqlglot.exp.Alias):
+            alias = projection.args.get("alias")
+            if isinstance(alias, sqlglot.exp.Identifier):
+                alias.set("quoted", True)
+            projections.append(projection)
+            continue
+        if isinstance(projection, sqlglot.exp.Column) and projection.output_name:
+            projections.append(
+                sqlglot.exp.Alias(
+                    this=projection,
+                    alias=sqlglot.exp.Identifier(this=projection.output_name, quoted=True),
+                )
+            )
+            continue
+        projections.append(projection)
+
+    output_select.set("expressions", projections)
+
+
 def _get_query_output_columns(query: sqlglot.exp.Expression) -> list[str] | None:
     """Extract unqualified output column names from a SELECT's projection list.
 
@@ -626,6 +693,8 @@ def apply_polars_io_source_exprs(
                 return query.copy().transform(fix_three_part_identifiers)
 
         inner, order_to_hoist, options_to_hoist = _prepare_inner_for_subquery(query, dialect=dialect)
+        if _is_mssql_dialect(dialect):
+            _stabilize_mssql_projection_aliases(inner)
 
         subquery = sqlglot.exp.Subquery(
             this=inner,
@@ -635,8 +704,14 @@ def apply_polars_io_source_exprs(
 
         # Column selection — flat names from the subquery output
         if with_columns is not None:
+            quote_outer_identifiers = _is_known_dialect(dialect)
             outer = outer.select(
-                *[sqlglot.exp.Column(this=name) for name in with_columns],
+                *[
+                    sqlglot.exp.Column(
+                        this=sqlglot.exp.Identifier(this=name, quoted=True) if quote_outer_identifiers else name,
+                    )
+                    for name in with_columns
+                ],
                 append=False,
                 dialect=dialect,
             )
@@ -648,6 +723,8 @@ def apply_polars_io_source_exprs(
         if predicate is not None:
             sql_predicate = convert_predicate_to_sql(predicate, dialect)
             if sql_predicate is not None:
+                if _is_known_dialect(dialect):
+                    sql_predicate = sql_predicate.transform(_quote_column_leaf_identifier)
                 outer = outer.where(sql_predicate, dialect=dialect)
 
         # Row limit
