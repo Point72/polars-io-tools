@@ -84,6 +84,10 @@ current_version = "0.1.2"
 commit = true
 tag = true
 commit_args = "-s"
+pre_commit_hooks = [
+    "cargo update --workspace",
+    "git add Cargo.lock",
+]
 
 [[tool.bumpversion.files]]
 filename = "polars_io_tools/__init__.py"
@@ -127,6 +131,7 @@ archs = "arm64"
 [tool.cibuildwheel.windows]
 environment = {PATH="$UserProfile\\.cargo\bin;$PATH", CARGO_TERM_COLOR="always"}
 skip = "*win32 *arm_64"
+
 
 [tool.coverage.run]
 branch = true
