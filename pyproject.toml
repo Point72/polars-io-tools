@@ -13,7 +13,7 @@ authors = [
 description = "Custom parsing extensions for lazy polars"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-version = "0.1.2"
+version = "0.1.3"
 requires-python = ">=3.11"
 keywords = []
 
@@ -80,7 +80,7 @@ Repository = "https://github.com/Point72/polars-io-tools"
 Homepage = "https://github.com/Point72/polars-io-tools"
 
 [tool.bumpversion]
-current_version = "0.1.2"
+current_version = "0.1.3"
 commit = true
 tag = true
 commit_args = "-s"
