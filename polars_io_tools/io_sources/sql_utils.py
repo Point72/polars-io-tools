@@ -302,6 +302,8 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             self.result = sqlglot.exp.Trim(this=input_exprs[0], position="LEADING")
         elif node.function_type == StringFunctionType.STRIP_CHARS_END:
             self.result = sqlglot.exp.Trim(this=input_exprs[0], position="TRAILING")
+        elif node.function_type == StringFunctionType.CONCAT_HORIZONTAL and input_exprs:
+            self.result = sqlglot.exp.Concat(expressions=input_exprs)
         else:
             log.warning(f"Unsupported string function: {node.function_type}")
             self.result = None

@@ -1102,6 +1102,16 @@ def test_strip_chars_predicate_pushed_down():
         tracker.assert_results_match(expr)
 
 
+def test_concat_horizontal_predicate_pushed_down():
+    """pl.concat_str translates to SQL CONCAT(...)."""
+    df = pl.DataFrame({"first": ["A", "B", "C"], "last": ["X", "Y", "Z"]})
+    tracker = PredicateTracker(df)
+
+    expr = pl.concat_str([pl.col("first"), pl.lit("-"), pl.col("last")]) == "A-X"
+    tracker.assert_predicate_pushed_down(expr)
+    tracker.assert_results_match(expr)
+
+
 def test_fill_null_predicates(tester):
     for val in [0, 1, 9]:
         expr = pl.col("nullable").fill_null(val) > 5
