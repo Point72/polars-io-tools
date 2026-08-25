@@ -1088,6 +1088,20 @@ def test_string_predicates(tester):
     tester.assert_predicate_pushed_down(expr3)
 
 
+def test_strip_chars_predicate_pushed_down():
+    """str.strip_chars / str.strip_chars_start / str.strip_chars_end translate to TRIM / LTRIM / RTRIM."""
+    df = pl.DataFrame({"padded": ["  A  ", "  B  ", "  C  ", " D ", "E"]})
+    tracker = PredicateTracker(df)
+
+    for expr in [
+        pl.col("padded").str.strip_chars() == "A",
+        pl.col("padded").str.strip_chars_start() == "A  ",
+        pl.col("padded").str.strip_chars_end() == "  A",
+    ]:
+        tracker.assert_predicate_pushed_down(expr)
+        tracker.assert_results_match(expr)
+
+
 def test_fill_null_predicates(tester):
     for val in [0, 1, 9]:
         expr = pl.col("nullable").fill_null(val) > 5
