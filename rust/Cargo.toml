@@ -1,6 +1,6 @@
 [package]
 name = "polars_io_tools"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Point72, L.P. <OpenSource@point72.com>"]
 edition = "2021"
 license = "Apache-2.0"
