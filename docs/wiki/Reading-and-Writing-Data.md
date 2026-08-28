@@ -41,6 +41,25 @@ The dialect is detected from the ODBC connection, so the generated SQL matches y
 database. Pass `fetch_size=` to control the batch size used when Polars does not
 request one.
 
+If a column is stored as a wider type than it is used as — for example a `datetime`
+column that is logically a `date` — cast it server-side with `cast_map` so filters on
+it still push down:
+
+```python
+lf = scan_db(
+    "SELECT * FROM trades",
+    connection="Driver={PostgreSQL};Server=db.example.com;Database=mkt;Uid=reader;******",
+    cast_map={"ts": pl.Date},
+)
+
+# `ts` is narrowed to a date in the query, so this filter becomes a SQL WHERE clause
+# instead of being applied after a full scan.
+result = lf.filter(pl.col("ts") == pl.date(2024, 1, 1)).collect()
+```
+
+`cast_map` wraps your query in a projecting subquery that casts the named columns and
+passes the rest through, so `select *` keeps flowing every column.
+
 ## Read from ClickHouse
 
 `scan_clickhouse` streams query results over ClickHouse's HTTP interface as Arrow IPC.

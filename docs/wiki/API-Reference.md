@@ -156,12 +156,15 @@ without materializing the whole frame.
 ### `scan_db`
 
 ```python
-scan_db(query, connection, fetch_size=10000, **kwargs) -> pl.LazyFrame
+scan_db(query, connection, fetch_size=10000, cast_map=None, **kwargs) -> pl.LazyFrame
 ```
 
 Run a SQL query over an ODBC `connection` string with predicate and projection pushdown.
 The SQL dialect is detected from the connection; filters become `WHERE` clauses and
-selections narrow the `SELECT`.
+selections narrow the `SELECT`. Pass `cast_map={column: dtype}` to cast columns
+server-side (a SQL `CAST`, keeping `select *`) and report the narrowed dtype in the
+schema, so a filter on a cast column still pushes down — for example narrowing a
+`datetime` column that is logically a `date`.
 
 ### `scan_clickhouse`
 

@@ -16,11 +16,65 @@ __all__ = (
     "convert_predicate_to_sql",
     "create_sqlglot_literal",
     "fix_three_part_identifiers",
+    "polars_dtype_to_sqlglot_type",
 )
 
 
 # Configure logging
 log = logging.getLogger(__name__)
+
+
+def polars_dtype_to_sqlglot_type(dtype: pl.DataType | type[pl.DataType], *, strict: bool = False) -> sqlglot.exp.DataType:
+    """
+    Convert a Polars dtype (class or instance) to a SQLGlot ``DataType``.
+
+    Decimal precision and scale are preserved so a decimal cast does not silently
+    truncate the fractional part.
+
+    Args:
+        dtype (pl.DataType): The Polars dtype to translate.
+        strict (bool): When True, raise for a dtype with no dedicated SQL mapping
+            instead of falling back to ``VARCHAR``.
+
+    Returns:
+        sqlglot.exp.DataType: The SQL type to cast to.
+
+    Raises:
+        ValueError: If ``strict`` is set and ``dtype`` has no dedicated SQL mapping.
+    """
+    type_map = {
+        pl.Int8: sqlglot.exp.DataType.Type.TINYINT,
+        pl.Int16: sqlglot.exp.DataType.Type.SMALLINT,
+        pl.Int32: sqlglot.exp.DataType.Type.INT,
+        pl.Int64: sqlglot.exp.DataType.Type.BIGINT,
+        pl.UInt8: getattr(sqlglot.exp.DataType.Type, "UTINYINT", sqlglot.exp.DataType.Type.TINYINT),
+        pl.UInt16: getattr(sqlglot.exp.DataType.Type, "USMALLINT", sqlglot.exp.DataType.Type.SMALLINT),
+        pl.UInt32: getattr(sqlglot.exp.DataType.Type, "UINT", sqlglot.exp.DataType.Type.INT),
+        pl.UInt64: getattr(sqlglot.exp.DataType.Type, "UBIGINT", sqlglot.exp.DataType.Type.BIGINT),
+        pl.Float32: sqlglot.exp.DataType.Type.FLOAT,
+        pl.Float64: sqlglot.exp.DataType.Type.DOUBLE,
+        pl.Utf8: sqlglot.exp.DataType.Type.VARCHAR,
+        pl.Date: sqlglot.exp.DataType.Type.DATE,
+        pl.Datetime: sqlglot.exp.DataType.Type.TIMESTAMP,
+        pl.Time: sqlglot.exp.DataType.Type.TIME,
+        pl.Decimal: sqlglot.exp.DataType.Type.DECIMAL,
+    }
+    key = dtype if isinstance(dtype, type) else type(dtype)
+    base = type_map.get(key)
+    if base is None:
+        if strict:
+            supported = ", ".join(sorted(t.__name__ for t in type_map))
+            raise ValueError(f"No SQL type mapping for Polars dtype {dtype!r}. Supported dtypes: {supported}.")
+        return sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.VARCHAR)
+
+    # Preserve decimal precision/scale so the cast keeps the fractional part.
+    if key is pl.Decimal and not isinstance(dtype, type):
+        precision = getattr(dtype, "precision", None)
+        if precision is not None:
+            scale = getattr(dtype, "scale", None) or 0
+            return sqlglot.exp.DataType.build(f"DECIMAL({precision}, {scale})")
+
+    return sqlglot.exp.DataType(this=base)
 
 
 def create_sqlglot_literal(value: Any) -> sqlglot.exp.Expression:
@@ -405,35 +459,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             self.result = input_expr
             return
 
-        # Map Polars types to SQL types
-        type_map = {
-            pl.Int8: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.TINYINT),
-            pl.Int16: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.SMALLINT),
-            pl.Int32: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.INT),
-            pl.Int64: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.BIGINT),
-            pl.UInt8: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.UTINYINT)
-            if hasattr(sqlglot.exp.DataType.Type, "UTINYINT")
-            else sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.TINYINT),
-            pl.UInt16: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.USMALLINT)
-            if hasattr(sqlglot.exp.DataType.Type, "USMALLINT")
-            else sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.SMALLINT),
-            pl.UInt32: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.UINT)
-            if hasattr(sqlglot.exp.DataType.Type, "UINT")
-            else sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.INT),
-            pl.UInt64: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.UBIGINT)
-            if hasattr(sqlglot.exp.DataType.Type, "UBIGINT")
-            else sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.BIGINT),
-            pl.Float32: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.FLOAT),
-            pl.Float64: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DOUBLE),
-            pl.Utf8: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.VARCHAR),
-            pl.Date: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DATE),
-            pl.Datetime: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.TIMESTAMP),
-            pl.Time: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.TIME),
-            pl.Decimal: sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DECIMAL),
-        }
-
-        # Get the SQL type
-        sql_type = type_map.get(type(node.dtype), "VARCHAR")
+        sql_type = polars_dtype_to_sqlglot_type(node.dtype)
 
         # Create the CAST expression
         self.result = sqlglot.exp.Cast(this=input_expr, to=sql_type)
@@ -676,6 +702,60 @@ def _prepare_inner_for_subquery(
             hint.pop()
 
     return inner, order_to_hoist, options_to_hoist
+
+
+def wrap_query_with_casts(
+    query: sqlglot.exp.Expression,
+    dialect: str | type[Dialect] | None,
+    ordered_columns: list[str],
+    cast_map: dict[str, pl.DataType | type[pl.DataType]],
+) -> sqlglot.exp.Expression:
+    """Wrap ``query`` in a projecting subquery that casts selected columns server-side.
+
+    Every column in ``ordered_columns`` is re-projected (preserving order); columns
+    present in ``cast_map`` are wrapped in a SQL ``CAST`` to the mapped type, the rest
+    pass through untouched. The original query is left intact as the inner relation,
+    so ``select *`` keeps flowing new upstream columns.
+
+    The narrowing lands one subquery level *below* the predicate/projection pushdown
+    added later by :func:`apply_polars_io_source_exprs`, so a filter on a cast column
+    (e.g. ``datetime`` narrowed to ``date``) resolves against the already-cast output
+    column and is pushed to the database rather than evaluated client-side.
+
+    Clauses that are illegal inside a derived table (an MSSQL top-level ``ORDER BY``
+    without ``TOP``/``OFFSET``, or ``OPTION`` hints) are hoisted onto the cast
+    ``SELECT`` so the nested subquery stays valid; the later wrapping in
+    :func:`apply_polars_io_source_exprs` hoists them again to statement level.
+    """
+    quote = _is_known_dialect(dialect)
+
+    def _ident(name: str) -> sqlglot.exp.Identifier:
+        return sqlglot.exp.Identifier(this=name, quoted=quote)
+
+    inner_query, order_to_hoist, options_to_hoist = _prepare_inner_for_subquery(query, dialect=dialect)
+
+    projections: list[sqlglot.exp.Expression] = []
+    for name in ordered_columns:
+        col = sqlglot.exp.Column(this=_ident(name))
+        if name in cast_map:
+            sql_type = polars_dtype_to_sqlglot_type(cast_map[name], strict=True)
+            projections.append(sqlglot.exp.Cast(this=col, to=sql_type).as_(name, quoted=quote))
+        else:
+            projections.append(col)
+
+    inner = sqlglot.exp.Subquery(
+        this=inner_query,
+        alias=sqlglot.exp.TableAlias(this=sqlglot.exp.Identifier(this="__cpl_cast")),
+    )
+    cast_select = sqlglot.exp.Select().from_(inner, dialect=dialect).select(*projections, append=False, dialect=dialect)
+
+    # Re-apply the clauses hoisted out of the (now nested) original query.
+    if order_to_hoist is not None:
+        cast_select.set("order", order_to_hoist)
+    for opt in options_to_hoist:
+        cast_select.args.setdefault("options", []).append(opt)
+
+    return cast_select
 
 
 def apply_polars_io_source_exprs(

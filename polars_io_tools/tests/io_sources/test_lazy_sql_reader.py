@@ -2821,3 +2821,141 @@ def test_mssql_parenthesized_set_operations_only_stabilize_leftmost_output_branc
         "[g]",
         "COUNT(*) AS except_count",
     ]
+
+
+# Tests for scan_db's server-side cast_map (datetime -> date narrowing pushdown)
+
+
+def _make_record_table(conn):
+    """Create a table whose RecordDate is a TIMESTAMP (the mis-declared-type case)."""
+    conn.execute(
+        """
+        CREATE TABLE RecordTbl AS SELECT * FROM (
+            SELECT CAST('2025-05-30 09:15:00' AS TIMESTAMP) AS RecordDate, 1 AS PointID, 1.5 AS Rate
+            UNION ALL
+            SELECT CAST('2025-05-30 17:45:00' AS TIMESTAMP) AS RecordDate, 2 AS PointID, 2.5 AS Rate
+            UNION ALL
+            SELECT CAST('2025-05-31 00:00:00' AS TIMESTAMP) AS RecordDate, 3 AS PointID, 3.5 AS Rate
+        )
+        """
+    )
+
+
+def test_cast_map_reports_target_dtype_in_schema(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date})
+    schema = lf.collect_schema()
+    assert schema["RecordDate"] == pl.Date
+    # Untouched columns keep their native dtypes and are still present (select * preserved).
+    assert set(schema.names()) == {"RecordDate", "PointID", "Rate"}
+
+
+def test_cast_map_narrows_column_server_side(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    out = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date}).sort("PointID").collect()
+    assert out["RecordDate"].dtype == pl.Date
+    assert out["RecordDate"].to_list() == [date(2025, 5, 30), date(2025, 5, 30), date(2025, 5, 31)]
+
+
+def test_cast_map_pushes_date_predicate_to_sql(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date})
+
+    import arrow_odbc
+
+    captured: list[str] = []
+    original = arrow_odbc.read_arrow_batches_from_odbc
+
+    def capturing(*args, **kwargs):
+        captured.append(args[0] if args else kwargs["query"])
+        return original(*args, **kwargs)
+
+    arrow_odbc.read_arrow_batches_from_odbc = capturing
+    try:
+        out = lf.filter(pl.col("RecordDate") == date(2025, 5, 30)).sort("PointID").collect()
+    finally:
+        arrow_odbc.read_arrow_batches_from_odbc = original
+
+    # Two rows on 2025-05-30 survive the narrowing; the 05-31 row is filtered out.
+    assert out["PointID"].to_list() == [1, 2]
+    assert out["RecordDate"].to_list() == [date(2025, 5, 30), date(2025, 5, 30)]
+
+    # The predicate reached SQL: the executed query casts RecordDate to DATE and filters on it.
+    assert captured, "No SQL captured"
+    sql = captured[-1]
+    assert "CAST" in sql.upper() and "DATE" in sql.upper()
+    assert "RecordDate" in sql
+    assert "WHERE" in sql.upper(), f"date predicate was not pushed to SQL: {sql}"
+
+
+def test_cast_map_projection_pushdown_still_prunes(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date})
+
+    import arrow_odbc
+
+    captured: list[str] = []
+    original = arrow_odbc.read_arrow_batches_from_odbc
+
+    def capturing(*args, **kwargs):
+        captured.append(args[0] if args else kwargs["query"])
+        return original(*args, **kwargs)
+
+    arrow_odbc.read_arrow_batches_from_odbc = capturing
+    try:
+        out = lf.select(["RecordDate", "PointID"]).sort("PointID").collect()
+    finally:
+        arrow_odbc.read_arrow_batches_from_odbc = original
+
+    assert out.columns == ["RecordDate", "PointID"]
+    assert out["RecordDate"].dtype == pl.Date
+    # The outer projection is pruned to the selected columns (the inner cast layer
+    # still enumerates every column so the DB prunes Rate via the outer select).
+    sql = captured[-1]
+    assert sql.strip().upper().startswith('SELECT "RECORDDATE", "POINTID" FROM')
+
+
+def test_cast_map_unknown_column_raises(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    with pytest.raises(ValueError, match="cast_map references column"):
+        cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"NotAColumn": pl.Date})
+
+
+def test_cast_map_none_is_unchanged(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string")
+    assert lf.collect_schema()["RecordDate"] == pl.Datetime("us")
+
+
+def test_cast_map_hoists_mssql_order_by_out_of_derived_table():
+    """A top-level MSSQL ORDER BY must not end up inside the cast derived table.
+
+    MSSQL rejects ORDER BY in a derived table without TOP/OFFSET (error 1033), so the
+    cast wrapper must hoist it to statement level.
+    """
+    from polars_io_tools.io_sources.sql_utils import apply_polars_io_source_exprs, wrap_query_with_casts
+
+    query = parse_one("SELECT * FROM dbo.t ORDER BY x", dialect=MSSQL)
+    wrapped = wrap_query_with_casts(query, MSSQL, ["x", "y"], {"x": pl.Date})
+    final = apply_polars_io_source_exprs(wrapped.copy(), MSSQL, None, pl.col("x") == date(2025, 5, 30), None, None)
+    sql = final.sql(dialect=MSSQL)
+
+    # ORDER BY sits at the end, after the outermost subquery closes, not inside __cpl_cast.
+    assert "AS __cpl_cast) AS __cpl_subq" in sql
+    assert "ORDER BY [x]" in sql
+    assert sql.rstrip().endswith("ORDER BY [x]")
+    assert "ORDER BY [x]) AS __cpl_cast" not in sql
+
+
+def test_cast_map_preserves_decimal_scale():
+    from polars_io_tools.io_sources.sql_utils import polars_dtype_to_sqlglot_type
+
+    assert polars_dtype_to_sqlglot_type(pl.Decimal(10, 2)).sql(dialect=MSSQL) == "NUMERIC(10, 2)"
+
+
+def test_cast_map_rejects_unsupported_dtype(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    # Boolean has no server-side narrowing mapping; reporting it as the schema while
+    # emitting VARCHAR would misrepresent the data, so it must be rejected.
+    with pytest.raises(ValueError, match="No SQL type mapping"):
+        cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Boolean})
