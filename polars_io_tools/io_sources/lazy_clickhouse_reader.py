@@ -25,7 +25,7 @@ def get_batch_reader_http(query: str, url: str, params: dict):
     return pa.ipc.open_stream(r.raw)
 
 
-def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000):
+def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000, description: str | None = None):
     # TODO: fetch_size param needs to be properly handled
     log.warning("fetch_size=%d is currently ignored and has no effect. Proper fetch_size support will be added in a future release.", fetch_size)
     dialect = "clickhouse"
@@ -102,4 +102,4 @@ def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000)
             err_msg += f"\n\nWhile running the above, received error: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
-    return register_io_source_with_is_pure(source_generator, schema=schema)
+    return register_io_source_with_is_pure(source_generator, schema=schema, explain_detail=description)

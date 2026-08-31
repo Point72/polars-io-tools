@@ -63,6 +63,7 @@ develop = [
     "hatchling",
     "mdformat",
     "mdformat-tables>=1",
+    "opentelemetry-sdk",
     "pytest",
     "pytest-cov",
     "ruff",

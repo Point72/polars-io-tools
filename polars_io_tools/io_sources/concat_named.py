@@ -18,6 +18,7 @@ def concat_named(
     identifier_cols: list[str | tuple[str, pl.DataType]],
     *,
     log_explain: bool = False,
+    description: str | None = None,
     **kwargs: Any,
 ) -> pl.LazyFrame:
     """
@@ -46,6 +47,8 @@ def concat_named(
             The order of elements in this list must match the order of values in the dictionary keys.
 
         log_explain (bool, default False): If True, logs the LazyFrame execution plan for debugging purposes.
+
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
         **kwargs (Any): Additional arguments passed to `pl.concat()` for concatenation.
 
@@ -177,4 +180,4 @@ def concat_named(
             err_msg += f"\n\nWhile running the above, received error: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
-    return register_io_source_with_is_pure(source_gen, schema=schema)
+    return register_io_source_with_is_pure(source_gen, schema=schema, explain_detail=description)

@@ -72,6 +72,7 @@ def cache_memory(
     self_or_fn: pl.LazyFrame | Callable[[], pl.LazyFrame],
     *,
     schema: pl.Schema | Callable[[], pl.Schema],
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """Collect a builder at most once into an in-memory buffer and replay it thereafter.
 
@@ -97,6 +98,7 @@ def cache_memory(
             A callable defers resolution until Polars needs it, so ``collect_schema()`` on
             the result never forces the builder to run — useful when the schema is derived
             from the builder's own lazy plan.
+        description (str | None, default None): Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
         pl.LazyFrame: A LazyFrame with ``schema``, backed by a generator over a one-time
@@ -237,4 +239,4 @@ def cache_memory(
     # register_io_source_with_is_pure (unlike the plain register_io_source, which raises ComputeError
     # for a callable schema) accepts a zero-arg callable schema and resolves it lazily. We hand it the
     # memoizing ``get_schema`` so Polars and the buffer reconciliation agree on one resolved schema.
-    return register_io_source_with_is_pure(io_source=source_generator, schema=get_schema)
+    return register_io_source_with_is_pure(io_source=source_generator, schema=get_schema, explain_detail=description)
