@@ -10,6 +10,7 @@ from .sql_dialects import MSSQL
 from .sql_utils import (
     apply_polars_io_source_exprs,
     fix_three_part_identifiers,
+    wrap_query_with_casts,
 )
 from .util import register_io_source_with_is_pure
 
@@ -90,7 +91,7 @@ def get_schema_from_query_odbc(
         raise ValueError(f"Could not determine schema for query: {query}, with error: {e}") from e
 
 
-def scan_db(query: str, connection: str, fetch_size: int = 10000, **kwargs) -> pl.LazyFrame:
+def scan_db(query: str, connection: str, fetch_size: int = 10000, cast_map: dict[str, Any] | None = None, **kwargs) -> pl.LazyFrame:
     """
     Create a LazyFrame from a SQL query with predicate pushdown support.
 
@@ -107,6 +108,19 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, **kwargs) -> p
             source generator function that scan_db wraps (because it is required \
             by the Polars IO plugins API). This value will only be used if Polars \
             does not pass a value for batch size; if it does, that will be used instead.
+        cast_map (dict[str, pl.DataType] | None, default None): Optional mapping of output column \
+            name to a Polars dtype to cast that column to *server-side*. The narrowing is emitted \
+            as a SQL ``CAST`` inside the query, and the reported schema reflects the target dtype, \
+            so filters on the cast column push down to the database. Use this to correct a \
+            mis-declared source type (e.g. a column stored as ``datetime`` that should be ``date``, \
+            or a numeric id delivered as ``float`` that should be an integer) without abandoning \
+            ``select *`` — remaining columns pass through untouched. \
+            Caveat: a predicate on a cast column is pushed down as ``CAST(col AS ...) <op> value``. \
+            Wrapping the column in a function can prevent the database from using an index on it \
+            (SARGability), so the effect on the query plan is backend dependent — some engines \
+            optimize specific conversions (for example SQL Server seeks on ``CAST(datetime AS date)``) \
+            while others fall back to a scan. For a hot path on a large indexed table, prefer a \
+            filter expressed directly on the physical column instead of the cast one.
         **kwargs: Additional arguments for the database connector
 
     Returns:
@@ -131,6 +145,15 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, **kwargs) -> p
         )
 
     schema, parsed_query, dialect = _fetch_info_needing_connection()
+
+    if cast_map:
+        unknown = [name for name in cast_map if name not in schema]
+        if unknown:
+            raise ValueError(f"cast_map references column(s) not in the query schema {list(schema)}: {unknown}")
+        # Narrow the columns server-side and report the target dtypes, so predicates on
+        # a cast column push down to the database instead of stalling above a client cast.
+        parsed_query = wrap_query_with_casts(parsed_query, dialect, list(schema), cast_map)
+        schema = {name: cast_map.get(name, dtype) for name, dtype in schema.items()}
 
     # Create the generator function for our custom IO source
     def source_generator(
