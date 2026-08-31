@@ -211,6 +211,29 @@ lf.filter(pl.col("date").is_between(pl.date(2024, 1, 1), pl.date(2024, 3, 31))).
 Use `cache_mode=CacheMode.REBUILD` to refresh partitions in the query scope while leaving
 others intact, and `aws_profile=` to select S3 credentials.
 
+## Cache in memory across a multi-branch evaluation
+
+Polars' common-subplan elimination does not deduplicate independent references to an
+IO-backed source, so a source read from several branches of one evaluation is re-executed
+once per reference. `cache_memory` collects it once into an in-memory buffer and replays
+that buffer on every reference, collapsing them to a single upstream execution — with no
+serialization (unlike `cache`) and no Parquet round-trip (unlike `cache_parquet`).
+
+```python
+# `source` is a scan_* frame or a register_io_source plugin, possibly non-serializable.
+cached = source.piot.cache_memory(schema=source.collect_schema())
+
+# Every branch reads the shared buffer; the source is executed once, not three times.
+a = cached.filter(pl.col("region") == "US")
+b = cached.filter(pl.col("region") == "EU")
+c = cached.group_by("sector").agg(pl.col("value").mean())
+pl.collect_all([a, b, c])
+```
+
+Pass a zero-argument builder to the top-level `cache_memory(build, schema=...)` to defer an
+expensive build until first collect, and a callable `schema` so `collect_schema()` resolves
+without running it. The buffer is reclaimed when `cached` is dropped.
+
 ## Control pushdown explicitly
 
 Two helpers give you manual control when the optimizer's defaults are not what you want:
