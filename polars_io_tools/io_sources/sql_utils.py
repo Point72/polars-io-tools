@@ -11,6 +11,7 @@ from .enum import ArrayFunctionType, BooleanFunctionType, ListFunctionType, Oper
 from .sql_dialects import MSSQL
 
 __all__ = (
+    "DEFAULT_MAX_IN_PREDICATE_SIZE",
     "SQLExpressionVisitor",
     "apply_polars_io_source_exprs",
     "convert_predicate_to_sql",
@@ -21,6 +22,16 @@ __all__ = (
 
 # Configure logging
 log = logging.getLogger(__name__)
+
+
+# Upper bound on the number of literals an ``is_in`` predicate may contain before we
+# stop translating it into a SQL ``IN (...)`` clause. Very large lists (e.g. an entire
+# key universe pushed down by a join) can exceed a backend's expression-complexity
+# limits — SQL Server raises error 8632 ("An expression services limit has been
+# reached"). Skipping pushdown for such a predicate is always correct: the polars IO
+# source re-applies the full predicate to the fetched rows, so only the pre-filter
+# narrowing (an optimization) is lost.
+DEFAULT_MAX_IN_PREDICATE_SIZE = 4096
 
 
 def create_sqlglot_literal(value: Any) -> sqlglot.exp.Expression:
@@ -86,7 +97,15 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
     Visitor that converts Polars expressions to SQLGlot expressions.
     """
 
-    def __init__(self, dialect: str | Dialects | type[Dialect] | None = Dialects.TSQL):
+    def __init__(
+        self,
+        dialect: str | Dialects | type[Dialect] | None = Dialects.TSQL,
+        max_in_predicate_size: int = DEFAULT_MAX_IN_PREDICATE_SIZE,
+    ):
+        # Maximum ``is_in`` list length to translate into a SQL ``IN (...)`` clause;
+        # larger lists skip pushdown (see ``DEFAULT_MAX_IN_PREDICATE_SIZE``). Propagated
+        # to child visitors so the guard applies at any depth of the expression tree.
+        self.max_in_predicate_size = max_in_predicate_size
         # Normalize to ``Dialects`` enum so internal checks use
         # ``self.dialect == Dialects.TSQL`` instead of raw strings.
         if dialect is None or dialect is MSSQL:
@@ -122,11 +141,11 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         """Convert binary expression to SQL expression."""
         # Visit left and right nodes
-        left_visitor = SQLExpressionVisitor(self.dialect)
+        left_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
         left_visitor.visit(node.left)
         left_expr = left_visitor.process_results()
 
-        right_visitor = SQLExpressionVisitor(self.dialect)
+        right_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
         right_visitor.visit(node.right)
         right_expr = right_visitor.process_results()
 
@@ -184,7 +203,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         # Process function inputs
         input_exprs = []
         for input_node in node.inputs:
-            input_visitor = SQLExpressionVisitor(self.dialect)
+            input_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
             input_visitor.visit(input_node)
             input_expr = input_visitor.process_results()
             if input_expr is None:
@@ -217,7 +236,18 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             self.result = sqlglot.exp.Not(this=sqlglot.exp.Is(this=input_exprs[0], expression=sqlglot.exp.Null()))
         elif node.function_type == BooleanFunctionType.IS_IN and len(input_exprs) >= 2:
             if isinstance(node.inputs[1].value, (list, tuple, set)):
-                values = [create_sqlglot_literal(v) for v in node.inputs[1].value]
+                in_values = node.inputs[1].value
+                if len(in_values) > self.max_in_predicate_size:
+                    # Oversized ``IN (...)`` lists can exceed a backend's expression
+                    # limits (e.g. SQL Server error 8632). Skip pushdown; the IO source
+                    # re-applies the full predicate to the fetched rows for correctness.
+                    log.debug(
+                        f"Skipping IN-list pushdown for column with {len(in_values)} values "
+                        f"(exceeds max_in_predicate_size={self.max_in_predicate_size})"
+                    )
+                    self.result = None
+                    return
+                values = [create_sqlglot_literal(v) for v in in_values]
                 self.result = sqlglot.exp.In(this=input_exprs[0], expressions=values)
             else:
                 self.result = sqlglot.exp.In(this=input_exprs[0], expressions=[input_exprs[1]])
@@ -389,7 +419,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
     def visit_cast(self, node: CastNode) -> None:
         """Convert cast operations to SQL CAST."""
         # Visit the input node
-        input_visitor = SQLExpressionVisitor(self.dialect)
+        input_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
         input_visitor.visit(node.input)
         input_expr = input_visitor.process_results()
 
@@ -449,15 +479,15 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
     def visit_ternary(self, node: TernaryNode) -> None:
         """Convert ternary expressions to SQL CASE expressions."""
         # Visit the predicate, truthy, and falsy nodes
-        pred_visitor = SQLExpressionVisitor(self.dialect)
+        pred_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
         pred_visitor.visit(node.predicate)
         pred_expr = pred_visitor.process_results()
 
-        true_visitor = SQLExpressionVisitor(self.dialect)
+        true_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
         true_visitor.visit(node.truthy)
         true_expr = true_visitor.process_results()
 
-        false_visitor = SQLExpressionVisitor(self.dialect)
+        false_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
         false_visitor.visit(node.falsy)
         false_expr = false_visitor.process_results()
 
@@ -486,13 +516,20 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             self.result = None
 
 
-def convert_predicate_to_sql(predicate: pl.Expr, dialect: str | type[Dialect] | None = "tsql") -> sqlglot.exp.Expression | None:
+def convert_predicate_to_sql(
+    predicate: pl.Expr,
+    dialect: str | type[Dialect] | None = "tsql",
+    max_in_predicate_size: int = DEFAULT_MAX_IN_PREDICATE_SIZE,
+) -> sqlglot.exp.Expression | None:
     """
     Convert a Polars predicate expression to a SQLGlot expression.
 
     Args:
         predicate (pl.Expr): The Polars predicate expression
         dialect (str): SQL dialect to use
+        max_in_predicate_size (int): Maximum ``is_in`` list length translated to a SQL
+            ``IN (...)`` clause; larger lists skip pushdown (see
+            ``DEFAULT_MAX_IN_PREDICATE_SIZE``).
 
     Returns:
         Optional[sqlglot.exp.Expression]: SQLGlot expression or None if conversion failed
@@ -501,7 +538,7 @@ def convert_predicate_to_sql(predicate: pl.Expr, dialect: str | type[Dialect] | 
         node = get_parsed_expr(predicate)
 
         # Use the visitor to convert to SQL
-        visitor = SQLExpressionVisitor(dialect)
+        visitor = SQLExpressionVisitor(dialect, max_in_predicate_size)
         visitor.visit(node)
         return visitor.process_results()
     except Exception:
@@ -685,11 +722,16 @@ def apply_polars_io_source_exprs(
     predicate: pl.Expr | None,
     n_rows: int | None,
     batch_size: int | None,
+    max_in_predicate_size: int = DEFAULT_MAX_IN_PREDICATE_SIZE,
 ) -> sqlglot.exp.Expression:
     """Apply Polars IO source expressions using subquery wrapping.
 
     Wraps the original query as a subquery and applies column selection,
     predicates, and row limits on the outer query.
+
+    ``max_in_predicate_size`` bounds how large an ``is_in`` list may be before its
+    pushdown into a SQL ``IN (...)`` clause is skipped (see
+    ``DEFAULT_MAX_IN_PREDICATE_SIZE``).
     """
     if with_columns is not None or predicate is not None or n_rows is not None:
         # When the only pushdown is a column selection that exactly matches the
@@ -729,7 +771,7 @@ def apply_polars_io_source_exprs(
         # Predicate — alias names resolve to real columns in the subquery
         # output so no rewriting is needed
         if predicate is not None:
-            sql_predicate = convert_predicate_to_sql(predicate, dialect)
+            sql_predicate = convert_predicate_to_sql(predicate, dialect, max_in_predicate_size)
             if sql_predicate is not None:
                 if _is_known_dialect(dialect):
                     sql_predicate = sql_predicate.transform(_quote_column_leaf_identifier)
