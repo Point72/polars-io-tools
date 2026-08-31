@@ -885,6 +885,37 @@ def test_convert_predicate_to_sql_with_mssql_class():
     assert result_str.sql() == result_cls.sql() == result_none.sql()
 
 
+def test_oversized_in_predicate_is_not_pushed_down():
+    """A large ``is_in`` list skips pushdown (would exceed backend expression limits).
+
+    Small ``IN`` lists are still translated; oversized ones drop out of the SQL and are
+    left to the IO source's post-fetch predicate re-application. When an oversized ``IN``
+    is ANDed with a selective predicate, the selective predicate is still pushed.
+    """
+    from polars_io_tools.io_sources.sql_utils import DEFAULT_MAX_IN_PREDICATE_SIZE
+
+    small_values = [f"ID{i}" for i in range(5)]
+    big_values = [f"ID{i}" for i in range(DEFAULT_MAX_IN_PREDICATE_SIZE + 1)]
+
+    # Small IN pushes down as usual.
+    small = convert_predicate_to_sql(pl.col("id").is_in(small_values), "tsql")
+    assert small is not None and "IN" in small.sql("tsql")
+
+    # Oversized IN is dropped entirely (nothing safe to push).
+    assert convert_predicate_to_sql(pl.col("id").is_in(big_values), "tsql") is None
+
+    # Oversized IN ANDed with a selective equality keeps the equality pushdown.
+    combo = convert_predicate_to_sql(pl.col("id").is_in(big_values) & (pl.col("year") == 2025), "tsql")
+    assert combo is not None
+    combo_sql = combo.sql("tsql")
+    assert "year" in combo_sql
+    assert "IN" not in combo_sql
+
+    # An explicit override raises the ceiling so the same list is pushed.
+    raised = convert_predicate_to_sql(pl.col("id").is_in(big_values), "tsql", max_in_predicate_size=len(big_values))
+    assert raised is not None and "IN" in raised.sql("tsql")
+
+
 def test_rename_with_filter_integration():
     """Test that aliases created via select work correctly with filters - integration-like test using mock data."""
 

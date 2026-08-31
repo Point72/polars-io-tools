@@ -42,6 +42,26 @@ only the partitions their predicate needs; missing partitions are fetched upstre
 written back. `time_unit` is `"daily"`, `"monthly"`, or `"yearly"`. Returns a LazyFrame
 reading from the cache.
 
+### `cache_memory`
+
+```python
+lf.piot.cache_memory(*, schema)
+```
+
+Collect the LazyFrame once into an in-memory buffer and replay it on every subsequent
+reference or collect, so a frame referenced from several branches executes upstream once
+rather than once per reference. Unlike `cache`, the key is not derived by serializing the
+plan — the buffer lives in the returned frame's own closure — so it also works with
+`register_io_source` plugins that close over non-serializable state (a connection, a lock,
+an open iterator). `schema` is the declared output schema, or a zero-argument callable
+returning it; a callable lets `collect_schema()` resolve without materializing the buffer.
+The collected frame is reconciled against `schema` once (a missing declared column or dtype
+mismatch raises; extra columns are dropped), and predicates and projections are applied to
+the buffer after materialization. The build runs at most once: a failure is recorded and
+re-raised on later collects, and the buffer is released when the returned frame is dropped.
+As a top-level function, `cache_memory(build_or_lf, *, schema)` additionally accepts a
+zero-argument builder callable, executed on first row demand, in place of a LazyFrame.
+
 ### `debug`
 
 ```python

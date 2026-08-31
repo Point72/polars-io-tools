@@ -9,6 +9,7 @@ from .concat_named import *
 from .delta_io import *
 from .join import *
 from .lazy_cache import cache, cache as _lazy_cache
+from .lazy_cache_memory import *
 from .lazy_cache_parquet import *
 from .lazy_clickhouse_reader import *
 from .lazy_clickhouse_writer import *
@@ -83,6 +84,10 @@ class PIOTOperations:
     @functools.wraps(cache_parquet)
     def cache_parquet(self, *args, **kwargs) -> pl.LazyFrame:
         return cache_parquet(self._lf, *args, **kwargs)
+
+    @functools.wraps(cache_memory)
+    def cache_memory(self, *args, **kwargs) -> pl.LazyFrame:
+        return cache_memory(self._lf, *args, **kwargs)
 
     @functools.wraps(_execute_on_ray_proto)
     def execute_on_ray(self, *args, **kwargs) -> pl.LazyFrame:
