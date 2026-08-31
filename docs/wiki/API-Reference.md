@@ -184,7 +184,9 @@ The SQL dialect is detected from the connection; filters become `WHERE` clauses 
 selections narrow the `SELECT`. Pass `cast_map={column: dtype}` to cast columns
 server-side (a SQL `CAST`, keeping `select *`) and report the narrowed dtype in the
 schema, so a filter on a cast column still pushes down — for example narrowing a
-`datetime` column that is logically a `date`.
+`datetime` column that is logically a `date`, or a `float` id that should be an integer.
+A predicate on a cast column pushes down over its `CAST(...)`, which can affect index use;
+the impact on the query plan is backend dependent (see Reading and Writing Data).
 
 ### `scan_clickhouse`
 

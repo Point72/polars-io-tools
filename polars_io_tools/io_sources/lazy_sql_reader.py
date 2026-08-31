@@ -112,8 +112,15 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, cast_map: dict
             name to a Polars dtype to cast that column to *server-side*. The narrowing is emitted \
             as a SQL ``CAST`` inside the query, and the reported schema reflects the target dtype, \
             so filters on the cast column push down to the database. Use this to correct a \
-            mis-declared source type (e.g. a column stored as ``datetime`` that should be ``date``) \
-            without abandoning ``select *`` — remaining columns pass through untouched.
+            mis-declared source type (e.g. a column stored as ``datetime`` that should be ``date``, \
+            or a numeric id delivered as ``float`` that should be an integer) without abandoning \
+            ``select *`` — remaining columns pass through untouched. \
+            Caveat: a predicate on a cast column is pushed down as ``CAST(col AS ...) <op> value``. \
+            Wrapping the column in a function can prevent the database from using an index on it \
+            (SARGability), so the effect on the query plan is backend dependent — some engines \
+            optimize specific conversions (for example SQL Server seeks on ``CAST(datetime AS date)``) \
+            while others fall back to a scan. For a hot path on a large indexed table, prefer a \
+            filter expressed directly on the physical column instead of the cast one.
         **kwargs: Additional arguments for the database connector
 
     Returns:
