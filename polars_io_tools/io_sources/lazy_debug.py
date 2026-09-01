@@ -15,6 +15,8 @@ def debug(
     self: pl.LazyFrame,
     log_level: int | None = None,
     description: str | None = None,
+    *,
+    is_pure: bool = False,
 ) -> pl.LazyFrame:
     """
     A very simple pass-through lazy frame source to help with debugging experimentation of polars io sources and lazy frame behavior.
@@ -23,6 +25,7 @@ def debug(
         self: The input data frame to cache columns of.
         log_level: If provided, will log at the given level. If None, will print. Defaults to None.
         description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
+        is_pure: Whether the wrapped input is pure (deterministic and side-effect-free). Defaults to ``False`` so repeated uses are not deduplicated -- ``debug`` logs on every execution, so collapsing executions would drop output you asked for. Set ``True`` only for a known-pure input where deduplication is wanted.
     """
     schema = self.collect_schema()
 
@@ -55,4 +58,4 @@ def debug(
             raise RuntimeError(err_msg) from e
 
     # TODO: Turn on validate_schema when this is solved: https://github.com/pola-rs/polars/issues/22110
-    return register_io_source_with_is_pure(source_generator, schema=schema, validate_schema=False, explain_detail=description)
+    return register_io_source_with_is_pure(source_generator, schema=schema, is_pure=is_pure, validate_schema=False, explain_detail=description)
