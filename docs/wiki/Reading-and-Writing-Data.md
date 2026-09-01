@@ -67,6 +67,67 @@ example SQL Server can still seek on `CAST(datetime AS date)`) while others fall
 full scan. When a filtered column is indexed and on a hot path, prefer filtering the
 physical column directly over its cast form.
 
+## Speed up a large SQL read by partitioning it
+
+When a scan-like extract is bounded by an indexed column, a single ODBC cursor is often the
+bottleneck. Pass `partitions=` and `scan_db` splits the read into independent slices and pulls
+them over parallel connections, concatenating the results in order. Build the slices from the
+filter you push down with `by_time`, `by_value`, or `by_range`:
+
+```python
+from polars_io_tools import scan_db, by_time
+
+lf = scan_db(
+    "SELECT * FROM daily_prices",
+    connection="Driver={PostgreSQL};Server=db.example.com;Database=mkt;Uid=reader;******",
+    partitions=by_time("price_date", every="1mo"),
+)
+
+# One slice per month, taken from the pushed-down date range:
+result = lf.filter(
+    (pl.col("price_date") >= pl.date(2025, 1, 1)) & (pl.col("price_date") < pl.date(2025, 7, 1))
+).collect()
+```
+
+- `by_time(column, every=)` — calendar windows; `every` is an interval string (`"1mo"`, `"2w"`,
+  `"5d"`, `"1q"`, `"1y"`) or an integer number of days.
+- `by_value(column, values=None)` — one slice per discrete value; with `values=None` the values
+  are read from the `IN` filter you push down.
+- `by_range(column, every=)` — fixed-width numeric buckets over the pushed-down range.
+
+How many slices run at once is capped by a process-wide SQL connection budget
+(`POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS`; default `min(pl.thread_pool_size(), 8)` — a modest 8 on a
+normal machine, self-throttling to 1 in fan-out clusters that pin `POLARS_MAX_THREADS=1`, since
+these reads are IO-bound and the cap is a connection budget, not the CPU thread pool); pass
+`max_concurrency=` to throttle below it on a busy server. Partitioning is fully opt-in — with no
+`partitions=`, or when a partitioner cannot derive a bounded split, `scan_db` runs the query over
+a single connection. Prefer a handful of medium slices over many tiny ones: each slice is a
+separate query with its own planning and round-trip cost.
+
+For hand-built slices, pass an iterable of `ReadPartition(predicate, key)`. Predicates that
+translate to SQL are pushed to the database; any part that cannot (for example an arbitrary
+Python UDF) is still enforced client-side, so each slice stays exact.
+
+Rows are yielded in completion order (whichever slice's batches arrive first), which is not
+deterministic; if you need a specific order, sort in Polars with `.sort()` after the read. If your
+query has a top-level `ORDER BY`, partitioning can't re-establish it across slices, so `scan_db`
+logs a warning and ignores it (the rows are still correct) — again, `.sort()` after the read.
+Clauses that would change the *result* under partitioning — a top-level `LIMIT`/`OFFSET`/`TOP`/`FETCH`,
+`QUALIFY`, or a window function — raise instead; apply them in Polars after the read (`.head()`, etc.),
+or read without `partitions=`.
+
+Each slice is streamed batch-by-batch over its own connection, so peak memory stays proportional to
+the connection budget times the arrow batch size — a large slice is never fully buffered in memory.
+
+Each slice opens its own ODBC connection, so a read split into many slices pays that many connects.
+If connect overhead dominates (many small slices, or TLS/Kerberos on every connect), prefer a few
+larger slices, and/or let the ODBC driver manager recycle physical connections by calling
+[`arrow_odbc.enable_odbc_connection_pooling()`](https://arrow-odbc.readthedocs.io/) once before your
+first read — pooled connects skip the handshake. This is a process-global arrow-odbc / driver-manager
+setting (it affects all ODBC use in your process and reuses physical connections, so session-scoped
+state such as temp tables can persist across them), so it is left to the caller rather than toggled
+by `scan_db`.
+
 ## Read from ClickHouse
 
 `scan_clickhouse` streams query results over ClickHouse's HTTP interface as Arrow IPC.

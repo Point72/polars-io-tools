@@ -1,7 +1,9 @@
+import concurrent.futures
 import io
 import logging
 import sys
-from datetime import date
+import threading
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import duckdb
@@ -2990,3 +2992,458 @@ def test_cast_map_rejects_unsupported_dtype(duckdb_connection):
     # emitting VARCHAR would misrepresent the data, so it must be rejected.
     with pytest.raises(ValueError, match="No SQL type mapping"):
         cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Boolean})
+
+
+class TestIntervalStr:
+    """Unit tests for the ``partitions`` interval-string normaliser."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("1mo", "1mo"),
+            ("2w", "2w"),
+            ("5d", "5d"),
+            ("1q", "1q"),
+            ("3y", "3y"),
+            ("mo", "1mo"),
+            ("month", "1mo"),
+            ("quarter", "1q"),
+            (7, "7d"),
+        ],
+    )
+    def test_valid(self, value, expected):
+        from polars_io_tools.io_sources.partitions import _interval_str
+
+        assert _interval_str(value) == expected
+
+    @pytest.mark.parametrize("value", ["", "1", "3h", "-2d", 0, -5, "1mth", True])
+    def test_invalid(self, value):
+        from polars_io_tools.io_sources.partitions import _interval_str
+
+        with pytest.raises((ValueError, TypeError)):
+            _interval_str(value)
+
+
+# scan_db fans partitions across a thread pool; DuckDB rejects concurrent use of a single
+# connection, so these tests install a lock-serialized reader over the shared connection.
+def _install_threadsafe_reader(monkeypatch):
+    lock = threading.Lock()
+
+    def _read(query, batch_size, connection_string, **kwargs):
+        with lock:
+            table = _duckdb_conn.execute(query).fetch_arrow_table()
+        return FakeBatchReader(table, batch_size)
+
+    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+
+
+class TestScanDbPartitions:
+    """Tests for the opt-in ``partitions=`` reading path in ``scan_db``."""
+
+    QUERY = "SELECT * FROM CC_Bond"
+    # CC_Bond.EventDate spans many years; this window straddles several so buckets are non-trivial.
+    DATE_FILTER = (pl.col("EventDate") >= datetime(2013, 1, 1)) & (pl.col("EventDate") < datetime(2017, 1, 1))
+    COUNTRY_FILTER = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+
+    @pytest.fixture(autouse=True)
+    def _threadsafe(self, monkeypatch):
+        _install_threadsafe_reader(monkeypatch)
+
+    def _sorted(self, df):
+        return df.sort(by=df.columns)
+
+    @pytest.mark.parametrize("every", ["1y", "1mo", "6mo", 90, "1q"])
+    def test_by_time_matches_unpartitioned(self, every):
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", every)).filter(self.DATE_FILTER).collect()
+        assert got.height > 0
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_by_time_partition_count(self, caplog):
+        # [2013-01-01, 2017-01-01) split yearly is exactly four windows (exclusive upper bound).
+        with caplog.at_level(logging.DEBUG):
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
+        assert any("running 4 partition(s)" in record.message for record in caplog.records)
+
+    def test_by_value_derived_from_predicate(self):
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.COUNTRY_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode")).filter(self.COUNTRY_FILTER).collect()
+        assert got.height > 0
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_by_value_explicit_groups(self):
+        values = [["GT", "BD"], "RO"]
+        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", values)).filter(flt).collect()
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_by_range_numeric(self):
+        flt = (pl.col("EventYear") >= 2013) & (pl.col("EventYear") < 2055)
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_range("EventYear", every=10)).filter(flt).collect()
+        assert got.height > 0
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_explicit_read_partition_list(self):
+        # All CC_Bond rows are FileType 'G', so this single explicit slice returns everything.
+        baseline = cpl.scan_db(self.QUERY, "conn").collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(pl.col("FileType") == "G", key="G")]).collect()
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_generator_partitions_retain_columns_under_projection(self):
+        # A one-shot generator of slices, plus a projection that omits the partition column: the
+        # column must still be retained to evaluate (and drop) the client-side filter.
+        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).select("CentreCode").collect()
+        parts = (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"])
+        got = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt).select("CentreCode").collect()
+        assert got.height > 0
+        assert got.columns == ["CentreCode"]
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_generator_partitions_are_reusable(self):
+        # A generator is materialised once, so re-collecting the same LazyFrame is not empty.
+        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+        parts = (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"])
+        lf = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt)
+        first, second = lf.collect(), lf.collect()
+        assert first.height > 0
+        assert_frame_equal(self._sorted(first), self._sorted(second))
+
+    def test_unbounded_predicate_falls_back_to_single_query(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate")).collect()
+        baseline = cpl.scan_db(self.QUERY, "conn").collect()
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+        assert any("running 1 partition(s)" in record.message for record in caplog.records)
+
+    def test_max_partitions_guardrail_raises(self):
+        with pytest.raises(pl.exceptions.ComputeError, match="exceeds max_partitions"):
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1d"), max_partitions=5).filter(self.DATE_FILTER).collect()
+
+    def test_projection_and_row_limit(self):
+        got = (
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1y"))
+            .filter(self.DATE_FILTER)
+            .select("CenterID", "EventDate")
+            .head(3)
+            .collect()
+        )
+        assert got.columns == ["CenterID", "EventDate"]
+        assert got.height == 3
+
+    def test_max_concurrency_matches_unpartitioned(self):
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1mo"), max_concurrency=1).filter(self.DATE_FILTER).collect()
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_unknown_partition_column_raises(self):
+        with pytest.raises(ValueError, match="not_a_column"):
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("not_a_column"))
+
+    def test_untranslatable_predicate_filters_client_side(self):
+        # A predicate that cannot be pushed to SQL is still enforced client-side, so the slice
+        # stays exact (here: only rows whose EventName contains "Day").
+        udf = pl.col("EventName").map_elements(lambda s: "Day" in s, return_dtype=pl.Boolean)
+        expected = cpl.scan_db(self.QUERY, "conn").filter(udf).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(udf, key=0)]).collect()
+        assert got.height > 0
+        assert_frame_equal(self._sorted(got), self._sorted(expected))
+
+    def test_explicit_partitions_over_max_raises(self):
+        parts = [cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"]]
+        with pytest.raises(pl.exceptions.ComputeError, match="exceeds max_partitions"):
+            cpl.scan_db(self.QUERY, "conn", partitions=parts, max_partitions=2).collect()
+
+    def test_unordered_matches_unpartitioned(self):
+        # Completion order returns the same rows as an unpartitioned read (order aside).
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1mo")).filter(self.DATE_FILTER).collect()
+        assert got.height > 0
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))
+
+    def test_unordered_row_limit(self):
+        # No outer predicate, so Polars pushes n_rows to the source and the partitioned fan-out
+        # itself must honour the limit (exercising _emit truncation and the early return).
+        groups = [["GT"], ["BD"], ["RO"]]
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", groups)).head(3).collect()
+        assert got.height == 3
+        assert set(got["ISOCountryCode"].to_list()) <= {"GT", "BD", "RO"}
+
+    def test_partitioned_query_with_order_by_warns_not_raises(self, caplog):
+        # A top-level ORDER BY only loses global order under partitioning (row set stays correct):
+        # warn and proceed, don't raise.
+        q = "SELECT * FROM CC_Bond ORDER BY EventDate DESC"
+        with caplog.at_level(logging.WARNING):
+            got = cpl.scan_db(q, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
+        assert_frame_equal(self._sorted(got), self._sorted(baseline))  # same rows
+        assert any("ORDER BY" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        ("query", "match"),
+        [
+            ("SELECT * FROM CC_Bond ORDER BY EventDate LIMIT 10", "LIMIT"),
+            ("SELECT * FROM CC_Bond OFFSET 5 ROWS", "OFFSET"),
+            ("SELECT *, ROW_NUMBER() OVER (ORDER BY EventDate) AS rn FROM CC_Bond", "window"),
+        ],
+    )
+    def test_partitioned_query_with_unsafe_clause_raises(self, query, match):
+        with pytest.raises((ValueError, pl.exceptions.ComputeError), match=match):
+            cpl.scan_db(query, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
+
+    def test_unpartitioned_query_with_limit_is_allowed(self):
+        # The guard only applies to a real (>1 slice) partitioned read; an unpartitioned query keeps
+        # its LIMIT.
+        got = cpl.scan_db("SELECT * FROM CC_Bond LIMIT 5", "conn").collect()
+        assert got.height == 5
+
+    def test_partitioned_head_does_not_push_limit_into_slices(self, monkeypatch):
+        # Per-slice LIMIT is unsafe when a slice predicate is enforced client-side, so it must never
+        # be pushed into a slice query; the client-side row counter trims instead.
+        captured: list[str] = []
+        lock = threading.Lock()
+
+        def _read(query, batch_size, connection_string, **kwargs):
+            with lock:
+                captured.append(query)
+                table = _duckdb_conn.execute(query).fetch_arrow_table()
+            return FakeBatchReader(table, batch_size)
+
+        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
+        try:
+            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).head(2).collect()
+        finally:
+            pool.shutdown(wait=True)
+        assert got.height == 2
+        slice_sql = [q for q in captured if "IN (" in q]
+        assert slice_sql, "no slice SQL captured"
+        assert not any("LIMIT" in q.upper() or " TOP " in q.upper() for q in slice_sql)
+
+    def test_partition_worker_error_surfaces_with_slice_sql(self, monkeypatch):
+        lock = threading.Lock()
+
+        def _read(query, batch_size, connection_string, **kwargs):
+            if "'GT'" in query:
+                raise RuntimeError("odbc boom")
+            with lock:
+                table = _duckdb_conn.execute(query).fetch_arrow_table()
+            return FakeBatchReader(table, batch_size)
+
+        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
+        try:
+            with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="partition slice"):
+                cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
+        finally:
+            pool.shutdown(wait=True)
+
+    def test_streaming_is_bounded_not_whole_slice(self, monkeypatch):
+        # Prove the workers STREAM: a bounded head(1) reads only a few batches, whereas whole-slice
+        # buffering would pull (nearly) every batch of every in-flight slice before yielding.
+        produced = [0]
+        lock = threading.Lock()
+
+        class _CountingReader:
+            def __init__(self, table):
+                self.schema = table.schema
+                self._it = iter(table.to_batches(max_chunksize=1))  # one row per batch, deterministically
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                batch = next(self._it)  # raises StopIteration at the end
+                with lock:
+                    produced[0] += 1
+                return batch
+
+        def _read(query, batch_size, connection_string, **kwargs):
+            with lock:
+                table = _duckdb_conn.execute(query).fetch_arrow_table()
+            # Replicate rows so a slice has *many* one-row batches: this makes "streaming a few
+            # batches" vs "reading the whole slice" a large, unambiguous difference on a tiny fixture.
+            if table.num_rows:
+                table = pa.concat_tables([table] * 50)
+            return _CountingReader(table)
+
+        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
+
+        # Enumerated slices need no pushed predicate, so `.head(1)` (no intervening filter) pushes
+        # n_rows into the source and exercises early-stop; a filter would block that pushdown.
+        parts = cpl.by_value("EventYear", [[2013], [2021], [2053], [2054]])
+        lf = cpl.scan_db(self.QUERY, "conn", partitions=parts)
+        try:
+            full = lf.collect()
+            with lock:
+                full_batches = produced[0]
+            assert full.height > 9 and full_batches > 20  # a full read pulls many batches
+
+            with lock:
+                produced[0] = 0
+            got = lf.head(1).collect()
+            assert got.height == 1
+            with lock:
+                head_batches = produced[0]
+            # The shared queue holds at most k items and each of the k workers parks after its next
+            # blocked put, so head(1) reads only a handful of batches -- far fewer than a whole slice.
+            assert head_batches <= 3 * 3, f"head(1) read {head_batches} batches (streaming should read only a few)"
+            assert head_batches < full_batches
+        finally:
+            pool.shutdown(wait=True)
+
+    def test_early_stop_joins_running_workers(self, monkeypatch):
+        # On n_rows early-stop the generator must not return while slice workers are still fetching:
+        # Future.cancel() cannot stop an already-running worker, so cleanup joins them. Each slice
+        # streams through a generator that records entry and (via finally) exit; when head(1) returns,
+        # every worker that started must also have exited -- else a connection/query is still live.
+        # Without the join a mid-stream worker leaves entered > exited.
+        import time
+
+        entered = [0]
+        exited = [0]
+        lock = threading.Lock()
+
+        class _SlowReader:
+            # Has `.schema` (read by the schema probe, which never iterates) and streams one-row
+            # batches with a per-batch sleep so workers stay mid-stream. __iter__ is a generator:
+            # when _stream_slice abandons it on stop, it is deallocated and its finally runs.
+            def __init__(self, table):
+                self.schema = table.schema
+                self._table = table
+
+            def __iter__(self):
+                with lock:
+                    entered[0] += 1
+                try:
+                    for batch in self._table.to_batches(max_chunksize=1):
+                        time.sleep(0.02)  # hold every worker inside its stream when the limit hits
+                        yield batch
+                finally:
+                    with lock:
+                        exited[0] += 1
+
+        def _read(query, batch_size, connection_string, **kwargs):
+            with lock:
+                table = _duckdb_conn.execute(query).fetch_arrow_table()
+            if table.num_rows:
+                table = pa.concat_tables([table] * 50)  # many one-row batches, so workers stay mid-stream
+            return _SlowReader(table)
+
+        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
+
+        parts = cpl.by_value("EventYear", [[2013], [2021], [2053]])  # k == number of slices == 3
+        try:
+            got = cpl.scan_db(self.QUERY, "conn", partitions=parts).head(1).collect()
+            assert got.height == 1
+            with lock:
+                assert entered[0] >= 1, "expected at least one worker to start streaming"
+                assert entered[0] == exited[0], f"{entered[0] - exited[0]} worker(s) still running after collect() returned"
+        finally:
+            pool.shutdown(wait=True)
+
+
+def test_connection_budget_env_parse(monkeypatch):
+    import polars_io_tools.io_sources.lazy_sql_reader as lsr
+
+    # Blank/whitespace is treated as unset (default) -- never crashes import or first use.
+    for blank in ("", " ", "  "):
+        monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", blank)
+        assert lsr._resolve_sql_connection_budget() == min(pl.thread_pool_size(), 8)
+    # Malformed values raise a clear error naming the variable, at use -- not at import.
+    for bad in ("auto", "8.5", "0", "-1"):
+        monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", bad)
+        with pytest.raises(ValueError, match="POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS"):
+            lsr._resolve_sql_connection_budget()
+    monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", " 4 ")
+    assert lsr._resolve_sql_connection_budget() == 4
+
+
+def test_partition_worker_error_surfaces(monkeypatch):
+    # Exercise the completion-order failure-reconciliation path (shared queue): an errored worker
+    # that posts no done marker must still surface, carrying its slice SQL.
+    lock = threading.Lock()
+
+    def _read(query, batch_size, connection_string, **kwargs):
+        if "'RO'" in query:
+            raise RuntimeError("odbc kaboom")
+        with lock:
+            table = _duckdb_conn.execute(query).fetch_arrow_table()
+        return FakeBatchReader(table, batch_size)
+
+    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
+    try:
+        with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="'RO'"):
+            cpl.scan_db("SELECT * FROM CC_Bond", "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_partial_submission_failure_does_not_leak_workers(monkeypatch):
+    # If task submission fails partway through the initial fan-out, the workers that DID start must
+    # still be signalled to stop (the failing submit happens inside the cleanup try/finally).
+    lock = threading.Lock()
+
+    def _read(query, batch_size, connection_string, **kwargs):
+        with lock:
+            table = _duckdb_conn.execute(query).fetch_arrow_table()
+        return FakeBatchReader(table, batch_size)
+
+    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
+    real_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+    class _FlakyExecutor:
+        def __init__(self):
+            self.n = 0
+
+        def submit(self, *args, **kwargs):
+            self.n += 1
+            if self.n == 2:  # accept the first worker, blow up on the second submission
+                raise RuntimeError("submit boom")
+            return real_pool.submit(*args, **kwargs)
+
+    monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (_FlakyExecutor(), 3))
+    try:
+        with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="submit boom"):
+            cpl.scan_db("SELECT * FROM CC_Bond", "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
+        # The one accepted worker must have exited (stop was set); the pool drains cleanly.
+        real_pool.shutdown(wait=True)  # would hang if a worker were stranded on a full queue
+    finally:
+        real_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("dialect_query", ["duckdb", "tsql"])
+@pytest.mark.parametrize(
+    ("query", "unsafe", "order"),
+    [
+        ("SELECT * FROM t", None, False),
+        ("SELECT * FROM t ORDER BY id", None, True),
+        ("SELECT * FROM t LIMIT 5", "LIMIT/TOP", False),
+        ("SELECT * FROM (SELECT * FROM t LIMIT 5) s", None, False),  # nested LIMIT is the user's own semantics
+        ("SELECT TOP 10 * FROM t", "LIMIT/TOP", False),
+        ("SELECT * FROM a UNION ALL SELECT * FROM b ORDER BY 1", None, True),
+        ("SELECT * FROM a UNION ALL SELECT * FROM b LIMIT 10", "LIMIT/TOP", False),
+        ("SELECT x FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) = 1", "a window function", False),
+    ],
+)
+def test_partition_guard_ast_detection(dialect_query, query, unsafe, order):
+    from sqlglot import parse_one
+
+    from polars_io_tools.io_sources.lazy_sql_reader import _has_top_level_order, _partition_unsafe_clause
+
+    # TOP is MSSQL-only syntax.
+    if "TOP" in query and dialect_query != "tsql":
+        return
+    parsed = parse_one(query, dialect=dialect_query)
+    assert _partition_unsafe_clause(parsed) == unsafe
+    assert _has_top_level_order(parsed) == order
