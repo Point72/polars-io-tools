@@ -342,3 +342,105 @@ def test_panel_betas_1d_promotion():
     X = df.select("x0", "x1", "x2").to_numpy()
     y_expected = X @ np.array([1.0, 2.0, 3.0])
     assert np.allclose(df["y0"].to_numpy(), y_expected, atol=1e-12)
+
+
+def test_n_workers_determinism_and_schema_parity():
+    # Fixed (seed, n_workers) reproduces exactly; schema/shape match the serial path.
+    kwargs = {"n_samples": 12_345, "n_features": 6, "n_responses": 2, "use_weights": True, "seed": 7}
+    serial = scan_synthetic_regression(**kwargs, n_workers=1).collect()
+    a = scan_synthetic_regression(**kwargs, n_workers=4).collect()
+    b = scan_synthetic_regression(**kwargs, n_workers=4).collect()
+    assert a.equals(b)
+    assert a.schema == serial.schema
+    assert a.shape == serial.shape
+    # Threading changes the RNG stream layout, so values differ from the serial path.
+    assert not a.equals(serial)
+
+
+def test_n_workers_batch_size_independence():
+    # With n_workers > 1, reproducibility is keyed on (seed, n_workers, fetch_size): blocks are
+    # sized n_workers * fetch_size, so fetch_size is part of the contract (like seed). What must
+    # still hold for is_pure is independence from the *runtime* batch_size Polars chooses at a
+    # fixed fetch_size -- verified here by comparing the in-memory and streaming engines.
+    kwargs = {"n_samples": 4000, "n_features": 4, "seed": 42, "n_workers": 8, "fetch_size": 512}
+    a = scan_synthetic_regression(**kwargs).collect()
+    b = scan_synthetic_regression(**kwargs).collect(engine="streaming")
+    assert a.equals(b)
+
+
+def test_n_workers_beta_recovery():
+    betas = np.array([1.0, -2.0, 0.5, 3.0])
+    df = scan_synthetic_regression(n_samples=200_000, n_features=4, n_responses=1, betas=betas, epsilon_scale=0.1, seed=3, n_workers=8).collect()
+    features = df.select("x0", "x1", "x2", "x3").to_numpy()
+    labels = df.select("y0").to_numpy()
+    fitted = LinearRegression().fit(features, labels).coef_
+    assert np.max(np.abs(fitted.reshape(-1) - betas)) < 0.02
+
+
+def test_n_workers_pushdowns():
+    kwargs = {"n_samples": 5000, "n_features": 5, "n_responses": 2, "seed": 1, "n_workers": 8}
+    assert scan_synthetic_regression(**kwargs).head(321).collect().height == 321
+    assert scan_synthetic_regression(**kwargs).select(["x0", "y1"]).collect().columns == ["x0", "y1"]
+
+
+def test_n_workers_panel_parity():
+    kwargs = {
+        "start_date": date(2020, 1, 1),
+        "end_date": date(2020, 2, 1),
+        "n_symbols": 500,
+        "n_features": 4,
+        "seed": 5,
+    }
+    serial = scan_synthetic_panel(**kwargs, n_workers=1).collect()
+    a = scan_synthetic_panel(**kwargs, n_workers=4).collect()
+    b = scan_synthetic_panel(**kwargs, n_workers=4).collect()
+    assert a.equals(b)
+    assert a.schema == serial.schema
+    assert a.shape == serial.shape
+
+
+def test_n_workers_invalid():
+    with pytest.raises(ValueError, match="n_workers must be >= 1"):
+        scan_synthetic_regression(n_samples=10, n_features=2, seed=1, n_workers=0)
+    with pytest.raises(ValueError, match="n_workers must be >= 1"):
+        scan_synthetic_panel(start_date=date(2020, 1, 1), end_date=date(2020, 1, 3), n_features=2, seed=1, n_workers=0)
+
+
+def test_n_workers_multi_block_batch_size_independence():
+    # n_samples spans several fixed blocks (block_rows = n_workers * fetch_size = 4 * 250 = 1000),
+    # exercising the block-cursor refill and boundary cap. Output must be identical whether Polars
+    # drives it in memory or via the streaming engine (different runtime batch sizes) at fixed
+    # fetch_size, and must not depend on that batch size.
+    kwargs = {"n_samples": 3300, "n_features": 3, "n_responses": 2, "use_weights": True, "seed": 9, "n_workers": 4, "fetch_size": 250}
+    a = scan_synthetic_regression(**kwargs).collect()
+    b = scan_synthetic_regression(**kwargs).collect(engine="streaming")
+    assert a.equals(b)
+    assert a.height == 3300
+
+
+def test_n_workers_panel_batch_size_independence_full():
+    # Threaded panel with categories, group_by, and weights: x/eps come from the block filler
+    # while aux/group/weight stay per-batch serial streams -- verify they stay row-aligned and
+    # the whole frame is independent of the runtime batch_size (in-memory vs streaming engine).
+    kwargs = {
+        "start_date": date(2020, 1, 1),
+        "end_date": date(2020, 3, 1),
+        "n_symbols": 137,  # not a divisor of block_rows, so date chunks straddle blocks
+        "n_features": 4,
+        "categories": [["A", "B", "C"]],
+        "group_by": ("g", ["x", "y"]),
+        "use_weights": True,
+        "seed": 21,
+        "n_workers": 8,
+        "fetch_size": 64,
+    }
+    a = scan_synthetic_panel(**kwargs).collect()
+    b = scan_synthetic_panel(**kwargs).collect(engine="streaming")
+    assert a.equals(b)
+
+
+def test_n_workers_head_pushdown_terminates_early():
+    # An early n_rows pushdown must return promptly and shut its pool down via the generator's
+    # finally, without generating the full declared dataset.
+    df = scan_synthetic_regression(n_samples=50_000_000, n_features=4, seed=1, n_workers=4).head(5).collect()
+    assert df.height == 5

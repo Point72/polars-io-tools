@@ -24,6 +24,19 @@ log = logging.getLogger(__name__)
 MeanComputer = Callable[[np.random.Generator, np.random.Generator, np.ndarray, int, int], tuple[np.ndarray, dict]]
 
 
+def _parallel_standard_normal(rngs: list[np.random.Generator], shape: tuple[int, int], pool) -> np.ndarray:
+    """Fill a ``shape`` array with standard-normal draws, one contiguous row-slice per generator.
+
+    Rows are split across ``rngs`` and each slice is filled in place via ``out=`` on ``pool``;
+    ``standard_normal`` releases the GIL, so the fill runs across cores. Following NumPy's
+    documented multithreaded-generation pattern; slices are disjoint, so the writes never race.
+    """
+    out = np.empty(shape, dtype=np.float64)
+    chunks = np.array_split(out, len(rngs), axis=0)
+    list(pool.map(lambda rng, chunk: rng.standard_normal(out=chunk), rngs, chunks))
+    return out
+
+
 def _check_reserved(name: str, kind: str, *, n_features: int, n_responses: int, use_weights: bool, extra: tuple[str, ...] = ()) -> None:
     """Raise ValueError if ``name`` collides with a generated column name."""
     reserved = {f"x{i}" for i in range(n_features)} | {f"y{i}" for i in range(n_responses)} | ({"weight"} if use_weights else set()) | set(extra)
@@ -46,11 +59,14 @@ def _register_source(
     mean_computer: MeanComputer,
     extras_schema: dict,
     chunk_sizes: np.ndarray | None = None,
+    n_workers: int = 1,
     explain_name: str,
     explain_detail: str | None = None,
 ) -> pl.LazyFrame:
     feature_cols = [f"x{i}" for i in range(n_features)]
     response_cols = [f"y{i}" for i in range(n_responses)]
+    if n_workers < 1:
+        raise ValueError(f"n_workers must be >= 1, got {n_workers}")
     schema_fields: dict[str, pl.DataType] = {name: pl.Float64() for name in feature_cols + response_cols}
     schema_fields.update(extras_schema)
     if use_weights:
@@ -65,11 +81,29 @@ def _register_source(
     ) -> Iterator[pl.DataFrame]:
         bs = batch_size or fetch_size
         x_ss, eps_ss, w_ss, aux_ss, group_ss = np.random.SeedSequence(seed).spawn(5)
-        x_rng = np.random.default_rng(x_ss)
-        eps_rng = np.random.default_rng(eps_ss)
         w_rng = np.random.default_rng(w_ss)
         aux_rng = np.random.default_rng(aux_ss)
         group_rng = np.random.default_rng(group_ss)
+
+        # x/eps are the dominant cost; optionally fill them in parallel. w/aux/group
+        # stay single-stream (cheap, and already batch_size-independent). n_workers==1
+        # keeps the exact serial streams, so default output is byte-for-byte unchanged.
+        threaded = n_workers > 1 and n_samples > 0
+        pool = None
+        if threaded:
+            from concurrent.futures import ThreadPoolExecutor
+
+            # Fixed-size blocks (independent of Polars' batch_size) filled in parallel by one
+            # persistent Generator per worker, so row i depends only on (seed, n_workers, fetch_size).
+            block_rows = min(n_workers * fetch_size, n_samples)
+            x_rngs = [np.random.default_rng(s) for s in x_ss.spawn(n_workers)]
+            eps_rngs = [np.random.default_rng(s) for s in eps_ss.spawn(n_workers)]
+            pool = ThreadPoolExecutor(max_workers=n_workers)
+            x_block = eps_block = None
+            block_pos = block_rows  # trigger a fill on the first iteration
+        else:
+            x_rng = np.random.default_rng(x_ss)
+            eps_rng = np.random.default_rng(eps_ss)
 
         remaining_gen = n_samples
         remaining_deliver = n_rows if n_rows is not None else n_samples
@@ -77,50 +111,65 @@ def _register_source(
         chunk_idx = 0
         rows_left_in_chunk = int(chunk_sizes[0]) if chunk_sizes is not None and len(chunk_sizes) > 0 else 0
 
-        while remaining_gen > 0 and remaining_deliver > 0:
-            if chunk_sizes is not None:
-                k = min(bs, rows_left_in_chunk, remaining_gen)
-                row_in_chunk = int(chunk_sizes[chunk_idx]) - rows_left_in_chunk
-            else:
-                k = min(bs, remaining_gen)
-                row_in_chunk = 0
-            x_batch = x_rng.standard_normal(size=(k, n_features))
-            if use_weights:
-                w_batch = w_rng.uniform(weights_low, weights_high, size=k)
-                eps_scale = epsilon_scale / np.sqrt(w_batch)[:, None]
-            else:
-                w_batch = None
-                eps_scale = epsilon_scale
-            eps_batch = eps_rng.standard_normal(size=(k, n_responses)) * eps_scale + epsilon_loc
-            mean_batch, extras = mean_computer(aux_rng, group_rng, x_batch, chunk_idx, row_in_chunk)
-            y_batch = mean_batch + eps_batch
+        try:
+            while remaining_gen > 0 and remaining_deliver > 0:
+                if chunk_sizes is not None:
+                    k = min(bs, rows_left_in_chunk, remaining_gen)
+                    row_in_chunk = int(chunk_sizes[chunk_idx]) - rows_left_in_chunk
+                else:
+                    k = min(bs, remaining_gen)
+                    row_in_chunk = 0
+                if threaded:
+                    if block_pos == block_rows:
+                        x_block = _parallel_standard_normal(x_rngs, (block_rows, n_features), pool)
+                        eps_block = _parallel_standard_normal(eps_rngs, (block_rows, n_responses), pool)
+                        block_pos = 0
+                    k = min(k, block_rows - block_pos)  # keep each batch within one fixed block
+                    x_batch = x_block[block_pos : block_pos + k]
+                    eps_raw = eps_block[block_pos : block_pos + k]
+                    block_pos += k
+                else:
+                    x_batch = x_rng.standard_normal(size=(k, n_features))
+                    eps_raw = eps_rng.standard_normal(size=(k, n_responses))
+                if use_weights:
+                    w_batch = w_rng.uniform(weights_low, weights_high, size=k)
+                    eps_scale = epsilon_scale / np.sqrt(w_batch)[:, None]
+                else:
+                    w_batch = None
+                    eps_scale = epsilon_scale
+                eps_batch = eps_raw * eps_scale + epsilon_loc
+                mean_batch, extras = mean_computer(aux_rng, group_rng, x_batch, chunk_idx, row_in_chunk)
+                y_batch = mean_batch + eps_batch
 
-            data: dict = {name: x_batch[:, i] for i, name in enumerate(feature_cols)}
-            for i, name in enumerate(response_cols):
-                data[name] = y_batch[:, i]
-            data.update(extras)
-            if use_weights:
-                data["weight"] = w_batch
+                data: dict = {name: x_batch[:, i] for i, name in enumerate(feature_cols)}
+                for i, name in enumerate(response_cols):
+                    data[name] = y_batch[:, i]
+                data.update(extras)
+                if use_weights:
+                    data["weight"] = w_batch
 
-            df = pl.DataFrame(data)
-            if predicate is not None:
-                df = df.filter(predicate)
-            if with_columns is not None:
-                df = df.select(with_columns)
+                df = pl.DataFrame(data)
+                if predicate is not None:
+                    df = df.filter(predicate)
+                if with_columns is not None:
+                    df = df.select(with_columns)
 
-            if df.height > remaining_deliver:
-                df = df.head(remaining_deliver)
-            remaining_deliver -= df.height
-            remaining_gen -= k  # Always k, not df.height: RNG must advance by the full generated batch to keep row-i values batch-independent.
+                if df.height > remaining_deliver:
+                    df = df.head(remaining_deliver)
+                remaining_deliver -= df.height
+                remaining_gen -= k  # Always k, not df.height: RNG must advance by the full generated batch to keep row-i values batch-independent.
 
-            if chunk_sizes is not None:
-                rows_left_in_chunk -= k
-                if rows_left_in_chunk == 0 and chunk_idx + 1 < len(chunk_sizes):
-                    chunk_idx += 1
-                    rows_left_in_chunk = int(chunk_sizes[chunk_idx])
+                if chunk_sizes is not None:
+                    rows_left_in_chunk -= k
+                    if rows_left_in_chunk == 0 and chunk_idx + 1 < len(chunk_sizes):
+                        chunk_idx += 1
+                        rows_left_in_chunk = int(chunk_sizes[chunk_idx])
 
-            log.debug("scan_synthetic: yielded %d rows; remaining_gen=%d, remaining_deliver=%d", df.height, remaining_gen, remaining_deliver)
-            yield df
+                log.debug("scan_synthetic: yielded %d rows; remaining_gen=%d, remaining_deliver=%d", df.height, remaining_gen, remaining_deliver)
+                yield df
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
 
     return register_io_source_with_is_pure(
         source_generator, schema=schema, is_pure=seed is not None, explain_name=explain_name, explain_detail=explain_detail
@@ -163,6 +212,7 @@ def scan_synthetic_regression(
     chunk_key: str | None = None,
     n_chunks: int | None = None,
     seed: int | None = None,
+    n_workers: int = 1,
     fetch_size: int = 10_000,
     description: str | None = None,
 ) -> pl.LazyFrame:
@@ -191,6 +241,7 @@ def scan_synthetic_regression(
         chunk_key: If provided together with ``n_chunks``, emits a monotonic ``Int64`` column with this name whose values are ``0, 1, ..., n_chunks - 1``. Must not collide with a generated column name.
         n_chunks: Number of contiguous chunks to split ``n_samples`` into. Required when ``chunk_key`` is set. Must satisfy ``1 <= n_chunks <= n_samples``.
         seed: Seed for ``np.random.default_rng``. If None, uses fresh entropy per call (and the source is registered with ``is_pure=False``).
+        n_workers: Number of threads used to fill the ``x``/``y`` Gaussian draws (the dominant cost) in parallel. ``1`` (default) keeps the fully serial path and its exact output. With ``n_workers > 1`` the draws are generated in fixed-size blocks split across threads, so reproducibility is keyed on ``(seed, n_workers, fetch_size)`` and remains independent of the ``batch_size`` Polars chooses; values differ from the serial path. Peak generation memory grows with ``n_workers`` (a block holds ``n_workers * fetch_size`` rows). Most useful when ``n_samples`` is large.
         fetch_size: Default number of rows generated per batch when Polars does not provide a ``batch_size``. Must be >= 1. Defaults to 10_000.
         description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
     """
@@ -260,6 +311,7 @@ def scan_synthetic_regression(
         mean_computer=mean_computer,
         extras_schema=extras_schema,
         chunk_sizes=chunk_sizes,
+        n_workers=n_workers,
         explain_name="scan_synthetic_regression",
         explain_detail=description,
     )
@@ -282,6 +334,7 @@ def scan_synthetic_panel(
     epsilon_loc: float = 0.0,
     epsilon_scale: float = 1.0,
     seed: int | None = None,
+    n_workers: int = 1,
     fetch_size: int = 10_000,
     description: str | None = None,
 ) -> pl.LazyFrame:
@@ -310,6 +363,7 @@ def scan_synthetic_panel(
         epsilon_loc: Mean of the Gaussian noise. Defaults to 0.0.
         epsilon_scale: When ``use_weights=False``, the noise stddev for every row. When ``use_weights=True``, the *reference* stddev at ``w=1``; actual per-row noise is ``N(loc, (epsilon_scale/√w)²)``. Must be >= 0. Defaults to 1.0.
         seed: Seed for ``np.random.default_rng``. If None, uses fresh entropy per call (and the source is registered with ``is_pure=False``).
+        n_workers: Number of threads used to fill the ``x``/``y`` Gaussian draws (the dominant cost) in parallel. ``1`` (default) keeps the fully serial path and its exact output. With ``n_workers > 1`` the draws are generated in fixed-size blocks split across threads, so reproducibility is keyed on ``(seed, n_workers, fetch_size)`` and remains independent of the ``batch_size`` Polars chooses; values differ from the serial path. Peak generation memory grows with ``n_workers`` (a block holds ``n_workers * fetch_size`` rows). For panels the per-date batch is ``n_symbols`` rows, so parallelism only helps when ``n_symbols`` is large.
         fetch_size: Default number of rows generated per batch when Polars does not provide a ``batch_size``. Must be >= 1. Defaults to 10_000.
         description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
     """
@@ -446,6 +500,7 @@ def scan_synthetic_panel(
         mean_computer=mean_computer,
         extras_schema=extras_schema,
         chunk_sizes=chunk_sizes,
+        n_workers=n_workers,
         explain_name="scan_synthetic_panel",
         explain_detail=description,
     )
