@@ -130,13 +130,34 @@ common sub-plan elimination.
 ### `execute_on_ray`
 
 ```python
-lf.piot.execute_on_ray(*, date_column, time_unit, return_as="arrow",
-                       remote_options=None, max_concurrency=100)
+lf.piot.execute_on_ray(partitions, *, return_as="arrow",
+                       remote_options=None, max_concurrency=100,
+                       preserve_partition_order=None)
 ```
 
-Split the LazyFrame into calendar periods and execute each on an already-initialised Ray
-cluster. `time_unit` is `"daily"`, `"monthly"`, or `"yearly"`. Requires `ray.init()` to
-have been called and a bounded predicate on `date_column`.
+Distribute the LazyFrame across an already-initialised Ray cluster, running one task per
+partition. `partitions` is either a partitioner or an explicit iterable of
+`ReadPartition(predicate, key)` (a `RayPartition` additionally carries per-task
+`remote_options`). Build partitions with:
+
+- `by_time(column, every)` — calendar windows derived from the pushed-down date range
+  (`every` is `"1mo"`/`"2w"`/`"5d"`/`"1q"`/`"1y"` or an integer number of days).
+- `by_value(column, values=None)` — one task per discrete value; derived from the pushed-down
+  `IN` filter when `values` is omitted.
+- `by_range(column, every)` — fixed-width numeric buckets over the pushed-down range.
+- `by_key(partitions, by, *, partition_remote_options=None)` — equality on caller-enumerated
+  keys; `by` is a column name, list, selector, or a `pl.Expr` (e.g. `pl.col("id").hash() % N`).
+  `partition_remote_options` sets per-partition Ray options from a struct column or `{key: dict}`.
+- `discrete_partitions` / `cartesian_partitions` — explicit `col.is_in(...)` member lists and
+  `date_window × bucket` products.
+
+A partitioner requires a bounded predicate on its column. Requires `ray.init()` to have been
+called. As a legacy shortcut, `execute_on_ray(date_column=..., time_unit="daily"|"monthly"|"yearly")`
+is equivalent to `partitions=by_time(date_column, ...)`.
+
+Chaining multiple `execute_on_ray` calls relies on predicate pushdown surviving intervening
+operations — partition once at the outermost boundary. For multi-stage distributed pipelines,
+prefer [Polars Cloud](https://docs.cloud.pola.rs/polars-cloud/).
 
 ### `sink_delta`
 

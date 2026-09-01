@@ -90,8 +90,11 @@ For a guided walkthrough, start with the
 - **Caching** — `cache` keeps an in-memory, column- and partition-level cache for
   iterative work; `cache_parquet` materializes date-partitioned Parquet on local disk
   or S3, fetching only the partitions a query needs.
-- **Distributed execution** — `execute_on_ray` splits a `LazyFrame` by calendar period
-  and runs the partitions across an existing Ray cluster.
+- **Distributed execution** — `execute_on_ray` splits a `LazyFrame` across an existing Ray
+  cluster, one task per partition. Build partitions with `by_time` (calendar windows),
+  `by_value` (discrete keys), `by_range` (numeric buckets), `by_key` (enumerated keys), or an
+  explicit `ReadPartition` list. (For multi-stage distributed pipelines,
+  [Polars Cloud](https://docs.cloud.pola.rs/polars-cloud/) is the more strategic option.)
 - **Ergonomics** — `iter_rows` for memory-efficient row iteration, `debug` to inspect
   what Polars pushes into a source, and `disable_optimizations` to compare against plain
   Polars.
