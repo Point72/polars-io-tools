@@ -20,6 +20,7 @@ from .lazy_iter_rows import *
 from .lazy_narwhals_reader import *
 from .lazy_probe import probe, probe as _lazy_probe
 from .lazy_sql_reader import *
+from .partitions import *
 from .pushdown_combine import *
 from .pushdown_pivot import *
 from .pushdown_unpivot import *
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
     from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
     from .lazy_iter_rows import iter_rows  # noqa: TC004
+    from .partitions import KeyPartitions, ReadPartition, by_key, by_range, by_time, by_value
     from .pushdown_combine import FilterSpec, pushdown_combine
     from .pushdown_pivot import pushdown_pivot
     from .pushdown_unpivot import pushdown_unpivot
@@ -50,7 +52,9 @@ if TYPE_CHECKING:
     # we also can't import it *inside* the execute_on_ray method of the
     # PIOTOperations class, because thit needs to be defined at the module level
     # for the `functools.wraps` decorator to work. That's why we use a stub here.
-    from .lazy_ray import execute_on_ray as _execute_on_ray_proto
+    from .lazy_ray import (
+        execute_on_ray as _execute_on_ray_proto,
+    )
 else:
 
     def _execute_on_ray_proto(*_a, **_kw): ...
