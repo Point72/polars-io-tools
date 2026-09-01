@@ -43,3 +43,12 @@ def test_debug_filter(caplog):
     assert "debug called with" in caplog.text
     assert "`with_columns=None`" in caplog.text
     assert '`predicate=[(col("a")) > (1)]`' in caplog.text
+
+
+def test_debug_logs_per_use_by_default(caplog):
+    # is_pure defaults to False, so reusing the same debug is not deduplicated: its log-side-effect runs per occurrence.
+    df = pl.DataFrame({"a": [1]}).lazy()
+    debug = df.piot.debug(log_level=logging.INFO)
+    caplog.set_level(logging.INFO)
+    pl.concat([debug, debug]).collect(engine="streaming")
+    assert caplog.text.count("debug called with") == 2

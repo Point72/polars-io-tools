@@ -18,6 +18,7 @@ from .lazy_datadog_reader import *
 from .lazy_debug import debug, debug as _lazy_debug
 from .lazy_iter_rows import *
 from .lazy_narwhals_reader import *
+from .lazy_probe import probe, probe as _lazy_probe
 from .lazy_sql_reader import *
 from .pushdown_combine import *
 from .pushdown_pivot import *
@@ -68,6 +69,10 @@ class PIOTOperations:
     @functools.wraps(_lazy_debug)
     def debug(self, *args, **kwargs) -> pl.LazyFrame:
         return _lazy_debug(self._lf, *args, **kwargs)
+
+    @functools.wraps(_lazy_probe)
+    def probe(self, *args, **kwargs) -> pl.LazyFrame:
+        return _lazy_probe(self._lf, *args, **kwargs)
 
     @functools.wraps(_lazy_cache)
     def cache(self, *args, **kwargs) -> pl.LazyFrame:
