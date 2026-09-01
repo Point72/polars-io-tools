@@ -7,6 +7,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from polars.testing import assert_frame_equal
 
 import polars_io_tools  # noqa: F401  -- registers the `.piot` namespace
+from polars_io_tools.io_sources.util import register_io_source_with_is_pure
 
 _EXPORTER = InMemorySpanExporter()
 
@@ -35,7 +36,26 @@ def _probe_spans():
 def test_probe_is_result_preserving_passthrough():
     df = pl.DataFrame({"id": [1, 2, 3], "v": [10, 20, 30]})
     out = df.lazy().piot.probe().collect(engine="streaming")
-    assert_frame_equal(out.sort("id"), df)
+    assert_frame_equal(out, df)
+
+
+def test_probe_forwards_n_rows_pushdown():
+    out = pl.LazyFrame({"id": list(range(100))}).piot.probe().head(5).collect(engine="streaming")
+    assert out["id"].to_list() == [0, 1, 2, 3, 4]
+    assert _probe_spans()[-1].attributes["polars_io_tools.total_rows"] == 5
+
+
+def test_probe_does_not_dedupe_impure_input():
+    # A pass-through cannot claim purity: reusing the same probe over an impure input must not collapse executions.
+    state = {"n": 0}
+
+    def impure(with_columns, predicate, n_rows, batch_size):
+        state["n"] += 1
+        yield pl.DataFrame({"run": [state["n"]]})
+
+    probe = register_io_source_with_is_pure(impure, schema=pl.Schema({"run": pl.Int64}), is_pure=False).piot.probe()
+    out = pl.concat([probe, probe]).collect(engine="streaming")
+    assert sorted(out["run"].to_list()) == [1, 2]
 
 
 def test_probe_emits_one_span_with_description():

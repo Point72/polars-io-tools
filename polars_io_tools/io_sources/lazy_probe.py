@@ -24,6 +24,8 @@ def probe(self: pl.LazyFrame, description: str | None = None) -> pl.LazyFrame:
     Overhead is on the order of milliseconds and grows with the number of rows passing through the probe
     (each batch makes a Rust-Python round trip); it is negligible relative to any non-trivial read but can
     dominate a small, fully-cached one. The overhead is the io-source boundary itself, not the telemetry.
+    Under a single-worker Polars pool the input is materialized in full before the first batch (see
+    ``collect_lf_in_io_source``), so memory and latency can be higher than the streaming path.
     ``next_elapsed_total_ms`` is caller-observed pull latency, so it can undercount a reader that decodes
     on background threads.
 
@@ -34,7 +36,6 @@ def probe(self: pl.LazyFrame, description: str | None = None) -> pl.LazyFrame:
     Returns:
         pl.LazyFrame: A LazyFrame equivalent to ``self`` whose execution emits one telemetry span.
     """
-    schema = self.collect_schema()
 
     def source_generator(
         with_columns: list[str] | None,
@@ -51,4 +52,10 @@ def probe(self: pl.LazyFrame, description: str | None = None) -> pl.LazyFrame:
             df = df.head(n_rows)
         yield from collect_lf_in_io_source(df, batch_size)
 
-    return register_io_source_with_is_pure(source_generator, schema=schema, validate_schema=False, explain_detail=description)
+    # A pass-through cannot know whether its input is pure, so register ``is_pure=False``: claiming purity
+    # would let Polars deduplicate repeated uses of the same probe and collapse executions, changing
+    # results for an impure input. It also ensures every occurrence is measured. The schema is passed as a
+    # callable so it is resolved lazily rather than forced at construction.
+    return register_io_source_with_is_pure(
+        source_generator, schema=self.collect_schema, is_pure=False, validate_schema=False, explain_detail=description
+    )
