@@ -77,3 +77,21 @@ def test_probe_forwards_predicate_pushdown():
 
     assert out.sort("id")["id"].to_list() == [2, 4]
     assert _probe_spans()[-1].attributes["polars_io_tools.total_rows"] == 2
+
+
+def test_probe_forwards_is_pure(monkeypatch):
+    # is_pure defaults to False (safe for an input of unknown purity) and can be opted into for a known-pure input.
+    captured = {}
+
+    def fake_register(io_source, *, schema, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("polars.io.plugins.register_io_source", fake_register)
+
+    pl.LazyFrame({"a": [1]}).piot.probe()
+    assert captured["is_pure"] is False
+
+    captured.clear()
+    pl.LazyFrame({"a": [1]}).piot.probe(is_pure=True)
+    assert captured["is_pure"] is True

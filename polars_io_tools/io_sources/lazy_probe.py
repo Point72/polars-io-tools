@@ -7,7 +7,7 @@ from .util import collect_lf_in_io_source, register_io_source_with_is_pure
 __all__ = ("probe",)
 
 
-def probe(self: pl.LazyFrame, description: str | None = None) -> pl.LazyFrame:
+def probe(self: pl.LazyFrame, description: str | None = None, *, is_pure: bool = False) -> pl.LazyFrame:
     """A result-preserving pass-through source that emits one OpenTelemetry span per execution.
 
     Inserting ``.piot.probe()`` at a point in a lazy pipeline turns that point into a measured
@@ -32,6 +32,7 @@ def probe(self: pl.LazyFrame, description: str | None = None) -> pl.LazyFrame:
     Args:
         self: The input LazyFrame to pass through unchanged.
         description: Optional free-form description of this probe instance, attached to its OpenTelemetry span (``explain_detail``) -- e.g. the pipeline stage being measured.
+        is_pure: Whether the wrapped input is pure (deterministic and side-effect-free). Defaults to ``False``: a pass-through cannot infer its input's purity, and ``False`` preserves results for an impure input and measures every occurrence. Set ``True`` when the input is known pure to let Polars deduplicate repeated uses of the same probe (one execution, one span) -- i.e. to propagate a pure input's dedup-ability through the probe.
 
     Returns:
         pl.LazyFrame: A LazyFrame equivalent to ``self`` whose execution emits one telemetry span.
@@ -52,10 +53,9 @@ def probe(self: pl.LazyFrame, description: str | None = None) -> pl.LazyFrame:
             df = df.head(n_rows)
         yield from collect_lf_in_io_source(df, batch_size)
 
-    # A pass-through cannot know whether its input is pure, so register ``is_pure=False``: claiming purity
-    # would let Polars deduplicate repeated uses of the same probe and collapse executions, changing
-    # results for an impure input. It also ensures every occurrence is measured. The schema is passed as a
-    # callable so it is resolved lazily rather than forced at construction.
+    # The probe's purity is its input's purity, which it cannot infer, so ``is_pure`` defaults to ``False``:
+    # claiming purity for an impure input would let Polars deduplicate repeated uses and change results. The
+    # schema is passed as a callable so it is resolved lazily rather than forced at construction.
     return register_io_source_with_is_pure(
-        source_generator, schema=self.collect_schema, is_pure=False, validate_schema=False, explain_detail=description
+        source_generator, schema=self.collect_schema, is_pure=is_pure, validate_schema=False, explain_detail=description
     )
