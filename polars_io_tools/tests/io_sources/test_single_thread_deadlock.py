@@ -39,7 +39,24 @@ def _run_in_subprocess(script: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_iosource_collect_batches_does_not_deadlock_at_threads_one():
+@pytest.mark.parametrize(
+    "otel_setup",
+    [
+        "",
+        """
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        provider = TracerProvider()
+        provider.add_span_processor(BatchSpanProcessor(InMemorySpanExporter()))
+        trace.set_tracer_provider(provider)
+        """,
+    ],
+    ids=["otel-no-op", "otel-batch-processor"],
+)
+def test_iosource_collect_batches_does_not_deadlock_at_threads_one(otel_setup):
     """Reproduces the polars-io-tools / polars deadlock and asserts the fix holds.
 
     Without the helper's thread-pool gate this script hangs forever at
@@ -57,6 +74,8 @@ def test_iosource_collect_batches_does_not_deadlock_at_threads_one():
         )
 
         assert pl.thread_pool_size() == 1, pl.thread_pool_size()
+
+        __OTEL_SETUP__
 
         # This is the minimal pattern that deadlocks polars 1.39.3+1.40.1
         # without the fix in collect_lf_in_io_source. Removing any one of:
@@ -90,7 +109,7 @@ def test_iosource_collect_batches_does_not_deadlock_at_threads_one():
         assert out.height == 100_000, out.height
         print("OK", out.height)
         """
-    )
+    ).replace("__OTEL_SETUP__", textwrap.dedent(otel_setup))
 
     try:
         result = _run_in_subprocess(script)

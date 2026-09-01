@@ -83,7 +83,7 @@ def _rename_columns_in_filters(
             df = df.select(with_columns)
         yield df
 
-    lf = register_io_source_with_is_pure(_dummy_source, schema=schema)
+    lf = register_io_source_with_is_pure(_dummy_source, schema=schema, explain_name="filtered_join.predicate_rename")
     # We apply the rename here to have polars change the column names for us
     # NOTE: we are performing the rename right to left here. This might seem a bit
     # counterintuitive, but we are renaming the right columns to the left columns.
@@ -106,6 +106,7 @@ def filtered_join(
     right_on: str | list[str] | None = None,
     nulls_equal: bool = False,
     log_explain: bool = False,
+    description: str | None = None,
     **join_kwargs,
 ) -> pl.LazyFrame:
     """
@@ -247,7 +248,7 @@ def filtered_join(
             err_msg += f"\n\nError: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
-    return register_io_source_with_is_pure(source_generator, schema=schema)
+    return register_io_source_with_is_pure(source_generator, schema=schema, explain_detail=description)
 
 
 def filtered_join_asof(
@@ -263,6 +264,7 @@ def filtered_join_asof(
     strategy: Literal["backward", "forward", "nearest"] = "backward",
     tolerance: str | float | datetime.timedelta | None = None,  # TODO: Only timedelta is supported for now
     log_explain: bool = True,
+    description: str | None = None,
     **join_kwargs,
 ) -> pl.LazyFrame:
     """
@@ -299,6 +301,7 @@ def filtered_join_asof(
         tolerance (timedelta, optional): Maximum time difference allowed for a match. Currently only timedelta is supported.
             When specified, enables temporal range expansion optimization.
         log_explain (bool, default True): Whether to log detailed execution plans for debugging
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
         **join_kwargs: Additional keyword arguments passed to the underlying join_asof operation
 
     Returns:
@@ -505,7 +508,7 @@ def filtered_join_asof(
             err_msg += f"\n\nError: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
-    return register_io_source_with_is_pure(source_generator, schema=schema)
+    return register_io_source_with_is_pure(source_generator, schema=schema, explain_detail=description)
 
 
 def join_between(

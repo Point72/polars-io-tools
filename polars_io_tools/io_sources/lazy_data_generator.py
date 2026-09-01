@@ -46,6 +46,8 @@ def _register_source(
     mean_computer: MeanComputer,
     extras_schema: dict,
     chunk_sizes: np.ndarray | None = None,
+    explain_name: str,
+    explain_detail: str | None = None,
 ) -> pl.LazyFrame:
     feature_cols = [f"x{i}" for i in range(n_features)]
     response_cols = [f"y{i}" for i in range(n_responses)]
@@ -120,7 +122,9 @@ def _register_source(
             log.debug("scan_synthetic: yielded %d rows; remaining_gen=%d, remaining_deliver=%d", df.height, remaining_gen, remaining_deliver)
             yield df
 
-    return register_io_source_with_is_pure(source_generator, schema=schema, is_pure=seed is not None)
+    return register_io_source_with_is_pure(
+        source_generator, schema=schema, is_pure=seed is not None, explain_name=explain_name, explain_detail=explain_detail
+    )
 
 
 def _validate_common(
@@ -160,6 +164,7 @@ def scan_synthetic_regression(
     n_chunks: int | None = None,
     seed: int | None = None,
     fetch_size: int = 10_000,
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """
     A lazy source of synthetic linear-regression data ``Y = X @ B + E`` with Gaussian noise.
@@ -187,6 +192,7 @@ def scan_synthetic_regression(
         n_chunks: Number of contiguous chunks to split ``n_samples`` into. Required when ``chunk_key`` is set. Must satisfy ``1 <= n_chunks <= n_samples``.
         seed: Seed for ``np.random.default_rng``. If None, uses fresh entropy per call (and the source is registered with ``is_pure=False``).
         fetch_size: Default number of rows generated per batch when Polars does not provide a ``batch_size``. Must be >= 1. Defaults to 10_000.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
     """
     _validate_common(
         n_features=n_features,
@@ -254,6 +260,8 @@ def scan_synthetic_regression(
         mean_computer=mean_computer,
         extras_schema=extras_schema,
         chunk_sizes=chunk_sizes,
+        explain_name="scan_synthetic_regression",
+        explain_detail=description,
     )
 
 
@@ -275,6 +283,7 @@ def scan_synthetic_panel(
     epsilon_scale: float = 1.0,
     seed: int | None = None,
     fetch_size: int = 10_000,
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """
     A lazy source of synthetic panel data on a ``(date, symbol)`` grid. This generator draws independent per-row noise, uses ``x_i``/``y_i`` column names, and treats weights as a WLS variance model. Rows are yielded date-by-date so ``.set_sorted("date").group_by("date")`` streams cleanly under ``engine="streaming"``.
@@ -302,6 +311,7 @@ def scan_synthetic_panel(
         epsilon_scale: When ``use_weights=False``, the noise stddev for every row. When ``use_weights=True``, the *reference* stddev at ``w=1``; actual per-row noise is ``N(loc, (epsilon_scale/√w)²)``. Must be >= 0. Defaults to 1.0.
         seed: Seed for ``np.random.default_rng``. If None, uses fresh entropy per call (and the source is registered with ``is_pure=False``).
         fetch_size: Default number of rows generated per batch when Polars does not provide a ``batch_size``. Must be >= 1. Defaults to 10_000.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
     """
     _validate_common(
         n_features=n_features,
@@ -436,4 +446,6 @@ def scan_synthetic_panel(
         mean_computer=mean_computer,
         extras_schema=extras_schema,
         chunk_sizes=chunk_sizes,
+        explain_name="scan_synthetic_panel",
+        explain_detail=description,
     )

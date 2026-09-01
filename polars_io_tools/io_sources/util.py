@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import functools
+import inspect
 import logging
 import os
 import socket
@@ -331,13 +334,39 @@ Full Stack Trace:
     return error_catching_io_source
 
 
-def register_io_source_with_is_pure(io_source, schema, wrap_with_error_catching: bool = True, **kwargs):
+@functools.cache
+def _register_io_source_supports_explain_labels() -> bool:
+    """Whether ``register_io_source`` accepts ``explain_name`` / ``explain_detail`` (pola-rs/polars#23978, unreleased)."""
+    from polars.io.plugins import register_io_source
+
+    return {"explain_name", "explain_detail"} <= inspect.signature(register_io_source).parameters.keys()
+
+
+def register_io_source_with_is_pure(
+    io_source,
+    schema,
+    wrap_with_error_catching: bool = True,
+    explain_name: str | None = None,
+    explain_detail: str | None = None,
+    **kwargs,
+):
     """
     Register an io source with is_pure=True if Polars version >= 1.33.1.
 
     Wraps `polars.io.plugins.register_io_source`, adding `is_pure=True` for
     Polars versions that support it (1.33.1+). Optionally wraps the source
     with `wrap_io_source_with_error_catching` for better diagnostics.
+
+    Each source execution is instrumented with OpenTelemetry: one
+    ``io_source.execute[<explain_name>]`` span recording its pull latency. This
+    is a no-op unless the application has configured an OpenTelemetry SDK, so it
+    is always installed and costs nothing when telemetry is not in use. It can
+    be disabled with ``OTEL_PYTHON_INSTRUMENTATION_POLARS_IO_TOOLS_ENABLED=false``
+    (the wrapper is then not installed, so there is zero overhead).
+    ``explain_name`` names the span -- low cardinality, defaulting to the source
+    function's name; ``explain_detail`` is a free-form per-instance description.
+    On Polars builds that accept them, both are forwarded to the scan so its
+    registered identity and description match the span's.
 
     Args:
         io_source (callable): The IO source function
@@ -347,6 +376,8 @@ def register_io_source_with_is_pure(io_source, schema, wrap_with_error_catching:
             Polars actually needs it (typically at collect time), which avoids
             forcing ``collect_schema()`` on input LazyFrames at construction.
             Callable schemas require Polars >= 1.22.0.
+        explain_name: Low-cardinality label (the source kind, e.g. ``scan_db``) naming the scan and the span; defaults to the source function's name.
+        explain_detail: Optional free-form per-instance description shown as the scan's ``explain_detail`` and attached to the span (e.g. the table / collection / query).
         **kwargs: Additional keyword arguments to pass to register_io_source
 
     Returns:
@@ -354,10 +385,34 @@ def register_io_source_with_is_pure(io_source, schema, wrap_with_error_catching:
     """
     from polars.io.plugins import register_io_source
 
+    from .profiling import _instrumentation_enabled, source_identity, wrap_io_source_with_profiling
+
+    original_io_source = io_source
+
     # Check if Polars version supports is_pure parameter (1.33.1+)
     if version.parse(pl.__version__) >= version.parse("1.33.1"):
         kwargs.setdefault("is_pure", True)
 
+    # Resolve the identity from the *original* callable -- error-catching wraps it
+    # in a generic closure that would otherwise mask distinct sources -- and use
+    # it consistently for the scan's ``explain_name`` and the profiling span.
+    name = source_identity(original_io_source, explain_name)
+    if _register_io_source_supports_explain_labels():
+        kwargs.setdefault("explain_name", name)
+        if explain_detail is not None:
+            kwargs.setdefault("explain_detail", explain_detail)
+
+    # Profile the original source directly (innermost) so timing excludes eager
+    # pre-iterator work and ``close()`` reaches the real iterator; error-catching
+    # then decorates the profiled source. Skipping the wrapper entirely when
+    # instrumentation is disabled keeps the disabled path zero-overhead.
+    if _instrumentation_enabled():
+        io_source = wrap_io_source_with_profiling(
+            io_source,
+            schema=schema,
+            explain_name=name,
+            explain_detail=explain_detail,
+        )
     if wrap_with_error_catching:
         io_source = wrap_io_source_with_error_catching(io_source)
     return register_io_source(io_source, schema=schema, **kwargs)

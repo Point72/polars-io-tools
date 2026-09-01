@@ -131,6 +131,7 @@ def execute_on_ray(
     return_as: Literal["arrow", "ipc", "parquet"] = "arrow",
     remote_options: dict | None = None,
     max_concurrency: int | None = 100,
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """
     Execute a Polars LazyFrame on an *already initialised* Ray cluster,
@@ -157,6 +158,7 @@ def execute_on_ray(
             https://docs.ray.io/en/latest/ray-core/patterns/limit-pending-tasks.html. You may also wish to experiment
             with using resource hints to manage concurrency, although we do not recommend doing so; please see the
             following page for this alternative pattern: https://docs.ray.io/en/latest/ray-core/patterns/limit-running-tasks.html
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
         pl.LazyFrame: A new LazyFrame whose execution plan includes information about
@@ -308,4 +310,4 @@ def execute_on_ray(
 
         pbar.close()
 
-    return register_io_source_with_is_pure(source_generator, schema=lambda: self.collect_schema())
+    return register_io_source_with_is_pure(source_generator, schema=lambda: self.collect_schema(), explain_detail=description)

@@ -1429,6 +1429,7 @@ def cache_parquet(
     extra_partition_cols: str | list[str] | None = None,
     schema: pl.Schema | None = None,
     write_bounding_columns: list[str] | None = None,
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """
     Cache a LazyFrame to Parquet files with optional date-based partitioning. Supports daily, monthly, or yearly
@@ -1489,6 +1490,7 @@ def cache_parquet(
             partition columns, not content), a bounded cache is typically regenerated with ``cache_mode=CacheMode.REBUILD``
             so each run overwrites with the current predicate's rows; under ``CacheMode.CACHE`` a partition first written
             under one predicate is not re-written for a wider one. Default None leaves write behavior unchanged.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
         pl.LazyFrame: If the cache has all data: a LazyFrame reading from the cache.
@@ -1929,4 +1931,4 @@ def cache_parquet(
             end = time.time()
             log.debug("End: Loading data from cache at %s took %s seconds", time_unit_dir, end - start)
 
-    return register_io_source_with_is_pure(io_source=source_generator, schema=schema, validate_schema=False)
+    return register_io_source_with_is_pure(io_source=source_generator, schema=schema, validate_schema=False, explain_detail=description)

@@ -578,6 +578,7 @@ def scan_delta(
     rechunk: bool | None = None,
     aws_profile: str | None = None,
     pushdown_predicate_deltalake: bool = True,
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """
     Lazily read from a Delta lake table with logical type translation.
@@ -635,6 +636,7 @@ def scan_delta(
             reading file metadata. This can significantly reduce I/O on partitioned
             tables. When ``False``, falls back to standard ``pl.scan_delta`` behavior
             without partition pruning.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
         LazyFrame
@@ -771,4 +773,4 @@ def scan_delta(
 
         yield from collect_lf_in_io_source(lf, batch_size)
 
-    return register_io_source_with_is_pure(source_generator, schema=exposed_schema)
+    return register_io_source_with_is_pure(source_generator, schema=exposed_schema, explain_detail=description)

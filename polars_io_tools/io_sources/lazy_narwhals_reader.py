@@ -161,7 +161,7 @@ def polars_to_nw(pred: pl.Expr) -> nw.Expr | None:
     return builder.process_results()
 
 
-def scan_narwhals(obj: Any, fetch_size: int) -> pl.LazyFrame:
+def scan_narwhals(obj: Any, fetch_size: int, description: str | None = None) -> pl.LazyFrame:
     """
     Turn an arbitrary Narwhals frame/series/lazyframe into a **Polars LazyFrame**
     so that the rest of the Polars optimisation pipeline can work unchanged.
@@ -174,6 +174,7 @@ def scan_narwhals(obj: Any, fetch_size: int) -> pl.LazyFrame:
             does not pass a value for batch size; if it does, that will be used instead.
             There is no default value for this parameter, because scan_narwhals isn't
             supposed to be called directly.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
         **kwargs: Additional arguments for the database connector
     Returns:
         pl.LazyFrame
@@ -261,21 +262,21 @@ def scan_narwhals(obj: Any, fetch_size: int) -> pl.LazyFrame:
         else:
             yield from pl_df.iter_slices(n_rows=bs)
 
-    return register_io_source_with_is_pure(io_source=source_generator, schema=schema)
+    return register_io_source_with_is_pure(io_source=source_generator, schema=schema, explain_detail=description)
 
 
 # from_narwhals takes either a NW lazyframe or a NW dataframe
 # if it's a dataframe, just call to_polars and call it a day.
 # if lazy, then use scan_narwhals to push things down
 @overload
-def from_narwhals(obj: nw.DataFrame[Any], fetch_size: int = 10_000) -> pl.DataFrame: ...
+def from_narwhals(obj: nw.DataFrame[Any], fetch_size: int = 10_000, description: str | None = None) -> pl.DataFrame: ...
 
 
 @overload
-def from_narwhals(obj: nw.LazyFrame[Any], fetch_size: int = 10_000) -> pl.LazyFrame: ...
+def from_narwhals(obj: nw.LazyFrame[Any], fetch_size: int = 10_000, description: str | None = None) -> pl.LazyFrame: ...
 
 
-def from_narwhals(obj: FrameT, fetch_size: int = 10_000) -> pl.DataFrame | pl.LazyFrame:
+def from_narwhals(obj: FrameT, fetch_size: int = 10_000, description: str | None = None) -> pl.DataFrame | pl.LazyFrame:
     """
     Accept either a Narwhals `DataFrame` or `LazyFrame` and hands
     back the equivalent Polars object.
@@ -283,6 +284,7 @@ def from_narwhals(obj: FrameT, fetch_size: int = 10_000) -> pl.DataFrame | pl.La
     Args:
         obj: Narwhals DataFrame **or** Narwhals LazyFrame.
         fetch_size (int, default 10_000): Passed through to `scan_narwhals` when `obj` is lazy.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``). Only applies when `obj` is lazy and non-Polars (i.e. registered as an IO source).
 
     Returns:
         polars.DataFrame        if `obj` is a Narwhals DataFrame
@@ -297,7 +299,7 @@ def from_narwhals(obj: FrameT, fetch_size: int = 10_000) -> pl.DataFrame | pl.La
         return cast(pl.DataFrame | pl.LazyFrame, obj.to_native())
 
     if callable(getattr(obj, "collect", None)):
-        return scan_narwhals(obj, fetch_size=fetch_size)
+        return scan_narwhals(obj, fetch_size=fetch_size, description=description)
     try:
         return obj.to_polars()  # type: ignore[return-value]
     except AttributeError:

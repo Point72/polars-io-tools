@@ -91,7 +91,9 @@ def get_schema_from_query_odbc(
         raise ValueError(f"Could not determine schema for query: {query}, with error: {e}") from e
 
 
-def scan_db(query: str, connection: str, fetch_size: int = 10000, cast_map: dict[str, Any] | None = None, **kwargs) -> pl.LazyFrame:
+def scan_db(
+    query: str, connection: str, fetch_size: int = 10000, cast_map: dict[str, Any] | None = None, description: str | None = None, **kwargs
+) -> pl.LazyFrame:
     """
     Create a LazyFrame from a SQL query with predicate pushdown support.
 
@@ -121,6 +123,7 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, cast_map: dict
             optimize specific conversions (for example SQL Server seeks on ``CAST(datetime AS date)``) \
             while others fall back to a scan. For a hot path on a large indexed table, prefer a \
             filter expressed directly on the physical column instead of the cast one.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
         **kwargs: Additional arguments for the database connector
 
     Returns:
@@ -219,4 +222,4 @@ def scan_db(query: str, connection: str, fetch_size: int = 10000, cast_map: dict
             err_msg += f"\n\nWhile running the above, received error: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
-    return register_io_source_with_is_pure(source_generator, schema=schema)
+    return register_io_source_with_is_pure(source_generator, schema=schema, explain_detail=description)

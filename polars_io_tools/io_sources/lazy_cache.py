@@ -139,6 +139,7 @@ def cache(
     cache_mode: Literal["cache", "ignore", "rebuild"] = "cache",
     validate: bool = True,
     log_explain: bool = False,
+    description: str | None = None,
     **kwargs,
 ) -> pl.LazyFrame:
     """
@@ -175,6 +176,7 @@ def cache(
             collected for the cache fill, so it adds no extra pass over the source. Set to False to
             skip it on hot paths where uniqueness is already guaranteed.
         log_explain: If True, logs the query plan when defining the function.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
     Notes:
@@ -446,4 +448,4 @@ def cache(
         else:
             yield from df.iter_slices(n_rows=batch_size)
 
-    return register_io_source_with_is_pure(source_generator, schema=schema, validate_schema=True)
+    return register_io_source_with_is_pure(source_generator, schema=schema, validate_schema=True, explain_detail=description)

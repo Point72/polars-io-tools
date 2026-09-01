@@ -53,6 +53,7 @@ def scan_datadog(
     dd_interval: int | None = None,
     additional_schema: dict | None = None,
     overwrite_schema: bool = False,
+    description: str | None = None,
 ) -> pl.LazyFrame:
     """
     Return a Polars `LazyFrame` that holds the result of a Datadog
@@ -92,6 +93,7 @@ def scan_datadog(
             columns that you expect to be present in the response.
         overwrite_schema: If True, the `additional_schema` will overwrite the default schema (not
             add to it). You should probably avoid using this for safety reasons.
+        description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
         pl.LazyFrame: A Polars LazyFrame
@@ -277,4 +279,4 @@ def scan_datadog(
 
             yield df
 
-    return register_io_source_with_is_pure(source_generator, schema=schema)
+    return register_io_source_with_is_pure(source_generator, schema=schema, explain_detail=description)
