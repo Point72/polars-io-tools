@@ -49,10 +49,11 @@ from .range_visitor import (
     _promote_dates_to_datetimes,
     convert_expr_to_datetime_range,
 )
+from .restrict_visitor import restrict_expr_to_columns
 from .set_visitor import convert_expr_to_valid_values
 from .util import collect_lf_in_io_source, register_io_source_with_is_pure
 
-__all__ = ("FilterSpec", "pushdown_combine")
+__all__ = ("FilterSpec", "IntervalFilterSpec", "pushdown_combine")
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,65 @@ class FilterSpec:
     value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
 
 
+@dataclass
+class IntervalFilterSpec:
+    """
+    Specification for pushing a filter into a validity-interval (history-of-change) source.
+
+    Where :class:`FilterSpec` maps one output column to one source column, this maps a single
+    output (request-date) column to a pair of source columns ``[start_col, end_col]`` that
+    describe the window over which each source row is valid. When the user filters the output
+    column to a range ``[lo, hi]``, the correct predicate is an *overlap*::
+
+        start_col <= hi AND end_col >= lo          # closed="both"
+
+    which cannot be expressed with a single-column ``FilterSpec``. This spec pushes that overlap
+    to the source (so SQL/TickStore range-predicate pushdown is preserved) and, because the
+    overlap is fully determined by each source row, resolves membership exactly at the source --
+    consumers no longer re-implement ``start <= d <= end`` in their ``combine``.
+
+    Args:
+        start_col (str): Source column holding the window's inclusive lower bound.
+
+        end_col (str): Source column holding the window's upper bound (see ``closed``).
+
+        closed (str): Interval endpoint semantics -- one of ``"both"``, ``"left"``, ``"right"``,
+            ``"none"``. The half-open variants flip the boundary comparison at the exact endpoints:
+
+              - ``"both"``  (``[start, end]``): ``end >= lo`` and ``start <= hi``
+              - ``"left"``  (``[start, end)``): ``end >  lo`` and ``start <= hi``
+              - ``"right"`` (``(start, end]``): ``end >= lo`` and ``start <  hi``
+              - ``"none"``  (``(start, end)``): ``end >  lo`` and ``start <  hi``
+
+        value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform the request
+            bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
+            values (e.g. a business-day offset applied to the request date). A callable is applied to
+            each finite bound; a dict maps finite bounds present in it and leaves absent bounds
+            unmapped (that bound's predicate is then not pushed). ``None`` passes bounds through.
+    """
+
+    start_col: str
+    end_col: str
+    closed: str = "both"
+    value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
+
+
+def _map_bound(value: Any, mapping: dict | Callable | None) -> tuple[Any, bool]:
+    """Map a single interval request bound through ``value_mapping``.
+
+    Returns ``(mapped_value, ok)``. ``ok`` is False only for a dict mapping that lacks the key,
+    signalling the caller not to push that bound's predicate (mirrors the ``FilterSpec`` dict-miss
+    behavior of deferring rather than pushing an incomplete filter).
+    """
+    if mapping is None:
+        return value, True
+    if callable(mapping):
+        return mapping(value), True
+    if value in mapping:
+        return mapping[value], True
+    return value, False
+
+
 def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> tuple[set[Any], set[Any]]:
     """Transform filter values using the provided mapping.
 
@@ -143,6 +203,76 @@ def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> t
     return mapped, unmapped
 
 
+# Endpoint comparison operators per ``closed`` mode. ``lower`` is the ``end_col >= lo`` side (left
+# endpoint of the request overlap); ``upper`` is the ``start_col <= hi`` side (right endpoint).
+_CLOSED_TO_LEFT = {"both": portion.CLOSED, "left": portion.OPEN, "right": portion.CLOSED, "none": portion.OPEN}
+_CLOSED_TO_RIGHT = {"both": portion.CLOSED, "left": portion.CLOSED, "right": portion.OPEN, "none": portion.OPEN}
+
+
+def _bound_expr(value: Any, source_col: str, source_dtype: pl.DataType, *, is_lower: bool, boundary) -> pl.Expr | None:
+    """Build a single-sided comparison predicate for an interval bound.
+
+    ``is_lower=True`` emits ``end_col >= / > value`` (a ``[value, +inf)`` / ``(value, +inf)`` interval);
+    ``is_lower=False`` emits ``start_col <= / < value``. Date bounds compared against a ``Datetime``
+    source column are widened to full-day datetime ranges via the same helper the ``FilterSpec`` path
+    uses, so intraday rows on the boundary day are not silently dropped.
+    """
+    if is_lower:
+        interval = portion.Interval.from_atomic(boundary, value, portion.inf, portion.OPEN)
+    else:
+        interval = portion.Interval.from_atomic(portion.OPEN, -portion.inf, value, boundary)
+    if isinstance(source_dtype, pl.Datetime):
+        interval = _extend_dates_to_full_datetimes(interval)
+    expr = _convert_interval_to_polars_expr(interval, source_col)
+    # A one-sided finite interval is never empty/universe here, but stay defensive.
+    return expr if isinstance(expr, pl.Expr) else None
+
+
+def _apply_interval_filter(
+    filtered_lf: pl.LazyFrame,
+    spec: IntervalFilterSpec,
+    date_range: portion.Interval,
+    source_schema: dict[str, pl.DataType],
+) -> pl.LazyFrame:
+    """Apply an interval-overlap filter to a source LazyFrame.
+
+    Given the request range ``date_range`` extracted for the output column, push the overlap
+    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source, mapping the
+    request bounds through ``spec.value_mapping`` first. The overlap is fully determined per source
+    row, so the surviving rows are exactly the overlapping windows -- no post-combine membership
+    predicate is needed.
+    """
+    if spec.start_col not in source_schema or spec.end_col not in source_schema:
+        log.debug(f"Interval columns {spec.start_col!r}/{spec.end_col!r} not both in source, skipping interval pushdown")
+        return filtered_lf
+
+    enclosure = date_range.enclosure
+    lo, hi = enclosure.lower, enclosure.upper
+
+    conditions: list[pl.Expr] = []
+
+    # end_col >= lo  (drops expired/seed rows). Skipped for an unbounded lower request bound.
+    if lo != -portion.inf:
+        lo_mapped, ok = _map_bound(lo, spec.value_mapping)
+        if ok:
+            expr = _bound_expr(lo_mapped, spec.end_col, source_schema[spec.end_col], is_lower=True, boundary=_CLOSED_TO_LEFT[spec.closed])
+            if expr is not None:
+                conditions.append(expr)
+
+    # start_col <= hi  (drops windows starting after the request). Skipped for an unbounded upper bound.
+    if hi != portion.inf:
+        hi_mapped, ok = _map_bound(hi, spec.value_mapping)
+        if ok:
+            expr = _bound_expr(hi_mapped, spec.start_col, source_schema[spec.start_col], is_lower=False, boundary=_CLOSED_TO_RIGHT[spec.closed])
+            if expr is not None:
+                conditions.append(expr)
+
+    for cond in conditions:
+        filtered_lf = filtered_lf.filter(cond)
+
+    return filtered_lf
+
+
 def _call_combine(
     combine: Callable[..., pl.LazyFrame],
     filtered_sources: dict[str, pl.LazyFrame],
@@ -170,7 +300,7 @@ def _call_combine(
 
 
 def _compute_output_schema(
-    sources: dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec]]],
+    sources: dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec | IntervalFilterSpec]]],
     combine: Callable[..., pl.LazyFrame],
     combine_kwargs: dict[str, Any] | None = None,
     sources_as_kwargs: bool = False,
@@ -182,7 +312,7 @@ def _compute_output_schema(
     actually processing any data.
 
     Args:
-        sources (dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec]]]): The source specifications
+        sources (dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec | IntervalFilterSpec]]]): The source specifications
         combine (Callable[..., pl.LazyFrame]): The combine function
         combine_kwargs (dict[str, Any] | None): Additional keyword arguments to pass to combine
         sources_as_kwargs (bool): If True, pass sources as individual kwargs; if False, pass as a dict
@@ -205,7 +335,7 @@ def _is_temporal_dtype(dtype: pl.DataType) -> bool:
 
 
 def pushdown_combine(
-    sources: dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec]]],
+    sources: dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec | IntervalFilterSpec]]],
     combine: Callable[..., pl.LazyFrame],
     *,
     combine_kwargs: dict[str, Any] | None = None,
@@ -220,7 +350,7 @@ def pushdown_combine(
     the combine function is called.
 
     Args:
-        sources (dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec]]]): Dictionary mapping source names to (LazyFrame, filter_specs) tuples.
+        sources (dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec | IntervalFilterSpec]]]): Dictionary mapping source names to (LazyFrame, filter_specs) tuples.
 
             The filter_specs dict maps OUTPUT column names to FilterSpec objects
             that describe how to transform filters on that column for this source.
@@ -340,6 +470,19 @@ def pushdown_combine(
                 combine=combine_with_region_mapping,
                 combine_kwargs={"region_to_code": REGION_TO_CODE},
             )
+
+        Validity-interval source via :class:`IntervalFilterSpec`::
+
+            lf = pushdown_combine(
+                sources={
+                    # window rows valid over [valid_from, valid_to]
+                    "schedule": (schedule_lf, {"date": IntervalFilterSpec(start_col="valid_from", end_col="valid_to")}),
+                },
+                combine=lambda s: s["schedule"],
+            )
+
+            # Pushes the overlap start<=hi AND end>=lo to the source; only covering windows survive.
+            result = lf.filter(pl.col("date").is_between(start, end)).collect()
     """
     # Compute output schema for the IO source.
     # Wrap in a lambda so that the schema (and the per-source `lf.collect_schema()`
@@ -408,6 +551,13 @@ def pushdown_combine(
             empty_temporal_range = False
 
             for output_col, spec in specs.items():
+                # Interval specs reference two source columns and push an overlap predicate; handle them
+                # separately from the single-column FilterSpec path below.
+                if isinstance(spec, IntervalFilterSpec):
+                    if output_col in extracted_ranges:
+                        filtered_lf = _apply_interval_filter(filtered_lf, spec, extracted_ranges[output_col], source_schema)
+                    continue
+
                 source_col = _get_source_col(output_col, spec)
 
                 # Skip if source column doesn't exist in this source
@@ -511,8 +661,17 @@ def pushdown_combine(
         # rolling calculations, and handles any filters we couldn't push down.
         # Example: if user filters date == Jan 5 with 3-day lookback, the source fetched
         # Jan 2-5, combine ran (e.g., computed lag values), and now we filter to just Jan 5.
+        #
+        # An IntervalFilterSpec output column is a *virtual* request axis (e.g. "date") that maps to
+        # source [start_col, end_col] and is not produced by combine, so it is absent from the output.
+        # Its overlap was already resolved exactly at the source, so restrict the final predicate to
+        # columns that actually exist in the output before applying it (a no-op for FilterSpec columns,
+        # which combine does produce).
         if predicate is not None:
-            result_lf = result_lf.filter(predicate)
+            output_cols = result_lf.collect_schema().names()
+            restricted_predicate = restrict_expr_to_columns(predicate, output_cols)
+            if restricted_predicate is not None:
+                result_lf = result_lf.filter(restricted_predicate)
 
         # Select requested columns
         if with_columns is not None:
