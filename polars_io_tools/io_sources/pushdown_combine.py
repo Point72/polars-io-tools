@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import polars as pl
@@ -148,12 +148,28 @@ class IntervalFilterSpec:
             values (e.g. a business-day offset applied to the request date). A callable is applied to
             each finite bound; a dict maps finite bounds present in it and leaves absent bounds
             unmapped (that bound's predicate is then not pushed). ``None`` passes bounds through.
+
+    Notes:
+        The pushdown is **conservative** -- it may keep non-overlapping rows, but never drops an
+        overlapping one. The request column is virtual (produced by another source in ``combine``,
+        not by the interval source), so unlike :class:`FilterSpec` there is no post-combine filter on
+        it to trim the surplus; exact per-row membership is the consumer's ``combine``. Two cases
+        over-select at the source:
+
+          - **Disjoint requests** (e.g. ``date in [Jan1..Jan5] OR [Feb1..Feb5]``) collapse to their
+            outer hull ``[Jan1, Feb5]``, so windows overlapping only the gap survive the pushdown.
+          - **A dict ``value_mapping`` missing a bound** skips that side's predicate entirely, so that
+            side is left unconstrained.
     """
 
     start_col: str
     end_col: str
     closed: str = "both"
     value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.closed not in _CLOSED_MODES:
+            raise ValueError(f"closed must be one of {sorted(_CLOSED_MODES)}, got {self.closed!r}")
 
 
 def _map_bound(value: Any, mapping: dict | Callable | None) -> tuple[Any, bool]:
@@ -207,22 +223,42 @@ def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> t
 # endpoint of the request overlap); ``upper`` is the ``start_col <= hi`` side (right endpoint).
 _CLOSED_TO_LEFT = {"both": portion.CLOSED, "left": portion.OPEN, "right": portion.CLOSED, "none": portion.OPEN}
 _CLOSED_TO_RIGHT = {"both": portion.CLOSED, "left": portion.CLOSED, "right": portion.OPEN, "none": portion.OPEN}
+_CLOSED_MODES = frozenset(_CLOSED_TO_LEFT)
 
 
 def _bound_expr(value: Any, source_col: str, source_dtype: pl.DataType, *, is_lower: bool, boundary) -> pl.Expr | None:
     """Build a single-sided comparison predicate for an interval bound.
 
-    ``is_lower=True`` emits ``end_col >= / > value`` (a ``[value, +inf)`` / ``(value, +inf)`` interval);
-    ``is_lower=False`` emits ``start_col <= / < value``. Date bounds compared against a ``Datetime``
-    source column are widened to full-day datetime ranges via the same helper the ``FilterSpec`` path
-    uses, so intraday rows on the boundary day are not silently dropped.
+    ``is_lower=True`` emits ``end_col >= / > value`` (closed / open ``boundary``); ``is_lower=False``
+    emits ``start_col <= / < value``.
+
+    When ``value`` is a ``date`` (not ``datetime``) but the source column is ``Datetime``, the request
+    is a whole *day*, so the comparison point is resolved to a datetime that keeps full-day overlap
+    semantics -- independently of the endpoint open/closed-ness, which only governs the operator:
+
+      - lower side (``end_col`` vs the request-day start): compare against ``datetime(day, 00:00)``.
+        End-closed (``both``/``right``) -> ``>=``; end-open (``left``/``none``) -> ``>`` so a window
+        ending exactly at that midnight is dropped.
+      - upper side (``start_col`` vs the request-day end): a window starting anywhere within the day
+        overlaps it, so always compare ``start < datetime(day + 1, 00:00)`` regardless of ``boundary``.
+
+    Passing an open-boundary *date* interval through the day-granular widener would instead shift the
+    value a full day (reading "open" as "strictly after day d"), silently dropping boundary-day rows.
     """
-    if is_lower:
+    is_date_on_datetime = isinstance(source_dtype, pl.Datetime) and isinstance(value, date) and not isinstance(value, datetime)
+    if is_date_on_datetime:
+        if is_lower:
+            point = datetime.combine(value, time.min)
+            interval = portion.Interval.from_atomic(boundary, point, portion.inf, portion.OPEN)
+        else:
+            # Full-day upper: start strictly before the day after ``value`` (endpoint closed-ness is
+            # immaterial for a day-wide request).
+            point = datetime.combine(value + timedelta(days=1), time.min)
+            interval = portion.Interval.from_atomic(portion.OPEN, -portion.inf, point, portion.OPEN)
+    elif is_lower:
         interval = portion.Interval.from_atomic(boundary, value, portion.inf, portion.OPEN)
     else:
         interval = portion.Interval.from_atomic(portion.OPEN, -portion.inf, value, boundary)
-    if isinstance(source_dtype, pl.Datetime):
-        interval = _extend_dates_to_full_datetimes(interval)
     expr = _convert_interval_to_polars_expr(interval, source_col)
     # A one-sided finite interval is never empty/universe here, but stay defensive.
     return expr if isinstance(expr, pl.Expr) else None

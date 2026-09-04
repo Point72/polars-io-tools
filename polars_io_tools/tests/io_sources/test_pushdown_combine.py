@@ -21,6 +21,7 @@ from polars_io_tools.io_sources.base import BinaryExprNode, FunctionNode
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
 from polars_io_tools.io_sources.pushdown_combine import (
     FilterSpec,
+    IntervalFilterSpec,
     _apply_value_mapping,
     _compute_output_schema,
     _get_source_col,
@@ -2268,6 +2269,158 @@ class TestDateFilterOnDatetimeSource:
         result = lf.filter(pl.col("timestamp") >= datetime(2024, 1, 2, 12, 0)).collect()
         assert len(result) == 3
         assert result["value"].to_list() == [4, 5, 6]
+
+
+# --- IntervalFilterSpec --------------------------------------------------------------------------
+#
+# An interval "schedule" source ([start, end] per row) is joined in combine to a "spine" source that
+# supplies the real request column ("date"). IntervalFilterSpec pushes the range-overlap
+# (start<=hi AND end>=lo, adjusted for `closed`) onto the schedule; per-row membership is combine's.
+
+
+class TestIntervalFilterSpecDefaults:
+    def test_defaults(self):
+        spec = IntervalFilterSpec(start_col="s", end_col="e")
+        assert spec.start_col == "s"
+        assert spec.end_col == "e"
+        assert spec.closed == "both"
+        assert spec.value_mapping is None
+
+    @pytest.mark.parametrize("closed", ["both", "left", "right", "none"])
+    def test_valid_closed_accepted(self, closed):
+        assert IntervalFilterSpec(start_col="s", end_col="e", closed=closed).closed == closed
+
+    def test_invalid_closed_raises(self):
+        with pytest.raises(ValueError, match="closed must be one of"):
+            IntervalFilterSpec(start_col="s", end_col="e", closed="closed")
+
+
+def _interval_lf(sched_df, spine_df, *, closed="both", value_mapping=None, membership=None):
+    """Join an interval schedule (IntervalFilterSpec) to a spine carrying `date` through pushdown_combine."""
+    spec = IntervalFilterSpec(start_col="start", end_col="end", closed=closed, value_mapping=value_mapping)
+
+    def combine(s):
+        joined = s["spine"].join(s["sched"], on="root")
+        if membership is None:
+            return joined.filter((pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end")))
+        return joined.filter(membership)
+
+    return pushdown_combine(
+        sources={
+            "sched": (sched_df.lazy(), {"date": spec}),
+            "spine": (spine_df.lazy(), {"date": FilterSpec()}),
+        },
+        combine=combine,
+    )
+
+
+class TestIntervalFilterSpecOverlap:
+    def test_selects_covering_windows(self):
+        sched = pl.DataFrame(
+            {
+                "root": ["A", "A", "A"],
+                "start": [date(2024, 1, 1), date(2024, 1, 11), date(2024, 1, 21)],
+                "end": [date(2024, 1, 10), date(2024, 1, 20), date(2024, 1, 30)],
+                "val": [1, 2, 3],
+            }
+        )
+        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 15)]})
+        lf = _interval_lf(sched, spine)
+        result = lf.filter(pl.col("date") == date(2024, 1, 15)).collect()
+        assert result["val"].to_list() == [2]  # only [11,20] covers Jan 15
+
+    def test_long_window_kept(self):
+        sched = pl.DataFrame({"root": ["A"], "start": [date(2020, 1, 1)], "end": [date(2030, 1, 1)], "val": [1]})
+        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 15)]})
+        lf = _interval_lf(sched, spine)
+        assert lf.filter(pl.col("date") == date(2024, 1, 15)).collect()["val"].to_list() == [1]
+
+    def test_bounds_pushed_to_source(self):
+        sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
+        tracker = PredicateTracker(sched)
+        spine = pl.DataFrame({"root": ["A", "A"], "date": [date(2024, 1, 12), date(2024, 1, 15)]})
+        spec = IntervalFilterSpec(start_col="start", end_col="end")
+        lf = pushdown_combine(
+            sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
+            combine=lambda s: s["spine"].join(s["sched"], on="root").filter((pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end"))),
+        )
+        lf.filter(pl.col("date").is_between(date(2024, 1, 12), date(2024, 1, 15))).collect()
+
+        analyzer = PredicateAnalyzer(tracker.last_predicate)
+        end_lower, _ = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("end"))
+        _, start_upper = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("start"))
+        assert end_lower == date(2024, 1, 12)  # end >= lo
+        assert start_upper == date(2024, 1, 15)  # start <= hi
+
+
+class TestIntervalFilterSpecClosed:
+    """closed x {Date, Datetime}: half-open modes flip only the exact-endpoint boundary, and a
+    Date request against a Datetime column keeps intraday boundary-day windows for every mode."""
+
+    @pytest.mark.parametrize(
+        ("closed", "keep_start_eq_hi", "keep_end_eq_lo"),
+        [("both", True, True), ("left", True, False), ("right", False, True), ("none", False, False)],
+    )
+    def test_date_endpoints(self, closed, keep_start_eq_hi, keep_end_eq_lo):
+        # Window starting exactly at hi (Jan 15): kept iff start endpoint is closed (both/left).
+        sched_start = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 15)], "end": [date(2024, 1, 20)], "val": [1]})
+        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 15)]})
+        lf = _interval_lf(sched_start, spine, closed=closed, membership=pl.lit(True))
+        got = bool(lf.filter(pl.col("date") == date(2024, 1, 15)).collect().height)
+        assert got == keep_start_eq_hi
+
+        # Window ending exactly at lo (Jan 15): kept iff end endpoint is closed (both/right).
+        sched_end = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 1)], "end": [date(2024, 1, 15)], "val": [1]})
+        lf = _interval_lf(sched_end, spine, closed=closed, membership=pl.lit(True))
+        got = bool(lf.filter(pl.col("date") == date(2024, 1, 15)).collect().height)
+        assert got == keep_end_eq_lo
+
+    @pytest.mark.parametrize("closed", ["both", "left", "right", "none"])
+    def test_datetime_intraday_boundary_not_pruned(self, closed):
+        # Datetime columns; a Date request on Jan 15 must not prune a window active intraday on Jan 15,
+        # under any closed mode (regression: half-open modes previously shifted the bound a full day and
+        # dropped the row at the source). Assert survival at the source via the tracked schedule.
+        # A ends 09:00 Jan 15 (exercises end>=lo widening); B starts 15:00 Jan 15 (exercises start<=hi).
+        sched = pl.DataFrame(
+            {
+                "root": ["A", "B"],
+                "start": [datetime(2024, 1, 1, 9, 0), datetime(2024, 1, 15, 15, 0)],
+                "end": [datetime(2024, 1, 15, 9, 0), datetime(2024, 1, 20, 9, 0)],
+                "val": [1, 2],
+            }
+        )
+        tracker = PredicateTracker(sched)
+        spine = pl.DataFrame({"root": ["A", "B"], "date": [date(2024, 1, 15), date(2024, 1, 15)]})
+        spec = IntervalFilterSpec(start_col="start", end_col="end", closed=closed)
+        lf = pushdown_combine(
+            sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
+            # No membership filter: the interval pushdown alone must retain both boundary-day windows.
+            combine=lambda s: s["spine"].join(s["sched"], on="root"),
+        )
+        result = lf.filter(pl.col("date") == date(2024, 1, 15)).collect()
+        assert sorted(set(result["val"].to_list())) == [1, 2]
+
+
+class TestIntervalFilterSpecConservative:
+    def test_disjoint_request_collapses_to_hull(self):
+        # A window in the gap between two disjoint request ranges survives the (hull) pushdown; documented
+        # conservative behavior. The consumer's per-row membership still trims the final output.
+        sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 20)], "end": [date(2024, 1, 25)], "val": [1]})
+        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 22)]})
+        tracker = PredicateTracker(sched)
+        spec = IntervalFilterSpec(start_col="start", end_col="end")
+        lf = pushdown_combine(
+            sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
+            combine=lambda s: s["spine"].join(s["sched"], on="root"),
+        )
+        # Disjoint request: Jan 1-5 OR Jan 30-31; the Jan 20-25 window lies in the gap.
+        lf.filter(
+            pl.col("date").is_between(date(2024, 1, 1), date(2024, 1, 5)) | pl.col("date").is_between(date(2024, 1, 30), date(2024, 1, 31))
+        ).collect()
+        # Pushed end>=lo uses the hull lower bound Jan 1 (not Jan 30), confirming hull collapse.
+        analyzer = PredicateAnalyzer(tracker.last_predicate)
+        end_lower, _ = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("end"))
+        assert end_lower == date(2024, 1, 1)
 
 
 if __name__ == "__main__":
