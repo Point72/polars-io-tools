@@ -320,6 +320,15 @@ Describes how a filter on an output column maps to a source: rename to `source_c
 expand temporal ranges by `lookback`/`lookahead`, and remap values with `value_mapping` (a
 dict or callable).
 
+### `IntervalFilterSpec`
+
+```python
+IntervalFilterSpec(start_col, end_col, closed="both", value_mapping=None)
+```
+
+Maps a filter on a request-date column onto a validity-interval source whose rows are valid
+over `[start_col, end_col]`. A range `[lo, hi]` pushes the overlap `start_col <= hi AND end_col >= lo` (adjusted for `closed`), remapping bounds with `value_mapping` first.
+
 ### `concat_named`
 
 ```python
