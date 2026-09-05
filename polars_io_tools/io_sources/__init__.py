@@ -20,6 +20,7 @@ from .lazy_iter_rows import *
 from .lazy_narwhals_reader import *
 from .lazy_probe import probe, probe as _lazy_probe
 from .lazy_sql_reader import *
+from .multi_source import *  # backwards-compat alias of pushdown_combine
 from .pushdown_combine import *
 from .pushdown_pivot import *
 from .pushdown_unpivot import *
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
     from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
     from .lazy_iter_rows import iter_rows  # noqa: TC004
+    from .multi_source import multi_source
     from .pushdown_combine import FilterSpec, pushdown_combine
     from .pushdown_pivot import pushdown_pivot
     from .pushdown_unpivot import pushdown_unpivot
