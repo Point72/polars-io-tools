@@ -324,6 +324,16 @@ def test_from_narwhals_polars_predicate_pushdown():
     assert_frame_equal(result_single_in, expected_single_in)
 
 
+def test_from_narwhals_filtered_pandas_index_is_not_a_column():
+    source = pd.DataFrame({"id": [0, 1, 2, 3], "x": [0, 1, 2, 3]})
+    predicate = pl.col("x") != 1  # Leaves a non-RangeIndex in pandas.
+    expected = pl.from_pandas(source).filter(predicate)
+
+    actual = cpl.from_narwhals(nw.from_native(source).lazy()).filter(predicate).collect()
+
+    assert_frame_equal(actual, expected)
+
+
 def _strip_brackets(sql: str) -> str:
     """
     This is a convenience function for the test below.

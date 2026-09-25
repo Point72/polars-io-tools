@@ -258,15 +258,20 @@ def scan_narwhals(obj: Any, fetch_size: int, description: str | None = None) -> 
             err_msg += f"\n\nWhile running the above, received error: {e.__class__.__name__}:{e}"
             raise RuntimeError(err_msg) from e
 
-        # The docs specify that the PyCapsule interface is faster for 1-time calls
         pl_df: pl.DataFrame
-        try:
-            pl_df = nw.from_arrow(nw_df, backend="polars").to_native()  # type: ignore[assignment]
-        except Exception:
-            log.exception("PyCapsule interface failed; falling back to Arrow conversion")
-            result = pl.from_arrow(nw_df.to_arrow())
-            # pl.from_arrow on a Table always returns DataFrame
-            pl_df = cast(pl.DataFrame, result)
+        if nw_df.implementation in (nw.Implementation.PANDAS, nw.Implementation.MODIN, nw.Implementation.CUDF):
+            # Filtered pandas-like frames may have a non-RangeIndex; converting
+            # through Arrow would turn that index into an extra data column.
+            pl_df = nw_df.to_polars()
+        else:
+            # The docs specify that the PyCapsule interface is faster for 1-time calls
+            try:
+                pl_df = nw.from_arrow(nw_df, backend="polars").to_native()  # type: ignore[assignment]
+            except Exception:
+                log.exception("PyCapsule interface failed; falling back to Arrow conversion")
+                result = pl.from_arrow(nw_df.to_arrow())
+                # pl.from_arrow on a Table always returns DataFrame
+                pl_df = cast(pl.DataFrame, result)
 
         if predicate is not None:
             pl_df = pl_df.filter(predicate)
