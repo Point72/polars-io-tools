@@ -161,7 +161,7 @@ def concat_named(
         if restricted_predicate is not None:
             lf_ids = set(index_df.filter(restricted_predicate).select(lf_id_col).to_series().to_list())
             lf_to_concat = [lf for lf_id, lf in data_dict.items() if lf_id in lf_ids]
-            true_lf = pl.concat(lf_to_concat, **kwargs)  # type: ignore[assignment]
+            true_lf = pl.concat(lf_to_concat, **kwargs) if lf_to_concat else pl.LazyFrame(schema=schema)
         else:
             true_lf = pl.concat(data_dict.values(), **kwargs)  # type: ignore[assignment]
         if predicate is not None:

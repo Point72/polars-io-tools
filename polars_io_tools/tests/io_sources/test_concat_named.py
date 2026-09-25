@@ -67,6 +67,19 @@ def test_concat_named_filter_pushdown():
     assert not queried["df2"]  # df2 should not be queried
 
 
+def test_concat_named_filter_selects_no_sources():
+    """A missing identifier returns an empty frame without reading any source."""
+
+    def fail_if_queried(_predicate):
+        pytest.fail("No source should be queried for a missing identifier")
+
+    lf1 = io_source_assert(pl.DataFrame({"value": [1]}), fail_if_queried)
+    lf2 = io_source_assert(pl.DataFrame({"value": [2]}), fail_if_queried)
+    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter(pl.col("source") == "missing").collect()
+
+    assert_frame_equal(result, pl.DataFrame(schema={"value": pl.Int64, "source": pl.String}))
+
+
 def test_concat_named_multiple_unique_columns():
     """Test concat_named with multiple unique columns."""
     df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
