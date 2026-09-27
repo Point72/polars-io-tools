@@ -1052,3 +1052,51 @@ def test_piot_cache_shared_cache_different_partition_cols():
     coarse = df.piot.cache(cache, order_by="x", partition_cols=("p",)).select("v").collect()
     assert sorted(fine["v"].to_list()) == [10, 20, 30, 40]
     assert sorted(coarse["v"].to_list()) == [10, 20, 30, 40]
+
+
+def test_unfiltered_select_excludes_cached_partitions(source, df):
+    """An unfiltered read over a fully-cached partitioned frame must not re-scan everything.
+
+    It should restrict the discovery query to exclude the already-cached partitions instead of
+    issuing a full-source scan (predicate=None).
+    """
+    cache = {}
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",))
+
+    # Fully populate: every column of every partition.
+    full = df_cache.collect()
+    source.reset()
+
+    # Unfiltered read again: the discovery query must carry a partition-exclusion predicate.
+    out = df_cache.collect()
+    preds = [c.predicate_str for c in source.calls]
+    assert preds, "expected a partition-discovery query"
+    assert all(p is not None for p in preds), f"expected exclusion predicate, got a full re-scan: {preds}"
+    assert any("y" in (p or "") for p in preds), f"exclusion should reference partition col y: {preds}"
+
+    assert_frame_equal(out.sort(["y", "x"]), full.sort(["y", "x"]))
+    assert_frame_equal(out.sort(["y", "x"]), df.collect().sort(["y", "x"]))
+
+
+def test_null_partition_unfiltered_incremental_fetch():
+    """Regression: a null-valued partition must survive an unfiltered read that fetches more columns.
+
+    First caching only ``x`` populates the null partition; a later unfiltered ``collect`` excludes
+    already-cached partitions from discovery, so the missing columns for the null partition are
+    fetched by the fixed-partition scan — which must use null-safe equality (``eq_missing``) or it
+    returns no rows and the assembled block has mismatched column heights.
+    """
+    data = pl.DataFrame(
+        {"g": [None, None, "a", "a"], "x": [1, 2, 3, 4], "yv": [10, 20, 30, 40]},
+        schema={"g": pl.String, "x": pl.Int64, "yv": pl.Int64},
+    ).lazy()
+    cache = {}
+    cached = data.piot.cache(cache, order_by="x", partition_cols=("g",))
+
+    cached.select("x").collect()  # populate x for g=None and g="a"
+    out = cached.collect()  # unfiltered: must fetch yv for the null partition without error
+
+    assert_frame_equal(
+        out.sort(["g", "x"], nulls_last=True),
+        data.collect().sort(["g", "x"], nulls_last=True),
+    )

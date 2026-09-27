@@ -5,7 +5,7 @@ import inspect
 import logging
 import os
 import socket
-from collections.abc import Hashable, Iterator
+from collections.abc import Hashable, Iterator, Sequence
 from datetime import date, datetime, timedelta
 from graphlib import TopologicalSorter
 from typing import Any, NamedTuple
@@ -25,6 +25,7 @@ __all__ = (
     "extract_description_block",
     "filter_no_pushdown",
     "inject_description_block",
+    "partition_exclusion_predicate",
     "partition_key",
     "register_io_source_with_is_pure",
     "with_columns_topo",
@@ -42,6 +43,135 @@ def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     regardless of insertion order, making the result usable as a dict key or set member.
     """
     return tuple(sorted(partition_values.items()))
+
+
+def _not_in(col: str, values: list) -> pl.Expr:
+    """Expression true for rows whose ``col`` value is *not* in ``values`` (null-aware).
+
+    Reproduces ``eq_missing`` semantics — a null column value is kept unless null is itself one
+    of ``values`` — while staying analyzable by the DNF contradiction detector.
+    """
+    # Built from is_in/is_null only: a fill_null wrapper would preserve the semantics but be
+    # opaque to the DNF analyzer (defeating the skip-the-query optimization), and is_in's
+    # nulls_equal argument is not available on the minimum supported Polars.
+    non_null = [v for v in values if v is not None]
+    not_in_non_null = pl.col(col).is_in(non_null).not_() if non_null else pl.lit(True)
+    if None in values:
+        # A null column value matches the known null partition, so exclude it.
+        return not_in_non_null & pl.col(col).is_not_null()
+    # A null column value is not a known partition, so keep it.
+    return not_in_non_null | pl.col(col).is_null()
+
+
+def _exclude_row_predicate(row: dict, schema: pl.Schema) -> pl.Expr:
+    """Predicate that is true for rows *not* matching a single known partition ``row``.
+
+    Built as ``OR(col != value)`` (the negation of ``AND(col == value)``). Comparisons use
+    ``ne_missing`` (and ``_not_in`` for list-valued, grouped columns) so a null partition value
+    matches exactly its own rows while the expression stays analyzable for contradiction
+    detection.
+    """
+    col_exprs = []
+    for col, value in row.items():
+        if schema[col] == pl.List:
+            if len(value) == 0:
+                continue
+            elif len(value) == 1:
+                col_exprs.append(pl.col(col).ne_missing(value[0]))
+            else:
+                col_exprs.append(_not_in(col, value))
+        else:
+            col_exprs.append(pl.col(col).ne_missing(value))
+    if len(col_exprs) == 1:
+        return col_exprs[0]
+    return pl.Expr.or_(*col_exprs)
+
+
+def _repeated_grouping(df: pl.DataFrame) -> pl.DataFrame:
+    """Shrink a frame of partition values by repeatedly grouping on all-but-one column.
+
+    ``is_in`` is much cheaper than a large disjunction of equalities, so we collapse repeated
+    values into per-column lists to keep the resulting predicate small. Grouping stops as soon
+    as a pass no longer reduces the row count.
+    """
+    if df.is_empty():
+        return df
+
+    columns = df.columns
+    last_df = None
+    for idx, col in enumerate(columns):
+        if df.schema[col] == pl.List:
+            agg_func = pl.col(col).explode().unique().sort()
+        else:
+            agg_func = pl.col(col).unique().sort()
+        new_df = df.group_by(
+            columns[:idx] + columns[idx + 1 :],
+        ).agg(agg_func)
+        if last_df is not None and new_df.height == last_df.height:
+            return df
+        last_df = df
+        df = new_df
+    return df
+
+
+def _exclusion_from_frame(df: pl.DataFrame) -> pl.Expr | None:
+    """Build ``~OR(AND(col == value))`` from a frame whose rows are known partitions.
+
+    Rows matching any known partition are excluded. Columns may be scalar or list-valued
+    (the latter collapsing to ``is_in``). Returns ``None`` for an empty frame.
+    """
+    if df.is_empty():
+        return None
+    schema = df.schema
+    if len(schema) == 1:
+        col_name, _dtyp = next(iter(schema.items()))
+        vals = df.select(col_name).to_series().to_list()
+        if len(vals) == 1:
+            inner_vals = vals[0]
+            if isinstance(inner_vals, list):
+                if len(inner_vals) == 0:
+                    return None
+                elif len(inner_vals) == 1:
+                    return pl.col(col_name).ne_missing(inner_vals[0])
+                else:
+                    return _not_in(col_name, inner_vals)
+
+    row_exprs = []
+    for row in df.iter_rows(named=True):
+        row_exprs.append(_exclude_row_predicate(row, schema))
+
+    if len(row_exprs) == 1:
+        return row_exprs[0]
+
+    return pl.Expr.and_(*row_exprs)
+
+
+def partition_exclusion_predicate(known: pl.DataFrame, cols: Sequence[str]) -> pl.Expr | None:
+    """Predicate that keeps only rows *not* in any of the given partition combinations.
+
+    ``known`` holds already-known partition values and ``cols`` names the partition columns.
+    The result excludes every row whose partition matches one already present — equivalent to
+    ``~OR(AND(col == value))`` over the distinct combinations — or ``None`` when there is
+    nothing to exclude. Comparisons are null-safe (``ne_missing``/``is_null``), so a null
+    partition value excludes exactly its own rows, while staying analyzable for contradiction
+    detection. A single column collapses to ``~col.is_in(values)``; with many combinations the
+    expression is shrunk by repeated grouping before it is built.
+
+    This is the single builder shared by the column, in-memory, and Parquet caches so the
+    "restrict a query to only the not-yet-cached partitions" logic lives in one place with one
+    consistent (null-safe, analyzable) behavior.
+    """
+    cols = list(cols)
+    if not cols or known.is_empty():
+        return None
+    known = known.select(cols)
+    if known.is_empty():
+        return None
+    if len(cols) > 1:
+        grouped = _repeated_grouping(known)
+    else:
+        grouped = known.select(pl.implode(cols[0]))
+    return _exclusion_from_frame(grouped)
 
 
 def optional_deps_error(feature: str) -> ModuleNotFoundError:

@@ -12,6 +12,7 @@ from polars.testing import assert_frame_equal
 from polars_io_tools.io_sources.util import (
     _resolve_endpoint_hostname,
     _storage_options_for,
+    partition_exclusion_predicate,
     register_io_source_with_is_pure,
     with_columns_topo,
     wrap_io_source_with_error_catching,
@@ -1198,3 +1199,58 @@ class TestResolveEndpointHostname:
         assert opts.pyarrow["endpoint_override"] == "http://grid:9020"
         assert opts.polars["endpoint_url"] == "http://grid:9020"
         assert "Failed to resolve hostname" in caplog.text
+
+
+class TestPartitionExclusionPredicate:
+    """Tests for the shared null-safe partition-exclusion predicate builder."""
+
+    def test_none_when_nothing_to_exclude(self):
+        assert partition_exclusion_predicate(pl.DataFrame({"a": []}, schema={"a": pl.Int64}), ["a"]) is None
+        assert partition_exclusion_predicate(pl.DataFrame({"a": [1]}), []) is None
+
+    def test_single_column_excludes_known(self):
+        df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [10, 20, 30, 40]})
+        known = pl.DataFrame({"a": [1, 3]})
+        out = df.filter(partition_exclusion_predicate(known, ["a"]))
+        assert out["a"].to_list() == [2, 4]
+
+    def test_multi_column_excludes_only_exact_combos(self):
+        df = pl.DataFrame({"a": [1, 1, 2, 2], "b": [10, 20, 10, 20]})
+        known = pl.DataFrame({"a": [1, 2], "b": [10, 20]})  # exclude (1,10) and (2,20)
+        out = df.filter(partition_exclusion_predicate(known, ["a", "b"])).sort(["a", "b"])
+        assert out.to_dict(as_series=False) == {"a": [1, 2], "b": [20, 10]}
+
+    @pytest.mark.parametrize(
+        "known_vals, expected",
+        [
+            ([1, 3], [None, 5]),  # null not a known key -> kept
+            ([1, None], [3, 5]),  # null IS a known key -> excluded
+            ([3], [1, None, 5]),
+            ([None], [1, 3, 5]),
+        ],
+    )
+    def test_null_safe_matches_eq_missing(self, known_vals, expected):
+        import functools
+        import operator
+
+        df = pl.DataFrame({"a": [1, None, 3, 5]}, schema={"a": pl.Int64})
+        known = pl.DataFrame({"a": known_vals}, schema={"a": pl.Int64})
+        got = df.filter(partition_exclusion_predicate(known, ["a"]))["a"].to_list()
+        assert got == expected
+        # Equivalent to the eq_missing reference form.
+        ref = functools.reduce(operator.and_, [~pl.col("a").eq_missing(v) for v in known_vals])
+        assert df.filter(ref)["a"].to_list() == expected
+
+    def test_remains_analyzable_for_contradiction_detection(self):
+        from polars_io_tools.io_sources.dnf_visitor import _is_contradiction
+
+        known = pl.DataFrame({"a": [1, 3]}, schema={"a": pl.Int64})
+        excl = partition_exclusion_predicate(known, ["a"])
+        # Querying for a in {1, 3} while excluding {1, 3} is impossible.
+        assert _is_contradiction(pl.col("a").is_in([1, 3]) & excl) is True
+
+    def test_duplicates_in_known_are_deduplicated(self):
+        df = pl.DataFrame({"a": [1, 2, 3]})
+        known = pl.DataFrame({"a": [1, 1, 1, 2]})
+        out = df.filter(partition_exclusion_predicate(known, ["a"]))
+        assert out["a"].to_list() == [3]

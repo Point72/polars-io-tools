@@ -29,7 +29,7 @@ from .._compat import POLARS_HAS_PARTITION_BY
 from .dnf_visitor import ColumnConstraintAnalyzer, DNFClause, convert_expr_to_dnf
 from .range_visitor import _convert_atomic_interval_to_polars_expr, convert_expr_to_datetime_range
 from .restrict_visitor import restrict_expr_to_columns
-from .util import _storage_options_for, collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import _storage_options_for, collect_lf_in_io_source, partition_exclusion_predicate, register_io_source_with_is_pure
 
 
 @dataclass(frozen=True)
@@ -352,27 +352,12 @@ def _build_not_existing_partitions_pred(
 ) -> pl.Expr | None:
     """Build a predicate that excludes existing partition combinations.
 
-    Returns an expression equivalent to NOT(OR(AND(col==val ...))) across rows in `existing_parts_df[join_cols]`.
-    If no rows or no join columns, returns None.
+    Returns an expression equivalent to ``NOT(OR(AND(col==val ...)))`` across rows in
+    ``existing_parts_df[join_cols]`` (see
+    :func:`~polars_io_tools.io_sources.util.partition_exclusion_predicate`), or ``None`` when
+    there are no rows or no join columns.
     """
-    if not join_cols or existing_parts_df.is_empty():
-        return None
-    rows = existing_parts_df.select(join_cols).unique().to_dicts()
-    if not rows:
-        return None
-    ors: list[pl.Expr] = []
-    for row in rows:
-        ands: list[pl.Expr] = []
-        for col in join_cols:
-            val = row[col]
-            ands.append(pl.col(col) == pl.lit(val))
-        if ands:
-            conj = functools.reduce(operator.and_, ands)
-            ors.append(conj)
-    if not ors:
-        return None
-    disj = functools.reduce(operator.or_, ors)
-    return ~disj
+    return partition_exclusion_predicate(existing_parts_df, join_cols)
 
 
 def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[str]:

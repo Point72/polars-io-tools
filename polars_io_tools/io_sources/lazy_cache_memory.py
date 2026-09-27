@@ -47,15 +47,13 @@ constructing a fresh ``cache_memory`` (a fresh call builds a fresh buffer), the 
 instance-scoped invalidation model as the success path.
 """
 
-import functools
-import operator
 import threading
 from collections.abc import Callable, Iterator, Sequence
 
 import polars as pl
 
 from .restrict_visitor import restrict_expr_to_columns
-from .util import PartitionKey, collect_lf_in_io_source, partition_key, register_io_source_with_is_pure
+from .util import PartitionKey, collect_lf_in_io_source, partition_exclusion_predicate, partition_key, register_io_source_with_is_pure
 
 __all__ = ("cache_memory",)
 
@@ -67,13 +65,20 @@ _NOTHING = object()
 def _exclude_built(built_keys: set[PartitionKey]) -> pl.Expr | None:
     """A predicate that excludes every already-built partition.
 
-    For each built partition key (a conjunction of ``col == value``), we exclude rows that
-    match it, then AND those exclusions together — i.e. "not in any already-built partition".
-    ``eq_missing`` is used so a null-valued partition key excludes exactly its own rows.
-    Returns ``None`` when nothing has been built yet (no restriction needed).
+    Returns "not in any already-built partition" (see
+    :func:`~polars_io_tools.io_sources.util.partition_exclusion_predicate`), or ``None`` when
+    nothing has been built yet (no restriction needed). ``eq_missing`` semantics mean a
+    null-valued partition key excludes exactly its own rows.
     """
-    clauses = [~functools.reduce(operator.and_, (pl.col(col).eq_missing(value) for col, value in key)) for key in built_keys if key]
-    return functools.reduce(operator.and_, clauses) if clauses else None
+    keys = [key for key in built_keys if key]
+    if not keys:
+        return None
+    cols = [col for col, _ in keys[0]]
+    # infer_schema_length=None scans every key so a partition column that is null in the first
+    # keys but valued later still infers the correct dtype (otherwise Polars infers Null and
+    # fails to append the later value).
+    known = pl.DataFrame([dict(key) for key in keys], infer_schema_length=None)
+    return partition_exclusion_predicate(known, cols)
 
 
 class _CachedBuildError(Exception):
