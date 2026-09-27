@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import threading
 from collections.abc import Iterator, MutableMapping, Sequence
 from typing import Any, Literal, NamedTuple
 
@@ -30,6 +31,20 @@ class _CacheKey(NamedTuple):
 
 _CACHE: dict[_CacheKey, pl.Series] = {}
 
+# Guards cache discovery and publication so concurrent collections sharing a cache cannot mutate
+# the mapping mid-iteration or read a half-published partition. collect_all runs outside the
+# lock, so independent collections still parallelize.
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_lock() -> threading.Lock:
+    """Return the shared cache lock, via a function so the io_source stays picklable.
+
+    A ``threading.Lock`` cannot be pickled, so the generator closes over this module-level
+    function (referenced by name) rather than the lock object itself.
+    """
+    return _CACHE_LOCK
+
 
 def _df_key(df: pl.LazyFrame, order_by: tuple[str, ...] = (), partition_cols: tuple[str, ...] = ()) -> str:
     """Return a unique key for the given dataframe, ordering key and partition layout."""
@@ -59,6 +74,7 @@ def cache(
     *,
     order_by: str | Sequence[str],
     partition_cols: tuple[str, ...] = (),
+    column_granularity: bool = True,
     cache_mode: Literal["cache", "ignore", "rebuild"] = "cache",
     validate: bool = True,
     log_explain: bool = False,
@@ -92,6 +108,12 @@ def cache(
             sorted by ``order_by`` (within each partition when ``partition_cols`` is set).
         partition_cols: An optional set of columns to partition the cache by. It is recommended that queries to the underlying frame for the partition cols are fast,
             i.e. they correspond to the parquet partition columns.
+        column_granularity: If True (default), each column is cached independently, so selecting a
+            not-yet-cached column re-queries the source for it. If False, the first touch of a partition
+            collects and stores its whole schema (under the same per-column keys), so later selects of any
+            column are served from the cache rather than re-evaluated — at the cost of evaluating every
+            column up front. Row partitioning is preserved either way, and a ``False`` fill is readable by a
+            ``True`` reader.
         cache_mode: The caching mode; use "cache" for regular caching, "rebuild" to overwrite existing elements of the cache (i.e. to force a refresh), or "ignore" to not use the cache at all.
         validate: If True (default), verify that ``order_by`` uniquely identifies rows of each
             collected block, raising at ``collect`` time otherwise (Polars surfaces this as a
@@ -182,38 +204,44 @@ def cache(
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         """A generator that returns a dataframe from the cache."""
-        # Get the set of columns to select
+        # Columns the caller actually wants back.
         if with_columns is None:
-            columns_to_select = list(schema)
+            return_columns = list(schema)
         else:
-            columns_to_select = with_columns
+            return_columns = with_columns
+        # Columns to look up and fill in the cache. When column_granularity is False we collect
+        # and store the whole schema on any miss (under the existing per-column keys), so a
+        # partition's first touch pulls every column and later selects are pure hits.
+        columns_to_select = list(schema) if not column_granularity else return_columns
 
         partition_predicate = None if predicate is None else restrict_expr_to_columns(predicate, set(partition_cols))
 
         # For each column, define a list of partitions we can find in the cache
         # Later, we will filter these partitions based on relevancy - for now we grab everything
         cached_partitions: dict[str, list[dict[str, Any]]] = {col: [] for col in columns_to_select}
-        if cache_mode == "cache":
-            if partition_cols:
-                # Traverse all cache keys once (might be slow, as we don't index the cache keys by (col, df_key)
-                # The goal is to find all partitions for which we have data for the given df, col
-                for cache_key in cache:
-                    if cache_key.df_key == df_key:
-                        for col in columns_to_select:
-                            if cache_key.col == col:
-                                cached_partitions[col].append(dict(cache_key.partition_key))
+        # Read under the lock so a concurrent publish can't resize the mapping mid-scan.
+        with _cache_lock():
+            if cache_mode == "cache":
+                if partition_cols:
+                    # Traverse all cache keys once (might be slow, as we don't index the cache keys by (col, df_key)
+                    # The goal is to find all partitions for which we have data for the given df, col
+                    for cache_key in cache:
+                        if cache_key.df_key == df_key:
+                            for col in columns_to_select:
+                                if cache_key.col == col:
+                                    cached_partitions[col].append(dict(cache_key.partition_key))
+                else:
+                    # When there are no partition columns, do not need to traverse all cache keys,
+                    # can look up the existence of the cache key directly
+                    for col in columns_to_select:
+                        cached_partitions[col] = []
+                        cache_key = _CacheKey(col=col, df_key=df_key, partition_key=_partition_key({}))
+                        if cache_key in cache:
+                            cached_partitions[col].append(dict(cache_key.partition_key))
+            elif cache_mode == "rebuild":
+                pass
             else:
-                # When there are no partition columns, do not need to traverse all cache keys,
-                # can look up the existence of the cache key directly
-                for col in columns_to_select:
-                    cached_partitions[col] = []
-                    cache_key = _CacheKey(col=col, df_key=df_key, partition_key=_partition_key({}))
-                    if cache_key in cache:
-                        cached_partitions[col].append(dict(cache_key.partition_key))
-        elif cache_mode == "rebuild":
-            pass
-        else:
-            raise NotImplementedError
+                raise NotImplementedError
 
         # Set up a variable to store the data that goes into the final result, keyed by partition
         data: dict[_PartitionKey, dict[str, pl.Series]] = {}
@@ -325,39 +353,40 @@ def cache(
         else:
             collected_frames = []
 
-        # Add the data from the frames to the cache
-        for partition_key, frame in zip(frames_to_collect, collected_frames):
-            if partition_key is None:
-                if partition_cols:
-                    frame_iter = frame.partition_by(partition_cols, as_dict=True).items()
-                else:
-                    frame_iter = [((), frame)]
+        # Publish under the lock so a partition's columns appear to other collections together.
+        with _cache_lock():
+            for partition_key, frame in zip(frames_to_collect, collected_frames):
+                if partition_key is None:
+                    if partition_cols:
+                        frame_iter = frame.partition_by(partition_cols, as_dict=True).items()
+                    else:
+                        frame_iter = [((), frame)]
 
-                for partition_values, partition_frame in frame_iter:
-                    if validate and all(c in partition_frame.columns for c in order_by):
-                        _validate_order_by_unique(partition_frame, order_by)
-                    partition_key = _partition_key(dict(zip(partition_cols, partition_values)))
-                    for col in partition_frame.columns:
+                    for partition_values, partition_frame in frame_iter:
+                        if validate and all(c in partition_frame.columns for c in order_by):
+                            _validate_order_by_unique(partition_frame, order_by)
+                        partition_key = _partition_key(dict(zip(partition_cols, partition_values)))
+                        for col in partition_frame.columns:
+                            cache_key = _CacheKey(col=col, df_key=df_key, partition_key=partition_key)
+                            log.debug("Caching new partition:  %s", cache_key)
+                            cache[cache_key] = partition_frame[col]
+                            data.setdefault(partition_key, {})[col] = partition_frame[col]
+                else:
+                    if validate and all(c in frame.columns for c in order_by):
+                        _validate_order_by_unique(frame, order_by)
+                    for col in frame.columns:
                         cache_key = _CacheKey(col=col, df_key=df_key, partition_key=partition_key)
                         log.debug("Caching new partition:  %s", cache_key)
-                        cache[cache_key] = partition_frame[col]
-                        data.setdefault(partition_key, {})[col] = partition_frame[col]
-            else:
-                if validate and all(c in frame.columns for c in order_by):
-                    _validate_order_by_unique(frame, order_by)
-                for col in frame.columns:
-                    cache_key = _CacheKey(col=col, df_key=df_key, partition_key=partition_key)
-                    log.debug("Caching new partition:  %s", cache_key)
-                    cache[cache_key] = frame[col]
-                    data.setdefault(partition_key, {})[col] = frame[col]
+                        cache[cache_key] = frame[col]
+                        data.setdefault(partition_key, {})[col] = frame[col]
 
         # Return the data as a dataframe
-        out_schema = {col: schema[col] for col in columns_to_select}
+        out_schema = {col: schema[col] for col in return_columns}
         frames = []
         for partition_key, col_values in data.items():
             # We might have pulled in more columns than requested for populating the cache,
             # We need to filter them out appropriately.
-            df = pl.DataFrame(col_values, schema_overrides=out_schema).select(columns_to_select)
+            df = pl.DataFrame(col_values, schema_overrides=out_schema).select(return_columns)
             if predicate is not None:
                 df = df.filter(predicate)
             frames.append(df)

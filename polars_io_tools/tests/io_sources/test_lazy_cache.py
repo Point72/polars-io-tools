@@ -1100,3 +1100,116 @@ def test_null_partition_unfiltered_incremental_fetch():
         out.sort(["g", "x"], nulls_last=True),
         data.collect().sort(["g", "x"], nulls_last=True),
     )
+
+
+def test_column_granularity_false_fills_all_columns(source, df):
+    """With column_granularity=False, the first touch pulls the whole schema."""
+    cache = {}
+    df_cache = df.piot.cache(cache, order_by="x", column_granularity=False)
+
+    out = df_cache.select("x2").collect()
+    counts = source.get_column_counts()
+    # Every column was fetched even though only x2 was requested.
+    for col in ("x", "y", "p", "x2", "y2", "p2"):
+        assert counts.get(col, 0) == 1, col
+    # One key per column of the (single, unpartitioned) block.
+    assert len(cache) == 6
+
+    source.reset()
+    # A later select of different columns is a pure cache hit: no source query.
+    out2 = df_cache.select(["y2", "p2"]).collect()
+    assert source.calls == []
+    assert_frame_equal(out, df.select("x2").collect())
+    assert_frame_equal(out2, df.select(["y2", "p2"]).collect())
+
+
+def test_column_granularity_false_preserves_partitioning(source, df):
+    """Row partitioning is preserved; each partition fills its full schema once."""
+    cache = {}
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",), column_granularity=False)
+
+    out_a = df_cache.filter(pl.col("y") == "a").select("x2").collect()
+    counts = source.get_column_counts()
+    for col in ("x", "p", "x2", "y2", "p2"):
+        assert counts.get(col, 0) == 1, col
+
+    source.reset()
+    # Same partition, different column -> served from cache, no query.
+    out_a2 = df_cache.filter(pl.col("y") == "a").select("p2").collect()
+    assert source.calls == []
+
+    source.reset()
+    # A different partition triggers exactly one more full-schema fill.
+    df_cache.filter(pl.col("y") == "b").select("x2").collect()
+    counts = source.get_column_counts()
+    for col in ("x", "p", "x2", "y2", "p2"):
+        assert counts.get(col, 0) == 1, col
+
+    assert_frame_equal(out_a, df.filter(pl.col("y") == "a").select("x2").collect())
+    assert_frame_equal(out_a2, df.filter(pl.col("y") == "a").select("p2").collect())
+
+
+def test_column_granularity_false_and_true_share_cache(source, df):
+    """A column_granularity=False fill populates keys a granularity=True reader hits."""
+    cache = {}
+    # Eager fill of all columns via the False reader.
+    df.piot.cache(cache, order_by="x", column_granularity=False).select("x2").collect()
+
+    source.reset()
+    # Default (per-column) reader finds every column already cached -> no query.
+    out = df.piot.cache(cache, order_by="x").select(["x2", "y2"]).collect()
+    assert source.calls == []
+    assert_frame_equal(out, df.select(["x2", "y2"]).collect())
+
+
+def test_concurrent_collections_shared_cache_do_not_race():
+    """Concurrent collections sharing one cache must not raise or corrupt it.
+
+    Barrier-synchronized threads each collect a distinct partition with
+    ``column_granularity=False`` so that, at any moment, some threads iterate the shared cache
+    during discovery while others publish into it. Without synchronization this raises
+    ``RuntimeError: dictionary changed size during iteration``.
+    """
+    import threading
+
+    n_partitions = 400
+    universe = pl.DataFrame(
+        {
+            "sym": [f"s{i}" for i in range(n_partitions)],
+            "x": list(range(n_partitions)),
+            "y": [i * 2 for i in range(n_partitions)],
+        }
+    ).lazy()
+
+    cache: dict = {}
+    n_threads = 8
+    per_thread = n_partitions // n_threads
+    barrier = threading.Barrier(n_threads)
+    errors: list[Exception] = []
+    results: dict[int, pl.DataFrame] = {}
+
+    def worker(tid: int) -> None:
+        try:
+            barrier.wait()
+            for j in range(per_thread):
+                sym = f"s{tid * per_thread + j}"
+                out = (
+                    universe.piot.cache(cache, order_by="sym", partition_cols=("sym",), column_granularity=False)
+                    .filter(pl.col("sym") == sym)
+                    .collect()
+                )
+                results[tid * per_thread + j] = out
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent collections raised: {errors[:3]}"
+    # Every partition was collected correctly, and every column landed in the cache.
+    combined = pl.concat([results[i] for i in range(n_partitions)]).sort("x")
+    assert_frame_equal(combined, universe.collect().sort("x"))
+    assert len(cache) == n_partitions * len(universe.collect_schema())
