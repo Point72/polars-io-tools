@@ -3056,22 +3056,25 @@ class TestWriteBoundingColumns:
         assert on_disk["x"].to_list() == [1, 2, 3, 4, 5]
 
     def test_empty_subset_pins_current_behavior(self, tmp_path):
-        """Degenerate empty subset is_in([]).
+        """Degenerate empty subset ``is_in([])`` with a bounded write.
 
-        FINDING: a bounded write with an empty subset produces ZERO partition files, so the
-        subsequent read raises ComputeError ('expanded paths were empty'). The UNBOUNDED
-        equivalent returns an empty frame cleanly. This test PINS the current (divergent)
-        behavior so any future fix is visible.
+        A bounded write with an empty subset produces ZERO partition files; the subsequent read
+        returns an empty frame with the expected schema, matching the UNBOUNDED equivalent below.
         """
         d = tmp_path / "empty"
-        with pytest.raises(pl.exceptions.ComputeError):
+        out = (
             cache_parquet(
                 self._make_source,
                 cache_path=d,
                 date_column="date",
                 cache_mode=CacheMode.REBUILD,
                 write_bounding_columns=["x"],
-            ).filter(pl.col("x").is_in([])).collect()
+            )
+            .filter(pl.col("x").is_in([]))
+            .collect()
+        )
+        assert out.height == 0
+        assert set(out.columns) == {"date", "x", "y", "value"}
 
     def test_empty_subset_unbounded_is_clean(self, tmp_path):
         """Contrast control: the UNBOUNDED empty-subset read returns an empty frame with no error."""
@@ -3088,3 +3091,207 @@ class TestWriteBoundingColumns:
         )
         assert out.height == 0
         assert set(out.columns) == {"date", "x", "y", "value"}
+
+
+class TestNonEnumerablePredicatesAndWrites:
+    """Read/write correctness for non-enumerable partition predicates (!=, unbounded ranges)
+    and the CACHE-mode invariant that existing partitions are never rewritten.
+
+    Note: null values in partition columns are unsupported (see cache_parquet docstring).
+    """
+
+    def _mk(self, tmp_path, source_calls=None):
+        data = pl.DataFrame(
+            {
+                "date": [datetime.date(2024, 1, 1)] * 5,
+                "symbol": ["s0", "s1", "s2", "s3", "s4"],
+                "region": ["a", "a", "b", "b", "b"],
+                "v": [1, 2, 3, 4, 5],
+            },
+            schema={"date": pl.Date, "symbol": pl.String, "region": pl.String, "v": pl.Int64},
+        )
+
+        def factory():
+            if source_calls is not None:
+                source_calls.append(1)
+            return data.lazy()
+
+        return data, factory
+
+    def _cache(self, factory, tmp_path, schema):
+        return cache_parquet(
+            factory,
+            cache_path=tmp_path,
+            date_column=None,
+            time_unit="daily",
+            extra_partition_cols=["symbol", "region"],
+            schema=schema,
+        )
+
+    def _mtimes(self, root):
+        return {os.path.join(r, f): os.path.getmtime(os.path.join(r, f)) for r, _, fs in os.walk(root) for f in fs}
+
+    @pytest.mark.parametrize(
+        "pred, expected_v",
+        [
+            (pl.col("symbol") != "s0", [2, 3, 4, 5]),
+            (pl.col("symbol").is_in(["s1", "s2", "s3", "s4"]), [2, 3, 4, 5]),  # positive control
+            (pl.col("v") > 2, [3, 4, 5]),  # non-partition predicate (UNCONSTRAINED)
+            ((pl.col("symbol") != "s0") | (pl.col("symbol") == "s0"), [1, 2, 3, 4, 5]),  # always-true OR
+            ((pl.col("symbol") != "s0") & (pl.col("region") == "b"), [3, 4, 5]),  # partial wildcard
+        ],
+    )
+    def test_populated_cache_read_correct(self, tmp_path, pred, expected_v):
+        data, factory = self._mk(tmp_path)
+        schema = data.schema
+        self._cache(factory, tmp_path, schema).collect()  # populate all
+        out = self._cache(factory, tmp_path, schema).filter(pred).collect()
+        assert sorted(out["v"].to_list()) == expected_v
+
+    def test_populated_cache_not_rewritten(self, tmp_path):
+        """CACHE mode must not rewrite existing partition files on a filtered read."""
+        data, factory = self._mk(tmp_path)
+        schema = data.schema
+        self._cache(factory, tmp_path, schema).collect()
+        before = self._mtimes(tmp_path)
+        time.sleep(0.05)
+        for pred in (pl.col("v") > 2, pl.col("symbol") != "s0"):
+            self._cache(factory, tmp_path, schema).filter(pred).collect()
+        after = self._mtimes(tmp_path)
+        rewritten = [p for p in after if p not in before or after[p] != before[p]]
+        assert rewritten == [], f"CACHE mode rewrote existing files: {rewritten}"
+
+    @pytest.mark.parametrize(
+        "pred, expected_v",
+        [
+            (pl.col("symbol") != "s0", [2, 3, 4, 5]),
+            ((pl.col("symbol") != "s0") | (pl.col("symbol") == "s0"), [1, 2, 3, 4, 5]),
+            ((pl.col("symbol") != "s0") & (pl.col("region") == "b"), [3, 4, 5]),
+        ],
+    )
+    def test_incomplete_cache_populates_missing(self, tmp_path, pred, expected_v):
+        """A non-enumerable predicate on an empty cache should populate the matching partitions."""
+        data, factory = self._mk(tmp_path)
+        schema = data.schema
+        # Fresh cache: first read with a negative/wildcard predicate must return correct rows.
+        out = self._cache(factory, tmp_path, schema).filter(pred).collect()
+        assert sorted(out["v"].to_list()) == expected_v
+
+    def test_contradiction_returns_empty(self, tmp_path):
+        data, factory = self._mk(tmp_path)
+        schema = data.schema
+        self._cache(factory, tmp_path, schema).collect()
+        out = self._cache(factory, tmp_path, schema).filter((pl.col("symbol") == "s0") & (pl.col("symbol") == "s1")).collect()
+        assert out.height == 0
+
+
+class TestDateColumnNonEnumerablePreserved:
+    """The read fix is scoped to date_column=None; date-partitioned caches keep prior behavior.
+
+    In particular, a non-enumerable extra-column predicate on a populated date-partitioned cache
+    must still read from cache without re-querying/rewriting from a (possibly changed) upstream.
+    """
+
+    def test_date_partitioned_negative_predicate_reads_cache(self, tmp_path):
+        orig = pl.DataFrame(
+            {"date": [datetime.date(2024, 1, 1)] * 3, "symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]},
+            schema={"date": pl.Date, "symbol": pl.String, "v": pl.Int64},
+        )
+        mutated = orig.with_columns((pl.col("v") + 100).alias("v"))
+        state = {"df": orig}
+
+        def factory():
+            return state["df"].lazy()
+
+        def mk():
+            return cache_parquet(
+                factory,
+                cache_path=tmp_path,
+                date_column="date",
+                time_unit="daily",
+                extra_partition_cols="symbol",
+                schema=orig.schema,
+            )
+
+        mk().collect()  # populate with orig
+        state["df"] = mutated  # upstream changes; CACHE mode must not overwrite
+        out = mk().filter(pl.col("symbol") != "s0").collect().sort("symbol")
+        assert out["v"].to_list() == [2, 3]
+
+
+def test_rebuild_wildcard_predicate_leaves_out_of_scope_partition(tmp_path):
+    """REBUILD with a non-enumerable predicate (date_column=None) refreshes only in-scope
+    partitions; a partition outside the predicate (``s0`` for ``symbol != 's0'``) is untouched."""
+    orig = pl.DataFrame(
+        {"symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]},
+        schema={"symbol": pl.String, "v": pl.Int64},
+    )
+    mutated = orig.with_columns((pl.col("v") + 100).alias("v"))
+    state = {"df": orig}
+
+    def factory():
+        return state["df"].lazy()
+
+    def mk(mode):
+        return cache_parquet(
+            factory,
+            cache_path=tmp_path,
+            date_column=None,
+            extra_partition_cols="symbol",
+            schema=orig.schema,
+            cache_mode=mode,
+        )
+
+    mk(CacheMode.CACHE).collect()  # populate
+    state["df"] = mutated
+    mk(CacheMode.REBUILD).filter(pl.col("symbol") != "s0").collect()
+    # s0 is out of scope -> original value; s1/s2 refreshed to mutated values.
+    got = mk(CacheMode.CACHE).collect().sort("symbol")
+    assert dict(zip(got["symbol"], got["v"])) == {"s0": 1, "s1": 102, "s2": 103}
+
+
+def test_wildcard_read_matching_no_files_returns_empty(tmp_path):
+    """A wildcard predicate that matches no cached files returns an empty frame, not an error."""
+    data = pl.DataFrame({"symbol": ["s0"], "v": [1]}, schema={"symbol": pl.String, "v": pl.Int64})
+
+    def factory():
+        return data.lazy()
+
+    def mk(mode=CacheMode.CACHE):
+        return cache_parquet(factory, cache_path=tmp_path, date_column=None, extra_partition_cols="symbol", schema=data.schema, cache_mode=mode)
+
+    # Fresh cache; upstream only has s0. Filtering != s0 writes/reads nothing -> empty frame.
+    out = mk().filter(pl.col("symbol") != "s0").collect()
+    assert out.height == 0
+    assert set(out.columns) == {"symbol", "v"}
+    # A pure-false predicate likewise returns empty rather than raising.
+    out2 = mk().filter(pl.lit(False)).collect()
+    assert out2.height == 0
+
+
+def test_rebuild_wildcard_removes_partition_that_disappeared_upstream(tmp_path):
+    """REBUILD with a non-enumerable predicate must drop cached in-scope partitions that the
+    refreshed upstream no longer emits, so a later wildcard scan does not return stale data."""
+    first = pl.DataFrame(
+        {"symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]},
+        schema={"symbol": pl.String, "v": pl.Int64},
+    )
+    # Upstream refresh drops s2 entirely (and would change s1).
+    second = pl.DataFrame(
+        {"symbol": ["s0", "s1"], "v": [1, 20]},
+        schema={"symbol": pl.String, "v": pl.Int64},
+    )
+    state = {"df": first}
+
+    def factory():
+        return state["df"].lazy()
+
+    def mk(mode):
+        return cache_parquet(factory, cache_path=tmp_path, date_column=None, extra_partition_cols="symbol", schema=first.schema, cache_mode=mode)
+
+    mk(CacheMode.CACHE).collect()  # populate s0, s1, s2
+    state["df"] = second
+    mk(CacheMode.REBUILD).filter(pl.col("symbol") != "s0").collect()  # refresh in-scope (s1..); s2 gone
+    got = mk(CacheMode.CACHE).collect().sort("symbol")
+    # s0 untouched (out of scope), s1 refreshed, s2 removed (no longer upstream).
+    assert dict(zip(got["symbol"], got["v"])) == {"s0": 1, "s1": 20}

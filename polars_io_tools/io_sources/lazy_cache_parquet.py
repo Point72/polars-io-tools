@@ -660,10 +660,21 @@ def _process_dnf_clause_to_partitions(
             column_value_sets[col] = set(col_df[col].to_list())
         else:
             col_df = _get_column_values_from_constraints(constraints, col, schema)
-            if col_df.is_empty():
+            if col_df is None:
+                # Non-enumerable constraint (e.g. !=, unbounded range). With no date column,
+                # leave the column unconstrained so the read globs and (under CACHE) the write
+                # queries upstream by the actual predicate. With a date column present, treat it
+                # as empty so the UNBOUNDED / date-clipping path handles it — the exclude-existing
+                # predicate is not date-partition-granularity aware.
+                if date_column is None:
+                    column_value_sets[col] = {None}
+                else:
+                    return pl.DataFrame(schema=partition_schema)
+            elif col_df.is_empty():
                 # Contradiction in column constraints
                 return pl.DataFrame(schema=partition_schema)
-            column_value_sets[col] = set(col_df[col].to_list())
+            else:
+                column_value_sets[col] = set(col_df[col].to_list())
 
     # Generate cross product of all column values (including None placeholders)
     import itertools
@@ -710,8 +721,14 @@ def _get_column_values_from_constraints(
     constraints: list[tuple[str, Any]],
     column: str,
     schema: pl.Schema,
-) -> pl.DataFrame:
-    """Convert column constraints to valid values."""
+) -> pl.DataFrame | None:
+    """Convert column constraints to valid values.
+
+    Returns an empty DataFrame for a genuine contradiction (no value can match), a populated
+    DataFrame for a finitely enumerable constraint, or ``None`` when the constraint cannot be
+    finitely enumerated (e.g. ``!=`` or an unbounded range) — the caller then leaves the column
+    unconstrained rather than mistaking it for a contradiction.
+    """
     if not constraints:
         return pl.DataFrame(schema={column: schema[column]})
 
@@ -723,7 +740,11 @@ def _get_column_values_from_constraints(
         return pl.DataFrame(schema={column: schema[column]})
 
     valid_values = _extract_finite_values(analyzer, column, schema)
+    if valid_values is None:
+        # Not finitely enumerable (e.g. `!=`, unbounded range): signal "unconstrained".
+        return None
     if not valid_values:
+        # Enumerable but empty: a contradiction.
         return pl.DataFrame(schema={column: schema[column]})
 
     return pl.DataFrame({column: list(valid_values)}, schema={column: schema[column]})
@@ -1330,6 +1351,12 @@ def _build_read_plan(
     join_cols = partition_info.join_cols
     extra_cols = [c for c in join_cols if c != (date_column or "")]
 
+    # No cached files exist yet: read nothing rather than globbing an empty directory (which
+    # raises "expanded paths were empty"). This happens when a wildcard/unconstrained read wrote
+    # no partitions, e.g. its predicate matched no upstream rows.
+    if partition_info.existing_parts_df.is_empty():
+        return ReadPlan(use_paths=[])
+
     def build_cache_paths(parts_df: pl.DataFrame) -> list[str] | None:
         return _build_scan_paths(
             parts_df=parts_df,
@@ -1497,12 +1524,21 @@ def cache_parquet(
             Otherwise: the original LazyFrame with data written to cache.
 
     Notes:
+        **Null partition values are not supported.** Partition columns (``date_column`` and
+        ``extra_partition_cols``) must not contain null/missing values; a null key does not
+        round-trip on read. Caching a frame with null partition values, or filtering such a cache
+        with ``col.is_null()``, produces undefined results — filter or fill nulls before caching.
+
         **Query Classification (Enumerability)**
 
         Queries are classified based on whether partition keys can be enumerated from the predicate:
 
         - **FINITE**: Partition keys can be fully enumerated (e.g., ``date.is_between(start, end)``).
           Writes missing partitions, creates empty files for gaps, reads from enumerated paths.
+          A predicate that constrains a partition column but cannot be enumerated to a finite set of
+          values (e.g. ``!=`` or an unbounded non-date range) leaves that column unconstrained: the
+          read falls back to a glob and applies the full predicate, and (under ``CacheMode.CACHE``)
+          the write queries upstream by the predicate while excluding already-cached partitions.
         - **UNBOUNDED**: One-sided date bounds (e.g., ``date >= X`` or ``date <= Y``).
           Always queries upstream filtering out existing partitions. Gap-filling is clipped to
           existing cache bounds (see below).
@@ -1706,9 +1742,32 @@ def cache_parquet(
 
         if do_write:
             lf_to_write = source_lf if source_lf is not None else get_source()
-            if not partitions_to_write_df.is_empty():
+            join_cols = part_info.join_cols
+            has_wildcard = (
+                bool(join_cols)
+                and not partitions_to_write_df.is_empty()
+                and partitions_to_write_df.select(join_cols).null_count().sum_horizontal().item() > 0
+            )
+            if date_column is None and has_wildcard and cache_mode in (CacheMode.CACHE, CacheMode.REBUILD):
+                # Non-enumerable / wildcard partition target (e.g. `!=`, unbounded range): the
+                # partitions to write cannot be enumerated, so query upstream by the actual
+                # partition-restricted predicate. CACHE also excludes already-cached partitions
+                # (never rewrite existing); REBUILD applies only the predicate, refreshing
+                # in-scope partitions and leaving out-of-scope ones (e.g. `s0` for `!= "s0"`) alone.
+                # Scoped to ``date_column is None`` because the exclude-existing predicate is not
+                # date-partition-granularity aware (a widened month/year key would be compared
+                # against raw dates).
+                restricted = restrict_expr_to_columns(predicate, set(join_cols)) if predicate is not None else None
+                write_parts = [restricted] if restricted is not None else []
+                if cache_mode == CacheMode.CACHE:
+                    not_existing = _build_not_existing_partitions_pred(existing_parts_df, join_cols)
+                    if not_existing is not None:
+                        write_parts.append(not_existing)
+                if write_parts:
+                    lf_to_write = lf_to_write.filter(functools.reduce(operator.and_, write_parts))
+            elif not partitions_to_write_df.is_empty():
                 # Narrow the write to only the partitions that are actually missing
-                extra_cols = [c for c in part_info.join_cols if c != (date_column or "")]
+                extra_cols = [c for c in join_cols if c != (date_column or "")]
                 write_filter = _generate_write_predicate_from_partitions_df(
                     partitions_df=partitions_to_write_df,
                     date_column=date_column,
@@ -1820,6 +1879,24 @@ def cache_parquet(
             # Update written_parts from tracked keys
             written_parts.update(tracked_keys)
             log.debug("Wrote %i new partition(s): %s", len(written_parts), sorted(written_parts))
+
+            # REBUILD refreshes every in-scope partition, so a partition that existed but was not
+            # re-emitted upstream is now stale; remove its file so the wildcard glob scan does not
+            # keep returning it. Only the wildcard path needs this: the enumerable path writes
+            # empty files for missing partitions below, and CACHE never removes anything.
+            if cache_mode == CacheMode.REBUILD and has_wildcard and date_column is None and not existing_parts_df.is_empty():
+                restricted = restrict_expr_to_columns(predicate, set(join_cols)) if predicate is not None else None
+                in_scope = existing_parts_df.drop_nulls()
+                if restricted is not None:
+                    in_scope = in_scope.filter(restricted)
+                if not in_scope.is_empty():
+                    in_scope_keys = {unquote(p) for p in in_scope.select(pl.concat_str(key_exprs, separator="/")).to_series()}
+                    for stale_key in sorted(in_scope_keys - written_parts):
+                        try:
+                            fs.delete_file(f"{fs_path_prefix}/{stale_key}.parquet")
+                            log.debug("Removed stale partition on REBUILD: %s", stale_key)
+                        except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
+                            log.warning("Failed to remove stale partition %s on REBUILD: %s", stale_key, e)
 
             missing = None
             # For bounded ranges (FINITE), optionally write empty missing partitions
