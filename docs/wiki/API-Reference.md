@@ -16,7 +16,7 @@ The signatures below show the namespace form where one exists.
 ### `cache`
 
 ```python
-lf.piot.cache(cache=None, *, order_by, partition_cols=(), cache_mode="cache", validate=True, log_explain=False, **kwargs)
+lf.piot.cache(cache=None, *, order_by, partition_cols=(), column_granularity=True, cache_mode="cache", validate=True, log_explain=False, **kwargs)
 ```
 
 Maintain an intermediate, per-column cache of the LazyFrame, optionally partitioned by
@@ -26,7 +26,13 @@ Maintain an intermediate, per-column cache of the LazyFrame, optionally partitio
 `"ignore"`. `order_by` is required and must uniquely identify each row (within each
 partition when `partition_cols` is used): columns are cached sorted by it so that
 independently cached columns stay aligned regardless of source ordering. Uniqueness is
-verified unless `validate=False`.
+verified unless `validate=False`. Set `column_granularity=False` to turn per-column
+caching off: on any miss a partition's whole schema is collected and stored at once, so
+later selects of any already-cached column are served from the cache rather than
+re-evaluated (at the cost of evaluating all columns on first touch); row partitioning is
+preserved and the two modes share the same cache keys. As in the default mode, an
+unfiltered select of a partitioned frame still queries the source once to discover
+partitions — constrain partitions with a predicate to avoid that re-query.
 
 ### `cache_parquet`
 
