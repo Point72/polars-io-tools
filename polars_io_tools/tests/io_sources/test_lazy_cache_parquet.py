@@ -1902,7 +1902,7 @@ def test_one_sided_lower_bound_upstream_contains_not_existing_predicate(tmp_path
     out = capsys.readouterr().out
     # Assert the upstream predicate contains the lower bound and a NOT over existing partitions
     assert ">= (2024-06-02)" in out or ">= 2024-06-02" in out
-    assert "~(" in out or "!" in out, "expected NOT predicate to exclude existing partitions"
+    assert "~(" in out or "!" in out or ".not(" in out, "expected NOT predicate to exclude existing partitions"
     assert 'col("date")' in out, "expected date column in NOT predicate"
     # Should reference at least one cached date in the NOT predicate
     assert "2024-06-01" in out or "2024-06-02" in out

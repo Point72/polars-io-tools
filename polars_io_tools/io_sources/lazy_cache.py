@@ -7,7 +7,12 @@ import polars as pl
 
 from .dnf_visitor import _is_contradiction
 from .restrict_visitor import restrict_expr_to_columns
-from .util import PartitionKey as _PartitionKey, partition_key as _partition_key, register_io_source_with_is_pure
+from .util import (
+    PartitionKey as _PartitionKey,
+    partition_exclusion_predicate,
+    partition_key as _partition_key,
+    register_io_source_with_is_pure,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,81 +35,6 @@ def _df_key(df: pl.LazyFrame, order_by: tuple[str, ...] = (), partition_cols: tu
     """Return a unique key for the given dataframe, ordering key and partition layout."""
     payload = df.serialize() + repr((tuple(order_by), tuple(partition_cols))).encode()
     return hashlib.md5(payload).hexdigest()
-
-
-def _generate_expr(row: dict, schema: pl.Schema) -> pl.Expr:
-    # Given a row of data, generate a Polars expression that represents
-    # NOT matching that row
-    col_exprs = []
-    for col, value in row.items():
-        if schema[col] == pl.List:
-            if len(value) == 0:
-                continue
-            elif len(value) == 1:
-                # If the value is a single item, we can use `ne` directly
-                col_exprs.append(pl.col(col).ne(value[0]))
-            else:
-                # If the value is a list, we can use `is_in` to check if the column is not in the list
-                col_exprs.append(pl.col(col).is_in(value).not_())
-        else:
-            target = value
-            col_exprs.append(pl.col(col).ne(target))
-    if len(col_exprs) == 1:
-        return col_exprs[0]
-    return pl.Expr.or_(*col_exprs)
-
-
-def _repeated_grouping(df: pl.DataFrame) -> pl.DataFrame:
-    # A performance optimization, is_in is much cheaper than OR operations
-    # we perform group_by's to create a smaller expression. These are expensive
-    # so we should only do this when we have few columns
-    if df.is_empty():
-        return df
-
-    columns = df.columns
-    last_df = None
-    for idx, col in enumerate(columns):
-        if df.schema[col] == pl.List:
-            agg_func = pl.col(col).explode().unique().sort()
-        else:
-            agg_func = pl.col(col).unique().sort()
-        new_df = df.group_by(
-            columns[:idx] + columns[idx + 1 :],
-        ).agg(agg_func)
-        if last_df is not None and new_df.height == last_df.height:
-            # If the height hasn't changed, we stop grouping
-            return df
-        last_df = df
-        df = new_df
-    return df
-
-
-def _extract_filter_from_df(df: pl.DataFrame) -> pl.Expr | None:
-    """Extract filters from a DataFrame, returning a list of expressions."""
-    if df.is_empty():
-        return None
-    schema = df.schema
-    if len(schema) == 1:
-        col_name, _dtyp = next(iter(schema.items()))
-        vals = df.select(col_name).to_series().to_list()
-        if len(vals) == 1:
-            inner_vals = vals[0]
-            if isinstance(inner_vals, list):
-                if len(inner_vals) == 0:
-                    return None
-                elif len(inner_vals) == 1:
-                    return pl.col(col_name).ne(inner_vals[0])
-                else:
-                    return pl.col(col_name).is_in(inner_vals).not_()
-
-    row_exprs = []
-    for row in df.iter_rows(named=True):
-        row_exprs.append(_generate_expr(row, schema))
-
-    if len(row_exprs) == 1:
-        return row_exprs[0]
-
-    return pl.Expr.and_(*row_exprs)
 
 
 def _validate_order_by_unique(frame: pl.DataFrame, order_by: tuple[str, ...]) -> None:
@@ -323,7 +253,7 @@ def cache(
             if partition_cols:
                 expr_list = []
                 for p_col, p_val in partition_key:
-                    expr_list.append(pl.col(p_col) == p_val)
+                    expr_list.append(pl.col(p_col).eq_missing(p_val))
                 selected_predicate = pl.Expr.and_(*expr_list) if len(expr_list) > 1 else expr_list[0]
                 filtered_df = self.filter(selected_predicate)
             else:
@@ -347,29 +277,33 @@ def cache(
                 if c not in cols_to_collect:
                     cols_to_collect.append(c)
             can_skip_query = False
-            if query_predicate is not None and filtered_partition_dfs:
-                # We already filtered the frame containing our partition information with our predicate.
-                # However, now we could have a large number of combinations to check.
+            if filtered_partition_dfs:
+                # Restrict the query to only the partitions we do not already have cached, by
+                # excluding every known partition. This runs even without an incoming predicate
+                # (an unfiltered read): otherwise an unfiltered select over a fully-cached
+                # partitioned frame would re-scan the whole source instead of just the missing
+                # partitions. Mirrors the in-memory cache's build planner.
                 filtered_tot_df = pl.concat(filtered_partition_dfs, how="vertical")
-                if not filtered_tot_df.is_empty():
-                    if len(partition_cols) > 1:
-                        # If we have multiple partition columns, we need to group by all but one of them,
-                        # so that we can check if the partition key is in the cache.
-                        grouped_df = _repeated_grouping(filtered_tot_df)
+                not_in_cache_expr = partition_exclusion_predicate(filtered_tot_df, partition_cols)
+                if not_in_cache_expr is not None:
+                    if query_predicate is None:
+                        # No incoming predicate: the query is just the exclusion. A bare
+                        # exclusion of already-seen partitions is never itself a contradiction
+                        # (short of enumerating the column's full domain, see the TODO above),
+                        # so skip the contradiction check, which can be expensive with many
+                        # partitions, and simply restrict the scan.
+                        query_predicate = not_in_cache_expr
                     else:
-                        # If we have only one partition column, we can just select it
-                        grouped_df = filtered_tot_df.select(pl.implode(partition_cols[0]))
-                    not_in_cache_expr = _extract_filter_from_df(grouped_df)
-                    if not_in_cache_expr is not None:
                         query_predicate = query_predicate & not_in_cache_expr
-                    # We can skip the query if our filters form a contradiction
-                    try:
-                        can_skip_query = _is_contradiction(query_predicate, schema=schema)
-                    except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
-                        log.warning(
-                            f"Failed to check if the query predicate is a contradiction, this may be due to a large number of partition columns: {e}",
-                        )
-                        can_skip_query = False
+                        # With an incoming predicate the combination may be impossible (all
+                        # matching partitions already cached); if so we can skip the query.
+                        try:
+                            can_skip_query = _is_contradiction(query_predicate, schema=schema)
+                        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
+                            log.warning(
+                                f"Failed to check if the query predicate is a contradiction, this may be due to a large number of partition columns: {e}",
+                            )
+                            can_skip_query = False
 
             # This frame doesn't correspond to a fixed partition key
             if not can_skip_query:

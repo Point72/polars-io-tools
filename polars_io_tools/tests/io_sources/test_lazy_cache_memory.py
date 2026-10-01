@@ -722,3 +722,29 @@ class TestCacheMemory(unittest.TestCase):
         gc.collect()
 
         self.assertIsNone(holder["ref"](), "partition buffers must be released once the frame is dropped")
+
+
+def test_exclude_built_infers_dtype_with_null_first_keys():
+    """Regression: carrier-frame inference must not fail when early keys are null-valued.
+
+    ``pl.DataFrame`` infers dtypes from a bounded prefix by default, so many ``a=None`` keys
+    followed by a valued ``a`` key beyond that prefix used to infer ``Null`` for ``a`` and fail
+    to append the later integer. ``infer_schema_length=None`` scans every key instead.
+    """
+    from polars_io_tools.io_sources.lazy_cache_memory import _exclude_built
+    from polars_io_tools.io_sources.util import partition_key
+
+    # Force the order (a sequence, not a set) so the single valued key deterministically lands
+    # past Polars' 100-row inference prefix — the case set iteration only hits sometimes.
+    keys = [partition_key({"a": None, "b": i}) for i in range(150)]
+    keys.append(partition_key({"a": 7, "b": 999}))
+    expr = _exclude_built(keys)
+    assert expr is not None
+
+    frame = pl.DataFrame(
+        {"a": [7, 7, None, 3], "b": [999, 1, 5, 5]},
+        schema={"a": pl.Int64, "b": pl.Int64},
+    )
+    # Keep only rows not matching a built partition: (a=7,b=999) and every (a=None, b in 0..149)
+    # are excluded; (a=7,b=1) and (a=3,b=5) are kept.
+    assert frame.filter(expr).to_dicts() == [{"a": 7, "b": 1}, {"a": 3, "b": 5}]
