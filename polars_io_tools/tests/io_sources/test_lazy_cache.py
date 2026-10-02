@@ -1,4 +1,7 @@
+import os
 import pickle
+import subprocess
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -1162,7 +1165,27 @@ def test_column_granularity_false_and_true_share_cache(source, df):
     assert_frame_equal(out, df.select(["x2", "y2"]).collect())
 
 
-def test_concurrent_collections_shared_cache_do_not_race():
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_concurrent_collections_shared_cache_do_not_race(num_threads):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import faulthandler; faulthandler.dump_traceback_later(30, exit=True); "
+                "from polars_io_tools.tests.io_sources.test_lazy_cache import _collect_concurrently; "
+                "_collect_concurrently()"
+            ),
+        ],
+        env={**os.environ, "POLARS_MAX_THREADS": str(num_threads)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _collect_concurrently():
     """Concurrent collections sharing one cache must not raise or corrupt it.
 
     Barrier-synchronized threads each collect a distinct partition with
@@ -1183,6 +1206,7 @@ def test_concurrent_collections_shared_cache_do_not_race():
 
     cache: dict = {}
     n_threads = 8
+    universes = [universe.clone() for _ in range(n_threads)]
     per_thread = n_partitions // n_threads
     barrier = threading.Barrier(n_threads)
     errors: list[Exception] = []
@@ -1194,7 +1218,8 @@ def test_concurrent_collections_shared_cache_do_not_race():
             for j in range(per_thread):
                 sym = f"s{tid * per_thread + j}"
                 out = (
-                    universe.piot.cache(cache, order_by="sym", partition_cols=("sym",), column_granularity=False)
+                    universes[tid]
+                    .piot.cache(cache, order_by="sym", partition_cols=("sym",), column_granularity=False)
                     .filter(pl.col("sym") == sym)
                     .collect()
                 )
