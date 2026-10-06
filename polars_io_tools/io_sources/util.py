@@ -15,7 +15,7 @@ import polars as pl
 import portion
 from packaging import version
 
-from .._compat import POLARS_HAS_COLLECT_BATCHES
+from .._compat import POLARS_GE_2, POLARS_HAS_COLLECT_BATCHES
 
 log = logging.getLogger(__name__)
 
@@ -313,7 +313,7 @@ def _storage_options_for(cache_uri: str, aws_profile: str | None = None) -> Stor
     # Create credential provider - it may have additional endpoint info
     credential_provider = pl.CredentialProviderAWS(
         profile_name=(aws_profile or os.getenv("AWS_PROFILE")),
-        _storage_options_has_endpoint_url=(endpoint is not None),
+        **({} if POLARS_GE_2 else {"_storage_options_has_endpoint_url": endpoint is not None}),
     )
 
     # If endpoint not already set, try to get it from the credential provider
@@ -435,7 +435,7 @@ def _format_kwargs_for_error(kwargs: dict) -> dict:
     return {key: _format_arg_for_error(value) for key, value in kwargs.items()}
 
 
-def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
+def wrap_io_source_with_error_catching(io_source, identifier: str = "", *, error_type: type[Exception] = RuntimeError):
     """
     Wrap an IO source function with comprehensive error catching and reporting.
 
@@ -459,6 +459,10 @@ def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
         try:
             yield from io_source(*args, **source_kwargs)
         except Exception as e:
+            try:
+                error_message = str(e)
+            except Exception:  # noqa: BLE001
+                error_message = "<exception str() failed>"
             # Build comprehensive error information
             io_source_name = getattr(io_source, "__name__", str(io_source))
             # Convert all pl.Expr instances to their full string representation
@@ -471,7 +475,7 @@ def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
 Function: {io_source_name}
 Identifier: {identifier}
 Error Type: {type(e).__name__}
-Error Message: {e!s}
+Error Message: {error_message}
 
 Call Arguments:
   args: {args_str}
@@ -483,7 +487,7 @@ Full Stack Trace:
 """
 
             # Re-raise with enhanced context (no logging to avoid unsuppressible error logs)
-            raise RuntimeError(f"IO Source '{io_source_name}' failed: {e!s} with detailed error information:\n{error_msg}") from e
+            raise error_type(f"IO Source '{io_source_name}' failed: {error_message} with detailed error information:\n{error_msg}") from e
 
     return error_catching_io_source
 
@@ -568,7 +572,7 @@ def register_io_source_with_is_pure(
             explain_detail=explain_detail,
         )
     if wrap_with_error_catching:
-        io_source = wrap_io_source_with_error_catching(io_source)
+        io_source = wrap_io_source_with_error_catching(io_source, error_type=pl.exceptions.ComputeError if POLARS_GE_2 else RuntimeError)
     return register_io_source(io_source, schema=schema, **kwargs)
 
 

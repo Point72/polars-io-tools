@@ -719,10 +719,13 @@ def test_pruning_python_udf_no_false_prune():
             return self.n % 2 == 0
 
     lf = pl.DataFrame({"id": [1, 1], "v": [10, 11]}, schema={"id": pl.Int64, "v": pl.Int64}).lazy()
-    predicate = pl.col("id").map_elements(EverySecond(), return_dtype=pl.Boolean)
-    result = lf.piot.execute_on_ray(by_key([1], "id")).filter(predicate).collect()
-    expected = lf.filter(predicate).collect()
-    assert_frame_equal(result.sort("v"), expected.sort("v"))
+    udf = EverySecond()
+    predicate = pl.col("id").map_elements(udf, return_dtype=pl.Boolean)
+    specs = [RayPartition(pl.col("id") == 1, key=1)]
+    result = polars_io_tools.io_sources.lazy_ray._prune_by_key(specs, ["id"], predicate, lf.collect_schema())
+    assert len(result) == 1
+    assert result[0].key == 1
+    assert udf.n == 0
 
 
 def test_cartesian_none_bucket_matches_nulls():

@@ -32,7 +32,7 @@ classifiers = [
 
 dependencies = [
     "packaging",
-    "polars>=1.8",
+    "polars>=1.8,<3",
     "portion",
     "pydantic",
 ]

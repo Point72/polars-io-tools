@@ -8,6 +8,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from polars_io_tools._compat import POLARS_GE_2
 from polars_io_tools.io_sources.profiling import (
     get_source_span_parent,
     profile_io_source_iterator,
@@ -360,7 +361,7 @@ def test_pure_self_join_emits_one_physical_execution():
         schema={"id": pl.Int64, "value": pl.Int64},
         explain_name="memory.reader",
     )
-    result = lf.join(lf, on="id").collect()
+    result = lf.join(lf, on="id").collect(engine="in-memory" if POLARS_GE_2 else "auto")
 
     assert result.height == 2
     assert calls == 1

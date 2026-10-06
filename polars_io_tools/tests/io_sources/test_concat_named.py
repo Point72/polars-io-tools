@@ -152,6 +152,39 @@ def test_concat_named_different_data_types():
     assert not queried["df2"]
 
 
+@pytest.mark.parametrize(
+    "identifier,dtype,expected",
+    [
+        ("2023-01-01", pl.Date, datetime.date(2023, 1, 1)),
+        ("2023-01-01T12:30:00", pl.Datetime("ms"), datetime.datetime(2023, 1, 1, 12, 30)),
+        ("12:30:00", pl.Time, datetime.time(12, 30)),
+    ],
+)
+def test_concat_named_temporal_string_identifiers(identifier, dtype, expected):
+    source = pl.DataFrame({"value": [1, 2]}).lazy()
+    result = cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier") == expected).collect()
+    expected_frame = pl.DataFrame({"value": [1, 2], "identifier": pl.Series([expected, expected], dtype=dtype)})
+    assert_frame_equal(result, expected_frame)
+
+
+@pytest.mark.parametrize(
+    "identifier,dtype,physical_value",
+    [
+        (1672531200000, pl.Datetime("ms"), 1672531200000),
+        ("2023-01-01T12:30:00.123456789", pl.Datetime("ns"), 1672576200123456789),
+        ("2023-01-01T12:30:00", pl.Datetime("ms", "America/New_York"), 1672594200000),
+    ],
+)
+def test_concat_named_temporal_identifier_precision(identifier, dtype, physical_value):
+    source = pl.DataFrame({"value": [1, 2]}).lazy()
+    result = (
+        cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier").cast(pl.Int64) == physical_value).collect()
+    )
+    assert result["value"].to_list() == [1, 2]
+    assert result.schema["identifier"] == dtype
+    assert result["identifier"].cast(pl.Int64).to_list() == [physical_value, physical_value]
+
+
 def test_concat_named_empty_dict():
     """Test concat_named with an empty dictionary."""
     # The function should raise a ValueError for empty dictionaries

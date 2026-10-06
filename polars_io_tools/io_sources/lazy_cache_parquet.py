@@ -62,7 +62,8 @@ def _path_as_file_uri(path: Path | PureWindowsPath) -> str:
 
 
 def _prepare_lf_for_sink_from_io_source(lf: pl.LazyFrame) -> pl.LazyFrame:
-    has_python_scan = "PYTHON SCAN" in lf.explain(optimized=False)
+    plan = lf.explain(optimized=False)
+    has_python_scan = "PYTHON SCAN" in plan or "PYTHON[" in plan
     if pl.thread_pool_size() > 1 and not has_python_scan:
         return lf
     # Avoid re-entering partitioned sink execution from an io_source callback when

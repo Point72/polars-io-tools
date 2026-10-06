@@ -27,7 +27,7 @@ from polars_io_tools.io_sources.pushdown_combine import (
     _get_source_col,
     pushdown_combine,
 )
-from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker
+from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker, io_source_assert
 
 
 class TestFilterSpecDefaults:
@@ -2489,12 +2489,12 @@ class TestSharedSourceColUnion:
         assert analyzer.extract_discrete_values(f) == {"A", "B"}  # union pushed to the scan
 
     def test_lone_side_pushes_no_group_predicate(self):
-        tracker = PredicateTracker(self._three_group_source())
-        self._build(tracker.lazy_frame).filter(pl.col("group1") == "A").collect()
-        # group2 unconstrained -> union is the full universe -> source must keep all groups.
-        # Either no predicate reaches the source, or it carries no discrete `group` filter.
-        if tracker.last_predicate is not None:
-            assert tracker.get_analyzer().find_discrete_filter("group") is None
+        predicates = []
+        source = io_source_assert(self._three_group_source(), predicates.append)
+        out = self._build(source).filter(pl.col("group1") == "A").collect()
+        assert set(out["group2"]) == {"B", "C"}
+        assert predicates
+        assert any(predicate is None or PredicateAnalyzer(predicate).find_discrete_filter("group") is None for predicate in predicates)
 
     def test_is_in_both_sides_unions(self):
         tracker = PredicateTracker(self._three_group_source())

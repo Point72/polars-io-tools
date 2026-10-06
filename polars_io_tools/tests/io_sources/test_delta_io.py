@@ -57,13 +57,15 @@ def test_build_delta_write_exprs_shapes_temporal():
     assert out.schema["value"] == pl.Int64
 
 
-def test_delta_roundtrip_schema_and_values(tmp_path):
+@pytest.mark.parametrize("rechunk", [None, False, True])
+@pytest.mark.parametrize("pushdown_predicate_deltalake", [False, True])
+def test_delta_roundtrip_schema_and_values(tmp_path, rechunk, pushdown_predicate_deltalake):
     df = _build_sample_df()
     table_path = os.path.join(tmp_path, "delta_table")
     # Namespace API should work
     df.lazy().piot.sink_delta(table_path, mode="overwrite")
 
-    lf = cpl.scan_delta(table_path)
+    lf = cpl.scan_delta(table_path, rechunk=rechunk, pushdown_predicate_deltalake=pushdown_predicate_deltalake)
     out = lf.collect()
 
     # Schema types should match target logical types
@@ -422,7 +424,7 @@ def test_delta_partition_pushdown_all_unsupported_ops_fallback(_partitioned_delt
 
 def test_delta_partition_pushdown_not_in(_partitioned_delta_table):
     lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
-    out = lf.filter(~pl.col("p").is_in(["A"]))
+    out = lf.filter(~pl.col("p").is_in(["A"]) | pl.col("p").is_null())
     df = out.sort(["p", "x"]).collect()
     # Expect B rows and the null partition row
     assert df.shape == (3, 2)
@@ -788,7 +790,7 @@ def test_delta_partition_pushdown_mixed_or_clause_unsafe_prune(_partitioned_delt
 
     lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None, pushdown_predicate_deltalake=True)
     # Construct OR of unsupported (<) and supported (=) predicate
-    pred = (pl.col("p") < "B") | (pl.col("p") == "B")
+    pred = (pl.col("p") < "B") | (pl.col("p") == "B") | pl.col("p").is_null()
     out = lf.filter(pred).sort("x").collect()
 
     # Expect rows for p == 'A' (from first) and p == 'B' (from second); null may pass through via filter semantics
