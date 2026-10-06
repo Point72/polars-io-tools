@@ -197,7 +197,7 @@ jobs:
         run: uv pip install -e '.[develop]' '${{ matrix.polars_spec }}'
 
       - name: Test
-        run: make test
+        run: make test-py
 
   test_clickhouse:
     name: test (clickhouse integration)
