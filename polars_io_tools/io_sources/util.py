@@ -494,7 +494,7 @@ Full Stack Trace:
 
 @functools.cache
 def _register_io_source_supports_explain_labels() -> bool:
-    """Whether ``register_io_source`` accepts ``explain_name`` / ``explain_detail`` (pola-rs/polars#23978, unreleased)."""
+    """Whether ``register_io_source`` accepts ``explain_name`` / ``explain_detail``."""
     from polars.io.plugins import register_io_source
 
     return {"explain_name", "explain_detail"} <= inspect.signature(register_io_source).parameters.keys()
