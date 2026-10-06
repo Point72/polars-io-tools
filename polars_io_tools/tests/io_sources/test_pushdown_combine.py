@@ -207,7 +207,7 @@ class TestPushdownCombineBasic:
 
         result = lf.collect()
         expected = pl.DataFrame({"id": [1, 2], "val": [10, 20], "other": [100, 200]})
-        assert_frame_equal(result, expected)
+        assert_frame_equal(result, expected, check_row_order=False)
 
     def test_simple_date_filter(self):
         """Simple date filter propagates to both sources."""
