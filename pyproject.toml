@@ -102,7 +102,8 @@ tag = true
 commit_args = "-s"
 pre_commit_hooks = [
     "cargo update --workspace",
-    "git add Cargo.lock",
+    "cargo update --manifest-path rust/Cargo.toml --workspace",
+    "git add Cargo.lock rust/Cargo.lock",
 ]
 
 [[tool.bumpversion.files]]
@@ -137,6 +138,7 @@ rustup target add aarch64-unknown-linux-gnu
 rustup target add x86_64-unknown-linux-gnu
 rustup show
 """
+before-build = "cargo clean --manifest-path {package}/Cargo.toml && rm -f {package}/polars_io_tools/*.so"
 environment = {PATH="$HOME/.cargo/bin:$PATH", CARGO_TERM_COLOR="always"}
 skip = "*i686* *musllinux*"
 
@@ -146,7 +148,7 @@ archs = "arm64"
 
 [tool.cibuildwheel.windows]
 environment = {PATH="$UserProfile\\.cargo\bin;$PATH", CARGO_TERM_COLOR="always"}
-skip = "*win32 *arm_64"
+skip = "*win32 *arm64"
 
 
 [tool.coverage.run]
@@ -163,13 +165,6 @@ exclude_also = [
 ]
 ignore_errors = true
 fail_under = 50
-
-[tool.hatch.build]
-artifacts = [
-    "polars_io_tools/*.dll",
-    "polars_io_tools/*.dylib",
-    "polars_io_tools/*.so",
-]
 
 [tool.hatch.build.sources]
 src = "/"
@@ -188,11 +183,20 @@ packages = [
     "Cargo.lock",
 ]
 exclude = [
+    "*.dll",
+    "*.dylib",
+    "*.so",
+    "*.pyd",
     "rust/Makefile",
     "target",
 ]
 
 [tool.hatch.build.targets.wheel]
+artifacts = [
+    "polars_io_tools/*.dll",
+    "polars_io_tools/*.dylib",
+    "polars_io_tools/*.so",
+]
 packages = [
     "polars_io_tools",
 ]

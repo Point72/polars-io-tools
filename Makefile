@@ -12,9 +12,7 @@ develop: develop-rs develop-py  ## setup project for development
 
 .PHONY: requirements-py requirements-rs requirements
 requirements-py:  ## install prerequisite python build requirements
-	python -m pip install --upgrade pip toml
-	python -m pip install `python -c 'import toml; c = toml.load("pyproject.toml"); print("\n".join(c["build-system"]["requires"]))'`
-	python -m pip install `python -c 'import toml; c = toml.load("pyproject.toml"); print(" ".join(c["project"]["optional-dependencies"]["develop"]))'`
+	uv pip install -r pyproject.toml --extra develop
 
 requirements-rs:  ## install prerequisite rust build requirements
 	make -C rust requirements
