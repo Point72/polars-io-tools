@@ -515,6 +515,12 @@ def register_io_source_with_is_pure(
     Polars versions that support it (1.33.1+). Optionally wraps the source
     with `wrap_io_source_with_error_catching` for better diagnostics.
 
+    The collection engine decides whether pure scans are reused; ``is_pure``
+    does not guarantee a single physical execution. With error catching enabled,
+    exceptions raised during source execution surface as
+    ``polars.exceptions.ComputeError`` with diagnostic context, including
+    exceptions raised by nested adapter code.
+
     Each source execution is instrumented with OpenTelemetry: one
     ``io_source.execute[<explain_name>]`` span recording its pull latency. This
     is a no-op unless the application has configured an OpenTelemetry SDK, so it

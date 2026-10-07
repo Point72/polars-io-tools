@@ -246,6 +246,26 @@ class TestRegisterIoSourceWithIsPure:
             # With is_pure=True, CSE should work and counter should be 1
             assert counter == 1, f"Expected counter=1 (CSE working), but got counter={counter}"
 
+    @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+    @pytest.mark.parametrize(
+        "engine",
+        [
+            "auto",
+            "streaming",
+            pytest.param("in-memory", marks=pytest.mark.skipif(not POLARS_GE_2, reason="Polars 1 uses auto for in-memory execution")),
+        ],
+    )
+    def test_source_exceptions_surface_as_compute_error(self, error_type, engine):
+        def failing_source(with_columns, predicate, n_rows, batch_size):
+            yield pl.DataFrame({"value": [1]})
+            raise error_type("reader failed")
+
+        lf = register_io_source_with_is_pure(failing_source, schema={"value": pl.Int64})
+        with pytest.raises(pl.exceptions.ComputeError, match="reader failed") as error:
+            lf.collect(engine=engine)
+        if POLARS_GE_2:
+            assert isinstance(error.value.__cause__, error_type)
+
     def test_kwargs_passthrough(self):
         """Test that additional kwargs are passed through correctly."""
 
