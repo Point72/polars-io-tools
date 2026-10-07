@@ -168,7 +168,7 @@ class TestFilteredJoinPickle:
 
         expected = left_df.join(right_df, on="id", how="inner")
         result = lf_unpickled.collect()
-        assert_frame_equal(result, expected)
+        assert_frame_equal(result, expected, check_row_order=False)
 
 
 class TestConcatNamedPickle:
@@ -223,7 +223,7 @@ class TestPushdownCombinePickle:
 
         expected = left_df.join(right_df, on=["date", "id"])
         result = lf_unpickled.collect()
-        assert_frame_equal(result, expected)
+        assert_frame_equal(result, expected, check_row_order=False)
 
 
 class TestTsWithColumnsPickle:

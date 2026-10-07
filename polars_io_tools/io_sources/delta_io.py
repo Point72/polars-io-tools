@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import polars as pl
 
-from .._compat import POLARS_HAS_COLLECT_BATCHES
+from .._compat import POLARS_GE_2, POLARS_HAS_COLLECT_BATCHES
 from .base import get_parsed_expr
 from .dnf_visitor import convert_expr_to_dnf
 from .enum import DataType
@@ -127,8 +127,8 @@ def _scan_parquet_with_delta_uris(
         hive_partitioning=bool(partition_columns),
         storage_options=storage_options,
         credential_provider=credential_provider,
-        rechunk=rechunk or False,
         cast_options=pl.ScanCastOptions._default_iceberg(),
+        **({} if POLARS_GE_2 else {"rechunk": rechunk or False}),
     )
 
 
@@ -751,7 +751,7 @@ def scan_delta(
                 delta_table_options=delta_table_options,
                 use_pyarrow=use_pyarrow,
                 pyarrow_options=pyarrow_options,
-                rechunk=rechunk,
+                **({} if POLARS_GE_2 else {"rechunk": rechunk}),
             )
         lf = inner_lf
         if not mapping:
@@ -777,6 +777,7 @@ def scan_delta(
         if n_rows is not None:
             lf = lf.limit(n_rows)
 
-        yield from collect_lf_in_io_source(lf, batch_size)
+        for batch in collect_lf_in_io_source(lf, batch_size):
+            yield batch.rechunk() if POLARS_GE_2 and rechunk else batch
 
     return register_io_source_with_is_pure(source_generator, schema=exposed_schema, explain_detail=description)

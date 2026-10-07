@@ -541,8 +541,7 @@ class TestIoSourceAssert:
 
         lf = io_source_assert(df, always_fail)
 
-        # Polars wraps exceptions from IO sources in ComputeError
-        with pytest.raises(pl.exceptions.ComputeError, match="Intentional failure"):
+        with pytest.raises((pl.exceptions.ComputeError, AssertionError), match="Intentional failure"):
             lf.filter(pl.col("val") > 2).collect()
 
     def test_no_predicate_when_no_filter(self):

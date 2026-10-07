@@ -135,10 +135,13 @@ def concat_named(
             else:
                 col_name = col_info
                 dtype = None  # inferred
-            index_lf[col_name].append(value)
             expr = pl.lit(value)
             if dtype is not None:
+                if isinstance(value, str) and dtype.base_type() in (pl.Date, pl.Datetime, pl.Time):
+                    expr = expr.str.strptime(dtype)
                 expr = expr.cast(dtype)
+                value = pl.select(expr.alias(col_name)).to_series()
+            index_lf[col_name].append(value)
             expr = expr.alias(col_name)
             expr_list.append(expr)
         lf = lf.with_columns(expr_list)
@@ -148,7 +151,7 @@ def concat_named(
         index_lf[lf_id_col].append(id_)
         data_dict[id_] = lf
 
-    index_df = pl.DataFrame(index_lf)
+    index_df = pl.DataFrame({name: pl.concat(values) if isinstance(values[0], pl.Series) else values for name, values in index_lf.items()})
 
     def source_gen(
         with_columns: list[str] | None,

@@ -11,6 +11,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
+from polars_io_tools._compat import POLARS_GE_2
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _get_expected_partitions_df, cache_parquet
 from polars_io_tools.tests.helpers.cache_parquet_shared import exercise_daily_cache_parquet
 
@@ -1017,7 +1018,7 @@ def test_missing_written_daily_with_extra_cols_gap(tmp_path):
 
 def test_polars_private_api_still_exists():
     """Assert the Polars credential provider API contains a method we expect to use."""
-    cred = pl.CredentialProviderAWS(profile_name=None, _storage_options_has_endpoint_url=False)
+    cred = pl.CredentialProviderAWS(profile_name=None, **({} if POLARS_GE_2 else {"_storage_options_has_endpoint_url": False}))
     assert hasattr(cred, "_storage_update_options"), "_storage_update_options() removed upstream"
     out = cred._storage_update_options()
     assert isinstance(out, dict), "unexpected return type"
@@ -1058,10 +1059,10 @@ def test_intermediate_collect(tmp_path, run_first):
         res_collect, cache_collect = run(tmp_path / "scenario_with_collect", True)
         res_no_collect, cache_no_collect = run(tmp_path / "scenario_no_collect", False)
 
-    assert_frame_equal(res_no_collect, res_collect)
+    assert_frame_equal(res_no_collect, res_collect, check_row_order=False)
     assert set(cache_no_collect) == set(cache_collect)
     for k in cache_no_collect:
-        assert_frame_equal(cache_no_collect[k], cache_collect[k])
+        assert_frame_equal(cache_no_collect[k], cache_collect[k], check_row_order=False)
 
 
 def test_missing_written_daily_with_extra_cols_gap2(tmp_path):

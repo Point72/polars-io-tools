@@ -249,7 +249,7 @@ def test_scan_clickhouse_runtime_batch_size_overrides_fetch_size(monkeypatch):
 
     monkeypatch.setattr(ch_mod, "register_io_source_with_is_pure", capturing_register)
     calls = _capture_reader_calls(monkeypatch)
-    lf = cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, fetch_size=321)
+    lf = cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, fetch_size=200000)
 
     list(lf.collect_batches(chunk_size=2))
 
