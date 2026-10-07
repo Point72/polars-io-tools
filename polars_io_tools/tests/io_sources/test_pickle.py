@@ -9,9 +9,11 @@ from datetime import date, datetime, timedelta
 
 import cloudpickle
 import polars as pl
+import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
+from polars_io_tools.io_sources.util import _exclusion_from_frame
 
 
 def _pickle_roundtrip(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -153,6 +155,27 @@ class TestpiotCachePickle:
 
         result = lf_unpickled.collect()
         assert_frame_equal(result, df)
+
+    @pytest.mark.parametrize(
+        "helper_name,expected_ids",
+        [
+            ("_generate_expr", [2, 3, 4, 5]),
+            ("_repeated_grouping", [3, 4, 5]),
+            ("_extract_filter_from_df", [3, 4, 5]),
+        ],
+    )
+    def test_legacy_cache_helper_pickle_references(self, helper_name, expected_ids):
+        payload = f"cpolars_io_tools.io_sources.lazy_cache\n{helper_name}\n.".encode("ascii")
+        helper = cloudpickle.loads(payload)
+        frame = pl.DataFrame({"id": [1, 2, 3, 4, 5], "desk": ["a", "a", "b", "c", None], "day": [1, 2, 1, 1, 1]})
+        known = pl.DataFrame({"desk": ["a", "a"], "day": [1, 2]})
+        if helper_name == "_generate_expr":
+            predicate = helper({"desk": "a", "day": 1}, frame.schema)
+        elif helper_name == "_repeated_grouping":
+            predicate = _exclusion_from_frame(helper(known))
+        else:
+            predicate = helper(known)
+        assert frame.filter(predicate)["id"].to_list() == expected_ids
 
 
 class TestFilteredJoinPickle:

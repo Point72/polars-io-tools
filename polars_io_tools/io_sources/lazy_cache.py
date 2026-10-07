@@ -10,6 +10,9 @@ from .dnf_visitor import _is_contradiction
 from .restrict_visitor import restrict_expr_to_columns
 from .util import (
     PartitionKey as _PartitionKey,
+    _exclude_row_predicate,
+    _exclusion_from_frame,
+    _repeated_grouping as _shared_repeated_grouping,
     partition_exclusion_predicate,
     partition_key as _partition_key,
     register_io_source_with_is_pure,
@@ -19,6 +22,10 @@ log = logging.getLogger(__name__)
 
 
 __all__ = ("cache",)
+
+_generate_expr = _exclude_row_predicate
+_repeated_grouping = _shared_repeated_grouping
+_extract_filter_from_df = _exclusion_from_frame
 
 
 class _CacheKey(NamedTuple):
