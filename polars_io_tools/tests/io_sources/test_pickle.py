@@ -13,6 +13,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
+from polars_io_tools.io_sources import util
 from polars_io_tools.io_sources.util import _exclusion_from_frame
 
 
@@ -172,10 +173,29 @@ class TestpiotCachePickle:
         if helper_name == "_generate_expr":
             predicate = helper({"desk": "a", "day": 1}, frame.schema)
         elif helper_name == "_repeated_grouping":
-            predicate = _exclusion_from_frame(helper(known))
+            grouped = helper(known)
+            assert grouped.height == 1
+            predicate = _exclusion_from_frame(grouped)
         else:
             predicate = helper(known)
         assert frame.filter(predicate)["id"].to_list() == expected_ids
+
+    @pytest.mark.parametrize(
+        "helper_name,new_util_name",
+        [
+            ("_generate_expr", "_exclude_row_predicate"),
+            ("_repeated_grouping", "_repeated_grouping"),
+            ("_extract_filter_from_df", "_exclusion_from_frame"),
+        ],
+    )
+    def test_legacy_helpers_repickle_without_new_util_names(self, helper_name, new_util_name, monkeypatch):
+        payload = f"cpolars_io_tools.io_sources.lazy_cache\n{helper_name}\n.".encode("ascii")
+        helper = cloudpickle.loads(payload)
+        repickled = cloudpickle.dumps(helper)
+        with monkeypatch.context() as old_runtime:
+            old_runtime.delattr(util, new_util_name)
+            restored = cloudpickle.loads(repickled)
+        assert restored is helper
 
 
 class TestFilteredJoinPickle:

@@ -23,9 +23,20 @@ log = logging.getLogger(__name__)
 
 __all__ = ("cache",)
 
-_generate_expr = _exclude_row_predicate
-_repeated_grouping = _shared_repeated_grouping
-_extract_filter_from_df = _exclusion_from_frame
+
+def _generate_expr(row: dict, schema: pl.Schema) -> pl.Expr:
+    """Exclude one partition while retaining its legacy pickle lookup path."""
+    return _exclude_row_predicate(row, schema)
+
+
+def _repeated_grouping(df: pl.DataFrame) -> pl.DataFrame:
+    """Group partition values while retaining its legacy pickle lookup path."""
+    return _shared_repeated_grouping(df)
+
+
+def _extract_filter_from_df(df: pl.DataFrame) -> pl.Expr | None:
+    """Exclude known partitions while retaining its legacy pickle lookup path."""
+    return _exclusion_from_frame(df)
 
 
 class _CacheKey(NamedTuple):
