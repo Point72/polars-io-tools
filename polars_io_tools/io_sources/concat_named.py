@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any
 
 import polars as pl
@@ -59,6 +60,9 @@ def concat_named(
         - Filter operations on the identifier columns are optimized to only load the LazyFrames
           that match the filter conditions.
         - The LazyFrames are concatenated in the same order as they appear in the input dictionary.
+                - Temporal string identifiers are trimmed. For a Datetime dtype without a time zone,
+                    input offsets are ignored and wall-clock values are retained. Time-zone-aware
+                    target dtypes use their declared time zone.
 
     Examples:
         Basic usage with single identifier column:
@@ -137,9 +141,23 @@ def concat_named(
                 dtype = None  # inferred
             expr = pl.lit(value)
             if dtype is not None:
-                dtype = pl.Schema({col_name: dtype})[col_name]
-                if isinstance(value, str) and dtype.base_type() in (pl.Date, pl.Datetime, pl.Time):
-                    expr = expr.str.strptime(dtype)
+                if isinstance(value, str):
+                    resolved_dtype = pl.Series(dtype=dtype).dtype
+                    if resolved_dtype.base_type() in (pl.Date, pl.Datetime, pl.Time):
+                        value = value.strip()
+                        expr = pl.lit(value)
+                        offset = None
+                        if isinstance(resolved_dtype, pl.Datetime) and resolved_dtype.time_zone is None:
+                            try:
+                                offset = datetime.fromisoformat(value).utcoffset()
+                            except ValueError:
+                                pass
+                        if offset is None:
+                            expr = expr.str.strptime(resolved_dtype)
+                        else:
+                            time_unit = resolved_dtype.time_unit
+                            expr = expr.str.strptime(pl.Datetime(time_unit, "UTC"), format="%+").dt.replace_time_zone(None)
+                            expr = expr + pl.lit(offset).cast(pl.Duration(time_unit))
                 expr = expr.cast(dtype)
                 value = pl.select(expr.alias(col_name)).to_series()
             index_lf[col_name].append(value)

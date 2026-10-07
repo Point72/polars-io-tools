@@ -1,4 +1,5 @@
 import datetime
+import decimal
 
 import polars as pl
 import pytest
@@ -176,6 +177,13 @@ def test_concat_named_temporal_string_identifiers(identifier, dtype, expected):
         ("2023-01-01", datetime.date, datetime.date(2023, 1, 1), pl.Date),
         ("2023-01-01T12:30:00", datetime.datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
         ("12:30:00", datetime.time, datetime.time(12, 30), pl.Time),
+        (42, int, 42, pl.Int64),
+        (True, bool, True, pl.Boolean),
+        (datetime.datetime(2023, 1, 1), pl.Datetime, datetime.datetime(2023, 1, 1), pl.Datetime("us")),
+        ("2023-01-01T12:30:00", pl.Datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
+        (datetime.timedelta(days=1), pl.Duration, datetime.timedelta(days=1), pl.Duration("us")),
+        (datetime.timedelta(days=1), datetime.timedelta, datetime.timedelta(days=1), pl.Duration("us")),
+        ("rates", pl.Categorical, "rates", pl.Categorical()),
     ],
 )
 def test_concat_named_python_dtype_identifiers(identifier, dtype, expected, polars_dtype):
@@ -183,6 +191,33 @@ def test_concat_named_python_dtype_identifiers(identifier, dtype, expected, pola
     result = cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier") == expected).collect()
     expected_frame = pl.DataFrame({"value": [1, 2], "identifier": pl.Series([expected, expected], dtype=polars_dtype)})
     assert_frame_equal(result, expected_frame)
+
+
+@pytest.mark.parametrize("dtype", [pl.Decimal, decimal.Decimal])
+def test_concat_named_unspecified_decimal_does_not_round(dtype):
+    source = pl.DataFrame({"value": [1]}).lazy()
+    with pytest.raises(TypeError):
+        cpl.concat_named({(decimal.Decimal("1.5"),): source}, [("identifier", dtype)])
+
+
+def test_concat_named_python_dtypes_prune_multiple_sources():
+    calls = []
+
+    def matching_source(predicate):
+        calls.append("matching")
+
+    def rejected_source(predicate):
+        pytest.fail("A non-matching identifier source was queried")
+
+    matching = io_source_assert(pl.DataFrame({"value": [10, 20]}), matching_source)
+    rejected = io_source_assert(pl.DataFrame({"value": [30]}), rejected_source)
+    frame = cpl.concat_named(
+        {("rates", "1"): rejected, ("rates", "2"): matching, ("credit", "2"): rejected},
+        [("desk", str), ("bucket", int)],
+    )
+    result = frame.filter((pl.col("desk") == "rates") & (pl.col("bucket") == 2)).collect()
+    assert_frame_equal(result, pl.DataFrame({"value": [10, 20], "desk": ["rates", "rates"], "bucket": [2, 2]}))
+    assert calls == ["matching"]
 
 
 @pytest.mark.parametrize(
@@ -194,6 +229,28 @@ def test_concat_named_python_dtype_identifiers(identifier, dtype, expected, pola
     ],
 )
 def test_concat_named_temporal_identifier_precision(identifier, dtype, physical_value):
+    source = pl.DataFrame({"value": [1, 2]}).lazy()
+    result = (
+        cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier").cast(pl.Int64) == physical_value).collect()
+    )
+    assert result["value"].to_list() == [1, 2]
+    assert result.schema["identifier"] == dtype
+    assert result["identifier"].cast(pl.Int64).to_list() == [physical_value, physical_value]
+
+
+@pytest.mark.parametrize(
+    "identifier,dtype,physical_value",
+    [
+        ("2023-01-01T12:30:00Z", pl.Datetime("us"), 1672576200000000),
+        ("2023-01-01T12:30:00+05:30", pl.Datetime("us"), 1672576200000000),
+        ("2023-01-01T12:30:00.123456789-05:30", pl.Datetime("ns"), 1672576200123456789),
+        (" 2023-01-01 ", pl.Date, 19358),
+        (" 12:30:00 ", pl.Time, 45000000000000),
+        (" 2023-01-01T12:30:00 ", pl.Datetime("ms"), 1672576200000),
+        ("2023-01-01T12:30:00+05:30", pl.Datetime("us", "America/New_York"), 1672556400000000),
+    ],
+)
+def test_concat_named_legacy_temporal_strings(identifier, dtype, physical_value):
     source = pl.DataFrame({"value": [1, 2]}).lazy()
     result = (
         cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier").cast(pl.Int64) == physical_value).collect()
