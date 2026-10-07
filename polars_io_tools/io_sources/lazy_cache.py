@@ -25,7 +25,10 @@ __all__ = ("cache",)
 
 
 def _generate_expr(row: dict, schema: pl.Schema) -> pl.Expr:
-    """Exclude one partition while retaining its legacy pickle lookup path."""
+    """Exclude one partition while retaining its legacy pickle lookup path.
+
+    Re-pickling uses this module path instead of the shared delegate's path.
+    """
     return _exclude_row_predicate(row, schema)
 
 

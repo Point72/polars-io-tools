@@ -34,6 +34,12 @@ preserved and the two modes share the same cache keys. As in the default mode, a
 unfiltered select of a partitioned frame still queries the source once to discover
 partitions — constrain partitions with a predicate to avoid that re-query.
 
+Serialized cache callbacks from version 0.2.4 retain their historical lookup paths
+when loaded and re-serialized. Python and Polars versions must match. Newly created
+plans are not forward-compatible with older package releases. Restoring callbacks
+does not repair persisted entries corrupted by earlier null-partition bugs; those
+caches require rebuilding.
+
 ### `cache_parquet`
 
 ```python

@@ -197,6 +197,28 @@ class TestpiotCachePickle:
             restored = cloudpickle.loads(repickled)
         assert restored is helper
 
+    @pytest.mark.parametrize(
+        "module_name,symbol",
+        [
+            ("lazy_cache", "_CacheKey"),
+            ("lazy_cache", "_validate_order_by_unique"),
+            ("dnf_visitor", "_is_contradiction"),
+            ("restrict_visitor", "restrict_expr_to_columns"),
+            ("profiling", "profile_io_source_iterator"),
+            ("profiling", "_fallback_n_columns"),
+            ("profiling", "_emit_span"),
+            ("profiling", "_close_inner"),
+            ("util", "partition_key"),
+            ("util", "_format_arg_for_error"),
+            ("util", "_format_args_for_error"),
+            ("util", "_format_kwargs_for_error"),
+        ],
+    )
+    def test_legacy_callback_dependency_pickle_references(self, module_name, symbol):
+        payload = f"cpolars_io_tools.io_sources.{module_name}\n{symbol}\n.".encode("ascii")
+        dependency = cloudpickle.loads(payload)
+        assert cloudpickle.loads(cloudpickle.dumps(dependency)) is dependency
+
 
 class TestFilteredJoinPickle:
     """Tests for filtered_join pickle support."""
