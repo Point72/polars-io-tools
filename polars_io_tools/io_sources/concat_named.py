@@ -1,5 +1,7 @@
 import logging
+import re
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any
 
 import polars as pl
@@ -59,6 +61,15 @@ def concat_named(
         - Filter operations on the identifier columns are optimized to only load the LazyFrames
           that match the filter conditions.
         - The LazyFrames are concatenated in the same order as they appear in the input dictionary.
+
+        Temporal string identifiers are trimmed. For a Datetime dtype without a time zone,
+        input offsets are ignored and wall-clock values are retained. Time-zone-aware
+        target dtypes use their declared time zone. Python datetime keys retain native
+        Polars cast semantics.
+
+        Explicit datetime string offsets use ISO syntax with numeric offsets or uppercase
+        ``Z``. Named-zone suffixes and bracketed zone annotations are not interpreted
+        as offsets.
 
     Examples:
         Basic usage with single identifier column:
@@ -136,11 +147,30 @@ def concat_named(
                 col_name = col_info
                 dtype = None  # inferred
             expr = pl.lit(value)
+            expected_microseconds = None
             if dtype is not None:
-                if isinstance(value, str) and dtype.base_type() in (pl.Date, pl.Datetime, pl.Time):
-                    expr = expr.str.strptime(dtype)
+                if isinstance(value, str):
+                    resolved_dtype = pl.Series(dtype=dtype).dtype
+                    if resolved_dtype.base_type() in (pl.Date, pl.Datetime, pl.Time):
+                        value = value.strip()
+                        expr = pl.lit(value)
+                        offset = None
+                        if isinstance(resolved_dtype, pl.Datetime) and resolved_dtype.time_zone is None:
+                            try:
+                                offset = datetime.fromisoformat(value).utcoffset()
+                            except ValueError:
+                                pass
+                        if offset is not None:
+                            value = re.sub(r"(?:Z|[+-]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d+)?)?)?)$", "", value).rstrip()
+                            expr = pl.lit(value)
+                        if isinstance(resolved_dtype, pl.Datetime) and resolved_dtype.time_unit == "ns":
+                            microsecond_dtype = pl.Datetime("us", resolved_dtype.time_zone)
+                            expected_microseconds = pl.select(expr.str.strptime(microsecond_dtype).dt.epoch("us")).item()
+                        expr = expr.str.strptime(resolved_dtype)
                 expr = expr.cast(dtype)
                 value = pl.select(expr.alias(col_name)).to_series()
+                if expected_microseconds is not None and value.dt.epoch("ns").item() // 1000 != expected_microseconds:
+                    raise pl.exceptions.InvalidOperationError("Datetime nanosecond identifier is out of range")
             index_lf[col_name].append(value)
             expr = expr.alias(col_name)
             expr_list.append(expr)

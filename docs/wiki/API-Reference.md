@@ -342,7 +342,7 @@ over `[start_col, end_col]`. A range `[lo, hi]` pushes the overlap `start_col <=
 ### `concat_named`
 
 ```python
-concat_named(lf_dict, identifier_cols, *, log_explain=False, **kwargs) -> pl.LazyFrame
+concat_named(lf_dict, identifier_cols, *, log_explain=False, description=None, **kwargs) -> pl.LazyFrame
 ```
 
 Vertically concatenate frames keyed by identifier tuples, adding `identifier_cols`. A
