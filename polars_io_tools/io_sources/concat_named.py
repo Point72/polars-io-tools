@@ -61,13 +61,15 @@ def concat_named(
         - Filter operations on the identifier columns are optimized to only load the LazyFrames
           that match the filter conditions.
         - The LazyFrames are concatenated in the same order as they appear in the input dictionary.
-                - Temporal string identifiers are trimmed. For a Datetime dtype without a time zone,
-                    input offsets are ignored and wall-clock values are retained. Time-zone-aware
-                    target dtypes use their declared time zone. Python datetime keys retain native
-                    Polars cast semantics.
-                - Explicit datetime string offsets use ISO syntax with numeric offsets or uppercase
-                    ``Z``. Named-zone suffixes and bracketed zone annotations are not interpreted
-                    as offsets.
+
+        Temporal string identifiers are trimmed. For a Datetime dtype without a time zone,
+        input offsets are ignored and wall-clock values are retained. Time-zone-aware
+        target dtypes use their declared time zone. Python datetime keys retain native
+        Polars cast semantics.
+
+        Explicit datetime string offsets use ISO syntax with numeric offsets or uppercase
+        ``Z``. Named-zone suffixes and bracketed zone annotations are not interpreted
+        as offsets.
 
     Examples:
         Basic usage with single identifier column:
@@ -159,7 +161,7 @@ def concat_named(
                             except ValueError:
                                 pass
                         if offset is not None:
-                            value = re.sub(r"(?:Z|[+-]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d+)?)?)?)$", "", value)
+                            value = re.sub(r"(?:Z|[+-]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d+)?)?)?)$", "", value).rstrip()
                             expr = pl.lit(value)
                         if isinstance(resolved_dtype, pl.Datetime) and resolved_dtype.time_unit == "ns":
                             microsecond_dtype = pl.Datetime("us", resolved_dtype.time_zone)

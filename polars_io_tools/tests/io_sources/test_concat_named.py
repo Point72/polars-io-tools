@@ -246,6 +246,7 @@ def test_concat_named_temporal_identifier_precision(identifier, dtype, physical_
         ("2023-01-01T12:30+05:30", pl.Datetime("us"), 1672576200000000),
         ("2023-01-01T12:30:00+05", pl.Datetime("us"), 1672576200000000),
         ("2023-01-01T12:30:00+05:30:15", pl.Datetime("us"), 1672576200000000),
+        ("2023-01-01T12:30:00 +05:30", pl.Datetime("us"), 1672576200000000),
         ("2023-01-01T12:30:00.123456789-05:30", pl.Datetime("ns"), 1672576200123456789),
         (" 2023-01-01 ", pl.Date, 19358),
         (" 12:30:00 ", pl.Time, 45000000000000),
@@ -269,6 +270,21 @@ def test_concat_named_rejects_out_of_range_nanoseconds(identifier, dtype):
     source = pl.DataFrame({"value": [1]}).lazy()
     with pytest.raises(pl.exceptions.InvalidOperationError, match="nanosecond.*range"):
         cpl.concat_named({(identifier,): source}, [("identifier", dtype)])
+
+
+@pytest.mark.parametrize(
+    "identifier,physical_value",
+    [
+        ("1677-09-21T00:12:43.145224192", -9223372036854775808),
+        ("2262-04-11T23:47:16.854775807", 9223372036854775807),
+        ("1677-09-21T00:12:43.145225192", -9223372036854774808),
+        ("1969-12-31T23:59:59.999999999", -1),
+    ],
+)
+def test_concat_named_accepts_nanosecond_boundaries(identifier, physical_value):
+    source = pl.DataFrame({"value": [1]}).lazy()
+    result = cpl.concat_named({(identifier,): source}, [("identifier", pl.Datetime("ns"))]).collect()
+    assert result["identifier"].cast(pl.Int64).to_list() == [physical_value]
 
 
 def test_concat_named_empty_dict():
