@@ -168,6 +168,24 @@ def test_concat_named_temporal_string_identifiers(identifier, dtype, expected):
 
 
 @pytest.mark.parametrize(
+    "identifier,dtype,expected,polars_dtype",
+    [
+        ("label", str, "label", pl.String),
+        ("42", int, 42, pl.Int64),
+        ("3.5", float, 3.5, pl.Float64),
+        ("2023-01-01", datetime.date, datetime.date(2023, 1, 1), pl.Date),
+        ("2023-01-01T12:30:00", datetime.datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
+        ("12:30:00", datetime.time, datetime.time(12, 30), pl.Time),
+    ],
+)
+def test_concat_named_python_dtype_identifiers(identifier, dtype, expected, polars_dtype):
+    source = pl.DataFrame({"value": [1, 2]}).lazy()
+    result = cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier") == expected).collect()
+    expected_frame = pl.DataFrame({"value": [1, 2], "identifier": pl.Series([expected, expected], dtype=polars_dtype)})
+    assert_frame_equal(result, expected_frame)
+
+
+@pytest.mark.parametrize(
     "identifier,dtype,physical_value",
     [
         (1672531200000, pl.Datetime("ms"), 1672531200000),

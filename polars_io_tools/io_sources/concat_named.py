@@ -137,6 +137,7 @@ def concat_named(
                 dtype = None  # inferred
             expr = pl.lit(value)
             if dtype is not None:
+                dtype = pl.Schema({col_name: dtype})[col_name]
                 if isinstance(value, str) and dtype.base_type() in (pl.Date, pl.Datetime, pl.Time):
                     expr = expr.str.strptime(dtype)
                 expr = expr.cast(dtype)
