@@ -1238,3 +1238,31 @@ def _collect_concurrently():
     combined = pl.concat([results[i] for i in range(n_partitions)]).sort("x")
     assert_frame_equal(combined, universe.collect().sort("x"))
     assert len(cache) == n_partitions * len(universe.collect_schema())
+
+
+def test_explicit_df_key_replaces_plan_identity(source, df):
+    """With ``df_key``, frames with different plans share cache entries; without it they do not."""
+    cache = {}
+    same_data_other_plan = df.select(pl.all())
+
+    df.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
+    source.reset()
+    out = same_data_other_plan.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
+    assert source.calls == []
+    assert_frame_equal(out, df.select("x2").collect().sort("x2"), check_row_order=False)
+
+    same_data_other_plan.piot.cache(cache, order_by="x").select("x2").collect()
+    assert source.calls
+
+    source.reset()
+    df.piot.cache(cache, order_by="x", df_key="frame-v2").select("x2").collect()
+    assert source.calls
+
+
+def test_explicit_df_key_still_separates_layouts(df):
+    """``order_by`` and ``partition_cols`` stay part of the key when ``df_key`` is given."""
+    cache = {}
+    df.piot.cache(cache, order_by="x", df_key="k").select("x2").collect()
+    df.piot.cache(cache, order_by=["x", "y"], df_key="k").select("x2").collect()
+    df.piot.cache(cache, order_by="x", partition_cols=("y",), df_key="k").select("x2").collect()
+    assert len({k.df_key for k in cache}) == 3

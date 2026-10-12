@@ -16,7 +16,7 @@ The signatures below show the namespace form where one exists.
 ### `cache`
 
 ```python
-lf.piot.cache(cache=None, *, order_by, partition_cols=(), column_granularity=True, cache_mode="cache", validate=True, log_explain=False, **kwargs)
+lf.piot.cache(cache=None, *, order_by, partition_cols=(), column_granularity=True, cache_mode="cache", validate=True, log_explain=False, description=None, df_key=None, **kwargs)
 ```
 
 Maintain an intermediate, per-column cache of the LazyFrame, optionally partitioned by
@@ -33,6 +33,10 @@ re-evaluated (at the cost of evaluating all columns on first touch); row partiti
 preserved and the two modes share the same cache keys. As in the default mode, an
 unfiltered select of a partitioned frame still queries the source once to discover
 partitions — constrain partitions with a predicate to avoid that re-query.
+By default, cache entries are keyed on the frame's serialized plan, which embeds the source
+file paths of Python IO sources and so can differ across environments. Pass `df_key` to
+key entries on an identity you choose instead, for example to share a persistent cache
+between machines.
 
 Serialized cache callbacks from version 0.2.4 retain their historical lookup paths
 when loaded and re-serialized. Python and Polars versions must match. Newly created

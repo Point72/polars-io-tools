@@ -67,9 +67,15 @@ def _cache_lock() -> threading.Lock:
     return _CACHE_LOCK
 
 
-def _df_key(df: pl.LazyFrame, order_by: tuple[str, ...] = (), partition_cols: tuple[str, ...] = ()) -> str:
-    """Return a unique key for the given dataframe, ordering key and partition layout."""
-    payload = df.serialize() + repr((tuple(order_by), tuple(partition_cols))).encode()
+def _df_key(
+    df: pl.LazyFrame,
+    order_by: tuple[str, ...] = (),
+    partition_cols: tuple[str, ...] = (),
+    df_key: str | None = None,
+) -> str:
+    """Return a unique key for the given dataframe (or explicit ``df_key``), ordering key and partition layout."""
+    identity = df.serialize() if df_key is None else b"df_key:" + df_key.encode()
+    payload = identity + repr((tuple(order_by), tuple(partition_cols))).encode()
     return hashlib.md5(payload).hexdigest()
 
 
@@ -100,6 +106,7 @@ def cache(
     validate: bool = True,
     log_explain: bool = False,
     description: str | None = None,
+    df_key: str | None = None,
     **kwargs,
 ) -> pl.LazyFrame:
     """
@@ -143,11 +150,17 @@ def cache(
             skip it on hot paths where uniqueness is already guaranteed.
         log_explain: If True, logs the query plan when defining the function.
         description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
+        df_key: Optional identity for the input LazyFrame, used in place of its serialized plan. The
+            caller is responsible for choosing a value that changes whenever the frame's contents would.
+            ``order_by`` and ``partition_cols`` are still folded into the cache key.
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
     Notes:
-        - The cache key is formed based on a serialized version of the input LazyFrame, the column name and the partitions.
+        - By default, the cache key is formed based on a serialized version of the input LazyFrame, the column name and the partitions.
           It means that if a persistent cache implementation is provided, the cache can remain valid between sessions.
+          The serialized plan of a frame built from Python IO sources includes pickled closures, which embed
+          source file paths, so it can differ across environments or library versions. Pass ``df_key`` when the
+          cache must be shared across such boundaries.
         - The cache will be invalidated if the input LazyFrame is changed in any way (i.e. by adding a new column, or changing the underlying data source).
           It also means that the act of generating the column_cache will change the key for downstream caches,
           i.e. `df.piot.cache(order_by="id").select(expr_1).piot.cache(order_by="id")` will have a different cache from `df.select(expr_1).piot.cache(order_by="id")`,
@@ -214,7 +227,7 @@ def cache(
     # Create a key for the dataframe as part of the cache keys. The ordering key and partition
     # layout are folded in so that caches built with a different order_by or different
     # partition_cols never collide.
-    df_key = _df_key(self, order_by, partition_cols)
+    df_key = _df_key(self, order_by, partition_cols, df_key)
     if log_explain:
         log.debug(str(self.explain()))
 
