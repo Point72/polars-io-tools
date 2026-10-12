@@ -602,9 +602,11 @@ def pushdown_combine(
     output_schema = lambda: _compute_output_schema(sources, combine, combine_kwargs, sources_as_kwargs)
 
     # Collect all output columns that have FilterSpecs across all sources
-    all_output_cols: set[str] = set()
+    output_col_set: set[str] = set()
     for _, specs in sources.values():
-        all_output_cols.update(specs.keys())
+        output_col_set.update(specs.keys())
+    # Sorted so the pickled closure (and hence the serialized plan) does not depend on PYTHONHASHSEED
+    all_output_cols = tuple(sorted(output_col_set))
 
     def source_generator(
         with_columns: list[str] | None,
