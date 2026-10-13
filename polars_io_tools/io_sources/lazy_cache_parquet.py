@@ -29,7 +29,7 @@ from .._compat import POLARS_HAS_PARTITION_BY
 from .dnf_visitor import ColumnConstraintAnalyzer, DNFClause, convert_expr_to_dnf
 from .range_visitor import _convert_atomic_interval_to_polars_expr, convert_expr_to_datetime_range
 from .restrict_visitor import restrict_expr_to_columns
-from .util import _storage_options_for, collect_lf_in_io_source, partition_exclusion_predicate, register_io_source_with_is_pure
+from .util import _is_in_collection, _storage_options_for, collect_lf_in_io_source, partition_exclusion_predicate, register_io_source_with_is_pure
 
 
 @dataclass(frozen=True)
@@ -293,8 +293,8 @@ _STRFTIME_MAP = {"year": "%Y", "month": "%m", "day": "%d"}
 def _strftime_from_template(tmpl: str) -> str:
     """Convert a partition template with $year/$month/$day placeholders to strftime format."""
     fmt = tmpl
-    for placeholder, code in [("$year", "%Y"), ("$month", "%m"), ("$day", "%d")]:
-        fmt = fmt.replace(placeholder, code)
+    for placeholder, code in _STRFTIME_MAP.items():
+        fmt = fmt.replace(f"${placeholder}", code)
     return fmt
 
 
@@ -318,47 +318,133 @@ def _build_scan_paths(
     join_cols = extra_cols + ([date_column] if date_column else [])
 
     # If any join column has None, we cannot enumerate finite paths
-    for row in parts_df.to_dicts():
-        if any(row.get(c) is None for c in join_cols):
-            return []
+    if join_cols and parts_df.select(join_cols).null_count().sum_horizontal().item() > 0:
+        return []
 
-    # Determine date formatting
     date_fmt = None
     if date_column:
-        if template_for_metadata:
-            date_fmt = _strftime_from_template(template_for_metadata)
-        else:
-            default_tmpl = _PARTITION_FORMATS[effective_time_unit]["default"]
-            date_fmt = _strftime_from_template(default_tmpl)
+        date_fmt = _strftime_from_template(template_for_metadata or _PARTITION_FORMATS[effective_time_unit]["default"])
 
-    # Ensure deterministic path order
-    parts_sorted = parts_df.sort(join_cols) if join_cols else parts_df
-
-    paths: list[str] = []
-    for row in parts_sorted.to_dicts():
-        components: list[str] = []
-        for c in extra_cols:
-            components.append(str(row[c]))
-        if date_column:
-            dval = row[date_column]
-            components.append(dval.strftime(date_fmt))
-        key = "/".join(components)
-        paths.append(f"{time_unit_dir}/{key}.parquet")
-    return paths
+    keys = _partition_keys(parts_df, extra_cols, date_column, date_fmt)
+    return [f"{time_unit_dir}/{key}.parquet" for key in sorted(keys.unique())]
 
 
 def _build_not_existing_partitions_pred(
     existing_parts_df: pl.DataFrame,
     join_cols: list[str],
+    date_column: str | None = None,
+    time_unit: Literal["daily", "monthly", "yearly", "null"] | None = None,
+    date_dtype: pl.DataType | None = None,
 ) -> pl.Expr | None:
-    """Build a predicate that excludes existing partition combinations.
+    """Keep rows outside cached partitions, or return None when there is nothing to exclude.
 
-    Returns an expression equivalent to ``NOT(OR(AND(col==val ...)))`` across rows in
-    ``existing_parts_df[join_cols]`` (see
-    :func:`~polars_io_tools.io_sources.util.partition_exclusion_predicate`), or ``None`` when
-    there are no rows or no join columns.
+    Date keys exclude their whole calendar period, including for timezone-aware columns.
     """
-    return partition_exclusion_predicate(existing_parts_df, join_cols)
+    if (
+        date_column is None
+        or date_column not in join_cols
+        or time_unit not in _PARTITION_FORMATS
+        or date_dtype is None
+        or existing_parts_df.is_empty()
+    ):
+        return partition_exclusion_predicate(existing_parts_df, join_cols)
+
+    extra_cols = [c for c in join_cols if c != date_column]
+    date_col = pl.col(date_column)
+    row_key = _partition_date_expr(date_column, date_dtype, time_unit)
+    keyed = existing_parts_df.with_columns(_stored_key_date_expr(date_column, existing_parts_df.schema[date_column]))
+
+    # A row is cached when its (combination, partition date) pair is. Group the pairs by combination (one `is_in` per distinct date set) or by
+    # date (one term per date), whichever gives fewer terms. Grouping by combination alone degrades when combinations cover different dates.
+    combos_by_dates: dict[frozenset[date], list[tuple]] = {}
+    combos_by_date: dict[date, list[tuple]] = {}
+    null_date_combos: list[tuple] = []
+    groups = keyed.group_by(extra_cols, maintain_order=True) if extra_cols else [((), keyed)]
+    for key, grp in groups:
+        combo = tuple(key) if extra_cols else ()
+        dates = frozenset(grp[date_column].drop_nulls().to_list())
+        if dates:
+            combos_by_dates.setdefault(dates, []).append(combo)
+        for d in dates:
+            combos_by_date.setdefault(d, []).append(combo)
+        if grp[date_column].null_count():
+            null_date_combos.append(combo)
+
+    def outside_combos(combos: list[tuple]) -> pl.Expr | None:
+        if not extra_cols:
+            return None
+        return partition_exclusion_predicate(pl.DataFrame(combos, schema=existing_parts_df.select(extra_cols).schema, orient="row"), extra_cols)
+
+    if len(combos_by_dates) <= len(combos_by_date):
+        keep_groups = [(~row_key.is_in(sorted(dates)) | date_col.is_null(), combos) for dates, combos in combos_by_dates.items()]
+    else:
+        keep_groups = [((row_key != d) | date_col.is_null(), combos) for d, combos in combos_by_date.items()]
+    if null_date_combos:
+        keep_groups.append((date_col.is_not_null(), null_date_combos))
+    keep_exprs: list[pl.Expr] = []
+    for keep, combos in keep_groups:
+        others = outside_combos(combos)
+        keep_exprs.append(keep if others is None else others | keep)
+    if not keep_exprs:
+        return None
+    return keep_exprs[0] if len(keep_exprs) == 1 else pl.Expr.and_(*keep_exprs)
+
+
+def _partition_date_expr(date_column: str, dtype: pl.DataType, time_unit: Literal["daily", "monthly", "yearly"]) -> pl.Expr:
+    """Expression for the calendar date (period start) of the partition holding each row.
+
+    Matches the writer, which formats the column with ``dt.strftime`` (local time for timezone-aware columns).
+    """
+    expr = pl.col(date_column)
+    if dtype != pl.Date:
+        expr = expr.dt.date()
+    if time_unit == "monthly":
+        expr = expr.dt.truncate("1mo")
+    elif time_unit == "yearly":
+        expr = expr.dt.truncate("1y")
+    return expr
+
+
+def _stored_key_date_expr(date_column: str, dtype: pl.DataType) -> pl.Expr:
+    """Calendar date of a partition key held in a partitions frame.
+
+    Partition frames hold key dates cast to the column dtype, which places them at midnight UTC for timezone-aware columns.
+    """
+    expr = pl.col(date_column)
+    if isinstance(dtype, pl.Datetime):
+        if dtype.time_zone is not None:
+            expr = expr.dt.convert_time_zone("UTC")
+        expr = expr.dt.date()
+    return expr
+
+
+def _partition_key_component(value: Any) -> str:
+    """Serialize one partition key value as the ``PartitionBy`` writer does for its path segment."""
+    return unquote(str(value))
+
+
+def _serialize_key_values(values: pl.Series) -> pl.Series:
+    """Serialize non-null partition values as the writer of the installed polars does."""
+    if POLARS_HAS_PARTITION_BY:
+        return pl.Series([_partition_key_component(v) for v in values.to_list()], dtype=pl.String)
+    # PartitionByKey (polars < 1.38) names partitions by the value cast to String
+    return values.cast(pl.String)
+
+
+def _partition_keys(parts_df: pl.DataFrame, extra_cols: list[str], date_column: str | None, date_fmt: str | None) -> pl.Series:
+    """Cache keys (``a/b/2024-01``, no extension) for each row of a partitions frame.
+
+    Uses the writer's serialization so keys compare equal to listed file keys. Rows with a null (unconstrained) partition value get a null key.
+    """
+    exprs = []
+    for c in extra_cols:
+        values = parts_df[c].drop_nulls().unique()
+        exprs.append(pl.col(c).replace_strict(values, _serialize_key_values(values), return_dtype=pl.String))
+    if date_column is not None and date_fmt is not None:
+        exprs.append(_stored_key_date_expr(date_column, parts_df.schema[date_column]).dt.strftime(date_fmt))
+    if not exprs:
+        return pl.Series("key", [None] * parts_df.height, dtype=pl.String)
+    return parts_df.select(pl.concat_str(exprs, separator="/").alias("key")).to_series()
 
 
 def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[str]:
@@ -401,99 +487,97 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
     return existing_parts
 
 
-def _is_custom_partition_format(
-    template_for_metadata: str | None,
-    time_unit: Literal["daily", "monthly", "yearly"] | None,
-    date_column: str | None,
-) -> bool:
-    """Return True if a non-default partition template is used.
-
-    A template is considered custom when it is provided and does not match the
-    default for the given `time_unit` (e.g., `$year-$month-$day` for `daily`).
-    """
-    if not (date_column and template_for_metadata and time_unit and time_unit in _PARTITION_FORMATS):
-        return False
-
-    default_format = _PARTITION_FORMATS[time_unit]["default"]
-    return template_for_metadata != default_format
-
-
-def _parse_custom_partition_files(
+def _split_custom_partition_keys(
     existing_files: set[str],
     all_partition_cols: list[str],
     date_column: str,
-    partition_schema_dict: dict,
 ) -> pl.DataFrame:
-    """Parse existing partition file keys using a custom template and reconstruct dates.
+    """Return raw extra-column and date keys from custom-format paths.
 
-    - Handles extra partition columns in `key=value` or plain formats.
-    - Extracts date components from path segments and builds a Date column via Polars.
-    - Returns a DataFrame with the expected partition schema.
+    Extra keys may be plain or ``key=value`` segments. The date key contains all remaining segments.
     """
     extra_cols = [col for col in all_partition_cols if col != date_column]
+    n_extra = len(extra_cols)
 
-    # Build data for all columns including separate date components
-    all_data = []
-    date_years = []
-    date_months = []
-    date_days = []
-
+    rows = []
     for file_path in existing_files:
         path_parts = file_path.split("/")
-        row = {}
+        if len(path_parts) <= n_extra:
+            continue
+        extras = [part.split("=", 1)[1] if "=" in part else part for part in path_parts[:n_extra]]
+        rows.append([*extras, "/".join(path_parts[n_extra:])])
 
-        # Handle extra columns (assume they come first)
-        for i, col in enumerate(extra_cols):
-            if i < len(path_parts):
-                part = path_parts[i]
-                # Handle key=value format
-                if "=" in part:
-                    row[col] = part.split("=", 1)[1]
-                else:
-                    row[col] = part
+    return pl.DataFrame(rows, schema={**{c: pl.Utf8 for c in extra_cols}, date_column: pl.Utf8}, orient="row")
 
-        # Extract date components from remaining path parts
-        remaining_parts = path_parts[len(extra_cols) :]
-        date_components = {"year": 1970, "month": 1, "day": 1}  # Defaults
 
-        for part in remaining_parts:
-            if "=" in part:
-                key, value = part.split("=", 1)
-                key_lower = key.lower()
-                try:
-                    if any(pattern in key_lower for pattern in ["year", "y"]):
-                        date_components["year"] = int(value)
-                    elif any(pattern in key_lower for pattern in ["month", "m"]):
-                        date_components["month"] = int(value)
-                    elif any(pattern in key_lower for pattern in ["day", "d"]):
-                        date_components["day"] = int(value)
-                except ValueError:
-                    # Skip invalid numeric values
+# Null partition values: "None" from PartitionBy (polars >= 1.38), "null" from PartitionByKey
+_NULL_KEY_TOKENS = ("None", "null")
+_BOOL_KEYS = {"True": True, "true": True, "False": False, "false": False}
+
+
+def _key_decoder(dtype: pl.DataType) -> Callable[[str], Any] | None:
+    """Parser for a partition key of ``dtype``, or None to fall back to a polars cast."""
+    if dtype == pl.Boolean:
+        return _BOOL_KEYS.__getitem__
+    if dtype.is_integer():
+        return int
+    if dtype.is_float():
+        return float
+    if dtype == pl.Date:
+        return datetime.date.fromisoformat
+    if isinstance(dtype, pl.Datetime):
+        return datetime.datetime.fromisoformat
+    if dtype == pl.Time:
+        return datetime.time.fromisoformat
+    return None
+
+
+def _parse_date_keys(df: pl.DataFrame, date_column: str, template: str) -> pl.DataFrame:
+    """Parse the date key column with ``template``; drop rows whose key does not match it."""
+    raw = pl.col(date_column)
+    parsed = pl.when(raw.is_in(_NULL_KEY_TOKENS)).then(None).otherwise(raw.str.strptime(pl.Date, _strftime_from_template(template), strict=False))
+    df = df.with_columns(parsed.alias("__piot_parsed__"))
+    malformed = pl.col("__piot_parsed__").is_null() & pl.col(date_column).is_not_null() & ~pl.col(date_column).is_in(_NULL_KEY_TOKENS)
+    n_malformed = df.select(malformed.sum()).item()
+    if n_malformed:
+        log.debug("Ignoring %d cached file(s) not matching partition format %r", n_malformed, template)
+        df = df.filter(~malformed)
+    return df.with_columns(pl.col("__piot_parsed__").alias(date_column)).drop("__piot_parsed__")
+
+
+def _cast_partition_keys(df: pl.DataFrame, partition_schema_dict: dict) -> pl.DataFrame:
+    """Decode string partition keys to the partition schema.
+
+    Accepts the key spellings of both polars writers. Rows whose key does not decode are dropped, so an unrecognized file is treated as not
+    cached rather than as the null partition.
+    """
+    undecoded = pl.Series(values=[False] * df.height, dtype=pl.Boolean)
+    for c, dtype in partition_schema_dict.items():
+        if df.schema[c] != pl.Utf8:
+            continue
+        if dtype == pl.Utf8 or dtype == pl.Categorical:
+            df = df.with_columns(pl.when(~pl.col(c).is_in(_NULL_KEY_TOKENS)).then(pl.col(c)).cast(dtype).alias(c))
+            continue
+        raw = df[c]
+        decode = _key_decoder(dtype)
+        if decode is None:
+            decoded = raw.cast(dtype, strict=False)
+        else:
+            mapping: dict[str, Any] = {}
+            for key in raw.drop_nulls().unique().to_list():
+                if key in _NULL_KEY_TOKENS:
                     continue
-
-        # Store row data and date components
-        all_data.append(row)
-        date_years.append(date_components["year"])
-        date_months.append(date_components["month"])
-        date_days.append(date_components["day"])
-
-    if not all_data:
-        return pl.DataFrame(schema=partition_schema_dict)
-
-    # Create DataFrame with extra columns
-    if extra_cols:
-        extra_data = {col: [row.get(col) for row in all_data] for col in extra_cols}
-        df = pl.DataFrame(extra_data)
-    else:
-        df = pl.DataFrame([{}] * len(all_data))
-
-    # Use Polars to construct the date column from components
-    df = df.with_columns([pl.Series("__year", date_years), pl.Series("__month", date_months), pl.Series("__day", date_days)])
-
-    # Construct date using Polars date function
-    df = df.with_columns(pl.date("__year", "__month", "__day").alias(date_column)).drop(["__year", "__month", "__day"])
-
-    return df.cast(partition_schema_dict, strict=False)
+                try:
+                    mapping[key] = decode(key)
+                except (ValueError, KeyError, ArithmeticError):
+                    pass
+            decoded = pl.Series(c, [mapping.get(key) for key in raw.to_list()], dtype=dtype, strict=False)
+        undecoded = undecoded | (raw.is_not_null() & ~raw.is_in(_NULL_KEY_TOKENS) & decoded.is_null())
+        df = df.with_columns(decoded.alias(c))
+    if undecoded.any():
+        log.debug("Ignoring %d cached file(s) whose partition keys do not match the schema", undecoded.sum())
+        df = df.filter(~undecoded)
+    return df
 
 
 def _construct_partitions_df_from_existing(
@@ -504,36 +588,29 @@ def _construct_partitions_df_from_existing(
     date_column: str | None = None,
     time_unit: Literal["daily", "monthly", "yearly"] | None = None,
 ) -> pl.DataFrame:
-    """Construct a partitions DataFrame from existing keys and optional templates.
-
-    If a custom template is provided, delegates to `_parse_custom_partition_files`.
-    Otherwise, assumes partition columns map to path segments directly.
-    """
+    """Decode existing file keys to the partition schema, omitting malformed keys."""
     partition_schema_dict = {k: schema[k] for k in all_partition_cols}
 
     if not existing_files:
         return pl.DataFrame(schema=partition_schema_dict)
 
-    # Check if we have a custom partition format
-    is_custom_format = _is_custom_partition_format(template_for_metadata, time_unit, date_column)
-
-    if is_custom_format and date_column is not None:
-        # For custom formats, delegate to specialized parsing function
-        # date_column is guaranteed to be non-None when is_custom_format is True
-        return _parse_custom_partition_files(existing_files, all_partition_cols, date_column, partition_schema_dict)
-
+    is_custom_format = (
+        date_column
+        and template_for_metadata
+        and time_unit in _PARTITION_FORMATS
+        and template_for_metadata != _PARTITION_FORMATS[time_unit]["default"]
+    )
+    if is_custom_format:
+        df = _split_custom_partition_keys(existing_files, all_partition_cols, date_column)
     else:
-        # Default case: partition structure matches column names directly
         raw_data = [part.split("/") for part in existing_files]
         df = pl.DataFrame(raw_data, schema={k: pl.Utf8 for k in all_partition_cols}, orient="row")
 
-        # Parse date column if needed for default formats
-        if date_column and template_for_metadata and date_column in all_partition_cols:
-            # Convert `$year/$month/$day` placeholders to strftime using helper
-            strftime_fmt = _strftime_from_template(template_for_metadata)
-            df = df.with_columns(pl.col(date_column).str.strptime(pl.Date, strftime_fmt))
-
-        return df.cast(partition_schema_dict, strict=False)
+    if date_column and template_for_metadata and (is_custom_format or date_column in all_partition_cols):
+        df = _parse_date_keys(df, date_column, template_for_metadata)
+    if is_custom_format:
+        df = df.select(all_partition_cols)
+    return _cast_partition_keys(df, partition_schema_dict)
 
 
 def _get_expected_partitions_df(
@@ -635,45 +712,39 @@ def _process_dnf_clause_to_partitions(
     for col in all_partition_cols:
         constraints = constraints_by_col.get(col, [])
 
-        if not constraints:
-            # Unconstrained column - use None as placeholder
+        matches_null = any(
+            op in ("is", "==", "in") and (val is None or (isinstance(val, (list, set, tuple)) and None in val)) for op, val in constraints
+        )
+        if not constraints or matches_null:
+            # Unconstrained, or matching null (which the None placeholder cannot distinguish from unconstrained)
             column_value_sets[col] = {None}
         elif date_column and col == date_column:
-            col_df = _get_date_partitions_from_constraints(constraints, date_column, time_unit, schema)
-            if col_df.is_empty():
+            values = _get_date_partitions_from_constraints(constraints, date_column, time_unit, schema)
+            if not values:
                 # Contradiction in date constraints
                 return pl.DataFrame(schema=partition_schema)
-            column_value_sets[col] = set(col_df[col].to_list())
+            column_value_sets[col] = values
         else:
-            col_df = _get_column_values_from_constraints(constraints, col, schema)
-            if col_df is None:
-                # Non-enumerable constraint (e.g. !=, unbounded range). With no date column,
-                # leave the column unconstrained so the read globs and (under CACHE) the write
-                # queries upstream by the actual predicate. With a date column present, treat it
-                # as empty so the UNBOUNDED / date-clipping path handles it — the exclude-existing
-                # predicate is not date-partition-granularity aware.
+            values = _get_column_values_from_constraints(constraints, col, schema)
+            if values is None:
+                # Non-enumerable extra-column constraints use wildcard reads without a date column,
+                # or the unbounded/date-clipping fallback when a date column is present.
                 if date_column is None:
                     column_value_sets[col] = {None}
                 else:
                     return pl.DataFrame(schema=partition_schema)
-            elif col_df.is_empty():
+            elif not values:
                 # Contradiction in column constraints
                 return pl.DataFrame(schema=partition_schema)
             else:
-                column_value_sets[col] = set(col_df[col].to_list())
+                column_value_sets[col] = values
 
     # Generate cross product of all column values (including None placeholders)
     import itertools
 
     all_combinations = itertools.product(*[column_value_sets[col] for col in all_partition_cols])
 
-    # Convert combinations to DataFrame rows
-    rows = []
-    for combination in all_combinations:
-        row = dict(zip(all_partition_cols, combination))
-        rows.append(row)
-
-    return pl.DataFrame(rows, schema=partition_schema)
+    return pl.DataFrame(list(all_combinations), schema=partition_schema, orient="row")
 
 
 def _get_date_partitions_from_constraints(
@@ -681,66 +752,55 @@ def _get_date_partitions_from_constraints(
     date_column: str,
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
-) -> pl.DataFrame:
-    """Convert date constraints to partitions with appropriate time unit widening."""
-    df_schema = {date_column: schema[date_column]}
+) -> set[date]:
+    """Return widened date keys, or an empty set when no finite dates can be enumerated."""
     if not constraints:
-        return pl.DataFrame(schema=df_schema)
+        return set()
 
     analyzer = ColumnConstraintAnalyzer(date_column)
     for op, val in constraints:
         analyzer.update_from_predicate(op, val)
 
     if analyzer.has_contradiction(schema=schema):
-        return pl.DataFrame(schema=df_schema)
+        return set()
 
-    valid_dates = _extract_and_widen_dates(analyzer, time_unit)
-    if not valid_dates:
-        # If no finite dates can be enumerated (e.g., one-sided bound), return empty.
-        # Upstream fallback is handled in source_generator.
-        return pl.DataFrame(schema=df_schema)
-
-    return pl.DataFrame({date_column: valid_dates}, schema=df_schema)
+    # `!=` only rules out a whole partition when a partition is exactly one Date value.
+    exact_exclusions = time_unit == "daily" and schema[date_column] == pl.Date
+    dates = _extract_and_widen_dates(analyzer, time_unit, exact_exclusions=exact_exclusions)
+    return set(pl.Series(date_column, dates, dtype=schema[date_column]).to_list())
 
 
 def _get_column_values_from_constraints(
     constraints: list[tuple[str, Any]],
     column: str,
     schema: pl.Schema,
-) -> pl.DataFrame | None:
-    """Convert column constraints to valid values.
-
-    Returns an empty DataFrame for a genuine contradiction (no value can match), a populated
-    DataFrame for a finitely enumerable constraint, or ``None`` when the constraint cannot be
-    finitely enumerated (e.g. ``!=`` or an unbounded range) — the caller then leaves the column
-    unconstrained rather than mistaking it for a contradiction.
-    """
+) -> set[Any] | None:
+    """Return finite matching values, an empty set for a contradiction, or None for a non-enumerable constraint."""
     if not constraints:
-        return pl.DataFrame(schema={column: schema[column]})
+        return set()
 
     analyzer = ColumnConstraintAnalyzer(column)
     for op, val in constraints:
         analyzer.update_from_predicate(op, val)
 
     if analyzer.has_contradiction(schema=schema):
-        return pl.DataFrame(schema={column: schema[column]})
+        return set()
 
-    valid_values = _extract_finite_values(analyzer, column, schema)
-    if valid_values is None:
-        # Not finitely enumerable (e.g. `!=`, unbounded range): signal "unconstrained".
-        return None
-    if not valid_values:
-        # Enumerable but empty: a contradiction.
-        return pl.DataFrame(schema={column: schema[column]})
-
-    return pl.DataFrame({column: list(valid_values)}, schema={column: schema[column]})
+    values = _extract_finite_values(analyzer, column, schema)
+    return None if values is None else set(pl.Series(column, list(values), dtype=schema[column]).to_list())
 
 
 def _extract_and_widen_dates(
     analyzer: ColumnConstraintAnalyzer,
     time_unit: Literal["daily", "monthly", "yearly"],
+    *,
+    exact_exclusions: bool = False,
 ) -> list[date]:
-    """Extract valid dates from analyzer and apply time unit widening."""
+    """Extract valid dates from analyzer and apply time unit widening.
+
+    Excluded (``!=``) values remove a partition only when ``exact_exclusions`` is set, i.e. when each partition holds a single date value;
+    otherwise the partition still has other matching rows.
+    """
     dates = set()
 
     # Handle exact values
@@ -763,11 +823,10 @@ def _extract_and_widen_dates(
         dates.update(range_dates)
 
     # Remove excluded dates
-    if analyzer.exclusion_values:
+    if exact_exclusions and analyzer.exclusion_values:
         for val in analyzer.exclusion_values:
-            date_val = _convert_to_date(val)
-            if date_val:
-                dates.discard(_widen_date(date_val, time_unit))
+            if type(val) is date:
+                dates.discard(val)
 
     return sorted(dates)
 
@@ -796,7 +855,6 @@ def _widen_date(date_val: date, time_unit: Literal["daily", "monthly", "yearly"]
 def _enumerate_date_range(
     analyzer: ColumnConstraintAnalyzer,
     time_unit: Literal["daily", "monthly", "yearly"],
-    max_partitions: int | None = None,
 ) -> set[date]:
     """Enumerate date range from bounds, applying widening."""
     dates = set()
@@ -824,7 +882,7 @@ def _enumerate_date_range(
     current = _widen_date(min_val, time_unit)
     max_widened = _widen_date(max_val, time_unit)
 
-    while current <= max_widened and (max_partitions is None or len(dates) < max_partitions):
+    while current <= max_widened:
         dates.add(current)
         current = _step_date(current, time_unit)
 
@@ -856,7 +914,7 @@ def _extract_finite_values(
     if analyzer.inclusion_set is not None:
         return analyzer.inclusion_set - analyzer.exclusion_values
 
-    # For bounded integer ranges, enumerate small ranges
+    # Bounded integer ranges can be enumerated.
     if analyzer.min_bound and analyzer.max_bound:
         col_type = schema.get(column)
         if col_type and col_type.is_integer():
@@ -865,8 +923,8 @@ def _extract_finite_values(
     return None
 
 
-def _enumerate_integer_range(analyzer: ColumnConstraintAnalyzer, max_size: int | None = None) -> set[int] | None:
-    """Enumerate integer range if it's small enough."""
+def _enumerate_integer_range(analyzer: ColumnConstraintAnalyzer) -> set[int] | None:
+    """Enumerate a bounded integer range, omitting excluded values."""
     if not analyzer.min_bound or not analyzer.max_bound:
         return None
     min_val, min_inclusive = analyzer.min_bound
@@ -876,9 +934,6 @@ def _enumerate_integer_range(analyzer: ColumnConstraintAnalyzer, max_size: int |
         min_val += 1
     if not max_inclusive:
         max_val -= 1
-
-    if (max_size is not None) and (max_val - min_val + 1 > max_size):
-        return None
 
     values = set(range(min_val, max_val + 1))
     return values - analyzer.exclusion_values
@@ -892,16 +947,9 @@ def _compute_clipped_expected_partitions(
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
 ) -> pl.DataFrame | None:
-    """Compute expected partitions for unbounded queries, clipped to existing data bounds.
+    """Return partitions for a one-sided date interval clipped to existing cache bounds.
 
-    Uses the predicate's interval (from convert_expr_to_datetime_range) to determine bounds.
-    - For unbounded above (lower=X, upper=+inf): Enumerate from X to max(existing)
-    - For unbounded below (lower=-inf, upper=Y): Enumerate from min(existing) to Y
-
-    Returns None if:
-    - The interval is empty or fully bounded (use normal enumeration)
-    - The interval is fully unbounded on both sides
-    - No existing partitions to clip to
+    Return None when the interval is not one-sided, no cached dates exist, or the clipped range is empty.
     """
     if predicate_interval.empty:
         return None
@@ -920,37 +968,19 @@ def _compute_clipped_expected_partitions(
     if existing_parts_df.is_empty() or date_column not in existing_parts_df.columns:
         return None
 
-    # Get existing date bounds
     existing_dates = existing_parts_df[date_column].drop_nulls()
     if existing_dates.is_empty():
         return None
 
-    existing_min = existing_dates.min()
-    existing_max = existing_dates.max()
-
-    # Compute clipped bounds
-    if is_unbounded_above:
-        # date >= X: use predicate's lower bound, clip upper to existing_max
-        lower_val = predicate_interval.lower
-        # Convert datetime to date if needed
-        predicate_min = lower_val.date() if isinstance(lower_val, datetime.datetime) else lower_val
-        existing_max_date = existing_max.date() if isinstance(existing_max, datetime.datetime) else existing_max
-        # existing_max_date must be a date at this point
-        if not isinstance(existing_max_date, date):
-            return None
-        clipped_min = _widen_date(predicate_min, time_unit)
-        clipped_max = _widen_date(existing_max_date, time_unit)
-    else:
-        # date <= Y: clip lower to existing_min, use predicate's upper bound
-        upper_val = predicate_interval.upper
-        # Convert datetime to date if needed
-        predicate_max = upper_val.date() if isinstance(upper_val, datetime.datetime) else upper_val
-        existing_min_date = existing_min.date() if isinstance(existing_min, datetime.datetime) else existing_min
-        # existing_min_date must be a date at this point
-        if not isinstance(existing_min_date, date):
-            return None
-        clipped_min = _widen_date(existing_min_date, time_unit)
-        clipped_max = _widen_date(predicate_max, time_unit)
+    existing_bound = _convert_to_date(existing_dates.max() if is_unbounded_above else existing_dates.min())
+    if existing_bound is None:
+        return None
+    predicate_bound = predicate_interval.lower if is_unbounded_above else predicate_interval.upper
+    if isinstance(predicate_bound, datetime.datetime):
+        predicate_bound = predicate_bound.date()
+    lower, upper = (predicate_bound, existing_bound) if is_unbounded_above else (existing_bound, predicate_bound)
+    clipped_min = _widen_date(lower, time_unit)
+    clipped_max = _widen_date(upper, time_unit)
 
     # Don't enumerate if clipped range is invalid
     if clipped_min > clipped_max:
@@ -963,28 +993,12 @@ def _compute_clipped_expected_partitions(
         dates.add(current)
         current = _step_date(current, time_unit)
 
-    if not dates:
-        return None
-
-    # Build partitions DataFrame
+    dates_df = pl.DataFrame({date_column: sorted(dates)}, schema={date_column: schema[date_column]})
+    if not extra_cols:
+        return dates_df
     all_partition_cols = extra_cols + [date_column]
     partition_schema = {col: schema[col] for col in all_partition_cols}
-
-    # For extra columns, cross product with the clipped dates
-    if extra_cols:
-        extra_combos = existing_parts_df.select(extra_cols).unique().to_dicts()
-        if not extra_combos:
-            return pl.DataFrame({date_column: sorted(dates)}, schema={date_column: schema[date_column]})
-
-        rows = []
-        for combo in extra_combos:
-            for d in dates:
-                row = combo.copy()
-                row[date_column] = d
-                rows.append(row)
-        return pl.DataFrame(rows, schema=partition_schema)
-    else:
-        return pl.DataFrame({date_column: sorted(dates)}, schema={date_column: schema[date_column]})
+    return existing_parts_df.select(extra_cols).unique().join(dates_df, how="cross").select(all_partition_cols).cast(partition_schema)
 
 
 def _generate_write_predicate_from_partitions_df(
@@ -993,49 +1007,25 @@ def _generate_write_predicate_from_partitions_df(
     extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly", "null"],
 ) -> pl.Expr | None:
-    """Generate a predicate that efficiently covers all partitions in the DataFrame.
-    There is an inherent trade-off here:
-    - If we list the partitions explicitly and we have many, we may end up with a very predicate that might segfault or cause poor performance.
-    - If we perform a cross-product of all partitions, we may be querying for much more data than necessary.
+    """Return a predicate covering the target partitions, or None when unrestricted.
 
-    Currently, we:
-    1. Groups partitions by contiguous date ranges using portion.Interval (if date_column exists)
-    2. Creates separate OR conditions for each contiguous range
-    3. Combines them to minimize the filter overhead
+    Within merged date ranges, extra-column values may cover more combinations than the target partitions.
     """
     if partitions_df.is_empty():
         return None
 
     # A single row with all-nulls for partition keys means "no predicate".
-    if partitions_df.height == 1 and all(v is None for v in partitions_df.row(0)):
+    if _is_all_null_row(partitions_df):
         return None
 
-    # Handle case where there's no date column - just use extra columns
     if not date_column:
-        # Without date column, create simple predicates for extra columns
         all_extra_predicates = []
-
         for row_dict in partitions_df.to_dicts():
-            row_predicates = []
-            for col in extra_cols:
-                val = row_dict.get(col)
-                if val is not None:
-                    row_predicates.append(pl.col(col) == val)
-
+            row_predicates = [pl.col(col) == row_dict[col] for col in extra_cols if row_dict.get(col) is not None]
             if row_predicates:
-                if len(row_predicates) == 1:
-                    all_extra_predicates.append(row_predicates[0])
-                else:
-                    all_extra_predicates.append(functools.reduce(operator.and_, row_predicates))
+                all_extra_predicates.append(pl.Expr.and_(*row_predicates))
+        return pl.Expr.or_(*all_extra_predicates) if all_extra_predicates else None
 
-        if not all_extra_predicates:
-            return None
-        elif len(all_extra_predicates) == 1:
-            return all_extra_predicates[0]
-        else:
-            return functools.reduce(operator.or_, all_extra_predicates)
-
-    # Step 1: Convert each partition row to an interval and collect associated partition values
     partition_intervals: list[tuple[Interval, dict[str, Any]]] = []
     for row_dict in partitions_df.to_dicts():
         date_val = row_dict.get(date_column)
@@ -1043,103 +1033,44 @@ def _generate_write_predicate_from_partitions_df(
             interval = portion.open(-portion.inf, portion.inf)
 
         else:
-            # Create interval based on time_unit
-            if time_unit == "daily":
-                start_date = date_val
-                end_date = date_val + timedelta(days=1)  # End exclusive
-            elif time_unit == "monthly":
-                start_date = date_val.replace(day=1)
-                end_date = _next_month_start(start_date)
-            elif time_unit == "yearly":
-                start_date = date(date_val.year, 1, 1)
-                end_date = date(date_val.year + 1, 1, 1)
-            else:
+            if time_unit not in _PARTITION_FORMATS:
                 raise ValueError(f"Unsupported time_unit: {time_unit}")
-
-            # Create interval (left-closed, right-open to match the logic)
-            start_date = _convert_to_date(start_date)
-            end_date = _convert_to_date(end_date)
-            if end_date is None:
-                end_date = portion.inf
-            interval = portion.closedopen(start_date, end_date)
-
-        # Collect non-null extra column values for this partition
+            start_date = _widen_date(_convert_to_date(date_val), time_unit)
+            interval = portion.closedopen(start_date, _step_date(start_date, time_unit))
         extra_values = {col: row_dict[col] for col in extra_cols if row_dict.get(col) is not None}
-
         partition_intervals.append((interval, extra_values))
 
-    if not partition_intervals:
-        return None
-
-    # Step 2: Group partitions by overlapping/adjacent intervals
-    # We'll merge intervals and collect all partition values that fall within each merged interval
     merged_groups: list[tuple[Interval, list[dict[str, Any]]]] = []
-
-    # Sort by interval start for merging
     partition_intervals.sort(key=lambda x: (x[0].lower, x[0].upper))
-
     current_interval = partition_intervals[0][0]
     current_partitions = [partition_intervals[0][1]]
 
     for interval, partition_values in partition_intervals[1:]:
-        # Check if this interval overlaps or is adjacent to current_interval
         if current_interval.overlaps(interval) or current_interval.adjacent(interval):
-            # Merge intervals and combine partition values
             current_interval = current_interval | interval
             current_partitions.append(partition_values)
         else:
-            # Save current group and start new one
             merged_groups.append((current_interval, current_partitions))
             current_interval = interval
             current_partitions = [partition_values]
 
-    # Don't forget the last group
     merged_groups.append((current_interval, current_partitions))
-
-    # Step 3: Create OR conditions for each merged group
     group_predicates = []
 
     for merged_interval, partition_list in merged_groups:
-        # Create date range predicate for this interval
-        # Convert portion interval bounds back to date objects
-        start_date = merged_interval.lower
-        end_date = merged_interval.upper
         cur_date_expr = _convert_atomic_interval_to_polars_expr(merged_interval, date_column)
-
-        # Collect all unique values for extra columns within this interval
-        values_per_column: dict[str, set[Any]] = {col: set() for col in extra_cols}
-        for partition_values in partition_list:
-            for col, val in partition_values.items():
-                if val is not None:
-                    values_per_column[col].add(val)
-
-        # Create extra column predicates
-        extra_preds = []
-        for col, values in values_per_column.items():
-            if len(values) == 0:
+        group_preds = [cur_date_expr] if cur_date_expr is not None else []
+        for col in extra_cols:
+            if any(col not in partition_values for partition_values in partition_list):
                 continue
-            elif len(values) == 1:
-                extra_preds.append(pl.col(col) == next(iter(values)))
+            values = {partition_values[col] for partition_values in partition_list}
+            if len(values) == 1:
+                group_preds.append(pl.col(col) == next(iter(values)))
             else:
-                extra_preds.append(pl.col(col).is_in(list(values)))
-
-        # Combine date predicate with extra column predicates
-        if extra_preds:
-            group_pred = cur_date_expr
-            for extra_pred in extra_preds:
-                group_pred = group_pred & extra_pred if group_pred is not None else extra_pred
-        else:
-            group_pred = cur_date_expr
-        if group_pred is not None:
-            group_predicates.append(group_pred)
-
-    # Step 4: Combine all group predicates with OR
-    if len(group_predicates) == 0:
-        return None
-    elif len(group_predicates) == 1:
-        return group_predicates[0]
-    else:
-        return functools.reduce(operator.or_, group_predicates)
+                group_preds.append(pl.col(col).is_in(_is_in_collection(list(values), partitions_df.schema[col])))
+        if group_preds:
+            group_predicates.append(pl.Expr.and_(*group_preds))
+    return pl.Expr.or_(*group_predicates) if group_predicates else None
 
 
 def _schema_from_cache(
@@ -1159,13 +1090,6 @@ def _schema_from_cache(
     except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
         log.debug("Could not infer schema from cache; this is the first write")
         return None
-
-
-def _next_month_start(d: datetime.date) -> datetime.date:
-    """Get the first day of the next month."""
-    if d.month == 12:
-        return datetime.date(d.year + 1, 1, 1)
-    return datetime.date(d.year, d.month + 1, 1)
 
 
 def _normalise_partition_format(time_unit: Literal["daily", "monthly", "yearly"], partition_format: str | None) -> tuple[str, str]:
@@ -1191,12 +1115,7 @@ def _normalise_partition_format(time_unit: Literal["daily", "monthly", "yearly"]
             msgs.append("unexpected " + ", ".join(f"${e}" for e in sorted(extra)))
         raise ValueError("Partition format error - " + "; ".join(msgs))
 
-    # Replace placeholders with strftime codes
-    strftime_fmt = partition_format
-    for ph, sfmt in _STRFTIME_MAP.items():
-        strftime_fmt = strftime_fmt.replace(f"${ph}", sfmt)
-
-    return strftime_fmt, tmpl.template
+    return _strftime_from_template(partition_format), tmpl.template
 
 
 def _build_write_plan(
@@ -1206,13 +1125,13 @@ def _build_write_plan(
     date_column: str | None,
     predicate: pl.Expr | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
+    date_dtype: pl.DataType | None = None,
 ) -> WritePlan:
     """Construct a write plan based on cache mode and enumerability.
 
     Consolidates special-case logic for one-sided/unbounded queries and unconstrained cases.
     """
     need_write = cache_mode in {CacheMode.CACHE, CacheMode.REBUILD}
-    filter_predicate: pl.Expr | None = None
 
     if not need_write:
         return WritePlan(False, None, False)
@@ -1226,7 +1145,9 @@ def _build_write_plan(
         # If we have partition columns, always query upstream (new partitions might exist)
         # Filter out rows that would fall into already-cached partitions
         if partition_info.join_cols:
-            not_existing = _build_not_existing_partitions_pred(partition_info.existing_parts_df, partition_info.join_cols)
+            not_existing = _build_not_existing_partitions_pred(
+                partition_info.existing_parts_df, partition_info.join_cols, date_column, effective_time_unit, date_dtype
+            )
             return WritePlan(True, not_existing, False)
         # No partition columns - single global partition, trust cache once written
         if partition_info.existing_parts_df.is_empty():
@@ -1237,19 +1158,16 @@ def _build_write_plan(
         restricted = (
             restrict_expr_to_columns(predicate, set(partition_info.join_cols)) if predicate is not None and partition_info.join_cols else None
         )
-        not_existing = _build_not_existing_partitions_pred(partition_info.existing_parts_df, partition_info.join_cols)
-        combined = restricted & not_existing if restricted is not None and not_existing is not None else (restricted or not_existing)
+        not_existing = _build_not_existing_partitions_pred(
+            partition_info.existing_parts_df, partition_info.join_cols, date_column, effective_time_unit, date_dtype
+        )
+        if restricted is not None and not_existing is not None:
+            combined = restricted & not_existing
+        else:
+            combined = restricted if restricted is not None else not_existing
         return WritePlan(True, combined, False)
 
-    if not partition_info.expected_parts_df.is_empty():
-        extra_cols = [c for c in partition_info.join_cols if c != (date_column or "")]
-        filter_predicate = _generate_write_predicate_from_partitions_df(
-            partitions_df=partition_info.expected_parts_df,
-            date_column=date_column,
-            extra_cols=extra_cols,
-            time_unit=effective_time_unit,
-        )
-    return WritePlan(True, filter_predicate, True)
+    return WritePlan(True, None, True)
 
 
 def _cache_scan_from_read_plan(
@@ -1325,6 +1243,7 @@ def _build_read_plan(
     time_unit_dir: str,
     template_for_metadata: str | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
+    has_cached_files: bool,
 ) -> ReadPlan:
     """Construct a read plan for reading from cache.
 
@@ -1340,7 +1259,7 @@ def _build_read_plan(
     # No cached files exist yet: read nothing rather than globbing an empty directory (which
     # raises "expanded paths were empty"). This happens when a wildcard/unconstrained read wrote
     # no partitions, e.g. its predicate matched no upstream rows.
-    if partition_info.existing_parts_df.is_empty():
+    if not has_cached_files:
         return ReadPlan(use_paths=[])
 
     def build_cache_paths(parts_df: pl.DataFrame) -> list[str] | None:
@@ -1380,11 +1299,17 @@ def _build_read_plan(
     return ReadPlan(use_paths=use_paths)
 
 
-def _compute_partitions_to_write(part_info: PartitionInfo, existing_parts_df: pl.DataFrame) -> pl.DataFrame:
-    """Compute which partitions need to be written (expected - existing)."""
-    if existing_parts_df.is_empty() or not part_info.join_cols:
-        return part_info.expected_parts_df
-    return part_info.expected_parts_df.join(existing_parts_df, on=part_info.join_cols, how="anti")
+def _compute_partitions_to_write(part_info: PartitionInfo, existing_keys: set[str], date_column: str | None, date_fmt: str | None) -> pl.DataFrame:
+    """Expected partitions whose cache file is not already present.
+
+    Rows with an unconstrained (null) partition value are always kept.
+    """
+    expected = part_info.expected_parts_df
+    if not existing_keys or not part_info.join_cols or expected.is_empty():
+        return expected
+    extra_cols = [c for c in part_info.join_cols if c != date_column]
+    keys = _partition_keys(expected, extra_cols, date_column, date_fmt)
+    return expected.filter(pl.Series([k is None or k not in existing_keys for k in keys], dtype=pl.Boolean))
 
 
 def _build_final_scan(
@@ -1477,6 +1402,8 @@ def cache_parquet(
         cache_path (str | pathlib.Path): Root directory where Parquet files are stored.
         date_column (str, optional): Name of the column that contains dates or datetimes. If None, only extra_partition_cols
             will be used for partitioning (no date-based organization).
+        extra_partition_cols (str | list[str], optional): Additional columns to partition by.
+            Duration and nanosecond Datetime columns are not supported.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
         partition_format (str, optional): Format using ``$year``, ``$month``, ``$day`` placeholders. If None, defaults based on time_unit:
 
@@ -1510,10 +1437,8 @@ def cache_parquet(
             Otherwise: the original LazyFrame with data written to cache.
 
     Notes:
-        **Null partition values are not supported.** Partition columns (``date_column`` and
-        ``extra_partition_cols``) must not contain null/missing values; a null key does not
-        round-trip on read. Caching a frame with null partition values, or filtering such a cache
-        with ``col.is_null()``, produces undefined results — filter or fill nulls before caching.
+        Null partition values are cached in their own partition. String partition columns must not contain the values ``"None"`` or
+        ``"null"``, which are read back as null.
 
         **Query Classification (Enumerability)**
 
@@ -1640,6 +1565,8 @@ def cache_parquet(
     for c in _extra_cols:
         if c not in schema.names():
             raise ValueError(f"extra_partition_cols: column {c} not present in dataframe")
+        if schema[c].base_type() == pl.Duration or (isinstance(schema[c], pl.Datetime) and schema[c].time_unit == "ns"):
+            raise ValueError(f"extra_partition_cols: cannot partition on Duration or nanosecond Datetime column {c}")
 
     if time_unit not in {"daily", "monthly", "yearly"}:
         raise ValueError(f"Invalid time unit {time_unit}; must be one of {{'daily','monthly','yearly'}}")
@@ -1704,6 +1631,7 @@ def cache_parquet(
             date_column=date_column,
             predicate=predicate,
             effective_time_unit=effective_time_unit,
+            date_dtype=schema[date_column] if date_column else None,
         )
 
         written_parts: set[str] = set()
@@ -1713,7 +1641,7 @@ def cache_parquet(
         if cache_mode == CacheMode.REBUILD:
             partitions_to_write_df = part_info.expected_parts_df
         elif is_finite:
-            partitions_to_write_df = _compute_partitions_to_write(part_info, existing_parts_df)
+            partitions_to_write_df = _compute_partitions_to_write(part_info, existing_parts, date_column, partition_format)
         else:
             partitions_to_write_df = part_info.expected_parts_df
         do_write = write_plan.should_write and not (is_finite and partitions_to_write_df.is_empty())
@@ -1735,14 +1663,8 @@ def cache_parquet(
                 and partitions_to_write_df.select(join_cols).null_count().sum_horizontal().item() > 0
             )
             if date_column is None and has_wildcard and cache_mode in (CacheMode.CACHE, CacheMode.REBUILD):
-                # Non-enumerable / wildcard partition target (e.g. `!=`, unbounded range): the
-                # partitions to write cannot be enumerated, so query upstream by the actual
-                # partition-restricted predicate. CACHE also excludes already-cached partitions
-                # (never rewrite existing); REBUILD applies only the predicate, refreshing
-                # in-scope partitions and leaving out-of-scope ones (e.g. `s0` for `!= "s0"`) alone.
-                # Scoped to ``date_column is None`` because the exclude-existing predicate is not
-                # date-partition-granularity aware (a widened month/year key would be compared
-                # against raw dates).
+                # Without date partitioning, wildcard targets use the partition-restricted query.
+                # CACHE skips existing partitions; REBUILD refreshes only partitions in scope.
                 restricted = restrict_expr_to_columns(predicate, set(join_cols)) if predicate is not None else None
                 write_parts = [restricted] if restricted is not None else []
                 if cache_mode == CacheMode.CACHE:
@@ -1760,6 +1682,13 @@ def cache_parquet(
                     extra_cols=extra_cols,
                     time_unit=effective_time_unit,
                 )
+                if has_wildcard and cache_mode == CacheMode.CACHE:
+                    # Placeholder rows leave some partition columns unconstrained, so the filter above also covers already-cached partitions
+                    not_existing = _build_not_existing_partitions_pred(
+                        existing_parts_df, join_cols, date_column, effective_time_unit, schema[date_column] if date_column else None
+                    )
+                    if not_existing is not None:
+                        write_filter = not_existing if write_filter is None else write_filter & not_existing
                 if write_filter is not None:
                     lf_to_write = lf_to_write.filter(write_filter)
             else:
@@ -1792,7 +1721,7 @@ def cache_parquet(
                             "partition count before the process starts, or write fewer "
                             "partitions per call."
                         )
-                    key_values = [unquote(str(v)) for v in ctx.partition_keys.row(0)]
+                    key_values = [_partition_key_component(v) for v in ctx.partition_keys.row(0)]
                 else:
                     # PartitionByKey: ctx.keys is a list of key objects with .str_value
                     key_values = [unquote(k.str_value) for k in ctx.keys]
@@ -1876,7 +1805,7 @@ def cache_parquet(
                 if restricted is not None:
                     in_scope = in_scope.filter(restricted)
                 if not in_scope.is_empty():
-                    in_scope_keys = {unquote(p) for p in in_scope.select(pl.concat_str(key_exprs, separator="/")).to_series()}
+                    in_scope_keys = set(_partition_keys(in_scope, _extra_cols, date_column, partition_format).drop_nulls())
                     for stale_key in sorted(in_scope_keys - written_parts):
                         try:
                             fs.delete_file(f"{fs_path_prefix}/{stale_key}.parquet")
@@ -1904,11 +1833,10 @@ def cache_parquet(
                     source_expected_df = part_info.expected_parts_df
 
                 # write missing partitions
-                # We get rid of rows with any nulls
-                # since we do not accept Nulls in partition keys
+                # Null expected keys are wildcard placeholders, so their empty paths cannot be enumerated.
                 nulls_dropped_expected_df = source_expected_df.drop_nulls()
                 if not nulls_dropped_expected_df.is_empty():
-                    expected_keys = {unquote(p) for p in nulls_dropped_expected_df.select(pl.concat_str(key_exprs, separator="/")).to_series()}
+                    expected_keys = set(_partition_keys(nulls_dropped_expected_df, _extra_cols, date_column, partition_format).drop_nulls())
                     # For REBUILD mode, don't subtract existing_parts - we want to overwrite
                     # For CACHE mode, skip partitions that already exist
                     if cache_mode == CacheMode.REBUILD:
@@ -1937,33 +1865,16 @@ def cache_parquet(
                     )
                     log.debug("Wrote %i empty partition(s): %s", len(missing), sorted(missing))
 
-        # Read results via centralized plan
-        # Refresh existing partitions snapshot after writes for accurate read planning
+        # Refresh the file listing to avoid scanning an empty cache after writes.
         existing_parts = _extract_existing_files(fs, fs_path_prefix)
-        existing_parts_df = _construct_partitions_df_from_existing(
-            existing_files=existing_parts,
-            schema=schema,
-            all_partition_cols=all_partition_cols,
-            template_for_metadata=template_for_metadata,
-            date_column=date_column,
-            time_unit=time_unit,
-        )
-        part_info_read = _build_partition_info(
-            expected_parts_df=expected_parts_df,
-            existing_parts_df=existing_parts_df,
-            date_column=date_column,
-            extra_cols=_extra_cols,
-            predicate=predicate,
-            time_unit=time_unit if date_column else None,
-            schema=schema,
-        )
         read_plan = _build_read_plan(
-            partition_info=part_info_read,
+            partition_info=part_info,
             date_column=date_column,
             predicate=predicate,
             time_unit_dir=time_unit_dir,
             template_for_metadata=template_for_metadata,
             effective_time_unit=effective_time_unit,
+            has_cached_files=bool(existing_parts),
         )
 
         scan_kwargs = {"storage_options": polars_opts} if polars_opts else {}

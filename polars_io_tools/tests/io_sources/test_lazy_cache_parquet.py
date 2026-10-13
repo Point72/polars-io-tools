@@ -1887,26 +1887,32 @@ def test_one_sided_upper_bound_upstream_predicate_shape(tmp_path, capsys):
     assert "is_between" not in out
 
 
-def test_one_sided_lower_bound_upstream_contains_not_existing_predicate(tmp_path, capsys):
+def test_one_sided_lower_bound_upstream_contains_not_existing_predicate(tmp_path):
     from datetime import date
+
+    from polars_io_tools.io_sources.util import register_io_source_with_is_pure
 
     # Seed cache with early dates
     cache_root = tmp_path / "one_sided_not_pred"
     base_src = pl.DataFrame({"date": [date(2024, 6, 1), date(2024, 6, 2)], "val": [1, 2]}).lazy()
     base_src.piot.cache_parquet(cache_root, "date", time_unit="daily").collect()
 
-    # Upstream has a later date; wrap with debug to inspect upstream plan
-    upstream = pl.DataFrame({"date": [date(2024, 6, 5)], "val": [5]}).lazy().piot.debug()
+    # Upstream has a later date; record the predicate pushed down to it
+    upstream_df = pl.DataFrame({"date": [date(2024, 6, 5)], "val": [5]})
+    pushed: list[pl.Expr | None] = []
 
-    (upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") >= date(2024, 6, 2)).collect())
+    def spy(with_columns, predicate, n_rows, batch_size):
+        pushed.append(predicate)
+        yield upstream_df.filter(predicate) if predicate is not None else upstream_df
 
-    out = capsys.readouterr().out
-    # Assert the upstream predicate contains the lower bound and a NOT over existing partitions
-    assert ">= (2024-06-02)" in out or ">= 2024-06-02" in out
-    assert "~(" in out or "!" in out or ".not(" in out, "expected NOT predicate to exclude existing partitions"
-    assert 'col("date")' in out, "expected date column in NOT predicate"
-    # Should reference at least one cached date in the NOT predicate
-    assert "2024-06-01" in out or "2024-06-02" in out
+    upstream = register_io_source_with_is_pure(spy, schema=upstream_df.schema, is_pure=False)
+    upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") >= date(2024, 6, 2)).collect()
+
+    # The upstream predicate keeps only uncached days at or after the lower bound
+    assert len(pushed) == 1 and pushed[0] is not None
+    probe = pl.DataFrame({"date": pl.date_range(date(2024, 5, 31), date(2024, 6, 4), eager=True)})
+    kept = probe.filter(pushed[0])["date"].to_list()
+    assert kept == [date(2024, 6, 3), date(2024, 6, 4)]
 
 
 def test_no_date_with_extra_unconstrained_queries_upstream_for_new_partitions(tmp_path):
@@ -1957,62 +1963,43 @@ def test_local_cache_parquet_daily_shared(tmp_path, caplog):
 
 
 class TestHelperFunctions:
-    """Tests for helper functions extracted during refactoring."""
+    """Tests for cache planning and file-writing helpers."""
 
-    def test_compute_partitions_to_write_empty_existing(self):
+    @pytest.mark.parametrize(
+        ("expected_days", "existing", "remaining_days"),
+        [
+            ([1, 2], set(), [1, 2]),
+            ([1, 2, 3], {"2024-01-01", "2024-01-03"}, [2]),
+            ([1, 2], {"2024-01-01", "2024-01-02"}, []),
+        ],
+        ids=["empty_existing", "some_existing", "all_existing"],
+    )
+    def test_compute_partitions_to_write(self, expected_days, existing, remaining_days):
         from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
 
-        expected = pl.DataFrame({"date": [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]})
-        existing = pl.DataFrame(schema={"date": pl.Date})
+        expected = pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in expected_days]})
         part_info = PartitionInfo(
             enumerability=Enumerability.FINITE,
             expected_parts_df=expected,
-            existing_parts_df=existing,
+            existing_parts_df=pl.DataFrame(),
             join_cols=["date"],
         )
-        result = _compute_partitions_to_write(part_info, existing)
-        assert_frame_equal(result, expected)
-
-    def test_compute_partitions_to_write_some_existing(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
-
-        expected = pl.DataFrame({"date": [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2), datetime.date(2024, 1, 3)]})
-        existing = pl.DataFrame({"date": [datetime.date(2024, 1, 1), datetime.date(2024, 1, 3)]})
-        part_info = PartitionInfo(
-            enumerability=Enumerability.FINITE,
-            expected_parts_df=expected,
-            existing_parts_df=existing,
-            join_cols=["date"],
-        )
-        result = _compute_partitions_to_write(part_info, existing)
-        assert result["date"].to_list() == [datetime.date(2024, 1, 2)]
-
-    def test_compute_partitions_to_write_all_existing(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
-
-        expected = pl.DataFrame({"date": [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]})
-        existing = pl.DataFrame({"date": [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]})
-        part_info = PartitionInfo(
-            enumerability=Enumerability.FINITE,
-            expected_parts_df=expected,
-            existing_parts_df=existing,
-            join_cols=["date"],
-        )
-        result = _compute_partitions_to_write(part_info, existing)
-        assert result.is_empty()
+        result = _compute_partitions_to_write(part_info, existing, "date", "%Y-%m-%d")
+        remaining = pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in remaining_days]}, schema=expected.schema)
+        assert_frame_equal(result, remaining)
 
     def test_compute_partitions_to_write_no_join_cols(self):
         from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
 
         expected = pl.DataFrame({"val": [1]})
-        existing = pl.DataFrame({"val": [1]})
+        existing = {"data"}
         part_info = PartitionInfo(
             enumerability=Enumerability.FINITE,
             expected_parts_df=expected,
-            existing_parts_df=existing,
+            existing_parts_df=pl.DataFrame(),
             join_cols=[],
         )
-        result = _compute_partitions_to_write(part_info, existing)
+        result = _compute_partitions_to_write(part_info, existing, "date", "%Y-%m-%d")
         assert_frame_equal(result, expected)
 
     def test_write_empty_parquet_files_sequentially(self, tmp_path):
@@ -2057,6 +2044,7 @@ class TestHelperFunctions:
             time_unit_dir="file:///tmp/cache/daily",
             template_for_metadata=None,
             effective_time_unit="daily",
+            has_cached_files=True,
         )
 
         assert read_plan.use_paths is None
