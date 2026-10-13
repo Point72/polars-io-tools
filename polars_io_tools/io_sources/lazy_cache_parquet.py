@@ -6,13 +6,13 @@ import operator
 import os
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from enum import Enum, auto
 from pathlib import Path, PureWindowsPath
 from string import Template
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 from zoneinfo import ZoneInfo
 
@@ -306,6 +306,11 @@ def _strftime_from_template(tmpl: str) -> str:
     return fmt
 
 
+def _cache_file_uri(time_unit_dir: str, key: str) -> str:
+    path = quote(key, safe="/") if POLARS_HAS_PARTITION_BY and urlparse(time_unit_dir).scheme in {"file", "s3", "s3a"} else key
+    return f"{time_unit_dir}/{path}.parquet"
+
+
 def _build_scan_paths(
     parts_df: pl.DataFrame,
     time_unit_dir: str,
@@ -333,7 +338,7 @@ def _build_scan_paths(
         date_fmt = _strftime_from_template(template_for_metadata or _PARTITION_FORMATS[effective_time_unit]["default"])
 
     keys = _partition_keys(parts_df, extra_cols, date_column, date_fmt)
-    return [f"{time_unit_dir}/{key}.parquet" for key in sorted(keys.unique())]
+    return [_cache_file_uri(time_unit_dir, key) for key in sorted(keys.unique())]
 
 
 def _build_not_existing_partitions_pred(
@@ -427,7 +432,7 @@ def _stored_key_date_expr(date_column: str, dtype: pl.DataType) -> pl.Expr:
 
 def _partition_key_component(value: Any) -> str:
     """Serialize one partition key value as the ``PartitionBy`` writer does for its path segment."""
-    return unquote(str(value))
+    return str(value)
 
 
 def _serialize_key_values(values: pl.Series) -> pl.Series:
@@ -438,7 +443,9 @@ def _serialize_key_values(values: pl.Series) -> pl.Series:
     return values.cast(pl.String)
 
 
-def _partition_keys(parts_df: pl.DataFrame, extra_cols: list[str], date_column: str | None, date_fmt: str | None) -> pl.Series:
+def _partition_keys(
+    parts_df: pl.DataFrame, extra_cols: list[str], date_column: str | None, date_fmt: str | None, null_key_token: str | None = None
+) -> pl.Series:
     """Cache keys (``a/b/2024-01``, no extension) for each row of a partitions frame.
 
     Uses the writer's serialization so keys compare equal to listed file keys. Rows with a null (unconstrained) partition value get a null key.
@@ -446,9 +453,11 @@ def _partition_keys(parts_df: pl.DataFrame, extra_cols: list[str], date_column: 
     exprs = []
     for c in extra_cols:
         values = parts_df[c].drop_nulls().unique()
-        exprs.append(pl.col(c).replace_strict(values, _serialize_key_values(values), return_dtype=pl.String))
+        expr = pl.col(c).replace_strict(values, _serialize_key_values(values), return_dtype=pl.String)
+        exprs.append(expr.fill_null(null_key_token) if null_key_token is not None else expr)
     if date_column is not None and date_fmt is not None:
-        exprs.append(_stored_key_date_expr(date_column, parts_df.schema[date_column]).dt.strftime(date_fmt))
+        expr = _stored_key_date_expr(date_column, parts_df.schema[date_column]).dt.strftime(date_fmt)
+        exprs.append(expr.fill_null(null_key_token) if null_key_token is not None else expr)
     if not exprs:
         return pl.Series("key", [None] * parts_df.height, dtype=pl.String)
     return parts_df.select(pl.concat_str(exprs, separator="/").alias("key")).to_series()
@@ -464,8 +473,7 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
         path = Path(fs_path_prefix)
         if path.exists():
             for p in path.glob("**/*.parquet"):
-                # On Windows, polars percent-encodes characters such as ":" in local file names.
-                existing_parts.add(unquote(p.relative_to(path).with_suffix("").as_posix()))
+                existing_parts.add(p.relative_to(path).with_suffix("").as_posix())
     else:
         # S3FileSystem is optional in pyarrow; use getattr for safe access
         S3FileSystem = getattr(pa_fs, "S3FileSystem", None)
@@ -491,6 +499,8 @@ def _split_custom_partition_keys(
     existing_files: set[str],
     all_partition_cols: list[str],
     date_column: str,
+    file_key_column: str | None = None,
+    decode_file_keys: bool = False,
 ) -> pl.DataFrame:
     """Return raw extra-column and date keys from custom-format paths; the date key contains all segments after the extra-column ones."""
     extra_cols = [col for col in all_partition_cols if col != date_column]
@@ -498,12 +508,16 @@ def _split_custom_partition_keys(
 
     rows = []
     for file_path in existing_files:
-        path_parts = file_path.split("/")
+        path_parts = (unquote(file_path) if decode_file_keys else file_path).split("/")
         if len(path_parts) <= n_extra:
             continue
-        rows.append([*path_parts[:n_extra], "/".join(path_parts[n_extra:])])
+        row = [*path_parts[:n_extra], "/".join(path_parts[n_extra:])]
+        rows.append([*row, file_path] if file_key_column else row)
 
-    return pl.DataFrame(rows, schema={**{c: pl.Utf8 for c in extra_cols}, date_column: pl.Utf8}, orient="row")
+    key_schema = {**{c: pl.Utf8 for c in extra_cols}, date_column: pl.Utf8}
+    if file_key_column:
+        key_schema[file_key_column] = pl.String
+    return pl.DataFrame(rows, schema=key_schema, orient="row")
 
 
 # Null partition values: "None" from PartitionBy (polars >= 1.38), "null" from PartitionByKey
@@ -583,30 +597,33 @@ def _construct_partitions_df_from_existing(
     template_for_metadata: str | None,
     date_column: str | None = None,
     time_unit: Literal["daily", "monthly", "yearly"] | None = None,
+    file_key_column: str | None = None,
+    decode_file_keys: bool = False,
 ) -> pl.DataFrame:
     """Decode existing file keys to the partition schema, omitting malformed keys."""
     partition_schema_dict = {k: schema[k] for k in all_partition_cols}
 
     if not existing_files:
-        return pl.DataFrame(schema=partition_schema_dict)
+        return pl.DataFrame(schema={**partition_schema_dict, **({file_key_column: pl.String} if file_key_column else {})})
 
-    is_custom_format = (
-        date_column
-        and template_for_metadata
-        and time_unit in _PARTITION_FORMATS
-        and template_for_metadata != _PARTITION_FORMATS[time_unit]["default"]
-    )
+    is_custom_format = bool(date_column and template_for_metadata)
     if is_custom_format:
-        df = _split_custom_partition_keys(existing_files, all_partition_cols, date_column)
+        df = _split_custom_partition_keys(existing_files, all_partition_cols, date_column, file_key_column, decode_file_keys)
     else:
-        raw_data = [part.split("/") for part in existing_files]
-        df = pl.DataFrame(raw_data, schema={k: pl.Utf8 for k in all_partition_cols}, orient="row")
+        raw_schema = {k: pl.Utf8 for k in all_partition_cols}
+        logical_keys = [(unquote(part) if decode_file_keys else part, part) for part in existing_files]
+        if file_key_column:
+            raw_schema[file_key_column] = pl.String
+            raw_data = [[*logical.split("/"), physical] if all_partition_cols else [physical] for logical, physical in logical_keys]
+        else:
+            raw_data = [logical.split("/") for logical, _ in logical_keys]
+        df = pl.DataFrame(raw_data, schema=raw_schema, orient="row")
 
     if date_column and template_for_metadata and (is_custom_format or date_column in all_partition_cols):
         df = _parse_date_keys(df, date_column, template_for_metadata)
     if is_custom_format:
-        df = df.select(all_partition_cols)
-    return _cast_partition_keys(df, partition_schema_dict)
+        df = df.select([*all_partition_cols, *([file_key_column] if file_key_column else [])])
+    return _cast_partition_keys(df, partition_schema_dict).cast(partition_schema_dict)
 
 
 def _get_expected_partitions_df(
@@ -1084,7 +1101,7 @@ def _cache_scan_from_read_plan(
         log.debug("Cache scan uses %d enumerated path(s): %s", len(read_plan.use_paths), read_plan.use_paths)
         if not read_plan.use_paths:
             return pl.LazyFrame(schema=schema)
-        return pl.scan_parquet(read_plan.use_paths, **scan_kwargs)
+        return pl.scan_parquet(read_plan.use_paths, **{**scan_kwargs, "glob": False})
     log.debug("Cache scan uses glob: %s/**/*.parquet", time_unit_dir)
     return pl.scan_parquet(f"{time_unit_dir}/**/*.parquet", **scan_kwargs)
 
@@ -1133,6 +1150,7 @@ def _build_read_plan(
     template_for_metadata: str | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
     has_cached_files: bool,
+    file_key_column: str | None = None,
 ) -> ReadPlan:
     """Choose explicit paths for finite queries, or a glob for wildcard queries."""
     join_cols = partition_info.join_cols
@@ -1152,7 +1170,12 @@ def _build_read_plan(
     if _has_null_keys(expected_df, join_cols) or predicate is None:
         return ReadPlan(use_paths=None)
 
-    use_paths = _build_scan_paths(expected_df, time_unit_dir, template_for_metadata, effective_time_unit, date_column, extra_cols)
+    if file_key_column:
+        known = partition_info.existing_parts_df.select([*join_cols, file_key_column]).cast(expected_df.schema)
+        matches = expected_df.join(known, on=join_cols, how="inner")
+        use_paths = [_cache_file_uri(time_unit_dir, key) for key in sorted(matches[file_key_column].unique())]
+    else:
+        use_paths = _build_scan_paths(expected_df, time_unit_dir, template_for_metadata, effective_time_unit, date_column, extra_cols)
     if len(use_paths) > _MAX_ENUMERATED_SCAN_PATHS:
         log.debug(
             "Cache scan has %d enumerated path(s), exceeding limit %d; using glob",
@@ -1171,9 +1194,11 @@ def _compute_partitions_to_write(part_info: PartitionInfo, existing_keys: set[st
     expected = part_info.expected_parts_df
     if not existing_keys or not part_info.join_cols or expected.is_empty():
         return expected
-    extra_cols = [c for c in part_info.join_cols if c != date_column]
-    keys = _partition_keys(expected, extra_cols, date_column, date_fmt)
-    return expected.filter(pl.Series([k is None or k not in existing_keys for k in keys], dtype=pl.Boolean))
+    existing = part_info.existing_parts_df
+    if existing.is_empty():
+        existing = _construct_partitions_df_from_existing(existing_keys, expected.schema, part_info.join_cols, date_fmt, date_column)
+    known = existing.select(part_info.join_cols).cast(expected.schema)
+    return expected.join(known, on=part_info.join_cols, how="anti")
 
 
 def _build_final_scan(
@@ -1235,6 +1260,97 @@ def _build_cache_metadata(
     return metadata
 
 
+def _rebuild_partition_scope(
+    predicate: pl.Expr | None,
+    date_column: str | None,
+    extra_cols: list[str],
+    time_unit: Literal["daily", "monthly", "yearly", "null"],
+    schema: pl.Schema,
+    *,
+    partition_keys: bool = False,
+) -> pl.Expr | None:
+    restricted = _restrict_predicate(predicate, extra_cols + ([date_column] if date_column else []))
+    if restricted is None:
+        return None
+    if date_column is None or date_column not in restricted.meta.root_names():
+        return restricted
+    extra_predicate = _restrict_predicate(predicate, extra_cols)
+    date_predicate = _restrict_predicate(predicate, [date_column])
+    null_row = pl.DataFrame({date_column: [None]}, schema={date_column: schema[date_column]})
+    includes_null_date = date_predicate is not None and null_row.select(date_predicate).item() is True
+    clauses = convert_expr_to_dnf(restricted)
+    if clauses is None:
+        return _restrict_predicate(predicate, extra_cols)
+    comparisons = {
+        "=": operator.eq,
+        "==": operator.eq,
+        "!=": operator.ne,
+        "<>": operator.ne,
+        ">": operator.gt,
+        ">=": operator.ge,
+        "<": operator.lt,
+        "<=": operator.le,
+        "!>": operator.le,
+        "!>=": operator.lt,
+        "!<": operator.ge,
+        "!<=": operator.gt,
+    }
+    scopes = []
+    for clause in clauses:
+        filters = []
+        date_constraints = []
+        for col, op, value in clause:
+            if col == date_column:
+                date_constraints.append((op, value))
+                continue
+            expr = pl.col(col)
+            if op == "is" or (op in ("=", "==") and value is None):
+                filters.append(expr.is_null())
+            elif op in ("!is", "is not"):
+                filters.append(expr.is_not_null())
+            elif op in ("in", "!in", "not in"):
+                values = list(value) if isinstance(value, (list, tuple, set)) else [value]
+                expr = expr.is_in(_is_in_collection(values, schema[col]))
+                filters.append((expr.not_() | pl.col(col).is_null()) if op != "in" else expr | pl.col(col).is_null())
+            elif op in ("~", "=~", "!~"):
+                expr = expr.str.contains(value)
+                filters.append(expr.not_() if op == "!~" else expr)
+            else:
+                expr = comparisons[op](expr, value)
+                filters.append(expr | pl.col(col).is_null() if op in ("!=", "<>") else expr)
+        if date_constraints:
+            analyzer = ColumnConstraintAnalyzer(date_column)
+            for op, value in date_constraints:
+                analyzer.update_from_predicate(op, value)
+            if analyzer.has_contradiction(schema=schema):
+                continue
+            date_expr = pl.col(date_column)
+            row_key = (
+                _stored_key_date_expr(date_column, schema[date_column])
+                if partition_keys
+                else _partition_date_expr(date_column, schema[date_column], time_unit)
+            )
+            values = analyzer.exact_values or analyzer.inclusion_set
+            if analyzer.is_null is True:
+                filters.append(date_expr.is_null())
+            elif values is not None:
+                dates = _extract_and_widen_dates(analyzer, time_unit, exact_exclusions=time_unit == "daily" and schema[date_column] == pl.Date)
+                selected = row_key.is_in(dates).fill_null(False)
+                filters.append(selected | date_expr.is_null() if None in values and includes_null_date else selected)
+            else:
+                filters.append(pl.lit(True) if includes_null_date else date_expr.is_not_null())
+                if analyzer.min_bound:
+                    filters.append(row_key >= _widen_date(_bound_date(analyzer.min_bound, 1), time_unit))
+                if analyzer.max_bound:
+                    filters.append(row_key <= _widen_date(_bound_date(analyzer.max_bound, -1), time_unit))
+                if time_unit == "daily" and schema[date_column] == pl.Date:
+                    filters.extend(date_expr.ne_missing(value) for value in analyzer.exclusion_values)
+        if not filters:
+            return None
+        scopes.append(pl.all_horizontal(filters))
+    return _and_predicates(pl.any_horizontal(scopes) if scopes else pl.lit(False), extra_predicate)
+
+
 def _write_partition_filter(
     partitions: pl.DataFrame,
     part_info: PartitionInfo,
@@ -1247,6 +1363,8 @@ def _write_partition_filter(
 ) -> pl.Expr | None:
     """Select complete target partitions, excluding existing ones in CACHE mode."""
     join_cols = part_info.join_cols
+    if cache_mode == CacheMode.REBUILD:
+        return _rebuild_partition_scope(predicate, date_column, [c for c in join_cols if c != date_column], time_unit, schema)
     if date_column is None and _has_null_keys(partitions, join_cols) and cache_mode in (CacheMode.CACHE, CacheMode.REBUILD):
         write_filter = _restrict_predicate(predicate, join_cols)
     elif not partitions.is_empty():
@@ -1274,9 +1392,11 @@ def _sink_cache_partitions(
     storage_options: dict,
     credential_provider: pl.CredentialProviderAWS | None,
     write_kwargs: dict,
-) -> set[str]:
-    """Sink one file per partition and return the emitted keys."""
+    key_aliases: dict[str, str],
+) -> tuple[set[str], set[str]]:
+    """Sink one file per partition and return its physical and logical keys."""
     written: set[str] = set()
+    written_logical: set[str] = set()
 
     def file_path(ctx):
         if hasattr(ctx, "partition_keys"):
@@ -1294,7 +1414,9 @@ def _sink_cache_partitions(
             values = [_partition_key_component(v) for v in ctx.partition_keys.row(0)]
         else:
             values = [unquote(k.str_value) for k in ctx.keys]
-        key = "/".join(values)
+        logical_key = "/".join(values)
+        key = key_aliases.get(logical_key, logical_key)
+        written_logical.add(logical_key)
         written.add(key)
         return f"{key}.parquet"
 
@@ -1333,7 +1455,7 @@ def _sink_cache_partitions(
         **sink_kwargs,
     )
     log.debug("Wrote %i new partition(s): %s", len(written), sorted(written))
-    return written
+    return written, written_logical
 
 
 def _missing_empty_keys(
@@ -1345,6 +1467,7 @@ def _missing_empty_keys(
     extra_cols: list[str],
     date_column: str | None,
     date_fmt: str | None,
+    scope: pl.Expr | None = None,
 ) -> set[str]:
     """Return enumerable gap keys, clipping unbounded queries to existing cache bounds."""
     if part_info.enumerability == Enumerability.UNBOUNDED:
@@ -1355,30 +1478,24 @@ def _missing_empty_keys(
         return set()
     if expected is None:
         return set()
+    if cache_mode == CacheMode.REBUILD and scope is not None:
+        expected = expected.filter(scope)
     expected = expected.drop_nulls()
     if expected.is_empty():
         return set()
+    known = _construct_partitions_df_from_existing(written, expected.schema, part_info.join_cols, date_fmt, date_column).cast(expected.schema)
+    if cache_mode != CacheMode.REBUILD:
+        existing_rows = part_info.existing_parts_df.select(part_info.join_cols).cast(expected.schema)
+        known = pl.concat([known, existing_rows], how="vertical")
+    expected = expected.join(known, on=part_info.join_cols, how="anti")
     keys = set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls())
-    return keys - written - (existing if cache_mode != CacheMode.REBUILD else set())
+    return keys
 
 
-def _stale_partition_keys(
-    targets: pl.DataFrame,
-    existing: pl.DataFrame,
-    written: set[str],
-    predicate: pl.Expr | None,
-    extra_cols: list[str],
-    date_column: str | None,
-    date_fmt: str | None,
-) -> set[str]:
+def _stale_partition_keys(existing: pl.DataFrame, written: set[str], scope: pl.Expr | None, file_key_column: str) -> set[str]:
     """Return cached wildcard targets absent from the rebuilt data."""
-    wildcard_rows = targets.filter(pl.any_horizontal(pl.all().is_null())).to_dicts()
-    matches_target = [pl.all_horizontal(pl.lit(True), *(pl.col(c) == v for c, v in row.items() if v is not None)) for row in wildcard_rows]
-    in_scope = existing.drop_nulls().filter(pl.any_horizontal(matches_target))
-    restricted = _restrict_predicate(predicate, extra_cols)
-    if restricted is not None:
-        in_scope = in_scope.filter(restricted)
-    return set(_partition_keys(in_scope, extra_cols, date_column, date_fmt).drop_nulls()) - written
+    in_scope = existing if scope is None else existing.filter(scope)
+    return set(in_scope[file_key_column].to_list()) - written
 
 
 def cache_parquet(
@@ -1599,6 +1716,9 @@ def cache_parquet(
         partition_format, template_for_metadata = None, None
 
     all_partition_cols = _extra_cols + ([date_column] if date_column else [])
+    file_key_column = "__piot_file_key__"
+    while file_key_column in all_partition_cols:
+        file_key_column += "_"
     key_exprs = [pl.col(col).alias(f"__piot_key_{col}__") for col in _extra_cols]
     if date_column is not None and partition_format is not None:
         key_exprs.append(pl.col(date_column).dt.strftime(partition_format).alias("__piot_key_date__"))
@@ -1621,6 +1741,8 @@ def cache_parquet(
             template_for_metadata=template_for_metadata,
             date_column=date_column,
             time_unit=time_unit,
+            file_key_column=file_key_column,
+            decode_file_keys=os.name == "nt" and isinstance(fs, pa_fs.LocalFileSystem),
         )
 
         expected_parts_df = _get_expected_partitions_df(predicate, date_column, _extra_cols, effective_time_unit, schema)
@@ -1674,15 +1796,32 @@ def cache_parquet(
                 extra_cols=_extra_cols,
                 user_metadata=write_kwargs.get("metadata"),
             )
-            written_parts = _sink_cache_partitions(
-                lf_to_write, time_unit_dir, key_exprs, len(partitions_to_write_df), cache_metadata, polars_opts, credential_provider, write_kwargs
+            key_aliases = {}
+            if all_partition_cols and not existing_parts_df.is_empty():
+                logical_keys = _partition_keys(
+                    existing_parts_df,
+                    _extra_cols,
+                    date_column,
+                    partition_format,
+                    null_key_token="None" if POLARS_HAS_PARTITION_BY else "null",
+                )
+                key_aliases = dict(zip(logical_keys, existing_parts_df[file_key_column]))
+            written_parts, written_logical_parts = _sink_cache_partitions(
+                lf_to_write,
+                time_unit_dir,
+                key_exprs,
+                len(partitions_to_write_df),
+                cache_metadata,
+                polars_opts,
+                credential_provider,
+                write_kwargs,
+                key_aliases,
             )
 
             # Enumerated rebuild targets receive empty files; wildcard targets require stale-file removal.
             if cache_mode == CacheMode.REBUILD and _has_null_keys(partitions_to_write_df, part_info.join_cols) and not existing_parts_df.is_empty():
-                stale = _stale_partition_keys(
-                    partitions_to_write_df, existing_parts_df, written_parts, predicate, _extra_cols, date_column, partition_format
-                )
+                key_scope = _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
+                stale = _stale_partition_keys(existing_parts_df, written_parts, key_scope, file_key_column)
                 for key in sorted(stale):
                     try:
                         fs.delete_file(f"{fs_path_prefix}/{key}.parquet")
@@ -1690,11 +1829,16 @@ def cache_parquet(
                     except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
                         log.warning("Failed to remove stale partition %s on REBUILD: %s", key, e)
 
+            key_scope = (
+                _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
+                if cache_mode == CacheMode.REBUILD
+                else None
+            )
             missing = _missing_empty_keys(
-                part_info, write_plan, cache_mode, written_parts, existing_parts, _extra_cols, date_column, partition_format
+                part_info, write_plan, cache_mode, written_logical_parts, existing_parts, _extra_cols, date_column, partition_format, key_scope
             )
             if missing:
-                paths = [f"{time_unit_dir}/{key}.parquet" for key in sorted(missing)]
+                paths = [f"{time_unit_dir}/{key_aliases.get(key, key)}.parquet" for key in sorted(missing)]
                 log.debug("Writing %d empty partition(s) sequentially", len(paths))
                 _write_empty_parquet_files_sequentially(
                     paths,
@@ -1708,6 +1852,19 @@ def cache_parquet(
 
         # Refresh the file listing to avoid scanning an empty cache after writes.
         existing_parts = _extract_existing_files(fs, fs_path_prefix)
+        part_info = replace(
+            part_info,
+            existing_parts_df=_construct_partitions_df_from_existing(
+                existing_parts,
+                schema,
+                all_partition_cols,
+                template_for_metadata,
+                date_column,
+                time_unit,
+                file_key_column=file_key_column,
+                decode_file_keys=os.name == "nt" and isinstance(fs, pa_fs.LocalFileSystem),
+            ),
+        )
         read_plan = _build_read_plan(
             partition_info=part_info,
             date_column=date_column,
@@ -1716,6 +1873,7 @@ def cache_parquet(
             template_for_metadata=template_for_metadata,
             effective_time_unit=effective_time_unit,
             has_cached_files=bool(existing_parts),
+            file_key_column=file_key_column,
         )
 
         scan_kwargs = _storage_kwargs(polars_opts, credential_provider)

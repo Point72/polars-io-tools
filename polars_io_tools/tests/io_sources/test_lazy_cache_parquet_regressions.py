@@ -4,6 +4,7 @@ import datetime
 import os
 import time
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -190,13 +191,13 @@ def test_extra_partition_col_dtypes_round_trip(tmp_path, values, dtype):
     assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
 
 
-def test_existing_file_keys_are_percent_decoded(tmp_path):
+def test_existing_file_keys_preserve_percent_encoding(tmp_path):
     import pyarrow.fs as pa_fs
 
     # Polars writes "2020-01-01 12:00:00" as "2020-01-01 12%3A00%3A00" in local file names on Windows.
     (tmp_path / "2020-01-01 12%3A00%3A00").mkdir()
     (tmp_path / "2020-01-01 12%3A00%3A00" / "2024-01.parquet").touch()
-    assert _extract_existing_files(pa_fs.LocalFileSystem(), str(tmp_path)) == {"2020-01-01 12:00:00/2024-01"}
+    assert _extract_existing_files(pa_fs.LocalFileSystem(), str(tmp_path)) == {"2020-01-01 12%3A00%3A00/2024-01"}
 
 
 @pytest.mark.parametrize(
@@ -410,3 +411,194 @@ def test_one_sided_exclusive_midnight_bound_does_not_mark_bound_date_cached(tmp_
     cache_parquet(src, tmp_path, "ts", time_unit="daily").filter(pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23))).collect()
     cache_parquet(src, tmp_path, "ts", time_unit="daily").filter(pl.col("ts") < DT(2024, 2, 20)).collect()
     assert_frame_equal(_sorted(cache_parquet(src, tmp_path, "ts", time_unit="daily").collect()), _sorted(src.collect()))
+
+
+def test_rebuild_null_date_scope_preserves_other_partitions(tmp_path):
+    seed = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 2, 10)], "value": [0, 1]})
+    cache_parquet(seed, tmp_path, "date").collect()
+    snapshot = _age_files(tmp_path)
+    current = pl.LazyFrame({"date": pl.Series([None], dtype=pl.Date), "value": [99]})
+    out = cache_parquet(current, tmp_path, "date", cache_mode=CacheMode.REBUILD).filter(pl.col("date").is_null()).collect()
+    assert_frame_equal(out, current.collect())
+    assert all(path.exists() for path in snapshot)
+    assert _rewritten(snapshot) == []
+    assert sorted(cache_parquet(current, tmp_path, "date").collect()["value"].to_list()) == [0, 1, 99]
+
+
+@pytest.mark.parametrize("null_column", ["date", "x"])
+def test_rebuild_removes_stale_null_partition(tmp_path, null_column):
+    src = pl.LazyFrame(
+        {
+            "date": [D(2024, 1, 10), None if null_column == "date" else D(2024, 1, 11)],
+            "x": ["a", None if null_column == "x" else "a"],
+            "value": [0, 1],
+        }
+    )
+    cache_parquet(src, tmp_path, "date", extra_partition_cols="x").collect()
+    current = src.filter(pl.col("value") == 0)
+    out = cache_parquet(current, tmp_path, "date", extra_partition_cols="x", cache_mode=CacheMode.REBUILD).collect()
+    assert_frame_equal(_sorted(out), _sorted(current.collect()))
+    assert len(list(tmp_path.rglob("*.parquet"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("values", "dtype", "old_keys"),
+    [
+        ([True, False], pl.Boolean, ["true", "false"]),
+        (
+            [DT(2020, 1, 1, 12), DT(2020, 1, 2, 0, 0, 0, 500)],
+            pl.Datetime("us"),
+            ["2020-01-01 12:00:00.000000", "2020-01-02 00:00:00.000500"],
+        ),
+    ],
+    ids=["boolean", "datetime"],
+)
+@pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.REBUILD])
+def test_old_partition_key_spellings_are_reused(tmp_path, values, dtype, old_keys, cache_mode):
+    src = pl.DataFrame({"date": [D(2024, 1, 10), D(2024, 1, 11)], "x": pl.Series(values, dtype=dtype), "value": [0, 1]})
+    for index, key in enumerate(old_keys):
+        if os.name == "nt":
+            key = quote(key, safe=" -_.")
+        path = tmp_path / "monthly" / key / "2024-01.parquet"
+        path.parent.mkdir(parents=True)
+        src.slice(index, 1).write_parquet(path)
+    snapshot = _age_files(tmp_path)
+    predicate = _JAN & (pl.col("x") == values[0])
+    current = src if cache_mode == CacheMode.CACHE else src.with_columns(pl.col("value") + 100)
+    for _ in range(2):
+        cached = cache_parquet(current.lazy(), tmp_path, "date", extra_partition_cols="x", cache_mode=cache_mode)
+        out = cached.filter(predicate).collect() if cache_mode == CacheMode.CACHE else cached.collect()
+        expected = current.filter(predicate) if cache_mode == CacheMode.CACHE else current
+        assert_frame_equal(_sorted(out), _sorted(expected))
+    assert_frame_equal(_sorted(cache_parquet(current.lazy(), tmp_path, "date", extra_partition_cols="x").collect()), _sorted(current))
+    if cache_mode == CacheMode.REBUILD:
+        remaining = current.filter(pl.col("value") == 101)
+        predicate = _JAN & (pl.col("x") == values[0])
+        out = cache_parquet(remaining.lazy(), tmp_path, "date", extra_partition_cols="x", cache_mode=CacheMode.REBUILD).filter(predicate).collect()
+        assert out.is_empty()
+        assert_frame_equal(_sorted(cache_parquet(remaining.lazy(), tmp_path, "date", extra_partition_cols="x").collect()), _sorted(remaining))
+    assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
+    if cache_mode == CacheMode.CACHE:
+        assert _rewritten(snapshot) == []
+
+
+@pytest.mark.parametrize("value", ["%2541", "%25", "a%253Ab"])
+def test_literal_percent_partition_values_round_trip(tmp_path, value):
+    src = pl.LazyFrame({"x": [value], "value": [0]})
+    predicate = pl.col("x") == value
+    out = cache_parquet(src, tmp_path, extra_partition_cols="x").filter(predicate).collect()
+    assert_frame_equal(out, src.collect())
+    snapshot = _age_files(tmp_path)
+    out = cache_parquet(src, tmp_path, extra_partition_cols="x").filter(predicate).collect()
+    assert_frame_equal(out, src.collect())
+    assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
+    assert _rewritten(snapshot) == []
+
+
+@pytest.mark.parametrize("tz", [None, "America/New_York"])
+def test_rebuild_datetime_scope_caches_whole_partition(tmp_path, tz):
+    zone = ZoneInfo(tz) if tz else None
+    src = pl.LazyFrame(
+        {
+            "ts": pl.Series([DT(2024, 1, 5, tzinfo=zone), DT(2024, 1, 15, tzinfo=zone), DT(2024, 2, 5, tzinfo=zone)], dtype=pl.Datetime("us", tz)),
+            "value": [0, 1, 2],
+        }
+    )
+    predicate = pl.col("ts").is_between(DT(2024, 1, 10, tzinfo=zone), DT(2024, 1, 20, tzinfo=zone))
+    out = cache_parquet(src, tmp_path, "ts", cache_mode=CacheMode.REBUILD).filter(predicate).collect()
+    assert out["value"].to_list() == [1]
+    assert_frame_equal(_sorted(cache_parquet(src, tmp_path, "ts").collect()), _sorted(src.collect()))
+
+
+@pytest.mark.parametrize(
+    ("time_unit", "dates", "bound"),
+    [
+        ("daily", [D(2024, 1, 31), D(2024, 2, 1)], D(2024, 1, 31)),
+        ("monthly", [D(2024, 1, 10), D(2024, 2, 10)], D(2024, 1, 31)),
+        ("yearly", [D(2023, 12, 10), D(2024, 2, 10)], D(2023, 12, 31)),
+    ],
+)
+def test_rebuild_exclusive_lower_bound_preserves_previous_partition(tmp_path, time_unit, dates, bound):
+    src = pl.LazyFrame({"date": dates, "value": [0, 1]})
+    cache_parquet(src, tmp_path, "date", time_unit=time_unit).collect()
+    snapshot = _age_files(tmp_path)
+    previous = next(path for path in snapshot if pl.read_parquet(path)["value"].to_list() == [0])
+    current = src.with_columns(pl.col("value") + 100)
+    out = cache_parquet(current, tmp_path, "date", time_unit=time_unit, cache_mode=CacheMode.REBUILD).filter(pl.col("date") > bound).collect()
+    assert out["value"].to_list() == [101]
+    assert pl.read_parquet(previous)["value"].to_list() == [0]
+    assert previous.stat().st_mtime_ns == snapshot[previous]
+
+
+@pytest.mark.parametrize("value", ["New York", "a#b", "x?y", "%2541"])
+def test_empty_marker_preserves_literal_partition_key(tmp_path, value):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)], "x": ["other"], "value": [0]})
+    predicate = _JAN & (pl.col("x") == value)
+    out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(predicate).collect()
+    assert out.is_empty()
+    snapshot = _age_files(tmp_path)
+    expanded = pl.concat([src, pl.LazyFrame({"date": [D(2024, 1, 10)], "x": [value], "value": [99]})])
+    out = cache_parquet(expanded, tmp_path, "date", extra_partition_cols="x").filter(predicate).collect()
+    assert out.is_empty()
+    assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
+    assert _rewritten(snapshot) == []
+
+
+@pytest.mark.parametrize("date_column", [None, "date"])
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("x").ne_missing("a"),
+        ~pl.col("x").eq_missing("a"),
+        pl.col("x").is_in(["b", None], nulls_equal=True),
+        _JAN & pl.col("x").ne_missing("a"),
+        _JAN & pl.col("x").is_in(["b", None], nulls_equal=True),
+    ],
+    ids=["ne-missing", "not-eq-missing", "in-null", "date-ne-missing", "date-in-null"],
+)
+def test_rebuild_missing_aware_predicate_refreshes_null_partition(tmp_path, date_column, predicate):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 3, "x": ["a", "b", None], "value": [0, 1, 2]})
+    cache_parquet(src, tmp_path, date_column, extra_partition_cols="x").collect()
+    current = src.with_columns(pl.col("value") + 100)
+    out = cache_parquet(current, tmp_path, date_column, extra_partition_cols="x", cache_mode=CacheMode.REBUILD).filter(predicate).collect()
+    assert_frame_equal(_sorted(out), _sorted(current.filter(predicate).collect()))
+
+
+@pytest.mark.parametrize("nulls_equal", [False, True])
+def test_rebuild_date_membership_respects_null_matching(tmp_path, nulls_equal):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10), None, D(2024, 2, 10)], "value": [0, 1, 2]})
+    cache_parquet(src, tmp_path, "date").collect()
+    snapshot = _age_files(tmp_path)
+    null_path = next(path for path in snapshot if pl.read_parquet(path)["date"].null_count())
+    current = src.filter(pl.col("value") == 0).with_columns(pl.col("value") + 100)
+    predicate = pl.col("date").is_in([D(2024, 1, 10), None], nulls_equal=nulls_equal)
+    out = cache_parquet(current, tmp_path, "date", cache_mode=CacheMode.REBUILD).filter(predicate).collect()
+    assert_frame_equal(out, current.collect())
+    assert null_path.exists() is not nulls_equal
+    if not nulls_equal:
+        assert null_path.stat().st_mtime_ns == snapshot[null_path]
+    remaining = cache_parquet(current, tmp_path, "date").collect()["value"].to_list()
+    assert sorted(remaining) == ([2, 100] if nulls_equal else [1, 2, 100])
+
+
+@pytest.mark.parametrize("tz", ["UTC", "America/New_York", "Asia/Tokyo"])
+@pytest.mark.parametrize("partition_format", [None, "$year/$month"])
+def test_rebuild_timezone_date_scope_with_unconstrained_extra_column(tmp_path, tz, partition_format):
+    zone = ZoneInfo(tz)
+    src = pl.LazyFrame(
+        {
+            "ts": pl.Series([DT(2024, 1, 10, tzinfo=zone), DT(2024, 2, 10, tzinfo=zone)], dtype=pl.Datetime("us", tz)),
+            "x": ["a", "b"],
+            "value": [0, 1],
+        }
+    )
+    options = {"extra_partition_cols": "x", "partition_format": partition_format}
+    cache_parquet(src, tmp_path, "ts", **options).collect()
+    snapshot = _age_files(tmp_path)
+    preserved = next(path for path in snapshot if pl.read_parquet(path)["value"].to_list() == [1])
+    current = src.filter(pl.col("value") == 0).with_columns(pl.col("value") + 100)
+    predicate = pl.col("ts").is_between(DT(2024, 1, 1, tzinfo=zone), DT(2024, 1, 31, tzinfo=zone))
+    out = cache_parquet(current, tmp_path, "ts", cache_mode=CacheMode.REBUILD, **options).filter(predicate).collect()
+    assert_frame_equal(out, current.collect())
+    assert preserved.stat().st_mtime_ns == snapshot[preserved]
+    assert sorted(cache_parquet(current, tmp_path, "ts", **options).collect()["value"].to_list()) == [1, 100]
