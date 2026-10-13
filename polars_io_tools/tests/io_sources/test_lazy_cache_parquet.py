@@ -1862,7 +1862,7 @@ def test_one_sided_lower_bound_upstream_predicate_shape(tmp_path, capsys):
     (upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") >= date(2024, 6, 2)).collect())
 
     out = capsys.readouterr().out
-    # Current behavior: one-sided read restricts upstream by original predicate only (>= lower bound)
+    # One-sided writes restrict upstream to whole partitions from the bound
     assert ">= (2024-06-02)" in out or ">= 2024-06-02" in out
     # And not a bounded is_between for the upstream path
     assert "is_between" not in out
@@ -1882,8 +1882,8 @@ def test_one_sided_upper_bound_upstream_predicate_shape(tmp_path, capsys):
     (upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") <= date(2024, 6, 4)).collect())
 
     out = capsys.readouterr().out
-    # Current behavior: one-sided read restricts upstream by original predicate only (<= upper bound)
-    assert "<= (2024-06-04)" in out or "<= 2024-06-04" in out
+    # One-sided writes restrict upstream to whole partitions up to the bound (exclusive start of the next day)
+    assert "< (2024-06-05)" in out or "< 2024-06-05" in out
     assert "is_between" not in out
 
 

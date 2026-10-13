@@ -11,7 +11,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from polars_io_tools._compat import POLARS_HAS_PARTITION_BY
-from polars_io_tools.io_sources.lazy_cache_parquet import _construct_partitions_df_from_existing, cache_parquet
+from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _construct_partitions_df_from_existing, cache_parquet
 
 D = datetime.date
 DT = datetime.datetime
@@ -326,3 +326,78 @@ def test_decimal_partition_finite_query_with_several_values(tmp_path):
     pred = pl.col("date").is_between(D(2024, 1, 1), D(2024, 1, 31)) & pl.col("x").is_in(src.collect()["x"])
     out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(pred).collect()
     assert_frame_equal(_sorted(out), _sorted(src.collect()))
+
+
+@pytest.mark.parametrize("tz", ["America/New_York", "Asia/Tokyo"])
+@pytest.mark.parametrize("time_unit", ["daily", "monthly"])
+def test_timezone_aware_finite_query_uses_local_partition_bounds(tmp_path, tz, time_unit):
+    local = [DT(2023, 12, 31, 23, 30), DT(2024, 1, 1, 0, 30), DT(2024, 1, 31, 23, 30), DT(2024, 2, 1, 0, 30)]
+    src = pl.LazyFrame({"ts": pl.Series(local).dt.replace_time_zone(tz), "value": [0, 1, 2, 3]})
+    pred = pl.col("ts").is_between(DT(2024, 1, 1, tzinfo=ZoneInfo(tz)), DT(2024, 1, 31, 23, 59, tzinfo=ZoneInfo(tz)))
+    for _ in range(2):
+        out = cache_parquet(src, tmp_path, "ts", time_unit=time_unit).filter(pred).collect()
+        assert sorted(out["value"].to_list()) == [1, 2]
+
+
+@pytest.mark.parametrize("time_unit", ["daily", "monthly"])
+def test_exclusive_datetime_bounds_keep_rest_of_bound_date(tmp_path, time_unit):
+    src = pl.LazyFrame({"ts": [DT(2024, 1, 31, 13), DT(2024, 2, 1, 13), DT(2024, 2, 2, 11)], "value": [0, 1, 2]})
+    pred = (pl.col("ts") > DT(2024, 1, 31, 12)) & (pl.col("ts") < DT(2024, 2, 2, 12))
+    for _ in range(2):
+        out = cache_parquet(src, tmp_path, "ts", time_unit=time_unit).filter(pred).collect()
+        assert sorted(out["value"].to_list()) == [0, 1, 2]
+
+
+def test_custom_partition_format_extra_value_with_equals_sign(tmp_path):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 1, 10)], "k": ["a=b", "c"], "value": [0, 1]})
+    kwargs = {"time_unit": "monthly", "partition_format": "$year/$month", "extra_partition_cols": "k"}
+    pred = pl.col("date").is_between(D(2024, 1, 1), D(2024, 1, 31))
+    cache_parquet(src, tmp_path, "date", **kwargs).filter(pred).collect()
+    snapshot = _age_files(tmp_path)
+    out = cache_parquet(src.with_columns(pl.col("value") + 10), tmp_path, "date", **kwargs).filter(pred).collect()
+    assert_frame_equal(_sorted(out), _sorted(src.collect()))
+    assert _rewritten(snapshot) == []
+
+
+def test_rebuild_without_date_constraint_removes_stale_partitions(tmp_path):
+    src = pl.LazyFrame({"date": [D(2024, 1, 15), D(2024, 2, 15), D(2024, 1, 15)], "k": ["a", "a", "b"], "value": [0, 1, 2]})
+    kwargs = {"time_unit": "monthly", "extra_partition_cols": "k"}
+
+    def cached_files():
+        return sorted(p.relative_to(tmp_path / "monthly").as_posix() for p in (tmp_path / "monthly").rglob("*.parquet"))
+
+    cache_parquet(src, tmp_path, "date", **kwargs).collect()
+    rebuilt = src.filter(pl.col("value") == 1)
+    out = cache_parquet(rebuilt, tmp_path, "date", cache_mode=CacheMode.REBUILD, **kwargs).filter(pl.col("k") == "a").collect()
+    assert out["value"].to_list() == [1]
+    assert cached_files() == ["a/2024-02.parquet", "b/2024-01.parquet"]
+
+    out = cache_parquet(rebuilt, tmp_path, "date", cache_mode=CacheMode.REBUILD, **kwargs).collect()
+    assert out["value"].to_list() == [1]
+    assert cached_files() == ["a/2024-02.parquet"]
+
+
+@pytest.mark.parametrize("dtype", [pl.Date, pl.Datetime("us"), pl.Datetime("us", "America/New_York")])
+@pytest.mark.parametrize("op", ["ge", "le"])
+def test_one_sided_query_caches_whole_partitions(tmp_path, dtype, op):
+    src = pl.LazyFrame({"ts": pl.Series([DT(2024, 1, 5), DT(2024, 1, 20), DT(2024, 2, 5)]).cast(dtype), "value": [0, 1, 2]})
+    bound = pl.lit(DT(2024, 1, 10)).cast(dtype)
+    pred = pl.col("ts") >= bound if op == "ge" else pl.col("ts") <= bound
+    out = cache_parquet(src, tmp_path, "ts", time_unit="monthly").filter(pred).collect()
+    assert_frame_equal(_sorted(out), _sorted(src.filter(pred).collect()))
+    assert_frame_equal(_sorted(cache_parquet(src, tmp_path, "ts", time_unit="monthly").collect()), _sorted(src.collect()))
+
+
+def test_one_sided_query_writes_empty_files_only_for_queried_extra_values(tmp_path):
+    src = pl.LazyFrame({"ts": [DT(2024, 1, 10, 9), DT(2024, 1, 21, 17)], "k": ["a", "a"], "value": [0, 1]})
+    kwargs = {"time_unit": "daily", "extra_partition_cols": "k"}
+    cache_parquet(src, tmp_path, "ts", **kwargs).filter(pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23))).collect()
+    cache_parquet(src, tmp_path, "ts", **kwargs).filter((pl.col("ts") > DT(2024, 1, 1)) & (pl.col("k") == "b")).collect()
+    assert_frame_equal(_sorted(cache_parquet(src, tmp_path, "ts", **kwargs).collect()), _sorted(src.collect()))
+
+
+def test_one_sided_exclusive_midnight_bound_does_not_mark_bound_date_cached(tmp_path):
+    src = pl.LazyFrame({"ts": [DT(2024, 1, 21, 17), DT(2024, 2, 20, 6)], "value": [0, 1]})
+    cache_parquet(src, tmp_path, "ts", time_unit="daily").filter(pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23))).collect()
+    cache_parquet(src, tmp_path, "ts", time_unit="daily").filter(pl.col("ts") < DT(2024, 2, 20)).collect()
+    assert_frame_equal(_sorted(cache_parquet(src, tmp_path, "ts", time_unit="daily").collect()), _sorted(src.collect()))
