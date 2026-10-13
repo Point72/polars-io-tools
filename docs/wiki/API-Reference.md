@@ -38,7 +38,8 @@ file paths of Python IO sources and so can differ across environments. Pass `df_
 key entries on an identity you choose instead, for example to share a persistent cache
 between machines. With `df_key`, physical categoricals in `order_by`, including nested
 ones, are rejected because their code order can differ across frames. Use lexical
-categorical ordering or a non-categorical ordering key instead.
+categorical ordering or a non-categorical ordering key instead. Both planned and
+materialized dtypes are checked; an invalid materialized ordering raises at collect time.
 
 Serialized cache callbacks from version 0.2.4 retain their historical lookup paths
 when loaded and re-serialized. Python and Polars versions must match. Newly created

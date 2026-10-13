@@ -90,6 +90,15 @@ def _contains_physical_categorical(dtype: pl.DataType) -> bool:
     return False
 
 
+def _validate_explicit_key_ordering(schema: pl.Schema, order_by: tuple[str, ...]) -> None:
+    physical_categorical_cols = [col for col in order_by if col in schema and _contains_physical_categorical(schema[col])]
+    if physical_categorical_cols:
+        raise ValueError(
+            f"df_key cannot be used with physical categorical order_by columns: {physical_categorical_cols}. "
+            "Use lexical categorical ordering or a non-categorical ordering key so independently cached columns stay aligned."
+        )
+
+
 def _validate_order_by_unique(frame: pl.DataFrame, order_by: tuple[str, ...]) -> None:
     """Raise if ``order_by`` does not uniquely identify the rows of ``frame``.
 
@@ -166,6 +175,7 @@ def cache(
             ``order_by`` and ``partition_cols`` are still folded into the cache key.
             Physical categoricals in ``order_by``, including nested ones, are rejected because their code
             order can differ across frames. Use lexical categorical ordering or a non-categorical ordering key instead.
+            Both planned and materialized dtypes are checked; an invalid materialized ordering raises at collect time.
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
     Notes:
@@ -234,13 +244,9 @@ def cache(
     if missing:
         raise ValueError(f"order_by columns not found in frame schema: {missing}")
 
-    if df_key is not None:
-        physical_categorical_cols = [col for col in order_by if _contains_physical_categorical(schema[col])]
-        if physical_categorical_cols:
-            raise ValueError(
-                f"df_key cannot be used with physical categorical order_by columns: {physical_categorical_cols}. "
-                "Use lexical categorical ordering or a non-categorical ordering key so independently cached columns stay aligned."
-            )
+    explicit_df_key = df_key is not None
+    if explicit_df_key:
+        _validate_explicit_key_ordering(schema, order_by)
 
     # Generate the schema of the partition columns, as we'll need to apply the partition predicate to a frame with this schema
     partition_schema = {p_col: schema[p_col] for p_col in partition_cols}
@@ -407,6 +413,10 @@ def cache(
                 raise RuntimeError(err_msg) from e
         else:
             collected_frames = []
+
+        if explicit_df_key:
+            for frame in collected_frames:
+                _validate_explicit_key_ordering(frame.schema, order_by)
 
         # Publish under the lock so a partition's columns appear to other collections together.
         with _cache_lock():

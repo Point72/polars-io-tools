@@ -1323,6 +1323,32 @@ def test_explicit_df_key_rejects_nested_physical_categorical_ordering(key_expr):
     assert frame.piot.cache(cache, order_by="key", cache_mode="ignore", df_key="same") is frame
 
 
+@pytest.mark.skipif(
+    getattr(pl.Categorical(), "ordering", "lexical") != "physical",
+    reason="Physical categorical ordering is not supported by this Polars version",
+)
+@pytest.mark.parametrize(
+    "key_expr",
+    [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
+    ids=["scalar", "struct", "list"],
+)
+@pytest.mark.parametrize("column_granularity", [False, True])
+@pytest.mark.parametrize("cache_mode", ["cache", "rebuild"])
+def test_explicit_df_key_rejects_materialized_physical_categorical_ordering(key_expr, column_granularity, cache_mode):
+    base = pl.DataFrame({"text": ["v3", "v1", "v2", "v0", "v5", "v4"], "value": [3, 1, 2, 0, 5, 4]}).lazy()
+    frame = pl.concat(
+        [
+            base.with_columns(key=pl.col("text").cast(pl.Categorical("lexical"))).head(3),
+            base.with_columns(key=pl.col("text").cast(pl.Categorical("physical"))).tail(3),
+        ]
+    ).with_columns(key_expr.alias("key"))
+    cache = {}
+    cached = frame.piot.cache(cache, order_by="key", df_key="same", column_granularity=column_granularity, cache_mode=cache_mode, validate=False)
+    with pytest.raises(pl.exceptions.ComputeError, match="physical categorical"):
+        cached.select("value").collect()
+    assert cache == {}
+
+
 @pytest.mark.parametrize(
     "key_expr",
     [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
