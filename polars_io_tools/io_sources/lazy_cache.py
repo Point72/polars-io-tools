@@ -153,6 +153,8 @@ def cache(
         df_key: Optional identity for the input LazyFrame, used in place of its serialized plan. The
             caller is responsible for choosing a value that changes whenever the frame's contents would.
             ``order_by`` and ``partition_cols`` are still folded into the cache key.
+            Physical categorical ``order_by`` columns are rejected because their code order can differ
+            across frames. Use lexical categorical ordering or a non-categorical ordering key instead.
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
     Notes:
@@ -220,6 +222,16 @@ def cache(
     missing = [col for col in order_by if col not in schema]
     if missing:
         raise ValueError(f"order_by columns not found in frame schema: {missing}")
+
+    if df_key is not None:
+        physical_categorical_cols = [
+            col for col in order_by if isinstance(schema[col], pl.Categorical) and getattr(schema[col], "ordering", "lexical") == "physical"
+        ]
+        if physical_categorical_cols:
+            raise ValueError(
+                f"df_key cannot be used with physical categorical order_by columns: {physical_categorical_cols}. "
+                "Use lexical categorical ordering or a non-categorical ordering key so independently cached columns stay aligned."
+            )
 
     # Generate the schema of the partition columns, as we'll need to apply the partition predicate to a frame with this schema
     partition_schema = {p_col: schema[p_col] for p_col in partition_cols}

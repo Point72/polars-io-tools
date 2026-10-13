@@ -1251,6 +1251,7 @@ def test_explicit_df_key_replaces_plan_identity(source, df):
     assert source.calls == []
     assert_frame_equal(out, df.select("x2").collect().sort("x2"), check_row_order=False)
 
+    source.reset()
     same_data_other_plan.piot.cache(cache, order_by="x").select("x2").collect()
     assert source.calls
 
@@ -1266,3 +1267,52 @@ def test_explicit_df_key_still_separates_layouts(df):
     df.piot.cache(cache, order_by=["x", "y"], df_key="k").select("x2").collect()
     df.piot.cache(cache, order_by="x", partition_cols=("y",), df_key="k").select("x2").collect()
     assert len({k.df_key for k in cache}) == 3
+
+
+@pytest.mark.skipif(
+    getattr(pl.Categorical(), "ordering", "lexical") != "physical",
+    reason="Physical categorical ordering is not supported by this Polars version",
+)
+@pytest.mark.parametrize("order_by", ["key", ("part", "key")])
+@pytest.mark.parametrize("partition_cols", [(), ("part",)])
+@pytest.mark.parametrize("column_granularity", [False, True])
+def test_explicit_df_key_rejects_physical_categorical_ordering(order_by, partition_cols, column_granularity):
+    frame = pl.DataFrame({"key": ["b", "a"], "part": ["p", "p"], "value": [20, 10]}).with_columns(pl.col("key").cast(pl.Categorical)).lazy()
+    cache = {}
+    with pytest.raises(ValueError, match="physical categorical"):
+        frame.piot.cache(
+            cache,
+            order_by=order_by,
+            partition_cols=partition_cols,
+            column_granularity=column_granularity,
+            validate=False,
+            df_key="same",
+        )
+    assert cache == {}
+    assert_frame_equal(frame.piot.cache(cache, order_by=order_by).collect(), frame.sort(order_by).collect())
+    assert frame.piot.cache(cache, order_by=order_by, cache_mode="ignore", df_key="same") is frame
+
+
+@pytest.mark.parametrize("partition_cols", [(), ("part",)])
+@pytest.mark.parametrize("column_granularity", [False, True])
+def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(partition_cols, column_granularity):
+    dtype = pl.Categorical()
+    if getattr(dtype, "ordering", "lexical") == "physical":
+        dtype = pl.Categorical("lexical")
+    first = (
+        pl.DataFrame({"key": ["b", "a"], "part": ["p", "p"], "left": [20, 10], "right": [200, 100]})
+        .with_columns(pl.col("key").cast(dtype))
+        .sort("left")
+        .lazy()
+    )
+    second = (
+        pl.DataFrame({"key": ["a", "b"], "part": ["p", "p"], "left": [10, 20], "right": [100, 200]})
+        .with_columns(pl.col("key").cast(dtype))
+        .sort("left")
+        .lazy()
+    )
+    cache = {}
+    options = {"order_by": "key", "partition_cols": partition_cols, "column_granularity": column_granularity, "df_key": "same"}
+    first.piot.cache(cache, **options).select("left").collect()
+    out = second.piot.cache(cache, **options).select("left", "right").collect()
+    assert_frame_equal(out, pl.DataFrame({"left": [10, 20], "right": [100, 200]}))

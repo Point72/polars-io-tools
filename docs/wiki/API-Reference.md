@@ -36,7 +36,9 @@ partitions — constrain partitions with a predicate to avoid that re-query.
 By default, cache entries are keyed on the frame's serialized plan, which embeds the source
 file paths of Python IO sources and so can differ across environments. Pass `df_key` to
 key entries on an identity you choose instead, for example to share a persistent cache
-between machines.
+between machines. With `df_key`, physical categorical `order_by` columns are rejected
+because their code order can differ across frames. Use lexical categorical ordering or
+a non-categorical ordering key instead.
 
 Serialized cache callbacks from version 0.2.4 retain their historical lookup paths
 when loaded and re-serialized. Python and Polars versions must match. Newly created
