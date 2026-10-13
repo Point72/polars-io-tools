@@ -1293,21 +1293,58 @@ def test_explicit_df_key_rejects_physical_categorical_ordering(order_by, partiti
     assert frame.piot.cache(cache, order_by=order_by, cache_mode="ignore", df_key="same") is frame
 
 
+@pytest.mark.skipif(
+    getattr(pl.Categorical(), "ordering", "lexical") != "physical",
+    reason="Physical categorical ordering is not supported by this Polars version",
+)
+@pytest.mark.parametrize(
+    "key_expr",
+    [
+        pl.struct(pl.lit(1).alias("number"), pl.col("key").alias("category")),
+        pl.concat_list(pl.col("key")),
+        pl.concat_list(pl.col("key")).list.to_array(1),
+        pl.struct(pl.concat_list(pl.col("key")).alias("categories")),
+        pl.concat_list(pl.struct(pl.col("key").alias("category"))),
+        pl.struct(pl.concat_list(pl.col("key")).list.to_array(1).alias("categories")),
+    ],
+    ids=["struct", "list", "array", "struct-list", "list-struct", "struct-array"],
+)
+def test_explicit_df_key_rejects_nested_physical_categorical_ordering(key_expr):
+    frame = (
+        pl.DataFrame({"key": ["b", "a"], "value": [20, 10]})
+        .lazy()
+        .with_columns(pl.col("key").cast(pl.Categorical))
+        .with_columns(key_expr.alias("key"))
+    )
+    cache = {}
+    with pytest.raises(ValueError, match="physical categorical"):
+        frame.piot.cache(cache, order_by="key", validate=False, df_key="same")
+    assert cache == {}
+    assert frame.piot.cache(cache, order_by="key", cache_mode="ignore", df_key="same") is frame
+
+
+@pytest.mark.parametrize(
+    "key_expr",
+    [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
+    ids=["scalar", "struct", "list"],
+)
 @pytest.mark.parametrize("partition_cols", [(), ("part",)])
 @pytest.mark.parametrize("column_granularity", [False, True])
-def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(partition_cols, column_granularity):
+def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(key_expr, partition_cols, column_granularity):
     dtype = pl.Categorical()
     if getattr(dtype, "ordering", "lexical") == "physical":
         dtype = pl.Categorical("lexical")
     first = (
         pl.DataFrame({"key": ["b", "a"], "part": ["p", "p"], "left": [20, 10], "right": [200, 100]})
         .with_columns(pl.col("key").cast(dtype))
+        .with_columns(key_expr.alias("key"))
         .sort("left")
         .lazy()
     )
     second = (
         pl.DataFrame({"key": ["a", "b"], "part": ["p", "p"], "left": [10, 20], "right": [100, 200]})
         .with_columns(pl.col("key").cast(dtype))
+        .with_columns(key_expr.alias("key"))
         .sort("left")
         .lazy()
     )

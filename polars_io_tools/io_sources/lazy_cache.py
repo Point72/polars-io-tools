@@ -79,6 +79,17 @@ def _df_key(
     return hashlib.md5(payload).hexdigest()
 
 
+def _contains_physical_categorical(dtype: pl.DataType) -> bool:
+    """Return whether a dtype contains a physically ordered categorical."""
+    if isinstance(dtype, pl.Categorical):
+        return getattr(dtype, "ordering", "lexical") == "physical"
+    if isinstance(dtype, (pl.List, pl.Array)):
+        return _contains_physical_categorical(dtype.inner)
+    if isinstance(dtype, pl.Struct):
+        return any(_contains_physical_categorical(field.dtype) for field in dtype.fields)
+    return False
+
+
 def _validate_order_by_unique(frame: pl.DataFrame, order_by: tuple[str, ...]) -> None:
     """Raise if ``order_by`` does not uniquely identify the rows of ``frame``.
 
@@ -153,8 +164,8 @@ def cache(
         df_key: Optional identity for the input LazyFrame, used in place of its serialized plan. The
             caller is responsible for choosing a value that changes whenever the frame's contents would.
             ``order_by`` and ``partition_cols`` are still folded into the cache key.
-            Physical categorical ``order_by`` columns are rejected because their code order can differ
-            across frames. Use lexical categorical ordering or a non-categorical ordering key instead.
+            Physical categoricals in ``order_by``, including nested ones, are rejected because their code
+            order can differ across frames. Use lexical categorical ordering or a non-categorical ordering key instead.
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
     Notes:
@@ -224,9 +235,7 @@ def cache(
         raise ValueError(f"order_by columns not found in frame schema: {missing}")
 
     if df_key is not None:
-        physical_categorical_cols = [
-            col for col in order_by if isinstance(schema[col], pl.Categorical) and getattr(schema[col], "ordering", "lexical") == "physical"
-        ]
+        physical_categorical_cols = [col for col in order_by if _contains_physical_categorical(schema[col])]
         if physical_categorical_cols:
             raise ValueError(
                 f"df_key cannot be used with physical categorical order_by columns: {physical_categorical_cols}. "
