@@ -464,7 +464,8 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
         path = Path(fs_path_prefix)
         if path.exists():
             for p in path.glob("**/*.parquet"):
-                existing_parts.add(p.relative_to(path).with_suffix("").as_posix())
+                # On Windows, polars percent-encodes characters such as ":" in local file names.
+                existing_parts.add(unquote(p.relative_to(path).with_suffix("").as_posix()))
     else:
         # S3FileSystem is optional in pyarrow; use getattr for safe access
         S3FileSystem = getattr(pa_fs, "S3FileSystem", None)

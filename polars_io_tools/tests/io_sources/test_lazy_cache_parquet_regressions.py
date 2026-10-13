@@ -11,7 +11,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from polars_io_tools._compat import POLARS_HAS_PARTITION_BY
-from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _construct_partitions_df_from_existing, cache_parquet
+from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _construct_partitions_df_from_existing, _extract_existing_files, cache_parquet
 
 D = datetime.date
 DT = datetime.datetime
@@ -188,6 +188,15 @@ def test_extra_partition_col_dtypes_round_trip(tmp_path, values, dtype):
         assert_frame_equal(_sorted(out), _sorted(src.collect()))
     assert _rewritten(snapshot) == []
     assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
+
+
+def test_existing_file_keys_are_percent_decoded(tmp_path):
+    import pyarrow.fs as pa_fs
+
+    # Polars writes "2020-01-01 12:00:00" as "2020-01-01 12%3A00%3A00" in local file names on Windows.
+    (tmp_path / "2020-01-01 12%3A00%3A00").mkdir()
+    (tmp_path / "2020-01-01 12%3A00%3A00" / "2024-01.parquet").touch()
+    assert _extract_existing_files(pa_fs.LocalFileSystem(), str(tmp_path)) == {"2020-01-01 12:00:00/2024-01"}
 
 
 @pytest.mark.parametrize(
