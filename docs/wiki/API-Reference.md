@@ -61,6 +61,11 @@ only the partitions their predicate needs; missing partitions are fetched upstre
 written back. `time_unit` is `"daily"`, `"monthly"`, or `"yearly"`. Returns a LazyFrame
 reading from the cache.
 
+With `cache_mode=CacheMode.READ_ONLY`, missing partitions are fetched upstream and
+returned alongside the cached rows without being written. With
+`cache_mode=CacheMode.CACHE_ONLY`, only cached rows are returned and upstream is never
+queried; a callable source then needs `schema` if the cache is empty.
+
 ### `cache_memory`
 
 ```python
@@ -407,11 +412,12 @@ projection, and filters on `index` flow through. `on` defaults to all non-`index
 ### `CacheMode`
 
 ```python
-CacheMode.CACHE | CacheMode.IGNORE | CacheMode.REBUILD
+CacheMode.CACHE | CacheMode.IGNORE | CacheMode.REBUILD | CacheMode.READ_ONLY | CacheMode.CACHE_ONLY
 ```
 
-Caching behavior passed to `cache_parquet`: read-and-fill, bypass, or refresh in-scope
-partitions.
+Caching behavior passed to `cache_parquet`: read-and-fill, bypass, refresh in-scope
+partitions, read cached partitions and query upstream for the rest without writing, or read
+cached partitions only.
 
 ## Utilities
 
