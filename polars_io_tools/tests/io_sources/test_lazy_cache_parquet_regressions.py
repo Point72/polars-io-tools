@@ -85,6 +85,24 @@ def test_daily_datetime_column_partitions_not_rewritten(tmp_path):
     assert _rewritten(snapshot) == []
 
 
+def test_finite_query_does_not_rewrite_cached_partitions_between_missing_ones(tmp_path):
+    src = pl.LazyFrame(
+        {
+            "date": [D(2024, 1, 10), D(2024, 1, 10), D(2024, 2, 10), D(2024, 2, 10)],
+            "sym": ["A", "B", "A", "B"],
+            "value": [0, 1, 2, 3],
+        }
+    )
+    kwargs = {"time_unit": "monthly", "extra_partition_cols": "sym"}
+    for date, sym in [(D(2024, 1, 10), "B"), (D(2024, 2, 10), "A")]:
+        cache_parquet(src, tmp_path, "date", **kwargs).filter((pl.col("date") == date) & (pl.col("sym") == sym)).collect()
+    snapshot = _age_files(tmp_path)
+    pred = pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29)) & pl.col("sym").is_in(["A", "B"])
+    out = cache_parquet(src, tmp_path, "date", **kwargs).filter(pred).collect()
+    assert_frame_equal(_sorted(out), _sorted(src.collect()))
+    assert _rewritten(snapshot) == []
+
+
 def test_extra_col_only_predicate_does_not_rewrite_cached_dates(tmp_path):
     src = pl.LazyFrame(
         {

@@ -1682,8 +1682,8 @@ def cache_parquet(
                     extra_cols=extra_cols,
                     time_unit=effective_time_unit,
                 )
-                if has_wildcard and cache_mode == CacheMode.CACHE:
-                    # Placeholder rows leave some partition columns unconstrained, so the filter above also covers already-cached partitions
+                if cache_mode == CacheMode.CACHE:
+                    # The filter above can cover cached partitions (merged date ranges, unconstrained placeholder columns), so exclude them
                     not_existing = _build_not_existing_partitions_pred(
                         existing_parts_df, join_cols, date_column, effective_time_unit, schema[date_column] if date_column else None
                     )
