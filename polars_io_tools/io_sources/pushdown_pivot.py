@@ -108,8 +108,10 @@ def pushdown_pivot(
         "values": value_cols,
         "maintain_order": maintain_order,
         "separator": separator,
-        "column_naming": column_naming,
     }
+    # Polars < 1.39 has no ``column_naming`` parameter; drop this once polars>=1.39 is required
+    if column_naming != "auto":
+        pivot_kwargs["column_naming"] = column_naming
 
     # Defer all `collect_schema()` walks (the source schema, the full pivot output schema, and the per-`on`-value pivot
     # schemas used for the output→on-value mapping) until Polars actually needs them — typically when it asks for the

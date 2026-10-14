@@ -45,7 +45,13 @@ def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     return tuple(sorted(partition_values.items()))
 
 
-def _not_in(col: str, values: list) -> pl.Expr:
+def _is_in_collection(values: list, dtype: pl.DataType) -> list | pl.Expr:
+    """Collection for ``pl.col(...).is_in`` holding non-null ``values`` of a column of ``dtype``."""
+    # A plain list of Decimals is inferred as Decimal(38, s), which is_in rejects
+    return pl.lit(values, dtype=pl.List(dtype)) if isinstance(dtype, pl.Decimal) else values
+
+
+def _not_in(col: str, values: list, dtype: pl.DataType) -> pl.Expr:
     """Expression true for rows whose ``col`` value is *not* in ``values`` (null-aware).
 
     Reproduces ``eq_missing`` semantics — a null column value is kept unless null is itself one
@@ -55,7 +61,7 @@ def _not_in(col: str, values: list) -> pl.Expr:
     # opaque to the DNF analyzer (defeating the skip-the-query optimization), and is_in's
     # nulls_equal argument is not available on the minimum supported Polars.
     non_null = [v for v in values if v is not None]
-    not_in_non_null = pl.col(col).is_in(non_null).not_() if non_null else pl.lit(True)
+    not_in_non_null = pl.col(col).is_in(_is_in_collection(non_null, dtype)).not_() if non_null else pl.lit(True)
     if None in values:
         # A null column value matches the known null partition, so exclude it.
         return not_in_non_null & pl.col(col).is_not_null()
@@ -79,7 +85,7 @@ def _exclude_row_predicate(row: dict, schema: pl.Schema) -> pl.Expr:
             elif len(value) == 1:
                 col_exprs.append(pl.col(col).ne_missing(value[0]))
             else:
-                col_exprs.append(_not_in(col, value))
+                col_exprs.append(_not_in(col, value, schema[col].inner))
         else:
             col_exprs.append(pl.col(col).ne_missing(value))
     if len(col_exprs) == 1:
@@ -124,7 +130,7 @@ def _exclusion_from_frame(df: pl.DataFrame) -> pl.Expr | None:
         return None
     schema = df.schema
     if len(schema) == 1:
-        col_name, _dtyp = next(iter(schema.items()))
+        col_name, dtyp = next(iter(schema.items()))
         vals = df.select(col_name).to_series().to_list()
         if len(vals) == 1:
             inner_vals = vals[0]
@@ -134,7 +140,7 @@ def _exclusion_from_frame(df: pl.DataFrame) -> pl.Expr | None:
                 elif len(inner_vals) == 1:
                     return pl.col(col_name).ne_missing(inner_vals[0])
                 else:
-                    return _not_in(col_name, inner_vals)
+                    return _not_in(col_name, inner_vals, dtyp.inner)
 
     row_exprs = []
     for row in df.iter_rows(named=True):
