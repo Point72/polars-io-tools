@@ -435,6 +435,12 @@ def _partition_key_component(value: Any) -> str:
     return str(value)
 
 
+def _encode_partition_file_key(key: str, windows: bool) -> str:
+    if not windows:
+        return key
+    return "".join(f"%{ord(char):02X}" if char in '%<>:"\\|?*' else char for char in key)
+
+
 def _serialize_key_values(values: pl.Series) -> pl.Series:
     """Serialize non-null partition values as the writer of the installed polars does."""
     if POLARS_HAS_PARTITION_BY:
@@ -1393,6 +1399,7 @@ def _sink_cache_partitions(
     credential_provider: pl.CredentialProviderAWS | None,
     write_kwargs: dict,
     key_aliases: dict[str, str],
+    encode_file_keys: bool,
 ) -> tuple[set[str], set[str]]:
     """Sink one file per partition and return its physical and logical keys."""
     written: set[str] = set()
@@ -1415,7 +1422,7 @@ def _sink_cache_partitions(
         else:
             values = [unquote(k.str_value) for k in ctx.keys]
         logical_key = "/".join(values)
-        key = key_aliases.get(logical_key, logical_key)
+        key = key_aliases.get(logical_key, _encode_partition_file_key(logical_key, encode_file_keys))
         written_logical.add(logical_key)
         written.add(key)
         return f"{key}.parquet"
@@ -1674,6 +1681,7 @@ def cache_parquet(
         pyarrow_opts, polars_opts, credential_provider = {}, {}, None
         fs = pa_fs.LocalFileSystem()
 
+    windows_file_keys = os.name == "nt" and isinstance(fs, pa_fs.LocalFileSystem)
     source_lf = self_or_fn if isinstance(self_or_fn, pl.LazyFrame) else None
 
     def get_source() -> pl.LazyFrame:
@@ -1742,7 +1750,7 @@ def cache_parquet(
             date_column=date_column,
             time_unit=time_unit,
             file_key_column=file_key_column,
-            decode_file_keys=os.name == "nt" and isinstance(fs, pa_fs.LocalFileSystem),
+            decode_file_keys=windows_file_keys,
         )
 
         expected_parts_df = _get_expected_partitions_df(predicate, date_column, _extra_cols, effective_time_unit, schema)
@@ -1816,6 +1824,7 @@ def cache_parquet(
                 credential_provider,
                 write_kwargs,
                 key_aliases,
+                windows_file_keys,
             )
 
             # Enumerated rebuild targets receive empty files; wildcard targets require stale-file removal.
@@ -1838,7 +1847,9 @@ def cache_parquet(
                 part_info, write_plan, cache_mode, written_logical_parts, existing_parts, _extra_cols, date_column, partition_format, key_scope
             )
             if missing:
-                paths = [f"{time_unit_dir}/{key_aliases.get(key, key)}.parquet" for key in sorted(missing)]
+                paths = [
+                    f"{time_unit_dir}/{key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys))}.parquet" for key in sorted(missing)
+                ]
                 log.debug("Writing %d empty partition(s) sequentially", len(paths))
                 _write_empty_parquet_files_sequentially(
                     paths,
@@ -1862,7 +1873,7 @@ def cache_parquet(
                 date_column,
                 time_unit,
                 file_key_column=file_key_column,
-                decode_file_keys=os.name == "nt" and isinstance(fs, pa_fs.LocalFileSystem),
+                decode_file_keys=windows_file_keys,
             ),
         )
         read_plan = _build_read_plan(

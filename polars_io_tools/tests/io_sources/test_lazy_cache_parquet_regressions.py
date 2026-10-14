@@ -1,9 +1,11 @@
 """Regression tests for cache_parquet planning bugs (re-writes, lost rows, key parsing)."""
 
 import datetime
+import importlib
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -602,3 +604,25 @@ def test_rebuild_timezone_date_scope_with_unconstrained_extra_column(tmp_path, t
     assert_frame_equal(out, current.collect())
     assert preserved.stat().st_mtime_ns == snapshot[preserved]
     assert sorted(cache_parquet(current, tmp_path, "ts", **options).collect()["value"].to_list()) == [1, 100]
+
+
+@pytest.mark.parametrize(
+    ("value", "file_key"),
+    [("%2541", "%252541"), ("%25", "%2525"), ("a%253Ab", "a%25253Ab"), ("x?y", "x%3Fy"), ("12:00", "12%3A00")],
+)
+@pytest.mark.parametrize("empty", [False, True])
+def test_windows_partition_file_keys_round_trip_on_any_platform(tmp_path, monkeypatch, value, file_key, empty):
+    module = importlib.import_module("polars_io_tools.io_sources.lazy_cache_parquet")
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)], "x": ["other" if empty else value], "value": [0]})
+    predicate = _JAN & (pl.col("x") == value)
+    expected = src.filter(predicate).collect()
+    out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(predicate).collect()
+    assert_frame_equal(out, expected)
+    assert (tmp_path / "monthly" / file_key / "2024-01.parquet").exists()
+    snapshot = _age_files(tmp_path)
+    expanded = pl.concat([src, pl.LazyFrame({"date": [D(2024, 1, 10)], "x": [value], "value": [99]})])
+    out = cache_parquet(expanded, tmp_path, "date", extra_partition_cols="x").filter(predicate).collect()
+    assert_frame_equal(out, expected)
+    assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
+    assert _rewritten(snapshot) == []
