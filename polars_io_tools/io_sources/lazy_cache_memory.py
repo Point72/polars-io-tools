@@ -52,6 +52,7 @@ from collections.abc import Callable, Iterator, Sequence
 
 import polars as pl
 
+from .._compat import POLARS_STREAMING_SUPPORTS_IO_PLUGIN
 from .restrict_visitor import restrict_expr_to_columns
 from .util import PartitionKey, collect_lf_in_io_source, partition_exclusion_predicate, partition_key, register_io_source_with_is_pure
 
@@ -250,7 +251,9 @@ def cache_memory(
             if todo is not None:
                 # Restricted build: filter the builder to just the demanded (not-yet-built) partitions.
                 lf = lf.filter(todo)
-            built = lf.collect()
+            # Build on the streaming engine, not the in-memory one: an in-memory build can deadlock
+            # when the cache is read from several branches (Rayon work-stealing). Needs Polars >= 1.26.
+            built = lf.collect(engine="streaming") if POLARS_STREAMING_SUPPORTS_IO_PLUGIN else lf.collect()
             # Reconcile the materialized frame against the declared schema ONCE, here at build time.
             # The check is deliberately asymmetric: a missing declared column or a dtype mismatch
             # raises (either would silently corrupt results); an extra column is dropped by the
