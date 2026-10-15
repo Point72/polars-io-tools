@@ -21,6 +21,7 @@ def concat_named(
     *,
     log_explain: bool = False,
     description: str | None = None,
+    use_resolver: bool = False,
     **kwargs: Any,
 ) -> pl.LazyFrame:
     """
@@ -51,6 +52,11 @@ def concat_named(
         log_explain (bool, default False): If True, logs the LazyFrame execution plan for debugging purposes.
 
         description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
+
+        use_resolver (bool, default False): Use the experimental Polars resolver API when available, exposing the pruned query in
+            ``explain()`` without collecting it inside an IO callback. Falls back to the IO callback on older Polars.
+            The resolver path does not emit a concat-level OpenTelemetry span or use ``description``; input-source spans are unaffected.
+            Errors propagate from the returned plan without concat-level exception wrapping.
 
         **kwargs (Any): Additional arguments passed to `pl.concat()` for concatenation.
 
@@ -183,20 +189,50 @@ def concat_named(
 
     index_df = pl.DataFrame({name: pl.concat(values) if isinstance(values[0], pl.Series) else values for name, values in index_lf.items()})
 
+    def concat_sources(predicate: pl.Expr | None) -> pl.LazyFrame:
+        restricted_predicate = restrict_expr_to_columns(predicate, col_names) if predicate is not None else None
+        if restricted_predicate is not None:
+            lf_ids = set(index_df.filter(restricted_predicate).select(lf_id_col).to_series().to_list())
+            lf_to_concat = [lf for lf_id, lf in data_dict.items() if lf_id in lf_ids]
+            return pl.concat(lf_to_concat, **kwargs) if lf_to_concat else pl.LazyFrame(schema=schema)
+        return pl.concat(data_dict.values(), **kwargs)
+
+    if use_resolver and hasattr(pl.LazyFrame, "from_lazyframe_resolver"):
+        from polars.lazyframe.resolver import FilterExpr, LazyFrameResolver, ResolvedLazyFrameProps
+
+        class ConcatNamedResolver(LazyFrameResolver):
+            def schema(self) -> dict[str, pl.DataType]:
+                return dict(schema)
+
+            def resolve_lazyframe(
+                self,
+                *,
+                projection: list[str] | None,
+                limit: int | None,
+                filters: list[FilterExpr],
+                filter_columns: list[str],
+                filter_drop_columns_idx: int | None,
+                existing_resolved_version_key: str | None,
+            ) -> tuple[pl.LazyFrame, ResolvedLazyFrameProps]:
+                predicate = pl.all_horizontal([item.expr for item in filters]) if filters and limit is None else None
+                resolved = concat_sources(predicate)
+                if limit is not None:
+                    resolved = resolved.head(limit)
+                if filters:
+                    resolved = resolved.filter([item.expr for item in filters])
+                if log_explain:
+                    log.debug(f"concat_named: LazyFrame plan:\n{resolved.explain()!s}")
+                return resolved, ResolvedLazyFrameProps(applied_filters=range(len(filters)))
+
+        return ConcatNamedResolver().lazy()
+
     def source_gen(
         with_columns: list[str] | None,
         predicate: pl.Expr | None,
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        restricted_predicate = restrict_expr_to_columns(predicate, col_names) if predicate is not None else None
-        true_lf: pl.LazyFrame
-        if restricted_predicate is not None:
-            lf_ids = set(index_df.filter(restricted_predicate).select(lf_id_col).to_series().to_list())
-            lf_to_concat = [lf for lf_id, lf in data_dict.items() if lf_id in lf_ids]
-            true_lf = pl.concat(lf_to_concat, **kwargs) if lf_to_concat else pl.LazyFrame(schema=schema)
-        else:
-            true_lf = pl.concat(data_dict.values(), **kwargs)  # type: ignore[assignment]
+        true_lf = concat_sources(predicate)
         if predicate is not None:
             true_lf = true_lf.filter(predicate)
         if with_columns is not None:
