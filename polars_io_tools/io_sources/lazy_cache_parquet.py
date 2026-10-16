@@ -139,6 +139,8 @@ class CacheMode(Enum):
     CACHE = auto()  # Normal caching behavior - read/write, keep existing objects
     IGNORE = auto()  # Bypass cache entirely, always generate fresh data
     REBUILD = auto()  # Ignore cache on reads, query upstream, and write fresh data (overwriting existing)
+    READ_ONLY = auto()  # Read cached partitions, query upstream for uncached partitions, never write
+    CACHE_ONLY = auto()  # Read cached partitions only, never query upstream or write
 
     @classmethod
     def validate(cls, v) -> "CacheMode":
@@ -469,7 +471,7 @@ def _partition_keys(
     return parts_df.select(pl.concat_str(exprs, separator="/").alias("key")).to_series()
 
 
-def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[str]:
+def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str, *, create_s3_dir: bool = True) -> set[str]:
     """Return relative file keys under a prefix, without reading cached data."""
     import pyarrow.fs as pa_fs
 
@@ -483,7 +485,7 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str) -> set[
     else:
         # S3FileSystem is optional in pyarrow; use getattr for safe access
         S3FileSystem = getattr(pa_fs, "S3FileSystem", None)
-        if S3FileSystem is not None and isinstance(fs, S3FileSystem):
+        if create_s3_dir and S3FileSystem is not None and isinstance(fs, S3FileSystem):
             try:
                 fs.create_dir(fs_path_prefix + "/")
             except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
@@ -1207,6 +1209,12 @@ def _compute_partitions_to_write(part_info: PartitionInfo, existing_keys: set[st
     return expected.join(known, on=part_info.join_cols, how="anti")
 
 
+def _conform_to_schema(lf: pl.LazyFrame, schema: pl.Schema) -> pl.LazyFrame:
+    """Select ``schema``'s columns, casting only those whose dtype differs so predicates on the rest still push down."""
+    actual = lf.collect_schema()
+    return lf.select([pl.col(name) if actual.get(name) == dtype else pl.col(name).cast(dtype) for name, dtype in schema.items()])
+
+
 def _build_final_scan(
     cache_scan: pl.LazyFrame,
     predicate: pl.Expr | None,
@@ -1569,6 +1577,12 @@ def cache_parquet(
             - ``CacheMode.REBUILD``: Refresh the cache - ignores existing cache on reads, queries upstream for all
               data matching the predicate, and writes fresh data to cache (overwriting existing partition files).
               Unlike deleting and rebuilding, this preserves partitions outside the current query scope.
+            - ``CacheMode.READ_ONLY``: Read the partitions that are already cached and query upstream for the
+              partitions that are not, without writing anything to the cache. A cached partition is always served
+              from the cache, even if it is empty.
+            - ``CacheMode.CACHE_ONLY``: Read only the partitions that are already cached; never query upstream or
+              write. Returns an empty frame if nothing matching is cached. With a callable source and an empty
+              cache, ``schema`` is required.
         aws_profile (str, optional): AWS profile name for S3 access. If None, uses the AWS_PROFILE environment variable.
             This is only relevant if the cache_path is an S3 URI.
         write_kwargs (dict, optional): Additional keyword arguments for writing Parquet files. Internally, this is passed
@@ -1594,7 +1608,9 @@ def cache_parquet(
 
         **Query Classification (Enumerability)**
 
-        Queries are classified based on whether partition keys can be enumerated from the predicate:
+        Queries are classified based on whether partition keys can be enumerated from the predicate. The writes
+        described below happen in ``CacheMode.CACHE`` and ``CacheMode.REBUILD``. ``CacheMode.READ_ONLY`` returns the
+        upstream rows it would have written, and ``CacheMode.CACHE_ONLY`` never queries upstream.
 
         - **FINITE**: Partition keys can be fully enumerated (e.g., ``date.is_between(start, end)``).
           Writes missing partitions, creates empty files for gaps, reads from enumerated paths.
@@ -1635,7 +1651,8 @@ def cache_parquet(
         **Write-Then-Read Architecture**
 
         ``cache_parquet`` follows a simple pattern: write missing partitions to cache, then read
-        entirely from cache. There is no merging of upstream and cache data during reads.
+        entirely from cache. There is no merging of upstream and cache data during reads, except in
+        ``CacheMode.READ_ONLY``, which cannot write and so reads uncached partitions from upstream.
 
         **Other Notes**
 
@@ -1693,6 +1710,8 @@ def cache_parquet(
     # Resolve schema with minimal cost: prefer provided, then cache, then source (callable only once)
     schema = schema or _schema_from_cache(cache_uri, polars_opts, credential_provider)
     if schema is None:
+        if cache_mode == CacheMode.CACHE_ONLY and source_lf is None:
+            raise ValueError("CacheMode.CACHE_ONLY with a callable source requires `schema` when the cache is empty")
         schema = get_source().collect_schema()
 
     # Validate that date_column exists in schema if provided
@@ -1741,7 +1760,16 @@ def cache_parquet(
     ) -> Iterator[pl.DataFrame]:
         log.debug("Running with %s against location %s with columns '%s' and predicate: '%s'", cache_mode, time_unit_dir, with_columns, predicate)
 
-        existing_parts = _extract_existing_files(fs, fs_path_prefix)
+        no_write = cache_mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY)
+        # READ_ONLY plans like CACHE, but reads the missing partitions from upstream instead of writing them.
+        plan_mode = CacheMode.CACHE if cache_mode == CacheMode.READ_ONLY else cache_mode
+        read_schema = schema
+        if cache_mode == CacheMode.READ_ONLY and with_columns is not None:
+            required_columns = set(with_columns) | set(all_partition_cols)
+            if predicate is not None:
+                required_columns.update(predicate.meta.root_names())
+            read_schema = pl.Schema({name: dtype for name, dtype in schema.items() if name in required_columns})
+        existing_parts = _extract_existing_files(fs, fs_path_prefix, create_s3_dir=not no_write)
         existing_parts_df = _construct_partitions_df_from_existing(
             existing_files=existing_parts,
             schema=schema,
@@ -1765,7 +1793,7 @@ def cache_parquet(
         )
 
         write_plan = _build_write_plan(
-            cache_mode=cache_mode,
+            cache_mode=plan_mode,
             partition_info=part_info,
             date_column=date_column,
             predicate=predicate,
@@ -1774,30 +1802,37 @@ def cache_parquet(
         )
 
         is_finite = part_info.enumerability == Enumerability.FINITE
-        if is_finite and cache_mode != CacheMode.REBUILD:
+        if is_finite and plan_mode != CacheMode.REBUILD:
             partitions_to_write_df = _compute_partitions_to_write(part_info, existing_parts, date_column, partition_format)
         else:
             partitions_to_write_df = part_info.expected_parts_df
-        do_write = write_plan.should_write and not (is_finite and partitions_to_write_df.is_empty())
+        fetch_upstream = write_plan.should_write and not (is_finite and partitions_to_write_df.is_empty())
 
         log.debug(
-            "Expected %d partitions, %d existing, writing %d (do_write=%s)",
+            "Expected %d partitions, %d existing, %d missing (fetch_upstream=%s, write=%s)",
             len(part_info.expected_parts_df),
             len(existing_parts_df),
             len(partitions_to_write_df),
-            do_write,
+            fetch_upstream,
+            fetch_upstream and not no_write,
         )
 
-        if do_write:
-            lf_to_write = get_source()
+        upstream_lf = None
+        if fetch_upstream:
+            upstream_lf = get_source()
+            if cache_mode == CacheMode.READ_ONLY:
+                # Rows are returned rather than written, so partition filters must see the cached dtypes.
+                upstream_lf = _conform_to_schema(upstream_lf, read_schema)
             write_filter = _write_partition_filter(
-                partitions_to_write_df, part_info, write_plan, cache_mode, predicate, date_column, effective_time_unit, schema
+                partitions_to_write_df, part_info, write_plan, plan_mode, predicate, date_column, effective_time_unit, schema
             )
             if write_filter is not None:
-                lf_to_write = lf_to_write.filter(write_filter)
+                upstream_lf = upstream_lf.filter(write_filter)
             bounding_pred = _restrict_predicate(predicate, write_bounding_columns or [])
             if bounding_pred is not None:
-                lf_to_write = lf_to_write.filter(bounding_pred)
+                upstream_lf = upstream_lf.filter(bounding_pred)
+
+        if upstream_lf is not None and not no_write:
             cache_metadata = _build_cache_metadata(
                 effective_time_unit=effective_time_unit,
                 template_for_metadata=template_for_metadata,
@@ -1815,7 +1850,7 @@ def cache_parquet(
                 )
                 key_aliases = dict(zip(logical_keys, existing_parts_df[file_key_column]))
             written_parts, written_logical_parts = _sink_cache_partitions(
-                lf_to_write,
+                upstream_lf,
                 time_unit_dir,
                 key_exprs,
                 len(partitions_to_write_df),
@@ -1861,21 +1896,22 @@ def cache_parquet(
                 )
                 log.debug("Wrote %i empty partition(s): %s", len(missing), sorted(missing))
 
-        # Refresh the file listing to avoid scanning an empty cache after writes.
-        existing_parts = _extract_existing_files(fs, fs_path_prefix)
-        part_info = replace(
-            part_info,
-            existing_parts_df=_construct_partitions_df_from_existing(
-                existing_parts,
-                schema,
-                all_partition_cols,
-                template_for_metadata,
-                date_column,
-                time_unit,
-                file_key_column=file_key_column,
-                decode_file_keys=windows_file_keys,
-            ),
-        )
+        if upstream_lf is not None and not no_write:
+            # Refresh the file listing to avoid scanning an empty cache after writes.
+            existing_parts = _extract_existing_files(fs, fs_path_prefix)
+            part_info = replace(
+                part_info,
+                existing_parts_df=_construct_partitions_df_from_existing(
+                    existing_parts,
+                    schema,
+                    all_partition_cols,
+                    template_for_metadata,
+                    date_column,
+                    time_unit,
+                    file_key_column=file_key_column,
+                    decode_file_keys=windows_file_keys,
+                ),
+            )
         read_plan = _build_read_plan(
             partition_info=part_info,
             date_column=date_column,
@@ -1891,6 +1927,10 @@ def cache_parquet(
         scan_kwargs.update(read_kwargs)
 
         cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
+        if no_write and upstream_lf is not None:
+            cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
+            if "n_rows" in read_kwargs:
+                cache_scan = cache_scan.head(read_kwargs["n_rows"])
         scan = _build_final_scan(cache_scan, predicate, with_columns, n_rows)
 
         yield from _collect_cache_scan(scan, schema, with_columns, batch_size, time_unit_dir)
