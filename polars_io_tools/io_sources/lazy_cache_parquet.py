@@ -1763,6 +1763,12 @@ def cache_parquet(
         no_write = cache_mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY)
         # READ_ONLY plans like CACHE, but reads the missing partitions from upstream instead of writing them.
         plan_mode = CacheMode.CACHE if cache_mode == CacheMode.READ_ONLY else cache_mode
+        read_schema = schema
+        if cache_mode == CacheMode.READ_ONLY and with_columns is not None:
+            required_columns = set(with_columns) | set(all_partition_cols)
+            if predicate is not None:
+                required_columns.update(predicate.meta.root_names())
+            read_schema = pl.Schema({name: dtype for name, dtype in schema.items() if name in required_columns})
         existing_parts = _extract_existing_files(fs, fs_path_prefix, create_s3_dir=not no_write)
         existing_parts_df = _construct_partitions_df_from_existing(
             existing_files=existing_parts,
@@ -1816,7 +1822,7 @@ def cache_parquet(
             upstream_lf = get_source()
             if cache_mode == CacheMode.READ_ONLY:
                 # Rows are returned rather than written, so partition filters must see the cached dtypes.
-                upstream_lf = _conform_to_schema(upstream_lf, schema)
+                upstream_lf = _conform_to_schema(upstream_lf, read_schema)
             write_filter = _write_partition_filter(
                 partitions_to_write_df, part_info, write_plan, plan_mode, predicate, date_column, effective_time_unit, schema
             )
@@ -1922,7 +1928,7 @@ def cache_parquet(
 
         cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
         if no_write and upstream_lf is not None:
-            cache_scan = pl.concat([_conform_to_schema(cache_scan, schema), upstream_lf], how="vertical")
+            cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
             if "n_rows" in read_kwargs:
                 cache_scan = cache_scan.head(read_kwargs["n_rows"])
         scan = _build_final_scan(cache_scan, predicate, with_columns, n_rows)

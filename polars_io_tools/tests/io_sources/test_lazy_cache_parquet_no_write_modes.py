@@ -234,6 +234,52 @@ def test_read_only_casts_upstream_to_declared_schema(jan_cached):
     assert sorted(result["half"].to_list()) == [0, 0, 46]
 
 
+@pytest.mark.parametrize("predicate", [None, JAN_FEB, pl.col("date") >= D(2024, 1, 1)], ids=["unconstrained", "finite", "unbounded"])
+@pytest.mark.parametrize("selection", [["date"], [pl.col("date").count()]], ids=["projection", "count"])
+def test_read_only_ignores_missing_unrequested_upstream_columns(jan_cached, predicate, selection):
+    before = _snapshot(jan_cached)
+    upstream = _source().select("date")
+    lf = cache_parquet(upstream, jan_cached, "date", cache_mode=CacheMode.READ_ONLY)
+    if predicate is not None:
+        lf = lf.filter(predicate)
+    expected = pl.DataFrame({"date": [D(2024, 1, 10), D(2024, 1, 15), D(2024, 2, 15)]})
+    assert_frame_equal(lf.select(selection).collect().sort(pl.all()), expected.select(selection).sort(pl.all()))
+    assert _snapshot(jan_cached) == before
+
+
+@pytest.mark.parametrize(
+    "selection", [["value"], ["date"], ["region", "date"], [pl.col("value").count()]], ids=["value", "date", "reordered", "count"]
+)
+@pytest.mark.parametrize("engine", ["auto", "streaming"])
+def test_read_only_projection_retains_filter_and_partition_columns(tmp_path, selection, engine):
+    source = pl.LazyFrame(
+        {
+            "date": [D(2024, 1, 10), D(2024, 1, 15), D(2024, 2, 15), D(2024, 2, 15)],
+            "region": ["A", "B", "A", "B"],
+            "value": [0, 1, 2, 3],
+            "unused": ["old"] * 4,
+        }
+    )
+    cache_parquet(source, tmp_path, "date", extra_partition_cols="region").filter(
+        (pl.col("date") == D(2024, 1, 10)) & (pl.col("region") == "A")
+    ).collect()
+    before = _snapshot(tmp_path)
+    upstream = source.drop("unused").with_columns(pl.col("date").cast(pl.Datetime("ns")), (pl.col("value") + 90).cast(pl.String))
+    lf = cache_parquet(upstream, tmp_path, "date", extra_partition_cols="region", cache_mode=CacheMode.READ_ONLY)
+    expected = pl.DataFrame({"date": [D(2024, 1, 10), D(2024, 2, 15), D(2024, 2, 15)], "region": ["A", "A", "B"], "value": [0, 92, 93]})
+    result = lf.filter(JAN_FEB & (pl.col("value") != 91)).select(selection).collect(engine=engine)
+    assert_frame_equal(result.sort(pl.all()), expected.select(selection).sort(pl.all()))
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("requirement", ["projection", "predicate"])
+def test_read_only_does_not_ignore_missing_required_upstream_columns(jan_cached, requirement):
+    lf = cache_parquet(_source().select("date"), jan_cached, "date", cache_mode=CacheMode.READ_ONLY)
+    query = lf.select("value") if requirement == "projection" else lf.filter(pl.col("value") > 0).select("date")
+    with pytest.raises(pl.exceptions.ComputeError, match="value"):
+        query.collect()
+
+
 def test_read_only_applies_predicate_to_conformed_upstream(tmp_path):
     upstream = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 1, 15)], "value": ["1", "2"]})
     schema = pl.Schema({"date": pl.Date, "value": pl.Int64})
