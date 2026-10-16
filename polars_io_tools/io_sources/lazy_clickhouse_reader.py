@@ -2,6 +2,7 @@ import logging
 
 import polars as pl
 
+from .._compat import POLARS_GE_2
 from .util import optional_deps_error, register_io_source_with_is_pure
 
 try:
@@ -80,6 +81,8 @@ def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000,
             # so streamed Arrow batches are sized accordingly. max_block_size is a plain HTTP
             # setting and a hint, not a hard guarantee on record-batch size.
             block_size = batch_size if batch_size is not None else fetch_size
+            if POLARS_GE_2 and fetch_size > 0:
+                block_size = min(block_size, fetch_size)
             ch_params = dict(params)
             if block_size > 0:
                 ch_params.setdefault("max_block_size", block_size)

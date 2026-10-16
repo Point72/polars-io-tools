@@ -16,7 +16,7 @@ The signatures below show the namespace form where one exists.
 ### `cache`
 
 ```python
-lf.piot.cache(cache=None, *, order_by, partition_cols=(), column_granularity=True, cache_mode="cache", validate=True, log_explain=False, **kwargs)
+lf.piot.cache(cache=None, *, order_by, partition_cols=(), column_granularity=True, cache_mode="cache", validate=True, log_explain=False, description=None, df_key=None, **kwargs)
 ```
 
 Maintain an intermediate, per-column cache of the LazyFrame, optionally partitioned by
@@ -33,6 +33,19 @@ re-evaluated (at the cost of evaluating all columns on first touch); row partiti
 preserved and the two modes share the same cache keys. As in the default mode, an
 unfiltered select of a partitioned frame still queries the source once to discover
 partitions — constrain partitions with a predicate to avoid that re-query.
+By default, cache entries are keyed on the frame's serialized plan, which embeds the source
+file paths of Python IO sources and so can differ across environments. Pass `df_key` to
+key entries on an identity you choose instead, for example to share a persistent cache
+between machines. With `df_key`, physical categoricals in `order_by`, including nested
+ones, are rejected because their code order can differ across frames. Use lexical
+categorical ordering or a non-categorical ordering key instead. Both planned and
+materialized dtypes are checked; an invalid materialized ordering raises at collect time.
+
+Serialized cache callbacks from version 0.2.4 retain their historical lookup paths
+when loaded and re-serialized. Python and Polars versions must match. Newly created
+plans are not forward-compatible with older package releases. Restoring callbacks
+does not repair persisted entries corrupted by earlier null-partition bugs; those
+caches require rebuilding.
 
 ### `cache_parquet`
 
@@ -47,6 +60,11 @@ Cache the LazyFrame to date-partitioned Parquet files on local disk or S3. Queri
 only the partitions their predicate needs; missing partitions are fetched upstream and
 written back. `time_unit` is `"daily"`, `"monthly"`, or `"yearly"`. Returns a LazyFrame
 reading from the cache.
+
+With `cache_mode=CacheMode.READ_ONLY`, missing partitions are fetched upstream and
+returned alongside the cached rows without being written. With
+`cache_mode=CacheMode.CACHE_ONLY`, only cached rows are returned and upstream is never
+queried; a callable source then needs `schema` if the cache is empty.
 
 ### `cache_memory`
 
@@ -342,7 +360,7 @@ over `[start_col, end_col]`. A range `[lo, hi]` pushes the overlap `start_col <=
 ### `concat_named`
 
 ```python
-concat_named(lf_dict, identifier_cols, *, log_explain=False, **kwargs) -> pl.LazyFrame
+concat_named(lf_dict, identifier_cols, *, log_explain=False, description=None, **kwargs) -> pl.LazyFrame
 ```
 
 Vertically concatenate frames keyed by identifier tuples, adding `identifier_cols`. A
@@ -394,11 +412,12 @@ projection, and filters on `index` flow through. `on` defaults to all non-`index
 ### `CacheMode`
 
 ```python
-CacheMode.CACHE | CacheMode.IGNORE | CacheMode.REBUILD
+CacheMode.CACHE | CacheMode.IGNORE | CacheMode.REBUILD | CacheMode.READ_ONLY | CacheMode.CACHE_ONLY
 ```
 
-Caching behavior passed to `cache_parquet`: read-and-fill, bypass, or refresh in-scope
-partitions.
+Caching behavior passed to `cache_parquet`: read-and-fill, bypass, refresh in-scope
+partitions, read cached partitions and query upstream for the rest without writing, or read
+cached partitions only.
 
 ## Utilities
 

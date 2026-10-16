@@ -9,6 +9,7 @@ from packaging import version
 from polars.exceptions import ColumnNotFoundError, SchemaError
 from polars.testing import assert_frame_equal
 
+from polars_io_tools._compat import POLARS_GE_2
 from polars_io_tools.io_sources.util import (
     _resolve_endpoint_hostname,
     _storage_options_for,
@@ -234,16 +235,36 @@ class TestRegisterIoSourceWithIsPure:
         lf = register_io_source_with_is_pure(counting_io_source, schema=schema)
 
         # Perform a self-join - this should trigger CSE if is_pure=True is working
-        result = lf.join(lf, on="id", how="inner").collect()
+        result = lf.join(lf, on="id", how="inner").collect(engine="in-memory" if POLARS_GE_2 else "auto")
 
         # Verify the result is correct
         expected = pl.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30], "value_right": [10, 20, 30]})
-        assert result.equals(expected)
+        assert_frame_equal(result, expected, check_row_order=False)
 
         # Check if CSE is working based on Polars version
         if version.parse(pl.__version__) >= version.parse("1.33.1"):
             # With is_pure=True, CSE should work and counter should be 1
             assert counter == 1, f"Expected counter=1 (CSE working), but got counter={counter}"
+
+    @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+    @pytest.mark.parametrize(
+        "engine",
+        [
+            "auto",
+            "streaming",
+            pytest.param("in-memory", marks=pytest.mark.skipif(not POLARS_GE_2, reason="Polars 1 uses auto for in-memory execution")),
+        ],
+    )
+    def test_source_exceptions_surface_as_compute_error(self, error_type, engine):
+        def failing_source(with_columns, predicate, n_rows, batch_size):
+            yield pl.DataFrame({"value": [1]})
+            raise error_type("reader failed")
+
+        lf = register_io_source_with_is_pure(failing_source, schema={"value": pl.Int64})
+        with pytest.raises(pl.exceptions.ComputeError, match="reader failed") as error:
+            lf.collect(engine=engine)
+        if POLARS_GE_2:
+            assert isinstance(error.value.__cause__, error_type)
 
     def test_kwargs_passthrough(self):
         """Test that additional kwargs are passed through correctly."""

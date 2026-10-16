@@ -8,6 +8,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from polars_io_tools._compat import POLARS_GE_2
 from polars_io_tools.io_sources.profiling import (
     get_source_span_parent,
     profile_io_source_iterator,
@@ -344,7 +345,11 @@ def test_default_source_identity_trims_closure_to_enclosing_function():
     assert _span().attributes["polars_io_tools.explain_name"] == "_module_level_reader"
 
 
-def test_pure_self_join_emits_one_physical_execution():
+@pytest.mark.parametrize(
+    "engine",
+    ["auto", "streaming", pytest.param("in-memory", marks=pytest.mark.skipif(not POLARS_GE_2, reason="Polars 1 uses auto for in-memory execution"))],
+)
+def test_pure_self_join_profiles_physical_executions(engine):
     calls = 0
 
     def source(with_columns, predicate, n_rows, batch_size):
@@ -360,13 +365,16 @@ def test_pure_self_join_emits_one_physical_execution():
         schema={"id": pl.Int64, "value": pl.Int64},
         explain_name="memory.reader",
     )
-    result = lf.join(lf, on="id").collect()
+    result = lf.join(lf, on="id").collect(engine=engine)
 
-    assert result.height == 2
-    assert calls == 1
-    span = _span()
-    assert span.attributes["polars_io_tools.explain_name"] == "memory.reader"
-    assert span.attributes["polars_io_tools.outcome"] == "exhausted"
+    assert result.sort("id").to_dict(as_series=False) == {"id": [1, 2], "value": [10, 20], "value_right": [10, 20]}
+    if engine == ("in-memory" if POLARS_GE_2 else "auto"):
+        assert calls == 1
+    spans = _EXPORTER.get_finished_spans()
+    assert calls >= 1
+    assert len(spans) == calls
+    assert all(span.attributes["polars_io_tools.explain_name"] == "memory.reader" for span in spans)
+    assert all(span.attributes["polars_io_tools.outcome"] == "exhausted" for span in spans)
 
 
 def _capture_registered_callback(source, monkeypatch, **kwargs):

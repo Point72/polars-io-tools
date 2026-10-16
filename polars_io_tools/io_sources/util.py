@@ -15,7 +15,7 @@ import polars as pl
 import portion
 from packaging import version
 
-from .._compat import POLARS_HAS_COLLECT_BATCHES
+from .._compat import POLARS_GE_2, POLARS_HAS_COLLECT_BATCHES
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,13 @@ def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     return tuple(sorted(partition_values.items()))
 
 
-def _not_in(col: str, values: list) -> pl.Expr:
+def _is_in_collection(values: list, dtype: pl.DataType) -> list | pl.Expr:
+    """Collection for ``pl.col(...).is_in`` holding non-null ``values`` of a column of ``dtype``."""
+    # A plain list of Decimals is inferred as Decimal(38, s), which is_in rejects
+    return pl.lit(values, dtype=pl.List(dtype)) if isinstance(dtype, pl.Decimal) else values
+
+
+def _not_in(col: str, values: list, dtype: pl.DataType) -> pl.Expr:
     """Expression true for rows whose ``col`` value is *not* in ``values`` (null-aware).
 
     Reproduces ``eq_missing`` semantics — a null column value is kept unless null is itself one
@@ -55,7 +61,7 @@ def _not_in(col: str, values: list) -> pl.Expr:
     # opaque to the DNF analyzer (defeating the skip-the-query optimization), and is_in's
     # nulls_equal argument is not available on the minimum supported Polars.
     non_null = [v for v in values if v is not None]
-    not_in_non_null = pl.col(col).is_in(non_null).not_() if non_null else pl.lit(True)
+    not_in_non_null = pl.col(col).is_in(_is_in_collection(non_null, dtype)).not_() if non_null else pl.lit(True)
     if None in values:
         # A null column value matches the known null partition, so exclude it.
         return not_in_non_null & pl.col(col).is_not_null()
@@ -79,7 +85,7 @@ def _exclude_row_predicate(row: dict, schema: pl.Schema) -> pl.Expr:
             elif len(value) == 1:
                 col_exprs.append(pl.col(col).ne_missing(value[0]))
             else:
-                col_exprs.append(_not_in(col, value))
+                col_exprs.append(_not_in(col, value, schema[col].inner))
         else:
             col_exprs.append(pl.col(col).ne_missing(value))
     if len(col_exprs) == 1:
@@ -124,7 +130,7 @@ def _exclusion_from_frame(df: pl.DataFrame) -> pl.Expr | None:
         return None
     schema = df.schema
     if len(schema) == 1:
-        col_name, _dtyp = next(iter(schema.items()))
+        col_name, dtyp = next(iter(schema.items()))
         vals = df.select(col_name).to_series().to_list()
         if len(vals) == 1:
             inner_vals = vals[0]
@@ -134,7 +140,7 @@ def _exclusion_from_frame(df: pl.DataFrame) -> pl.Expr | None:
                 elif len(inner_vals) == 1:
                     return pl.col(col_name).ne_missing(inner_vals[0])
                 else:
-                    return _not_in(col_name, inner_vals)
+                    return _not_in(col_name, inner_vals, dtyp.inner)
 
     row_exprs = []
     for row in df.iter_rows(named=True):
@@ -313,7 +319,7 @@ def _storage_options_for(cache_uri: str, aws_profile: str | None = None) -> Stor
     # Create credential provider - it may have additional endpoint info
     credential_provider = pl.CredentialProviderAWS(
         profile_name=(aws_profile or os.getenv("AWS_PROFILE")),
-        _storage_options_has_endpoint_url=(endpoint is not None),
+        **({} if POLARS_GE_2 else {"_storage_options_has_endpoint_url": endpoint is not None}),
     )
 
     # If endpoint not already set, try to get it from the credential provider
@@ -435,7 +441,7 @@ def _format_kwargs_for_error(kwargs: dict) -> dict:
     return {key: _format_arg_for_error(value) for key, value in kwargs.items()}
 
 
-def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
+def wrap_io_source_with_error_catching(io_source, identifier: str = "", *, error_type: type[Exception] = RuntimeError):
     """
     Wrap an IO source function with comprehensive error catching and reporting.
 
@@ -459,6 +465,10 @@ def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
         try:
             yield from io_source(*args, **source_kwargs)
         except Exception as e:
+            try:
+                error_message = str(e)
+            except Exception:  # noqa: BLE001
+                error_message = "<exception str() failed>"
             # Build comprehensive error information
             io_source_name = getattr(io_source, "__name__", str(io_source))
             # Convert all pl.Expr instances to their full string representation
@@ -471,7 +481,7 @@ def wrap_io_source_with_error_catching(io_source, identifier: str = ""):
 Function: {io_source_name}
 Identifier: {identifier}
 Error Type: {type(e).__name__}
-Error Message: {e!s}
+Error Message: {error_message}
 
 Call Arguments:
   args: {args_str}
@@ -483,14 +493,14 @@ Full Stack Trace:
 """
 
             # Re-raise with enhanced context (no logging to avoid unsuppressible error logs)
-            raise RuntimeError(f"IO Source '{io_source_name}' failed: {e!s} with detailed error information:\n{error_msg}") from e
+            raise error_type(f"IO Source '{io_source_name}' failed: {error_message} with detailed error information:\n{error_msg}") from e
 
     return error_catching_io_source
 
 
 @functools.cache
 def _register_io_source_supports_explain_labels() -> bool:
-    """Whether ``register_io_source`` accepts ``explain_name`` / ``explain_detail`` (pola-rs/polars#23978, unreleased)."""
+    """Whether ``register_io_source`` accepts ``explain_name`` / ``explain_detail``."""
     from polars.io.plugins import register_io_source
 
     return {"explain_name", "explain_detail"} <= inspect.signature(register_io_source).parameters.keys()
@@ -510,6 +520,12 @@ def register_io_source_with_is_pure(
     Wraps `polars.io.plugins.register_io_source`, adding `is_pure=True` for
     Polars versions that support it (1.33.1+). Optionally wraps the source
     with `wrap_io_source_with_error_catching` for better diagnostics.
+
+    The collection engine decides whether pure scans are reused; ``is_pure``
+    does not guarantee a single physical execution. With error catching enabled,
+    exceptions raised during source execution surface as
+    ``polars.exceptions.ComputeError`` with diagnostic context, including
+    exceptions raised by nested adapter code.
 
     Each source execution is instrumented with OpenTelemetry: one
     ``io_source.execute[<explain_name>]`` span recording its pull latency. This
@@ -568,7 +584,7 @@ def register_io_source_with_is_pure(
             explain_detail=explain_detail,
         )
     if wrap_with_error_catching:
-        io_source = wrap_io_source_with_error_catching(io_source)
+        io_source = wrap_io_source_with_error_catching(io_source, error_type=pl.exceptions.ComputeError if POLARS_GE_2 else RuntimeError)
     return register_io_source(io_source, schema=schema, **kwargs)
 
 

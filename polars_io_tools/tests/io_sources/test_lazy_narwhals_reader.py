@@ -144,7 +144,7 @@ def test_from_narwhals_with_predicate_pushdown():
         pl.col("x").is_in([None, 1], nulls_equal=True),
         pl.col("x").is_in([1], nulls_equal=True).eq_missing(False),
         pl.col("x").is_in(None, nulls_equal=True),
-        pl.col("x").is_in(1, nulls_equal=True),
+        pl.col("x").is_in(pl.lit(1, dtype=pl.Int64), nulls_equal=True),
     ],
 )
 def test_from_narwhals_null_aware_predicate_matches_polars(predicate: pl.Expr):

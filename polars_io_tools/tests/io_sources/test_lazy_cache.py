@@ -1,4 +1,7 @@
+import os
 import pickle
+import subprocess
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -1162,7 +1165,27 @@ def test_column_granularity_false_and_true_share_cache(source, df):
     assert_frame_equal(out, df.select(["x2", "y2"]).collect())
 
 
-def test_concurrent_collections_shared_cache_do_not_race():
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_concurrent_collections_shared_cache_do_not_race(num_threads):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import faulthandler; faulthandler.dump_traceback_later(30, exit=True); "
+                "from polars_io_tools.tests.io_sources.test_lazy_cache import _collect_concurrently; "
+                "_collect_concurrently()"
+            ),
+        ],
+        env={**os.environ, "POLARS_MAX_THREADS": str(num_threads)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _collect_concurrently():
     """Concurrent collections sharing one cache must not raise or corrupt it.
 
     Barrier-synchronized threads each collect a distinct partition with
@@ -1183,6 +1206,7 @@ def test_concurrent_collections_shared_cache_do_not_race():
 
     cache: dict = {}
     n_threads = 8
+    universes = [universe.clone() for _ in range(n_threads)]
     per_thread = n_partitions // n_threads
     barrier = threading.Barrier(n_threads)
     errors: list[Exception] = []
@@ -1194,7 +1218,8 @@ def test_concurrent_collections_shared_cache_do_not_race():
             for j in range(per_thread):
                 sym = f"s{tid * per_thread + j}"
                 out = (
-                    universe.piot.cache(cache, order_by="sym", partition_cols=("sym",), column_granularity=False)
+                    universes[tid]
+                    .piot.cache(cache, order_by="sym", partition_cols=("sym",), column_granularity=False)
                     .filter(pl.col("sym") == sym)
                     .collect()
                 )
@@ -1213,3 +1238,144 @@ def test_concurrent_collections_shared_cache_do_not_race():
     combined = pl.concat([results[i] for i in range(n_partitions)]).sort("x")
     assert_frame_equal(combined, universe.collect().sort("x"))
     assert len(cache) == n_partitions * len(universe.collect_schema())
+
+
+def test_explicit_df_key_replaces_plan_identity(source, df):
+    """With ``df_key``, frames with different plans share cache entries; without it they do not."""
+    cache = {}
+    same_data_other_plan = df.select(pl.all())
+
+    df.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
+    source.reset()
+    out = same_data_other_plan.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
+    assert source.calls == []
+    assert_frame_equal(out, df.select("x2").collect().sort("x2"), check_row_order=False)
+
+    source.reset()
+    same_data_other_plan.piot.cache(cache, order_by="x").select("x2").collect()
+    assert source.calls
+
+    source.reset()
+    df.piot.cache(cache, order_by="x", df_key="frame-v2").select("x2").collect()
+    assert source.calls
+
+
+def test_explicit_df_key_still_separates_layouts(df):
+    """``order_by`` and ``partition_cols`` stay part of the key when ``df_key`` is given."""
+    cache = {}
+    df.piot.cache(cache, order_by="x", df_key="k").select("x2").collect()
+    df.piot.cache(cache, order_by=["x", "y"], df_key="k").select("x2").collect()
+    df.piot.cache(cache, order_by="x", partition_cols=("y",), df_key="k").select("x2").collect()
+    assert len({k.df_key for k in cache}) == 3
+
+
+@pytest.mark.skipif(
+    getattr(pl.Categorical(), "ordering", "lexical") != "physical",
+    reason="Physical categorical ordering is not supported by this Polars version",
+)
+@pytest.mark.parametrize("order_by", ["key", ("part", "key")])
+@pytest.mark.parametrize("partition_cols", [(), ("part",)])
+@pytest.mark.parametrize("column_granularity", [False, True])
+def test_explicit_df_key_rejects_physical_categorical_ordering(order_by, partition_cols, column_granularity):
+    frame = pl.DataFrame({"key": ["b", "a"], "part": ["p", "p"], "value": [20, 10]}).with_columns(pl.col("key").cast(pl.Categorical)).lazy()
+    cache = {}
+    with pytest.raises(ValueError, match="physical categorical"):
+        frame.piot.cache(
+            cache,
+            order_by=order_by,
+            partition_cols=partition_cols,
+            column_granularity=column_granularity,
+            validate=False,
+            df_key="same",
+        )
+    assert cache == {}
+    assert_frame_equal(frame.piot.cache(cache, order_by=order_by).collect(), frame.sort(order_by).collect())
+    assert frame.piot.cache(cache, order_by=order_by, cache_mode="ignore", df_key="same") is frame
+
+
+@pytest.mark.skipif(
+    getattr(pl.Categorical(), "ordering", "lexical") != "physical",
+    reason="Physical categorical ordering is not supported by this Polars version",
+)
+@pytest.mark.parametrize(
+    "key_expr",
+    [
+        pl.struct(pl.lit(1).alias("number"), pl.col("key").alias("category")),
+        pl.concat_list(pl.col("key")),
+        pl.concat_list(pl.col("key")).list.to_array(1),
+        pl.struct(pl.concat_list(pl.col("key")).alias("categories")),
+        pl.concat_list(pl.struct(pl.col("key").alias("category"))),
+        pl.struct(pl.concat_list(pl.col("key")).list.to_array(1).alias("categories")),
+    ],
+    ids=["struct", "list", "array", "struct-list", "list-struct", "struct-array"],
+)
+def test_explicit_df_key_rejects_nested_physical_categorical_ordering(key_expr):
+    frame = (
+        pl.DataFrame({"key": ["b", "a"], "value": [20, 10]})
+        .lazy()
+        .with_columns(pl.col("key").cast(pl.Categorical))
+        .with_columns(key_expr.alias("key"))
+    )
+    cache = {}
+    with pytest.raises(ValueError, match="physical categorical"):
+        frame.piot.cache(cache, order_by="key", validate=False, df_key="same")
+    assert cache == {}
+    assert frame.piot.cache(cache, order_by="key", cache_mode="ignore", df_key="same") is frame
+
+
+@pytest.mark.skipif(
+    getattr(pl.Categorical(), "ordering", "lexical") != "physical",
+    reason="Physical categorical ordering is not supported by this Polars version",
+)
+@pytest.mark.parametrize(
+    "key_expr",
+    [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
+    ids=["scalar", "struct", "list"],
+)
+@pytest.mark.parametrize("column_granularity", [False, True])
+@pytest.mark.parametrize("cache_mode", ["cache", "rebuild"])
+def test_explicit_df_key_rejects_materialized_physical_categorical_ordering(key_expr, column_granularity, cache_mode):
+    base = pl.DataFrame({"text": ["v3", "v1", "v2", "v0", "v5", "v4"], "value": [3, 1, 2, 0, 5, 4]}).lazy()
+    frame = pl.concat(
+        [
+            base.with_columns(key=pl.col("text").cast(pl.Categorical("lexical"))).head(3),
+            base.with_columns(key=pl.col("text").cast(pl.Categorical("physical"))).tail(3),
+        ]
+    ).with_columns(key_expr.alias("key"))
+    cache = {}
+    cached = frame.piot.cache(cache, order_by="key", df_key="same", column_granularity=column_granularity, cache_mode=cache_mode, validate=False)
+    with pytest.raises(pl.exceptions.ComputeError, match="physical categorical"):
+        cached.select("value").collect()
+    assert cache == {}
+
+
+@pytest.mark.parametrize(
+    "key_expr",
+    [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
+    ids=["scalar", "struct", "list"],
+)
+@pytest.mark.parametrize("partition_cols", [(), ("part",)])
+@pytest.mark.parametrize("column_granularity", [False, True])
+def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(key_expr, partition_cols, column_granularity):
+    dtype = pl.Categorical()
+    if getattr(dtype, "ordering", "lexical") == "physical":
+        dtype = pl.Categorical("lexical")
+    first = (
+        pl.DataFrame({"key": ["b", "a"], "part": ["p", "p"], "left": [20, 10], "right": [200, 100]})
+        .with_columns(pl.col("key").cast(dtype))
+        .with_columns(key_expr.alias("key"))
+        .sort("left")
+        .lazy()
+    )
+    second = (
+        pl.DataFrame({"key": ["a", "b"], "part": ["p", "p"], "left": [10, 20], "right": [100, 200]})
+        .with_columns(pl.col("key").cast(dtype))
+        .with_columns(key_expr.alias("key"))
+        .sort("left")
+        .lazy()
+    )
+    cache = {}
+    options = {"order_by": "key", "partition_cols": partition_cols, "column_granularity": column_granularity, "df_key": "same"}
+    first.piot.cache(cache, **options).select("left").collect()
+    out = second.piot.cache(cache, **options).select("left", "right").collect()
+    assert_frame_equal(out, pl.DataFrame({"left": [10, 20], "right": [100, 200]}))

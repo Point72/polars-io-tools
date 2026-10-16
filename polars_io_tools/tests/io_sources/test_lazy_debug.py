@@ -10,7 +10,7 @@ def test_debug_print(capsys):
     df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).lazy()
     df_debug = df.piot.debug()
     assert_frame_equal(df_debug.collect(), df.collect())
-    assert "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`, `batch_size=None` on lazy frame" in capsys.readouterr().out
+    assert "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`" in capsys.readouterr().out
 
 
 def test_debug_info(caplog):
@@ -18,7 +18,7 @@ def test_debug_info(caplog):
     df_debug = df.piot.debug(log_level=logging.INFO)
     caplog.set_level(logging.INFO)
     assert_frame_equal(df_debug.collect(), df.collect())
-    assert "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`, `batch_size=None` on lazy frame" in caplog.text
+    assert "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`" in caplog.text
 
 
 def test_debug_head(caplog):

@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -31,9 +31,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: ubuntu-latest
+          - name: ubuntu-24.04
             dist_path: dist
-            os: ubuntu-latest
+            os: ubuntu-24.04
             python: "3.11"
             target: native
           - name: ubuntu-24.04-arm
@@ -41,14 +41,14 @@ jobs:
             os: ubuntu-24.04-arm
             python: "3.11"
             target: native
-          - name: macos-latest
+          - name: macos-26
             dist_path: dist
-            os: macos-latest
+            os: macos-26
             python: "3.11"
             target: native
-          - name: windows-latest
+          - name: windows-2025
             dist_path: dist
-            os: windows-latest
+            os: windows-2025
             python: "3.11"
             target: native
           
@@ -60,12 +60,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions-ext/python/setup@ec67f82b3bd863948308a41ecb9e70547cbb19c7
+        uses: actions-ext/python/setup@c8228d827a81b9f8c808825328af361c45461ba3
         with:
           version: ${{ matrix.python }}
 
       - name: Setup Rust
-        uses: actions-ext/rust/setup@0f0b7c9ab3cdb6e9a1f79e2147974d6762ddafea
+        uses: actions-ext/rust/setup@10df15e12bbd1cc1cf48089f2e232349f98c74e7
 
       - name: Install dependencies
         run: make develop
@@ -77,7 +77,7 @@ jobs:
 
       - name: Checks
         run: make checks
-        if: matrix.name == 'ubuntu-latest'
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Build
         run: make build
@@ -102,10 +102,10 @@ jobs:
         uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3  # v2.24.0
         with:
           files: '**/junit.xml'
-        if: matrix.name == 'ubuntu-latest'
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Upload coverage
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
         if: matrix.target == 'native'
@@ -127,7 +127,7 @@ jobs:
         shell: bash
         env:
           CIBW_ARCHS_LINUX: native
-        if: matrix.name == 'ubuntu-latest'
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Build distributions (Linux ARM64)
         run: |
@@ -150,22 +150,54 @@ jobs:
         if: matrix.target == 'native' && runner.os != 'Linux'
 
       - name: Test wheel
-        uses: actions-ext/python/test-wheel@ec67f82b3bd863948308a41ecb9e70547cbb19c7
+        uses: actions-ext/python/test-wheel@c8228d827a81b9f8c808825328af361c45461ba3
         with:
           module: polars_io_tools
         if: matrix.target == 'native' && runner.os == 'Linux'
 
       - name: Test source distribution
-        uses: actions-ext/python/test-sdist@ec67f82b3bd863948308a41ecb9e70547cbb19c7
+        uses: actions-ext/python/test-sdist@c8228d827a81b9f8c808825328af361c45461ba3
         with:
           module: polars_io_tools
-        if: matrix.name == 'ubuntu-latest'
+        if: matrix.name == 'ubuntu-24.04'
 
       - name: Upload distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: dist-${{ matrix.name }}
           path: ${{ matrix.dist_path }}
+
+  test_polars:
+    name: test (Polars ${{ matrix.polars_major }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - polars_major: "1"
+            polars_spec: "polars>=1.8,<2"
+          - polars_major: "2"
+            polars_spec: "polars>=2,<3"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions-ext/python/setup@c8228d827a81b9f8c808825328af361c45461ba3
+        with:
+          version: "3.11"
+
+      - name: Setup Rust
+        uses: actions-ext/rust/setup@10df15e12bbd1cc1cf48089f2e232349f98c74e7
+
+      - name: Install dependencies
+        run: uv pip install -e '.[develop]' '${{ matrix.polars_spec }}'
+
+      - name: Test
+        run: make test-py
 
   test_clickhouse:
     name: test (clickhouse integration)
@@ -180,7 +212,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions-ext/python/setup@ec67f82b3bd863948308a41ecb9e70547cbb19c7
+        uses: actions-ext/python/setup@c8228d827a81b9f8c808825328af361c45461ba3
         with:
           version: "3.11"
 
@@ -188,7 +220,7 @@ jobs:
       - name: Download wheel
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          name: dist-ubuntu-latest
+          name: dist-ubuntu-24.04
           path: dist
 
       - name: Install wheel

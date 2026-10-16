@@ -108,8 +108,10 @@ def pushdown_pivot(
         "values": value_cols,
         "maintain_order": maintain_order,
         "separator": separator,
-        "column_naming": column_naming,
     }
+    # Polars < 1.39 has no ``column_naming`` parameter; drop this once polars>=1.39 is required
+    if column_naming != "auto":
+        pivot_kwargs["column_naming"] = column_naming
 
     # Defer all `collect_schema()` walks (the source schema, the full pivot output schema, and the per-`on`-value pivot
     # schemas used for the output→on-value mapping) until Polars actually needs them — typically when it asks for the
@@ -142,7 +144,8 @@ def pushdown_pivot(
             declared_schema=declared_schema,
             declared_cols=declared_cols,
             on_value_to_output_cols=on_value_to_output_cols,
-            output_col_set=set(output_to_on_value),
+            # Stored as a list so the pickled closure does not depend on PYTHONHASHSEED
+            output_cols=list(output_to_on_value),
         )
         return _resolved
 
@@ -157,7 +160,7 @@ def pushdown_pivot(
         declared_schema: pl.Schema = state["declared_schema"]
         declared_cols: list[str] = state["declared_cols"]
         on_value_to_output_cols: dict[Any, list[str]] = state["on_value_to_output_cols"]
-        output_col_set: set[str] = state["output_col_set"]
+        output_col_set: set[str] = set(state["output_cols"])
 
         pred_index_safe: pl.Expr | None = None
         pred_root_names: set[str] = set()

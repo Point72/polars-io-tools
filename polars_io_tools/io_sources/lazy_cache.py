@@ -10,6 +10,9 @@ from .dnf_visitor import _is_contradiction
 from .restrict_visitor import restrict_expr_to_columns
 from .util import (
     PartitionKey as _PartitionKey,
+    _exclude_row_predicate,
+    _exclusion_from_frame,
+    _repeated_grouping as _shared_repeated_grouping,
     partition_exclusion_predicate,
     partition_key as _partition_key,
     register_io_source_with_is_pure,
@@ -19,6 +22,24 @@ log = logging.getLogger(__name__)
 
 
 __all__ = ("cache",)
+
+
+def _generate_expr(row: dict, schema: pl.Schema) -> pl.Expr:
+    """Exclude one partition while retaining its legacy pickle lookup path.
+
+    Re-pickling uses this module path instead of the shared delegate's path.
+    """
+    return _exclude_row_predicate(row, schema)
+
+
+def _repeated_grouping(df: pl.DataFrame) -> pl.DataFrame:
+    """Group partition values while retaining its legacy pickle lookup path."""
+    return _shared_repeated_grouping(df)
+
+
+def _extract_filter_from_df(df: pl.DataFrame) -> pl.Expr | None:
+    """Exclude known partitions while retaining its legacy pickle lookup path."""
+    return _exclusion_from_frame(df)
 
 
 class _CacheKey(NamedTuple):
@@ -46,10 +67,36 @@ def _cache_lock() -> threading.Lock:
     return _CACHE_LOCK
 
 
-def _df_key(df: pl.LazyFrame, order_by: tuple[str, ...] = (), partition_cols: tuple[str, ...] = ()) -> str:
-    """Return a unique key for the given dataframe, ordering key and partition layout."""
-    payload = df.serialize() + repr((tuple(order_by), tuple(partition_cols))).encode()
+def _df_key(
+    df: pl.LazyFrame,
+    order_by: tuple[str, ...] = (),
+    partition_cols: tuple[str, ...] = (),
+    df_key: str | None = None,
+) -> str:
+    """Return a unique key for the given dataframe (or explicit ``df_key``), ordering key and partition layout."""
+    identity = df.serialize() if df_key is None else b"df_key:" + df_key.encode()
+    payload = identity + repr((tuple(order_by), tuple(partition_cols))).encode()
     return hashlib.md5(payload).hexdigest()
+
+
+def _contains_physical_categorical(dtype: pl.DataType) -> bool:
+    """Return whether a dtype contains a physically ordered categorical."""
+    if isinstance(dtype, pl.Categorical):
+        return getattr(dtype, "ordering", "lexical") == "physical"
+    if isinstance(dtype, (pl.List, pl.Array)):
+        return _contains_physical_categorical(dtype.inner)
+    if isinstance(dtype, pl.Struct):
+        return any(_contains_physical_categorical(field.dtype) for field in dtype.fields)
+    return False
+
+
+def _validate_explicit_key_ordering(schema: pl.Schema, order_by: tuple[str, ...]) -> None:
+    physical_categorical_cols = [col for col in order_by if col in schema and _contains_physical_categorical(schema[col])]
+    if physical_categorical_cols:
+        raise ValueError(
+            f"df_key cannot be used with physical categorical order_by columns: {physical_categorical_cols}. "
+            "Use lexical categorical ordering or a non-categorical ordering key so independently cached columns stay aligned."
+        )
 
 
 def _validate_order_by_unique(frame: pl.DataFrame, order_by: tuple[str, ...]) -> None:
@@ -79,6 +126,7 @@ def cache(
     validate: bool = True,
     log_explain: bool = False,
     description: str | None = None,
+    df_key: str | None = None,
     **kwargs,
 ) -> pl.LazyFrame:
     """
@@ -122,11 +170,20 @@ def cache(
             skip it on hot paths where uniqueness is already guaranteed.
         log_explain: If True, logs the query plan when defining the function.
         description: Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
+        df_key: Optional identity for the input LazyFrame, used in place of its serialized plan. The
+            caller is responsible for choosing a value that changes whenever the frame's contents would.
+            ``order_by`` and ``partition_cols`` are still folded into the cache key.
+            Physical categoricals in ``order_by``, including nested ones, are rejected because their code
+            order can differ across frames. Use lexical categorical ordering or a non-categorical ordering key instead.
+            Both planned and materialized dtypes are checked; an invalid materialized ordering raises at collect time.
         **kwargs: Arguments to pass to the collect() method of the input data frame (i.e. to use a different engine)
 
     Notes:
-        - The cache key is formed based on a serialized version of the input LazyFrame, the column name and the partitions.
+        - By default, the cache key is formed based on a serialized version of the input LazyFrame, the column name and the partitions.
           It means that if a persistent cache implementation is provided, the cache can remain valid between sessions.
+          The serialized plan of a frame built from Python IO sources includes pickled closures, which embed
+          source file paths, so it can differ across environments or library versions. Pass ``df_key`` when the
+          cache must be shared across such boundaries.
         - The cache will be invalidated if the input LazyFrame is changed in any way (i.e. by adding a new column, or changing the underlying data source).
           It also means that the act of generating the column_cache will change the key for downstream caches,
           i.e. `df.piot.cache(order_by="id").select(expr_1).piot.cache(order_by="id")` will have a different cache from `df.select(expr_1).piot.cache(order_by="id")`,
@@ -187,13 +244,17 @@ def cache(
     if missing:
         raise ValueError(f"order_by columns not found in frame schema: {missing}")
 
+    explicit_df_key = df_key is not None
+    if explicit_df_key:
+        _validate_explicit_key_ordering(schema, order_by)
+
     # Generate the schema of the partition columns, as we'll need to apply the partition predicate to a frame with this schema
     partition_schema = {p_col: schema[p_col] for p_col in partition_cols}
 
     # Create a key for the dataframe as part of the cache keys. The ordering key and partition
     # layout are folded in so that caches built with a different order_by or different
     # partition_cols never collide.
-    df_key = _df_key(self, order_by, partition_cols)
+    df_key = _df_key(self, order_by, partition_cols, df_key)
     if log_explain:
         log.debug(str(self.explain()))
 
@@ -352,6 +413,10 @@ def cache(
                 raise RuntimeError(err_msg) from e
         else:
             collected_frames = []
+
+        if explicit_df_key:
+            for frame in collected_frames:
+                _validate_explicit_key_ordering(frame.schema, order_by)
 
         # Publish under the lock so a partition's columns appear to other collections together.
         with _cache_lock():
