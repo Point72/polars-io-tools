@@ -14,8 +14,8 @@ POLARS_HAS_COLLECT_BATCHES = version.parse(pl.__version__) >= version.parse("1.3
 # Polars 1.38.0 unified the partition interface
 POLARS_HAS_PARTITION_BY = version.parse(pl.__version__) >= version.parse("1.38.0")
 
-# engine="streaming" only runs register_io_source/PythonScan sources from Polars 1.26.0;
-# 1.25.x lowers IR::PythonScan to todo!() and panics, and 1.24 and earlier predate the value.
-POLARS_STREAMING_SUPPORTS_IO_PLUGIN = version.parse(pl.__version__) >= version.parse("1.26.0")
+# Nested streaming IO-source collection is enabled only on verified runtimes.
+# Earlier streaming engines can deadlock when nested caches share a small worker pool.
+POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN = version.parse(pl.__version__) >= version.parse("1.43.2")
 
 __all__ = ()
