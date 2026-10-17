@@ -26,17 +26,62 @@ from polars_io_tools.io_sources.util import register_io_source_with_is_pure
 _TIMEOUT_S = 60
 
 
-def _run_in_subprocess(script: str) -> subprocess.CompletedProcess:
+def _run_in_subprocess(script: str, *, threads: int = 1) -> subprocess.CompletedProcess:
     # Inherit the parent env so the subprocess finds libpython, the venv,
     # PYTHONPATH, etc. (we only need to override POLARS_MAX_THREADS).
-    env = {**os.environ, "POLARS_MAX_THREADS": "1"}
+    env = {**os.environ, "POLARS_MAX_THREADS": str(threads)}
     return subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-P", "-c", script],
         env=env,
         capture_output=True,
         text=True,
         timeout=_TIMEOUT_S,
     )
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+@pytest.mark.parametrize("scenario", ["join", "fanout"])
+def test_nested_memory_cache_build_does_not_deadlock(threads, scenario):
+    script = textwrap.dedent(
+        f"""
+        import os
+        os.environ["POLARS_ENGINE_AFFINITY"] = "in-memory"
+
+        import faulthandler
+        import polars as pl
+        from polars_io_tools.io_sources import cache_memory
+
+        faulthandler.dump_traceback_later(30, exit=True)
+        frame = pl.LazyFrame({{"id": [1, 2, 3], "value": [10, 20, 30]}})
+        schema = frame.collect_schema()
+        builds = [0, 0]
+
+        def build_inner():
+            builds[0] += 1
+            return frame
+
+        inner = cache_memory(build_inner, schema=schema)
+
+        def build_outer():
+            builds[1] += 1
+            return inner
+
+        outer = cache_memory(build_outer, schema=schema)
+        if {scenario!r} == "join":
+            result = outer.join(inner, on="id").filter(pl.col("id") > 1).collect()
+            assert result["id"].sort().to_list() == [2, 3], result
+        else:
+            results = pl.collect_all([outer.filter(pl.col("id") == 1), outer.filter(pl.col("id") == 2), inner.filter(pl.col("id") == 3)])
+            assert [result["id"].to_list() for result in results] == [[1], [2], [3]], results
+        assert outer.collect()["value"].to_list() == [10, 20, 30]
+        assert builds == [1, 1], builds
+        faulthandler.cancel_dump_traceback_later()
+        print("OK")
+        """
+    )
+    result = _run_in_subprocess(script, threads=threads)
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert "OK" in result.stdout
 
 
 @pytest.mark.parametrize(
