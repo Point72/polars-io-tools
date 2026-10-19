@@ -1972,25 +1972,25 @@ class TestHelperFunctions:
     """Tests for cache planning and file-writing helpers."""
 
     @pytest.mark.parametrize(
-        ("expected_days", "existing", "remaining_days"),
+        ("expected_days", "existing_days", "remaining_days"),
         [
-            ([1, 2], set(), [1, 2]),
-            ([1, 2, 3], {"2024-01-01", "2024-01-03"}, [2]),
-            ([1, 2], {"2024-01-01", "2024-01-02"}, []),
+            ([1, 2], [], [1, 2]),
+            ([1, 2, 3], [1, 3], [2]),
+            ([1, 2], [1, 2], []),
         ],
         ids=["empty_existing", "some_existing", "all_existing"],
     )
-    def test_compute_partitions_to_write(self, expected_days, existing, remaining_days):
+    def test_compute_partitions_to_write(self, expected_days, existing_days, remaining_days):
         from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
 
         expected = pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in expected_days]})
         part_info = PartitionInfo(
             enumerability=Enumerability.FINITE,
             expected_parts_df=expected,
-            existing_parts_df=pl.DataFrame(),
+            existing_parts_df=pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in existing_days]}, schema=expected.schema),
             join_cols=["date"],
         )
-        result = _compute_partitions_to_write(part_info, existing, "date", "%Y-%m-%d")
+        result = _compute_partitions_to_write(part_info)
         remaining = pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in remaining_days]}, schema=expected.schema)
         assert_frame_equal(result, remaining)
 
@@ -1998,14 +1998,13 @@ class TestHelperFunctions:
         from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
 
         expected = pl.DataFrame({"val": [1]})
-        existing = {"data"}
         part_info = PartitionInfo(
             enumerability=Enumerability.FINITE,
             expected_parts_df=expected,
-            existing_parts_df=pl.DataFrame(),
+            existing_parts_df=pl.DataFrame({"val": [1]}),
             join_cols=[],
         )
-        result = _compute_partitions_to_write(part_info, existing, "date", "%Y-%m-%d")
+        result = _compute_partitions_to_write(part_info)
         assert_frame_equal(result, expected)
 
     def test_write_empty_parquet_files_sequentially(self, tmp_path):

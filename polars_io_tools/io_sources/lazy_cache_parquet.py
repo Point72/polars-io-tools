@@ -1230,17 +1230,15 @@ def _build_read_plan(
     return ReadPlan(use_paths=use_paths)
 
 
-def _compute_partitions_to_write(part_info: PartitionInfo, existing_keys: set[str], date_column: str | None, date_fmt: str | None) -> pl.DataFrame:
+def _compute_partitions_to_write(part_info: PartitionInfo) -> pl.DataFrame:
     """Expected partitions whose cache file is not already present.
 
     Rows with an unconstrained (null) partition value are always kept.
     """
     expected = part_info.expected_parts_df
-    if not existing_keys or not part_info.join_cols or expected.is_empty():
-        return expected
     existing = part_info.existing_parts_df
-    if existing.is_empty():
-        existing = _construct_partitions_df_from_existing(existing_keys, expected.schema, part_info.join_cols, date_fmt, date_column)
+    if existing.is_empty() or not part_info.join_cols or expected.is_empty():
+        return expected
     known = existing.select(part_info.join_cols).cast(expected.schema)
     return expected.join(known, on=part_info.join_cols, how="anti")
 
@@ -1554,7 +1552,6 @@ def _missing_empty_keys(
     write_plan: WritePlan,
     cache_mode: CacheMode,
     written: set[str],
-    existing: set[str],
     extra_cols: list[str],
     date_column: str | None,
     date_fmt: str | None,
@@ -2024,7 +2021,7 @@ def cache_parquet(
 
                 is_finite = part_info.enumerability == Enumerability.FINITE
                 if is_finite and plan_mode != CacheMode.REBUILD:
-                    partitions_to_write_df = _compute_partitions_to_write(part_info, plan_parts, date_column, partition_format)
+                    partitions_to_write_df = _compute_partitions_to_write(part_info)
                 else:
                     partitions_to_write_df = part_info.expected_parts_df
                 fetch_upstream = write_plan.should_write and not (is_finite and partitions_to_write_df.is_empty())
@@ -2113,7 +2110,7 @@ def cache_parquet(
                     else None
                 )
                 missing = _missing_empty_keys(
-                    part_info, write_plan, cache_mode, written_logical_parts, plan_parts, _extra_cols, date_column, partition_format, key_scope
+                    part_info, write_plan, cache_mode, written_logical_parts, _extra_cols, date_column, partition_format, key_scope
                 )
                 empty_keys = {key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys)) for key in missing}
                 # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
