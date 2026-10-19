@@ -1803,30 +1803,10 @@ def test_no_date_with_extra_cols_unconstrained_queries_upstream(tmp_path, capsys
     assert "predicate=" in second, "UNCONSTRAINED with partition cols should query upstream"
 
 
-def test_strftime_from_template_and_build_scan_paths(tmp_path):
-    import polars as pl
+def test_strftime_from_template():
+    from polars_io_tools.io_sources.lazy_cache_parquet import _strftime_from_template
 
-    from polars_io_tools.io_sources.lazy_cache_parquet import _build_scan_paths, _strftime_from_template
-
-    tmpl = "theYear=$year/theMonth=$month/theDay=$day"
-    fmt = _strftime_from_template(tmpl)
-    assert fmt == "theYear=%Y/theMonth=%m/theDay=%d"
-
-    parts = pl.DataFrame({"region": ["US", "EU"], "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2)]})
-    time_dir = str(tmp_path / "daily")
-    # Custom template should be honored
-    paths = _build_scan_paths(parts, time_dir, tmpl, "daily", "date", ["region"])
-    assert paths == [
-        f"{time_dir}/EU/theYear=2024/theMonth=06/theDay=02.parquet",
-        f"{time_dir}/US/theYear=2024/theMonth=06/theDay=01.parquet",
-    ]
-
-    # Default template should fall back to YYYY-MM-DD
-    paths_default = _build_scan_paths(parts, time_dir, None, "daily", "date", ["region"])
-    assert paths_default == [
-        f"{time_dir}/EU/2024-06-02.parquet",
-        f"{time_dir}/US/2024-06-01.parquet",
-    ]
+    assert _strftime_from_template("theYear=$year/theMonth=$month/theDay=$day") == "theYear=%Y/theMonth=%m/theDay=%d"
 
 
 def test_no_date_no_extra_first_writes_second_reads_cache(tmp_path, capsys):
@@ -2038,18 +2018,16 @@ class TestHelperFunctions:
         part_info = PartitionInfo(
             enumerability=Enumerability.FINITE,
             expected_parts_df=pl.DataFrame({"date": dates}),
-            existing_parts_df=pl.DataFrame({"date": dates}),
+            existing_parts_df=pl.DataFrame({"date": dates, "file": [str(d) for d in dates]}),
             join_cols=["date"],
         )
 
         read_plan = _build_read_plan(
             partition_info=part_info,
-            date_column="date",
             predicate=pl.col("date") >= dates[0],
             time_unit_dir="file:///tmp/cache/daily",
-            template_for_metadata=None,
-            effective_time_unit="daily",
             has_cached_files=True,
+            file_key_column="file",
         )
 
         assert read_plan.use_paths is None

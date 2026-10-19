@@ -325,36 +325,6 @@ def _cache_file_uri(time_unit_dir: str, key: str) -> str:
     return f"{time_unit_dir}/{path}.parquet"
 
 
-def _build_scan_paths(
-    parts_df: pl.DataFrame,
-    time_unit_dir: str,
-    template_for_metadata: str | None,
-    effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
-    date_column: str | None,
-    extra_cols: list[str],
-) -> list[str]:
-    """Build explicit cache file paths from an expected partitions DataFrame.
-
-    - Returns [] if `parts_df` is empty or any join column has None (cannot enumerate).
-    - Sorts rows by join columns for deterministic order.
-    - Uses custom template or default format to render date strings.
-    """
-    if parts_df.is_empty():
-        return []
-
-    join_cols = extra_cols + ([date_column] if date_column else [])
-
-    if _has_null_keys(parts_df, join_cols):
-        return []
-
-    date_fmt = None
-    if date_column:
-        date_fmt = _strftime_from_template(template_for_metadata or _PARTITION_FORMATS[effective_time_unit]["default"])
-
-    keys = _partition_keys(parts_df, extra_cols, date_column, date_fmt)
-    return [_cache_file_uri(time_unit_dir, key) for key in sorted(keys.unique())]
-
-
 def _build_not_existing_partitions_pred(
     existing_parts_df: pl.DataFrame,
     join_cols: list[str],
@@ -1188,17 +1158,13 @@ def _get_fs_path_directory_info(
 def _build_read_plan(
     *,
     partition_info: PartitionInfo,
-    date_column: str | None,
     predicate: pl.Expr | None,
     time_unit_dir: str,
-    template_for_metadata: str | None,
-    effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
     has_cached_files: bool,
-    file_key_column: str | None = None,
+    file_key_column: str,
 ) -> ReadPlan:
     """Choose explicit paths for finite queries, or a glob for wildcard queries."""
     join_cols = partition_info.join_cols
-    extra_cols = [c for c in join_cols if c != (date_column or "")]
 
     # Globbing an empty cache raises "expanded paths were empty".
     if not has_cached_files:
@@ -1214,12 +1180,9 @@ def _build_read_plan(
     if _has_null_keys(expected_df, join_cols) or predicate is None:
         return ReadPlan(use_paths=None)
 
-    if file_key_column:
-        known = partition_info.existing_parts_df.select([*join_cols, file_key_column]).cast(expected_df.schema)
-        matches = expected_df.join(known, on=join_cols, how="inner")
-        use_paths = [_cache_file_uri(time_unit_dir, key) for key in sorted(matches[file_key_column].unique())]
-    else:
-        use_paths = _build_scan_paths(expected_df, time_unit_dir, template_for_metadata, effective_time_unit, date_column, extra_cols)
+    known = partition_info.existing_parts_df.select([*join_cols, file_key_column]).cast(expected_df.schema)
+    matches = expected_df.join(known, on=join_cols, how="inner")
+    use_paths = [_cache_file_uri(time_unit_dir, key) for key in sorted(matches[file_key_column].unique())]
     if len(use_paths) > _MAX_ENUMERATED_SCAN_PATHS:
         log.debug(
             "Cache scan has %d enumerated path(s), exceeding limit %d; using glob",
@@ -2155,11 +2118,8 @@ def cache_parquet(
 
         read_plan = _build_read_plan(
             partition_info=part_info,
-            date_column=date_column,
             predicate=predicate,
             time_unit_dir=time_unit_dir,
-            template_for_metadata=template_for_metadata,
-            effective_time_unit=effective_time_unit,
             has_cached_files=bool(existing_parts),
             file_key_column=file_key_column,
         )
