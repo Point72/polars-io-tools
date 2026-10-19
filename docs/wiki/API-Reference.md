@@ -52,9 +52,10 @@ caches require rebuilding.
 ```python
 lf.piot.cache_parquet(cache_path, date_column=None, *, time_unit="monthly",
                       partition_format=None, cache_mode=CacheMode.CACHE, ttl=None,
-                      final_after=None, lock=None, aws_profile=None,
-                      write_kwargs=None, read_kwargs=None, extra_partition_cols=None,
-                      schema=None, write_bounding_columns=None)
+                      final_after=None, lock=None, file_visitor=None,
+                      aws_profile=None, write_kwargs=None, read_kwargs=None,
+                      extra_partition_cols=None, schema=None,
+                      write_bounding_columns=None)
 ```
 
 Cache the LazyFrame to date-partitioned Parquet files on local disk or S3. Queries read
@@ -85,6 +86,13 @@ write take the lock: under `CacheMode.CACHE` when partitions are missing or expi
 the partitions cannot be enumerated, as for a query without date bounds; under
 `CacheMode.REBUILD` always. A process checks the cache again once it holds the lock, so it reads
 partitions that another process just wrote instead of fetching them again.
+
+`file_visitor` is called with the path of each cache file after it is written, as a local
+path or an `s3://` URI. Use it to set permissions or a group on new files, for example
+`lambda p: os.chmod(p, 0o664)` on a local cache. Directories are not visited. It runs
+inside `lock`, and an exception it raises propagates without undoing the write. Each file
+is visited once per write, so a file left unvisited by such an exception is visited only
+when a later query rewrites it.
 
 ### `cache_memory`
 
