@@ -452,8 +452,9 @@ def test_rebuild_removes_stale_null_partition(tmp_path, null_column):
             pl.Datetime("us"),
             ["2020-01-01 12:00:00.000000", "2020-01-02 00:00:00.000500"],
         ),
+        ([True, None], pl.Boolean, ["true", "null"]),
     ],
-    ids=["boolean", "datetime"],
+    ids=["boolean", "datetime", "null"],
 )
 @pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.REBUILD])
 def test_old_partition_key_spellings_are_reused(tmp_path, values, dtype, old_keys, cache_mode):
