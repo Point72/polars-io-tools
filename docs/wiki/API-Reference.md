@@ -51,7 +51,8 @@ caches require rebuilding.
 
 ```python
 lf.piot.cache_parquet(cache_path, date_column=None, *, time_unit="monthly",
-                      partition_format=None, cache_mode=CacheMode.CACHE, aws_profile=None,
+                      partition_format=None, cache_mode=CacheMode.CACHE, ttl=None,
+                      final_after=None, aws_profile=None,
                       write_kwargs=None, read_kwargs=None, extra_partition_cols=None,
                       schema=None, write_bounding_columns=None)
 ```
@@ -65,6 +66,14 @@ With `cache_mode=CacheMode.READ_ONLY`, missing partitions are fetched upstream a
 returned alongside the cached rows without being written. With
 `cache_mode=CacheMode.CACHE_ONLY`, only cached rows are returned and upstream is never
 queried; a callable source then needs `schema` if the cache is empty.
+
+By default a cached partition is never refetched. `ttl` (a `timedelta`, or a callable
+`(written_at, period_end, now) -> bool`) refetches files written at least that long ago,
+and `final_after` stops refetching a partition once its file was written that long after
+the period ended. For example, `ttl=timedelta(hours=1), final_after=timedelta(days=3)`
+with monthly partitions refreshes the current month hourly until a rewrite at least three
+days after the month ends. Expiry uses file modification times, so it needs no catalog. A
+process reading a file while another refreshes it can fail with a Parquet error.
 
 ### `cache_memory`
 

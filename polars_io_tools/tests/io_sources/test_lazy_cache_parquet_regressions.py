@@ -626,3 +626,25 @@ def test_windows_partition_file_keys_round_trip_on_any_platform(tmp_path, monkey
     assert_frame_equal(out, expected)
     assert sorted(tmp_path.rglob("*.parquet")) == sorted(snapshot)
     assert _rewritten(snapshot) == []
+
+
+def test_or_with_one_sided_date_clause_reads_every_cached_match(tmp_path):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 2, 10), D(2024, 3, 10)], "value": [1, 2, 3]})
+    cache_parquet(src, tmp_path, "date").collect()
+    predicate = (pl.col("date") == D(2024, 3, 10)) | (pl.col("date") < D(2024, 2, 15))
+    assert sorted(cache_parquet(src, tmp_path, "date").filter(predicate).collect()["value"]) == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("date") >= D(2024, 1, 1),
+        pl.col("sym").is_in(["A"]) | (pl.col("date") < D(2024, 1, 20)),
+        pl.col("date").is_null() | (pl.col("date") < D(2024, 3, 1)),
+    ],
+)
+def test_rebuild_unbounded_query_drops_rows_upstream_no_longer_has(tmp_path, predicate):
+    old = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 2, 10), None], "sym": ["A", None, "A"], "value": [1, 1, 1]})
+    cache_parquet(old, tmp_path, "date", extra_partition_cols="sym").collect()
+    out = cache_parquet(old.clear(), tmp_path, "date", extra_partition_cols="sym", cache_mode=CacheMode.REBUILD).filter(predicate).collect()
+    assert out.is_empty()
