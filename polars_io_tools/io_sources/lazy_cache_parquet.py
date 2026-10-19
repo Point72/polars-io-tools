@@ -1423,8 +1423,7 @@ def _sink_cache_partitions(
     storage_options: dict,
     credential_provider: pl.CredentialProviderAWS | None,
     write_kwargs: dict,
-    key_aliases: dict[str, str],
-    encode_file_keys: bool,
+    physical_key: Callable[[str], str],
     fs: "pa_fs.FileSystem",
     fs_path_prefix: str,
 ) -> tuple[set[str], set[str]]:
@@ -1453,7 +1452,7 @@ def _sink_cache_partitions(
         else:
             values = [unquote(k.str_value) for k in ctx.keys]
         logical_key = "/".join(values)
-        key = key_aliases.get(logical_key, _encode_partition_file_key(logical_key, encode_file_keys))
+        key = physical_key(logical_key)
         if key in written:
             raise reopened(logical_key)
         written_logical.add(logical_key)
@@ -2037,6 +2036,11 @@ def cache_parquet(
                         null_key_token="None" if POLARS_HAS_PARTITION_BY else "null",
                     )
                     key_aliases = dict(zip(logical_keys, existing_parts_df[file_key_column]))
+
+                # Existing files keep their names on rewrite, including legacy null tokens and older spellings.
+                def physical_key(logical_key: str) -> str:
+                    return key_aliases.get(logical_key, _encode_partition_file_key(logical_key, windows_file_keys))
+
                 written_parts, written_logical_parts = _sink_cache_partitions(
                     upstream_lf,
                     time_unit_dir,
@@ -2046,8 +2050,7 @@ def cache_parquet(
                     polars_opts,
                     credential_provider,
                     write_kwargs,
-                    key_aliases,
-                    windows_file_keys,
+                    physical_key,
                     fs,
                     fs_path_prefix,
                 )
@@ -2075,7 +2078,7 @@ def cache_parquet(
                 missing = _missing_empty_keys(
                     part_info, write_plan, cache_mode, written_logical_parts, _extra_cols, date_column, partition_format, key_scope
                 )
-                empty_keys = {key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys)) for key in missing}
+                empty_keys = {physical_key(key) for key in missing}
                 # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
                 emptied_expired = refresh_keys - written_parts
                 if emptied_expired:
