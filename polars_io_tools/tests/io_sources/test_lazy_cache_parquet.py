@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
+from polars.exceptions import ComputeError, PanicException
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
@@ -3705,3 +3706,99 @@ def test_refresh_null_partition_listed_in_is_in(tmp_path, set_now):
     predicate = pl.col("sym").is_in(["A", None], nulls_equal=True) & (pl.col("date") < D(2026, 2, 1))
     out = cache_parquet(source.with_columns(value=pl.lit(2, pl.Int64)), tmp_path, "date", **kwargs).filter(predicate).collect()
     assert out["value"].to_list() == [2, 2]
+
+
+@pytest.mark.parametrize("error", [ComputeError("parquet: File out of specification"), OSError("range invalid"), PanicException("panicked")])
+def test_cache_read_retries_once_after_failure(tmp_path, monkeypatch, caplog, error):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    real = lazy_cache_parquet.collect_lf_in_io_source
+    calls = []
+
+    def flaky(lf, batch_size):
+        calls.append(batch_size)
+        if len(calls) == 1:
+            raise error
+        return real(lf, batch_size)
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", flaky)
+    assert cache_parquet(source, tmp_path, "date").collect().height == 30
+    assert len(calls) == 2
+    assert any("attempt 1/2" in r.getMessage() for r in caplog.records)
+
+
+def test_cache_read_retry_sees_replaced_file(tmp_path, monkeypatch):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    path = tmp_path / "monthly" / "2026-09.parquet"
+    real = lazy_cache_parquet.collect_lf_in_io_source
+    calls = []
+
+    def replaced_mid_read(lf, batch_size):
+        calls.append(lf)
+        if len(calls) == 1:
+            list(real(lf, batch_size))
+            source.with_columns(value=pl.lit(2, pl.Int64)).collect().write_parquet(path.with_suffix(".tmp"), compression="uncompressed")
+            os.replace(path.with_suffix(".tmp"), path)
+            raise ComputeError("parquet: File out of specification")
+        return real(lf, batch_size)
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", replaced_mid_read)
+    assert cache_parquet(source, tmp_path, "date").collect()["value"].unique().to_list() == [2]
+
+
+@pytest.mark.parametrize(("retries", "attempts"), [(None, 2), ("0", 1), ("3", 4), ("bad", 2)])
+def test_cache_read_raises_after_retries(tmp_path, monkeypatch, retries, attempts):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    calls = []
+
+    def broken(lf, batch_size):
+        calls.append(batch_size)
+        raise OSError("still broken")
+
+    if retries is not None:
+        monkeypatch.setenv("POLARS_IO_TOOLS_CACHE_READ_RETRIES", retries)
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", broken)
+    with pytest.raises(Exception, match="still broken"):
+        cache_parquet(source, tmp_path, "date").collect()
+    assert len(calls) == attempts
+
+
+def test_cache_read_not_retried_after_rows_returned(tmp_path, monkeypatch):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    real = lazy_cache_parquet.collect_lf_in_io_source
+    calls = []
+
+    def fails_after_first_batch(lf, batch_size):
+        calls.append(batch_size)
+        yield next(iter(real(lf, batch_size)))
+        raise OSError("broken mid-read")
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", fails_after_first_batch)
+    with pytest.raises(Exception, match="broken mid-read"):
+        cache_parquet(source, tmp_path, "date").collect()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(("case", "attempts"), [("cached", 2), ("missing", 1), ("expired", 1)])
+def test_read_only_retries_only_cache_reads(tmp_path, monkeypatch, set_now, caplog, case, attempts):
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 11, 1))
+    cache_parquet(_source(D(2026, 9, 30) if case == "missing" else D(2026, 10, 31)), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 11, 1))
+    if case == "expired":
+        _set_mtime(tmp_path, T(2026, 10, 1), "monthly/2026-10.parquet")
+    calls = []
+
+    def broken(lf, batch_size):
+        calls.append(batch_size)
+        raise OSError("still broken")
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", broken)
+    lf = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", cache_mode=CacheMode.READ_ONLY, **kwargs)
+    with pytest.raises(Exception, match="still broken"):
+        lf.filter(pl.col("date").is_between(START, D(2026, 10, 31))).collect()
+    assert len(calls) == attempts
+    assert any("attempt 1/2" in r.getMessage() for r in caplog.records) == (attempts == 2)

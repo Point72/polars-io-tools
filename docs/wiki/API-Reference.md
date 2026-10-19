@@ -73,7 +73,9 @@ and `final_after` stops refetching a partition once its file was written that lo
 the period ended. For example, `ttl=timedelta(hours=1), final_after=timedelta(days=3)`
 with monthly partitions refreshes the current month hourly until a rewrite at least three
 days after the month ends. Expiry uses file modification times, so it needs no catalog. A
-process reading a file while another refreshes it can fail with a Parquet error.
+cache read that fails before returning any rows, for example because another process
+refreshed a file mid-read, is retried `POLARS_IO_TOOLS_CACHE_READ_RETRIES` times (default 1),
+unless the read also queries upstream.
 
 ### `cache_memory`
 

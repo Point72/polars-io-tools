@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 import polars as pl
 import portion
-from polars.exceptions import ComputeError
+from polars.exceptions import ComputeError, PanicException
 from portion import Interval
 from pydantic import GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
@@ -84,6 +84,13 @@ def _max_open_sinks() -> int:
         return int(os.environ.get("POLARS_MAX_OPEN_SINKS", _DEFAULT_MAX_OPEN_SINKS))
     except ValueError:
         return _DEFAULT_MAX_OPEN_SINKS
+
+
+def _cache_read_retries() -> int:
+    try:
+        return max(0, int(os.environ.get("POLARS_IO_TOOLS_CACHE_READ_RETRIES", "1")))
+    except ValueError:
+        return 1
 
 
 def _storage_kwargs(storage_options: dict | None, credential_provider: pl.CredentialProviderAWS | None) -> dict:
@@ -1261,17 +1268,37 @@ def _build_final_scan(
 
 
 def _collect_cache_scan(
-    scan: pl.LazyFrame,
+    make_scan: Callable[[], pl.LazyFrame],
     schema: pl.Schema,
     with_columns: list[str] | None,
     batch_size: int | None,
     time_unit_dir: str,
+    retry: bool = True,
 ) -> Iterator[pl.DataFrame]:
-    """Collect a cache scan, handling predicates that eliminate every row group."""
+    """Collect a cache scan, handling predicates that eliminate every row group.
+
+    Set ``retry`` to False when the scan includes an upstream query, which a retry would run again.
+    """
     log.debug("Start: Loading data from cache at %s", time_unit_dir)
     start = time.time()
+    scan = make_scan()
     try:
-        yield from collect_lf_in_io_source(scan, batch_size)
+        # A concurrent refresh can replace a file mid-read. A read that fails before yielding any rows is retried with a new scan,
+        # since a scan keeps the Parquet metadata it has already read.
+        attempts = 1 + _cache_read_retries() if retry else 1
+        for attempt in range(attempts):
+            if attempt:
+                scan = make_scan()
+            yielded = False
+            try:
+                for batch in collect_lf_in_io_source(scan, batch_size):
+                    yielded = True
+                    yield batch
+                return
+            except (ComputeError, OSError, PanicException) as e:
+                if yielded or attempt + 1 == attempts or "expected at least 1 source" in str(e):
+                    raise
+                log.warning("Cache read failed (attempt %d/%d), retrying; a concurrent refresh can cause this: %s", attempt + 1, attempts, e)
     except Exception as e:
         if isinstance(e, ComputeError) and "expected at least 1 source" in str(e):
             log.debug("Predicate eliminated all row groups - returning empty dataframe with schema %s", schema)
@@ -1694,8 +1721,9 @@ def cache_parquet(
             syncing a cache may reset. A callable ``ttl(written_at, period_end, now) -> bool`` replaces the built-in
             policy and returns True for an expired file. Its arguments are timezone-aware UTC datetimes, and
             ``period_end`` is the exclusive end of the file's date partition, or None without one. The callable must
-            depend only on its arguments. A process reading a file while another process refreshes it can fail with a
-            Parquet error.
+            depend only on its arguments. A read that fails before returning any rows, for example because another
+            process refreshed a file mid-read, is retried ``POLARS_IO_TOOLS_CACHE_READ_RETRIES`` times (default 1),
+            unless the read also queries upstream.
         final_after (timedelta, optional): Never expire a partition once its file was written at least this long after
             the partition's period ended (local midnight for timezone-aware columns, UTC midnight otherwise). ``ttl``
             then applies only to the remaining partitions; without ``ttl`` they are refetched on every query. Requires
@@ -2101,13 +2129,14 @@ def cache_parquet(
         scan_kwargs = _storage_kwargs(polars_opts, credential_provider)
         scan_kwargs.update(read_kwargs)
 
-        cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
-        if no_write and upstream_lf is not None:
-            cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
-            if "n_rows" in read_kwargs:
-                cache_scan = cache_scan.head(read_kwargs["n_rows"])
-        scan = _build_final_scan(cache_scan, predicate, with_columns, n_rows)
+        def make_scan() -> pl.LazyFrame:
+            cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
+            if no_write and upstream_lf is not None:
+                cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
+                if "n_rows" in read_kwargs:
+                    cache_scan = cache_scan.head(read_kwargs["n_rows"])
+            return _build_final_scan(cache_scan, predicate, with_columns, n_rows)
 
-        yield from _collect_cache_scan(scan, schema, with_columns, batch_size, time_unit_dir)
+        yield from _collect_cache_scan(make_scan, schema, with_columns, batch_size, time_unit_dir, retry=not (no_write and upstream_lf is not None))
 
     return register_io_source_with_is_pure(io_source=source_generator, schema=schema, validate_schema=False, explain_detail=description)
