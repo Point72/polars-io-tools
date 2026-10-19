@@ -52,7 +52,7 @@ caches require rebuilding.
 ```python
 lf.piot.cache_parquet(cache_path, date_column=None, *, time_unit="monthly",
                       partition_format=None, cache_mode=CacheMode.CACHE, ttl=None,
-                      final_after=None, aws_profile=None,
+                      final_after=None, lock=None, aws_profile=None,
                       write_kwargs=None, read_kwargs=None, extra_partition_cols=None,
                       schema=None, write_bounding_columns=None)
 ```
@@ -76,6 +76,15 @@ days after the month ends. Expiry uses file modification times, so it needs no c
 cache read that fails before returning any rows, for example because another process
 refreshed a file mid-read, is retried `POLARS_IO_TOOLS_CACHE_READ_RETRIES` times (default 1),
 unless the read also queries upstream.
+
+When several processes write to the same cache, pass `lock`, a callable that takes the
+cache directory and returns a context manager, such as
+`lambda d: filelock.SoftFileLock(d + ".lock")` on a shared file system. The lock needs a
+path of its own, since the callable receives the directory itself. Only queries that may
+write take the lock: under `CacheMode.CACHE` when partitions are missing or expired, or when
+the partitions cannot be enumerated, as for a query without date bounds; under
+`CacheMode.REBUILD` always. A process checks the cache again once it holds the lock, so it reads
+partitions that another process just wrote instead of fetching them again.
 
 ### `cache_memory`
 

@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import os
 import pickle
@@ -3802,3 +3803,71 @@ def test_read_only_retries_only_cache_reads(tmp_path, monkeypatch, set_now, capl
         lf.filter(pl.col("date").is_between(START, D(2026, 10, 31))).collect()
     assert len(calls) == attempts
     assert any("attempt 1/2" in r.getMessage() for r in caplog.records) == (attempts == 2)
+
+
+def test_lock_taken_only_for_writes(tmp_path):
+    names = []
+
+    @contextlib.contextmanager
+    def lock(name):
+        names.append(name)
+        yield
+
+    predicate = pl.col("date").is_between(START, D(2026, 9, 30))
+    for mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY, CacheMode.CACHE, CacheMode.CACHE):
+        cache_parquet(_source(D(2026, 9, 30)), tmp_path, "date", cache_mode=mode, lock=lock).filter(predicate).collect()
+    assert names == [str((tmp_path / "monthly").resolve())]
+
+
+def test_lock_plans_again_once_held(tmp_path):
+    source = _source(D(2026, 9, 30))
+
+    @contextlib.contextmanager
+    def lock(name):
+        # Another process fills the cache while this one waits for the lock.
+        cache_parquet(source.with_columns(value=pl.lit(2, pl.Int64)), tmp_path, "date").collect()
+        yield
+
+    predicate = pl.col("date").is_between(START, D(2026, 9, 30))
+    out = cache_parquet(source, tmp_path, "date", lock=lock).filter(predicate).collect()
+    assert out["value"].unique().to_list() == [2]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_lock_held_only_while_writing(tmp_path, monkeypatch, fail):
+    held = False
+    seen = []
+
+    @contextlib.contextmanager
+    def lock(name):
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    real_sink = pl.LazyFrame.sink_parquet
+    real_collect = lazy_cache_parquet.collect_lf_in_io_source
+
+    def sink(self, target, **kwargs):
+        seen.append(("write", held))
+        if fail:
+            raise RuntimeError("sink failed")
+        return real_sink(self, target, **kwargs)
+
+    def collect(lf, batch_size):
+        seen.append(("read", held))
+        return real_collect(lf, batch_size)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", sink)
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", collect)
+    lf = cache_parquet(_source(D(2026, 9, 30)), tmp_path, "date", lock=lock).filter(pl.col("date").is_between(START, D(2026, 9, 30)))
+    if fail:
+        with pytest.raises(ComputeError, match="sink failed"):
+            lf.collect()
+        assert seen == [("write", True)]
+    else:
+        lf.collect()
+        assert seen == [("write", True), ("read", False)]
+    assert not held
