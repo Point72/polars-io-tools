@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 import polars as pl
 import portion
-from polars.exceptions import ComputeError
+from polars.exceptions import ComputeError, PanicException
 from portion import Interval
 from pydantic import GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
@@ -84,6 +84,13 @@ def _max_open_sinks() -> int:
         return int(os.environ.get("POLARS_MAX_OPEN_SINKS", _DEFAULT_MAX_OPEN_SINKS))
     except ValueError:
         return _DEFAULT_MAX_OPEN_SINKS
+
+
+def _cache_read_retries() -> int:
+    try:
+        return max(0, int(os.environ.get("POLARS_IO_TOOLS_CACHE_READ_RETRIES", "1")))
+    except ValueError:
+        return 1
 
 
 def _storage_kwargs(storage_options: dict | None, credential_provider: pl.CredentialProviderAWS | None) -> dict:
@@ -254,8 +261,12 @@ def _build_partition_info(
     predicate: pl.Expr | None = None,
     time_unit: Literal["daily", "monthly", "yearly"] | None = None,
     schema: pl.Schema | None = None,
+    bounds_parts_df: pl.DataFrame | None = None,
 ) -> PartitionInfo:
-    """Create a PartitionInfo snapshot to drive downstream planning decisions."""
+    """Create a PartitionInfo snapshot to drive downstream planning decisions.
+
+    ``bounds_parts_df`` sets the cached date bounds that clip one-sided queries; it defaults to ``existing_parts_df``.
+    """
     join_cols = extra_cols + ([date_column] if date_column else [])
     enumerability = _classify_enumerability(expected_parts_df, date_column)
 
@@ -265,7 +276,7 @@ def _build_partition_info(
         date_interval = _local_date_interval(predicate, date_column, schema[date_column])
         clipped_expected_parts_df = _compute_clipped_expected_partitions(
             predicate_interval=date_interval,
-            existing_parts_df=existing_parts_df,
+            existing_parts_df=existing_parts_df if bounds_parts_df is None else bounds_parts_df,
             date_column=date_column,
             extra_cols=extra_cols,
             time_unit=time_unit,
@@ -471,8 +482,13 @@ def _partition_keys(
     return parts_df.select(pl.concat_str(exprs, separator="/").alias("key")).to_series()
 
 
-def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str, *, create_s3_dir: bool = True) -> set[str]:
-    """Return relative file keys under a prefix, without reading cached data."""
+def _extract_existing_files(
+    fs: "pa_fs.FileSystem", fs_path_prefix: str, *, create_s3_dir: bool = True, mtimes: dict[str, datetime.datetime] | None = None
+) -> set[str]:
+    """Return relative file keys under a prefix, without reading cached data.
+
+    When ``mtimes`` is given, it is filled with each key's UTC modification time.
+    """
     import pyarrow.fs as pa_fs
 
     existing_parts: set[str] = set()
@@ -481,7 +497,14 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str, *, crea
         path = Path(fs_path_prefix)
         if path.exists():
             for p in path.glob("**/*.parquet"):
-                existing_parts.add(p.relative_to(path).with_suffix("").as_posix())
+                key = p.relative_to(path).with_suffix("").as_posix()
+                if mtimes is not None:
+                    try:
+                        mtimes[key] = datetime.datetime.fromtimestamp(p.stat().st_mtime, datetime.UTC)
+                    except FileNotFoundError:
+                        # Deleted by another process since the glob.
+                        continue
+                existing_parts.add(key)
     else:
         # S3FileSystem is optional in pyarrow; use getattr for safe access
         S3FileSystem = getattr(pa_fs, "S3FileSystem", None)
@@ -494,8 +517,11 @@ def _extract_existing_files(fs: "pa_fs.FileSystem", fs_path_prefix: str, *, crea
         try:
             for info in fs.get_file_info(pa_fs.FileSelector(fs_path_prefix, recursive=True)):
                 if info.type == pa_fs.FileType.File and info.path.endswith(".parquet"):
-                    rel = Path(info.path[len(fs_path_prefix) + 1 :])
-                    existing_parts.add(rel.with_suffix("").as_posix())
+                    key = Path(info.path[len(fs_path_prefix) + 1 :]).with_suffix("").as_posix()
+                    existing_parts.add(key)
+                    if mtimes is not None and info.mtime is not None:
+                        mtime = info.mtime
+                        mtimes[key] = mtime.replace(tzinfo=datetime.UTC) if mtime.tzinfo is None else mtime.astimezone(datetime.UTC)
         except Exception:  # noqa: BLE001,S110 -- intentional broad catch; best-effort cleanup, failure is non-fatal
             # Directory doesn't exist yet
             pass
@@ -678,8 +704,10 @@ def _enumerate_partitions_from_dnf(
         clause_dfs = []
         for clause in dnf_clauses:
             clause_df = _process_dnf_clause_to_partitions(clause, date_column, extra_cols, time_unit, schema)
-
-            if clause_df is not None and not clause_df.is_empty():
+            if clause_df is None:
+                # One non-enumerable clause makes the whole disjunction unbounded.
+                return pl.DataFrame(schema=partition_schema)
+            if not clause_df.is_empty():
                 clause_dfs.append(clause_df)
 
         if not clause_dfs:
@@ -699,7 +727,10 @@ def _process_dnf_clause_to_partitions(
     time_unit: Literal["daily", "monthly", "yearly"],
     schema: pl.Schema,
 ) -> pl.DataFrame | None:
-    """Process a single DNF clause, using None for unconstrained columns."""
+    """Process a single DNF clause, using None for unconstrained columns.
+
+    Return an empty frame when the clause matches nothing, or None when its partitions cannot be enumerated.
+    """
     all_partition_cols = extra_cols + ([date_column] if date_column else [])
     partition_schema = {c: schema[c] for c in all_partition_cols}
 
@@ -726,6 +757,8 @@ def _process_dnf_clause_to_partitions(
             if analyzer.has_contradiction(schema=schema):
                 return pl.DataFrame(schema=partition_schema)
             if col == date_column:
+                if not (analyzer.exact_values or analyzer.inclusion_set or (analyzer.min_bound and analyzer.max_bound)):
+                    return None
                 # A date exclusion removes a whole partition only when that partition holds one Date value.
                 values = _extract_and_widen_dates(analyzer, time_unit, exact_exclusions=time_unit == "daily" and schema[col] == pl.Date)
             else:
@@ -738,7 +771,7 @@ def _process_dnf_clause_to_partitions(
                 if date_column is None:
                     column_value_sets[col] = {None}
                 else:
-                    return pl.DataFrame(schema=partition_schema)
+                    return None
             elif not values:
                 return pl.DataFrame(schema=partition_schema)
             else:
@@ -760,13 +793,15 @@ def _extract_and_widen_dates(
     """
     dates = set()
 
-    for values in (analyzer.exact_values, analyzer.inclusion_set):
-        for val in values or ():
+    value_sets = [set(values) for values in (analyzer.exact_values, analyzer.inclusion_set) if values]
+    if value_sets:
+        # Listed values and range bounds all constrain this clause, so keep only listed values within the bounds.
+        lower, upper = _bound_date(analyzer.min_bound, step=1), _bound_date(analyzer.max_bound, step=-1)
+        for val in set.intersection(*value_sets):
             date_val = _convert_to_date(val)
-            if date_val:
+            if date_val and (lower is None or date_val >= lower) and (upper is None or date_val <= upper):
                 dates.add(_widen_date(date_val, time_unit))
-
-    if analyzer.min_bound or analyzer.max_bound:
+    elif analyzer.min_bound or analyzer.max_bound:
         dates.update(_enumerate_date_range(analyzer, time_unit))
 
     if exact_exclusions and analyzer.exclusion_values:
@@ -1086,7 +1121,7 @@ def _build_write_plan(
         if date_column is not None and date_dtype is not None and effective_time_unit in _PARTITION_FORMATS:
             interval = _local_date_interval(predicate, date_column, date_dtype)
             if interval.empty:
-                filters.append(pl.lit(False))
+                date_filter = pl.lit(False)
             else:
                 lower, upper = -portion.inf, portion.inf
                 if interval.lower != -portion.inf:
@@ -1094,7 +1129,18 @@ def _build_write_plan(
                 if interval.upper != portion.inf:
                     upper = _widen_date(_bound_date((interval.upper, interval.right == portion.CLOSED), -1), effective_time_unit)
                     upper = _step_date(upper, effective_time_unit)
-                filters.append(_partition_dates_expr(portion.closedopen(lower, upper), date_column, date_dtype))
+                date_filter = _partition_dates_expr(portion.closedopen(lower, upper), date_column, date_dtype)
+            if date_filter is not None:
+                date_predicate = _restrict_predicate(predicate, [date_column])
+                null_row = pl.DataFrame({date_column: [None]}, schema={date_column: date_dtype})
+                try:
+                    includes_null_date = date_predicate is None or null_row.select(date_predicate).item() is True
+                except Exception:
+                    log.debug("Could not evaluate the date predicate on null; including null-date partitions", exc_info=True)
+                    includes_null_date = True
+                if includes_null_date:
+                    date_filter = date_filter | pl.col(date_column).is_null()
+            filters.append(date_filter)
     return WritePlan(True, _and_predicates(*filters), False)
 
 
@@ -1233,17 +1279,37 @@ def _build_final_scan(
 
 
 def _collect_cache_scan(
-    scan: pl.LazyFrame,
+    make_scan: Callable[[], pl.LazyFrame],
     schema: pl.Schema,
     with_columns: list[str] | None,
     batch_size: int | None,
     time_unit_dir: str,
+    retry: bool = True,
 ) -> Iterator[pl.DataFrame]:
-    """Collect a cache scan, handling predicates that eliminate every row group."""
+    """Collect a cache scan, handling predicates that eliminate every row group.
+
+    Set ``retry`` to False when the scan includes an upstream query, which a retry would run again.
+    """
     log.debug("Start: Loading data from cache at %s", time_unit_dir)
     start = time.time()
+    scan = make_scan()
     try:
-        yield from collect_lf_in_io_source(scan, batch_size)
+        # A concurrent refresh can replace a file mid-read. A read that fails before yielding any rows is retried with a new scan,
+        # since a scan keeps the Parquet metadata it has already read.
+        attempts = 1 + _cache_read_retries() if retry else 1
+        for attempt in range(attempts):
+            if attempt:
+                scan = make_scan()
+            yielded = False
+            try:
+                for batch in collect_lf_in_io_source(scan, batch_size):
+                    yielded = True
+                    yield batch
+                return
+            except (ComputeError, OSError, PanicException) as e:
+                if yielded or attempt + 1 == attempts or "expected at least 1 source" in str(e):
+                    raise
+                log.warning("Cache read failed (attempt %d/%d), retrying; a concurrent refresh can cause this: %s", attempt + 1, attempts, e)
     except Exception as e:
         if isinstance(e, ComputeError) and "expected at least 1 source" in str(e):
             log.debug("Predicate eliminated all row groups - returning empty dataframe with schema %s", schema)
@@ -1408,29 +1474,37 @@ def _sink_cache_partitions(
     write_kwargs: dict,
     key_aliases: dict[str, str],
     encode_file_keys: bool,
+    fs: "pa_fs.FileSystem",
+    fs_path_prefix: str,
 ) -> tuple[set[str], set[str]]:
-    """Sink one file per partition and return its physical and logical keys."""
+    """Sink one file per partition and return its physical and logical keys.
+
+    If the sink fails, every file it opened is deleted (best effort), so a partially written partition is refetched rather than read as complete.
+    """
     written: set[str] = set()
     written_logical: set[str] = set()
+
+    def reopened(key: object) -> RuntimeError:
+        return RuntimeError(
+            f"cache_parquet: polars reopened a partition sink for key {key!r}. "
+            f"The open-sink cap ({_max_open_sinks()}) was exceeded and rows would be "
+            "silently dropped. Set POLARS_MAX_OPEN_SINKS above the "
+            "partition count before the process starts, or write fewer "
+            "partitions per call."
+        )
 
     def file_path(ctx):
         if hasattr(ctx, "partition_keys"):
             # A reopened sink overwrites its earlier file; fail rather than silently dropping rows.
             if ctx.index_in_partition != 0:
-                raise RuntimeError(
-                    "cache_parquet: polars reopened a partition sink "
-                    f"(index_in_partition={ctx.index_in_partition}) for key "
-                    f"{ctx.partition_keys.row(0)!r}. The open-sink cap "
-                    f"({_max_open_sinks()}) was exceeded and rows would be "
-                    "silently dropped. Set POLARS_MAX_OPEN_SINKS above the "
-                    "partition count before the process starts, or write fewer "
-                    "partitions per call."
-                )
+                raise reopened(ctx.partition_keys.row(0))
             values = [_partition_key_component(v) for v in ctx.partition_keys.row(0)]
         else:
             values = [unquote(k.str_value) for k in ctx.keys]
         logical_key = "/".join(values)
         key = key_aliases.get(logical_key, _encode_partition_file_key(logical_key, encode_file_keys))
+        if key in written:
+            raise reopened(logical_key)
         written_logical.add(logical_key)
         written.add(key)
         return f"{key}.parquet"
@@ -1460,15 +1534,27 @@ def _sink_cache_partitions(
 
     sink_kwargs = dict(write_kwargs)
     sink_kwargs.pop("metadata", None)
-    _prepare_lf_for_sink_from_io_source(lf).sink_parquet(  # type: ignore[call-overload]
-        partition_obj,
-        maintain_order=True,
-        mkdir=True,
-        metadata=metadata,
-        storage_options=storage_options,
-        **({"credential_provider": credential_provider} if credential_provider else {}),
-        **sink_kwargs,
-    )
+    try:
+        _prepare_lf_for_sink_from_io_source(lf).sink_parquet(  # type: ignore[call-overload]
+            partition_obj,
+            maintain_order=True,
+            mkdir=True,
+            metadata=metadata,
+            storage_options=storage_options,
+            **({"credential_provider": credential_provider} if credential_provider else {}),
+            **sink_kwargs,
+        )
+    except BaseException:  # PanicException derives from BaseException.
+        if written:
+            log.warning("Cache write failed; deleting %d partition file(s) it opened: %s", len(written), sorted(written))
+        for key in sorted(written):
+            try:
+                fs.delete_file(f"{fs_path_prefix}/{key}.parquet")
+            except FileNotFoundError:
+                pass
+            except Exception as e:  # noqa: BLE001 -- keep the original error; this file may hold incomplete data
+                log.warning("Failed to delete partition %s after a failed cache write: %s", key, e)
+        raise
     log.debug("Wrote %i new partition(s): %s", len(written), sorted(written))
     return written, written_logical
 
@@ -1513,6 +1599,59 @@ def _stale_partition_keys(existing: pl.DataFrame, written: set[str], scope: pl.E
     return set(in_scope[file_key_column].to_list()) - written
 
 
+ExpiryPolicy = Callable[[datetime.datetime, datetime.datetime | None, datetime.datetime], bool]
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+def _default_expired(
+    written_at: datetime.datetime,
+    period_end: datetime.datetime | None,
+    now: datetime.datetime,
+    *,
+    ttl: timedelta | None,
+    final_after: timedelta | None,
+) -> bool:
+    if final_after is not None and period_end is not None and written_at >= period_end + final_after:
+        return False
+    return ttl is None or now - written_at >= ttl
+
+
+def _expired_file_keys(
+    parts_df: pl.DataFrame,
+    mtimes: dict[str, datetime.datetime],
+    *,
+    file_key_column: str,
+    date_column: str | None,
+    date_dtype: pl.DataType | None,
+    time_unit: Literal["daily", "monthly", "yearly"],
+    is_expired: ExpiryPolicy,
+    now: datetime.datetime,
+) -> set[str]:
+    """Physical keys of cached files that ``is_expired`` reports as expired."""
+    keys = parts_df[file_key_column].to_list()
+    starts = [None] * len(keys)
+    if date_column is not None and date_dtype is not None:
+        starts = parts_df.select(_stored_key_date_expr(date_column, date_dtype)).to_series().to_list()
+    # Periods end at local midnight for timezone-aware columns and at UTC midnight otherwise.
+    zone = ZoneInfo(getattr(date_dtype, "time_zone", None) or "UTC")
+    expired = set()
+    for key, start in zip(keys, starts, strict=True):
+        written_at = mtimes.get(key)
+        if written_at is None:
+            continue
+        period_end = None
+        if start is not None:
+            period_end = datetime.datetime.combine(_step_date(_widen_date(start, time_unit), time_unit), datetime.time(), zone).astimezone(
+                datetime.UTC
+            )
+        if is_expired(written_at, period_end, now):
+            expired.add(key)
+    return expired
+
+
 def cache_parquet(
     self_or_fn: pl.LazyFrame | Callable[[], pl.LazyFrame],
     cache_path: str | Path,
@@ -1521,6 +1660,8 @@ def cache_parquet(
     time_unit: Literal["daily", "monthly", "yearly"] = "monthly",
     partition_format: str | None = None,
     cache_mode: CacheMode = CacheMode.CACHE,
+    ttl: timedelta | ExpiryPolicy | None = None,
+    final_after: timedelta | None = None,
     aws_profile: str | None = None,
     write_kwargs: dict | None = None,
     read_kwargs: dict | None = None,
@@ -1583,6 +1724,21 @@ def cache_parquet(
             - ``CacheMode.CACHE_ONLY``: Read only the partitions that are already cached; never query upstream or
               write. Returns an empty frame if nothing matching is cached. With a callable source and an empty
               cache, ``schema`` is required.
+        ttl (timedelta | Callable, optional): Expire cached files written at least this long ago. An expired file is
+            refetched and overwritten under ``CacheMode.CACHE``, and read from upstream instead of the cache under
+            ``CacheMode.READ_ONLY``. ``CacheMode.CACHE_ONLY`` serves expired files and ``CacheMode.REBUILD`` ignores
+            expiry. Only files within the query's partition scope are refetched; an expired file for which upstream
+            returns no rows is replaced by an empty file. Expiry uses the file modification time, which copying or
+            syncing a cache may reset. A callable ``ttl(written_at, period_end, now) -> bool`` replaces the built-in
+            policy and returns True for an expired file. Its arguments are timezone-aware UTC datetimes, and
+            ``period_end`` is the exclusive end of the file's date partition, or None without one. The callable must
+            depend only on its arguments. A read that fails before returning any rows, for example because another
+            process refreshed a file mid-read, is retried ``POLARS_IO_TOOLS_CACHE_READ_RETRIES`` times (default 1),
+            unless the read also queries upstream.
+        final_after (timedelta, optional): Never expire a partition once its file was written at least this long after
+            the partition's period ended (local midnight for timezone-aware columns, UTC midnight otherwise). ``ttl``
+            then applies only to the remaining partitions; without ``ttl`` they are refetched on every query. Requires
+            ``date_column`` and a non-callable ``ttl``.
         aws_profile (str, optional): AWS profile name for S3 access. If None, uses the AWS_PROFILE environment variable.
             This is only relevant if the cache_path is an S3 URI.
         write_kwargs (dict, optional): Additional keyword arguments for writing Parquet files. Internally, this is passed
@@ -1645,8 +1801,8 @@ def cache_parquet(
         **Data Arrival Assumption**: This assumes data arrives monotonically - once data exists for
         date X, all dates before X are complete. Gaps within existing bounds are treated as truly
         empty (no data existed), not as "data arriving later." If your data source can have late-
-        arriving data for dates within the existing range, use ``cache_mode=CacheMode.REBUILD`` to
-        refresh the cache.
+        arriving data for dates within the existing range, set ``ttl`` and ``final_after`` so recent
+        partitions are refetched, or use ``cache_mode=CacheMode.REBUILD`` to refresh the cache.
 
         **Write-Then-Read Architecture**
 
@@ -1667,11 +1823,32 @@ def cache_parquet(
           silently drop rows, so ``cache_parquet`` raises instead. To write more partitions in one call,
           set ``POLARS_MAX_OPEN_SINKS`` above the partition count *before the process starts*, or reduce
           the partition count per call (e.g. a coarser ``time_unit`` or chunked date ranges).
+        - Failed writes: if a write raises, the partition files it opened are deleted so the next query
+          refetches them. Deletion is best effort; failures are logged, and a file that survives may need
+          manual removal. A killed process deletes nothing. Concurrent readers may fail or read incomplete
+          partitions.
     """
     if cache_mode == CacheMode.IGNORE:
         return self_or_fn() if callable(self_or_fn) else self_or_fn
 
     # Validate arguments
+    if ttl is not None and not isinstance(ttl, timedelta) and not callable(ttl):
+        raise TypeError(f"ttl must be a timedelta or a callable, got {type(ttl).__name__}")
+    if final_after is not None:
+        if not isinstance(final_after, timedelta):
+            raise TypeError(f"final_after must be a timedelta, got {type(final_after).__name__}")
+        if date_column is None:
+            raise ValueError("final_after requires date_column")
+        if callable(ttl):
+            raise ValueError("final_after cannot be combined with a callable ttl")
+    for name, value in (("ttl", ttl), ("final_after", final_after)):
+        if isinstance(value, timedelta) and value < timedelta(0):
+            raise ValueError(f"{name} must not be negative")
+    is_expired: ExpiryPolicy | None = None
+    if callable(ttl):
+        is_expired = ttl
+    elif ttl is not None or final_after is not None:
+        is_expired = functools.partial(_default_expired, ttl=ttl, final_after=final_after)
     write_kwargs = write_kwargs or {}
     read_kwargs = read_kwargs or {}
 
@@ -1769,7 +1946,8 @@ def cache_parquet(
             if predicate is not None:
                 required_columns.update(predicate.meta.root_names())
             read_schema = pl.Schema({name: dtype for name, dtype in schema.items() if name in required_columns})
-        existing_parts = _extract_existing_files(fs, fs_path_prefix, create_s3_dir=not no_write)
+        mtimes: dict[str, datetime.datetime] | None = {} if is_expired is not None and cache_mode in (CacheMode.CACHE, CacheMode.READ_ONLY) else None
+        existing_parts = _extract_existing_files(fs, fs_path_prefix, create_s3_dir=not no_write, mtimes=mtimes)
         existing_parts_df = _construct_partitions_df_from_existing(
             existing_files=existing_parts,
             schema=schema,
@@ -1781,15 +1959,37 @@ def cache_parquet(
             decode_file_keys=windows_file_keys,
         )
 
+        # Expired files in the query's partition scope are planned as missing; all other files stay cached.
+        refresh_keys: set[str] = set()
+        if mtimes:
+            expired = _expired_file_keys(
+                existing_parts_df,
+                mtimes,
+                file_key_column=file_key_column,
+                date_column=date_column,
+                date_dtype=schema[date_column] if date_column else None,
+                time_unit=time_unit,
+                is_expired=is_expired,  # type: ignore[arg-type]
+                now=_utcnow(),
+            )
+            if expired:
+                expired_df = existing_parts_df.filter(pl.col(file_key_column).is_in(sorted(expired)))
+                scope = _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
+                refresh_keys = set((expired_df if scope is None else expired_df.filter(scope))[file_key_column].to_list())
+                log.debug("Refreshing %d expired partition(s) in scope: %s", len(refresh_keys), sorted(refresh_keys))
+        plan_parts = existing_parts - refresh_keys
+        plan_parts_df = existing_parts_df.filter(~pl.col(file_key_column).is_in(sorted(refresh_keys))) if refresh_keys else existing_parts_df
+
         expected_parts_df = _get_expected_partitions_df(predicate, date_column, _extra_cols, effective_time_unit, schema)
         part_info = _build_partition_info(
             expected_parts_df=expected_parts_df,
-            existing_parts_df=existing_parts_df,
+            existing_parts_df=plan_parts_df,
             date_column=date_column,
             extra_cols=_extra_cols,
             predicate=predicate,
             time_unit=time_unit if date_column else None,
             schema=schema,
+            bounds_parts_df=existing_parts_df,
         )
 
         write_plan = _build_write_plan(
@@ -1803,7 +2003,7 @@ def cache_parquet(
 
         is_finite = part_info.enumerability == Enumerability.FINITE
         if is_finite and plan_mode != CacheMode.REBUILD:
-            partitions_to_write_df = _compute_partitions_to_write(part_info, existing_parts, date_column, partition_format)
+            partitions_to_write_df = _compute_partitions_to_write(part_info, plan_parts, date_column, partition_format)
         else:
             partitions_to_write_df = part_info.expected_parts_df
         fetch_upstream = write_plan.should_write and not (is_finite and partitions_to_write_df.is_empty())
@@ -1860,10 +2060,13 @@ def cache_parquet(
                 write_kwargs,
                 key_aliases,
                 windows_file_keys,
+                fs,
+                fs_path_prefix,
             )
 
-            # Enumerated rebuild targets receive empty files; wildcard targets require stale-file removal.
-            if cache_mode == CacheMode.REBUILD and _has_null_keys(partitions_to_write_df, part_info.join_cols) and not existing_parts_df.is_empty():
+            # Enumerated rebuild targets receive empty files; wildcard and unbounded targets require stale-file removal.
+            wildcard = not is_finite or _has_null_keys(partitions_to_write_df, part_info.join_cols)
+            if cache_mode == CacheMode.REBUILD and wildcard and not existing_parts_df.is_empty():
                 key_scope = _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
                 stale = _stale_partition_keys(existing_parts_df, written_parts, key_scope, file_key_column)
                 for key in sorted(stale):
@@ -1879,12 +2082,16 @@ def cache_parquet(
                 else None
             )
             missing = _missing_empty_keys(
-                part_info, write_plan, cache_mode, written_logical_parts, existing_parts, _extra_cols, date_column, partition_format, key_scope
+                part_info, write_plan, cache_mode, written_logical_parts, plan_parts, _extra_cols, date_column, partition_format, key_scope
             )
-            if missing:
-                paths = [
-                    f"{time_unit_dir}/{key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys))}.parquet" for key in sorted(missing)
-                ]
+            empty_paths = {f"{time_unit_dir}/{key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys))}.parquet" for key in missing}
+            # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
+            emptied_expired = refresh_keys - written_parts
+            if emptied_expired:
+                log.warning("Replacing %d expired cache file(s) with empty files: %s", len(emptied_expired), sorted(emptied_expired))
+                empty_paths.update(f"{time_unit_dir}/{key}.parquet" for key in emptied_expired)
+            if empty_paths:
+                paths = sorted(empty_paths)
                 log.debug("Writing %d empty partition(s) sequentially", len(paths))
                 _write_empty_parquet_files_sequentially(
                     paths,
@@ -1894,7 +2101,7 @@ def cache_parquet(
                     credential_provider=credential_provider,
                     write_kwargs=write_kwargs,
                 )
-                log.debug("Wrote %i empty partition(s): %s", len(missing), sorted(missing))
+                log.debug("Wrote %i empty partition(s): %s", len(paths), paths)
 
         if upstream_lf is not None and not no_write:
             # Refresh the file listing to avoid scanning an empty cache after writes.
@@ -1912,6 +2119,9 @@ def cache_parquet(
                     decode_file_keys=windows_file_keys,
                 ),
             )
+        elif refresh_keys and cache_mode == CacheMode.CACHE:
+            # Nothing was written, so read every cached file.
+            part_info = replace(part_info, existing_parts_df=existing_parts_df)
         read_plan = _build_read_plan(
             partition_info=part_info,
             date_column=date_column,
@@ -1923,16 +2133,21 @@ def cache_parquet(
             file_key_column=file_key_column,
         )
 
+        if refresh_keys and no_write and read_plan.use_paths is None:
+            # Upstream supplies the expired partitions, so scan only the other cached files.
+            read_plan = ReadPlan(use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(plan_parts)])
+
         scan_kwargs = _storage_kwargs(polars_opts, credential_provider)
         scan_kwargs.update(read_kwargs)
 
-        cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
-        if no_write and upstream_lf is not None:
-            cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
-            if "n_rows" in read_kwargs:
-                cache_scan = cache_scan.head(read_kwargs["n_rows"])
-        scan = _build_final_scan(cache_scan, predicate, with_columns, n_rows)
+        def make_scan() -> pl.LazyFrame:
+            cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
+            if no_write and upstream_lf is not None:
+                cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
+                if "n_rows" in read_kwargs:
+                    cache_scan = cache_scan.head(read_kwargs["n_rows"])
+            return _build_final_scan(cache_scan, predicate, with_columns, n_rows)
 
-        yield from _collect_cache_scan(scan, schema, with_columns, batch_size, time_unit_dir)
+        yield from _collect_cache_scan(make_scan, schema, with_columns, batch_size, time_unit_dir, retry=not (no_write and upstream_lf is not None))
 
     return register_io_source_with_is_pure(io_source=source_generator, schema=schema, validate_schema=False, explain_detail=description)

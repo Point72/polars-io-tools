@@ -1,18 +1,23 @@
 import datetime
 import os
+import pickle
 import shutil
 import time
-from pathlib import PureWindowsPath
+from datetime import timedelta
+from pathlib import Path, PureWindowsPath
 
+import cloudpickle
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
+from polars.exceptions import ComputeError, PanicException
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
 from polars_io_tools._compat import POLARS_GE_2
-from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _get_expected_partitions_df, cache_parquet
+from polars_io_tools.io_sources import lazy_cache_parquet
+from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _default_expired, _get_expected_partitions_df, cache_parquet
 from polars_io_tools.tests.helpers.cache_parquet_shared import exercise_daily_cache_parquet
 
 
@@ -3284,3 +3289,584 @@ def test_rebuild_wildcard_removes_partition_that_disappeared_upstream(tmp_path):
     got = mk(CacheMode.CACHE).collect().sort("symbol")
     # s0 untouched (out of scope), s1 refreshed, s2 removed (no longer upstream).
     assert dict(zip(got["symbol"], got["v"])) == {"s0": 1, "s1": 20}
+
+
+def test_rebuild_one_sided_empties_dropped_day_within_bounds(tmp_path):
+    days = [datetime.date(2024, 6, d) for d in (1, 2, 3)]
+    source = pl.LazyFrame({"date": days, "value": [1, 2, 3]})
+    cache_parquet(source, tmp_path, "date", time_unit="daily").collect()
+
+    # Unlike the no-date case above, a dropped day inside the cached date bounds is kept as an empty file.
+    rebuilt = source.filter(pl.col("date") != days[1])
+    out = cache_parquet(rebuilt, tmp_path, "date", time_unit="daily", cache_mode=CacheMode.REBUILD).filter(pl.col("date") >= days[0]).collect()
+    assert out.sort("date")["value"].to_list() == [1, 3]
+    assert pl.read_parquet(tmp_path / "daily" / "2024-06-02.parquet").is_empty()
+
+
+D = datetime.date
+UTC = datetime.UTC
+
+
+def T(*args) -> datetime.datetime:
+    return datetime.datetime(*args, tzinfo=UTC)
+
+
+START = D(2026, 9, 1)
+
+
+def _source(end: datetime.date, value: int = 1, start: datetime.date = START) -> pl.LazyFrame:
+    dates = pl.date_range(start, end, eager=True)
+    return pl.LazyFrame({"date": dates, "value": [value] * len(dates)})
+
+
+def _set_mtime(cache: Path, when: datetime.datetime, pattern: str = "**/*.parquet") -> None:
+    for path in cache.glob(pattern):
+        os.utime(path, (when.timestamp(), when.timestamp()))
+
+
+def _mtimes(cache: Path) -> dict[str, int]:
+    return {p.relative_to(cache).as_posix(): p.stat().st_mtime_ns for p in cache.glob("**/*.parquet")}
+
+
+@pytest.fixture
+def set_now(monkeypatch):
+    def setter(when: datetime.datetime) -> None:
+        monkeypatch.setattr(lazy_cache_parquet, "_utcnow", lambda: when)
+
+    return setter
+
+
+OCT = pl.col("date").is_between(D(2026, 10, 1), D(2026, 10, 31))
+
+
+@pytest.mark.parametrize(
+    ("written_at", "period_end", "now", "ttl", "final_after", "expected"),
+    [
+        (T(2026, 10, 1), None, T(2026, 10, 2), timedelta(days=1), None, True),
+        (T(2026, 10, 1), None, T(2026, 10, 1, 23), timedelta(days=1), None, False),
+        (T(2026, 11, 4), T(2026, 11, 1), T(2027, 1, 1), timedelta(hours=1), timedelta(days=3), False),
+        (T(2026, 11, 3), T(2026, 11, 1), T(2026, 11, 3, 2), timedelta(hours=1), timedelta(days=3), True),
+        (T(2026, 11, 3), T(2026, 11, 1), T(2026, 11, 3), None, timedelta(days=3), True),
+        (T(2026, 11, 3), None, T(2026, 11, 3), None, timedelta(days=3), True),
+    ],
+)
+def test_default_expired(written_at, period_end, now, ttl, final_after, expected):
+    assert _default_expired(written_at, period_end, now, ttl=ttl, final_after=final_after) is expected
+
+
+def test_partial_month_refreshes_until_settled(tmp_path, set_now):
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1), "final_after": timedelta(days=3)}
+    set_now(T(2026, 10, 15, 12))
+    assert cache_parquet(_source(D(2026, 10, 15)), tmp_path, "date", **kwargs).filter(OCT).collect()["date"].max() == D(2026, 10, 15)
+    _set_mtime(tmp_path, T(2026, 10, 15, 12))
+
+    set_now(T(2026, 10, 15, 12, 30))
+    assert cache_parquet(_source(D(2026, 10, 17)), tmp_path, "date", **kwargs).filter(OCT).collect()["date"].max() == D(2026, 10, 15)
+
+    set_now(T(2026, 10, 15, 14))
+    assert cache_parquet(_source(D(2026, 10, 17)), tmp_path, "date", **kwargs).filter(OCT).collect()["date"].max() == D(2026, 10, 17)
+
+    # A rewrite three days after the month ends makes October permanent.
+    _set_mtime(tmp_path, T(2026, 11, 4))
+    set_now(T(2027, 1, 1))
+    result = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", **kwargs).filter(OCT).collect()
+    assert result["date"].max() == D(2026, 10, 17)
+    assert result["value"].unique().to_list() == [1]
+
+
+def test_empty_future_partitions_refresh(tmp_path, set_now):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1), "final_after": timedelta(days=0)}
+    window = pl.col("date").is_between(D(2026, 10, 15), D(2026, 10, 25))
+    set_now(T(2026, 10, 19, 12))
+    assert cache_parquet(_source(D(2026, 10, 19)), tmp_path, "date", **kwargs).filter(window).collect()["date"].max() == D(2026, 10, 19)
+    assert (tmp_path / "daily" / "2026-10-25.parquet").exists()
+    _set_mtime(tmp_path, T(2026, 10, 19, 12))
+
+    set_now(T(2026, 10, 23, 12))
+    assert cache_parquet(_source(D(2026, 10, 23)), tmp_path, "date", **kwargs).filter(window).collect()["date"].max() == D(2026, 10, 23)
+
+
+def test_no_date_column_ttl(tmp_path, set_now):
+    source = pl.LazyFrame({"value": [1, 2]})
+    set_now(T(2026, 10, 19))
+    cache_parquet(source, tmp_path, ttl=timedelta(days=1)).collect()
+    _set_mtime(tmp_path, T(2026, 10, 19))
+
+    set_now(T(2026, 10, 19, 12))
+    assert cache_parquet(source.with_columns(value=pl.col("value") * 10), tmp_path, ttl=timedelta(days=1)).collect()["value"].to_list() == [1, 2]
+
+    set_now(T(2026, 10, 20))
+    assert cache_parquet(source.with_columns(value=pl.col("value") * 10), tmp_path, ttl=timedelta(days=1)).collect()["value"].to_list() == [10, 20]
+
+    # Upstream returning no rows empties the expired file instead of serving its stale rows.
+    _set_mtime(tmp_path, T(2026, 10, 19))
+    assert cache_parquet(source.filter(pl.lit(False)), tmp_path, ttl=timedelta(days=1)).collect().is_empty()
+    assert (tmp_path / "null" / "data.parquet").exists()
+
+    # The empty file counts as cached, so it is not fetched again until it expires.
+    _set_mtime(tmp_path, T(2026, 10, 19, 12))
+    assert cache_parquet(source, tmp_path, ttl=timedelta(days=1)).collect().is_empty()
+
+
+def test_refresh_is_limited_to_query_partitions(tmp_path, set_now):
+    source = pl.LazyFrame(
+        {
+            "date": [D(2026, 1, 5), D(2026, 1, 6), D(2026, 2, 5), D(2026, 2, 6)],
+            "sym": ["A", "B", "A", "B"],
+            "value": [1, 1, 1, 1],
+        }
+    )
+    kwargs = {"time_unit": "monthly", "extra_partition_cols": "sym", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 3, 1))
+    cache_parquet(source, tmp_path, "date", **kwargs).filter(pl.col("date").is_between(D(2026, 1, 1), D(2026, 2, 28))).collect()
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    before = _mtimes(tmp_path)
+
+    set_now(T(2026, 3, 2))
+    jan = pl.col("date").is_between(D(2026, 1, 1), D(2026, 1, 31))
+    feb = pl.col("date").is_between(D(2026, 2, 1), D(2026, 2, 28))
+    predicate = (jan & (pl.col("sym") == "A")) | (feb & (pl.col("sym") == "B"))
+    result = cache_parquet(source.with_columns(value=pl.lit(2, pl.Int64)), tmp_path, "date", **kwargs).filter(predicate).collect()
+    assert result.sort("date")["value"].to_list() == [2, 2]
+    after = _mtimes(tmp_path)
+    assert {k for k in before if before[k] != after[k]} == {"monthly/A/2026-01.parquet", "monthly/B/2026-02.parquet"}
+
+
+def test_refresh_keeps_null_partition_rows_outside_membership_scope(tmp_path, set_now, caplog):
+    source = pl.LazyFrame(
+        {
+            "date": [D(2026, 1, 5), D(2026, 1, 6), D(2026, 2, 5)],
+            "sym": ["A", None, "A"],
+            "value": [1, 1, 1],
+        }
+    )
+    kwargs = {"time_unit": "monthly", "extra_partition_cols": "sym", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 3, 1))
+    cache_parquet(source, tmp_path, "date", **kwargs).filter(pl.col("date").is_between(D(2026, 1, 1), D(2026, 2, 28))).collect()
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    null_files = [k for k in _mtimes(tmp_path) if "/A/" not in k]
+    assert null_files
+
+    # The null partition is outside the query scope; refreshing it must not drop rows upstream still has.
+    set_now(T(2026, 3, 2))
+    for predicate in [pl.col("sym").is_in(["A"]), pl.col("sym") == "A", pl.col("sym") != "B"]:
+        _set_mtime(tmp_path, T(2026, 3, 1))
+        cache_parquet(source, tmp_path, "date", **kwargs).filter(predicate & (pl.col("date") < D(2026, 2, 1))).collect()
+        assert pl.read_parquet(tmp_path / null_files[0]).height == 1
+
+    # An expired file that upstream no longer fills is emptied with a warning.
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    set_now(T(2026, 3, 2))
+    cache_parquet(source.filter(pl.col("sym").is_not_null()), tmp_path, "date", **kwargs).collect()
+    assert pl.read_parquet(tmp_path / null_files[0]).is_empty()
+    assert any(r.levelname == "WARNING" and "expired cache file" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("predicate", [pl.col("sym").ne_missing("A"), ~pl.col("sym").eq_missing("A")])
+def test_refresh_null_partition_matched_by_missing_aware_comparison(tmp_path, set_now, predicate):
+    source = pl.LazyFrame({"date": [D(2026, 1, 5), D(2026, 1, 5)], "sym": ["B", None], "value": [1, 1]})
+    kwargs = {"time_unit": "monthly", "extra_partition_cols": "sym", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 3, 1))
+    cache_parquet(source, tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    set_now(T(2026, 3, 2))
+    jan = pl.col("date").is_between(D(2026, 1, 1), D(2026, 1, 31))
+    out = cache_parquet(source.with_columns(value=pl.lit(2, pl.Int64)), tmp_path, "date", **kwargs).filter(jan & predicate).collect()
+    assert out["value"].to_list() == [2, 2]
+
+
+def test_unbounded_refresh_above_open_sink_cap(tmp_path, set_now, monkeypatch):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 9, 4))
+    cache_parquet(_source(D(2026, 9, 3)), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 9, 4))
+
+    monkeypatch.setattr(lazy_cache_parquet, "_max_open_sinks", lambda: 2)
+    set_now(T(2026, 9, 5))
+    assert cache_parquet(_source(D(2026, 9, 3), value=2), tmp_path, "date", **kwargs).collect()["value"].to_list() == [2, 2, 2]
+
+
+def test_bounded_refresh_above_open_sink_cap_raises_before_writing(tmp_path, set_now, monkeypatch):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 9, 4))
+    cache_parquet(_source(D(2026, 9, 3)), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 9, 4))
+    before = _mtimes(tmp_path)
+
+    monkeypatch.setattr(lazy_cache_parquet, "_max_open_sinks", lambda: 2)
+    set_now(T(2026, 9, 5))
+    lf = cache_parquet(_source(D(2026, 9, 3), value=2), tmp_path, "date", **kwargs).filter(pl.col("date").is_between(START, D(2026, 9, 3)))
+    with pytest.raises(Exception, match="open-sink cap"):
+        lf.collect()
+    assert _mtimes(tmp_path) == before
+
+
+@pytest.mark.parametrize("error", [RuntimeError("sink failed"), PanicException("sink panicked")])
+def test_failed_sink_deletes_partially_written_files(tmp_path, set_now, monkeypatch, error):
+    # The second write's real mtime is long after October 2025 ends, so a leftover partial file would count as final.
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1), "final_after": timedelta(days=1)}
+    source = _source(D(2025, 10, 31), start=D(2025, 9, 1))
+    cache_parquet(source, tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2025, 10, 15))
+    sep = tmp_path / "monthly" / "2025-09.parquet"
+    sep_mtime = sep.stat().st_mtime_ns
+    set_now(T(2025, 10, 16))
+
+    real_sink = pl.LazyFrame.sink_parquet
+
+    def partial_sink(self, target, **kwargs):
+        real_sink(self.filter(pl.col("date").dt.day() <= 10), target, **kwargs)
+        raise error
+
+    with monkeypatch.context() as m:
+        m.setattr(pl.LazyFrame, "sink_parquet", partial_sink)
+        with pytest.raises(BaseException, match="sink"):
+            cache_parquet(source.with_columns(value=pl.lit(2, pl.Int64)), tmp_path, "date", **kwargs).collect()
+    assert not (tmp_path / "monthly" / "2025-10.parquet").exists()
+    assert sep.stat().st_mtime_ns == sep_mtime
+
+    oct_rows = (
+        cache_parquet(source.with_columns(value=pl.lit(3, pl.Int64)), tmp_path, "date", **kwargs).collect().filter(pl.col("date").dt.month() == 10)
+    )
+    assert oct_rows.height == 31
+    assert oct_rows["value"].unique().to_list() == [3]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_sink_rejects_reopened_partition(tmp_path, monkeypatch, legacy):
+    from types import SimpleNamespace
+
+    providers = []
+
+    def capture(**kwargs):
+        providers.append(kwargs.get("file_path_provider") or kwargs.get("file_path"))
+
+    monkeypatch.setattr(lazy_cache_parquet, "POLARS_HAS_PARTITION_BY", not legacy)
+    monkeypatch.setattr(pl, "PartitionByKey" if legacy else "PartitionBy", capture, raising=False)
+
+    def reopening_sink(self, target, **kwargs):
+        if legacy:
+            ctx = SimpleNamespace(keys=[SimpleNamespace(str_value="2026-09")])
+        else:
+            ctx = SimpleNamespace(partition_keys=pl.DataFrame({"k": ["2026-09"]}), index_in_partition=0)
+        providers[0](ctx)
+        providers[0](ctx)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", reopening_sink)
+    with pytest.raises(Exception, match="reopened a partition sink"):
+        cache_parquet(_source(D(2026, 9, 30)), tmp_path, "date").collect()
+
+
+def test_listing_skips_file_deleted_after_glob(tmp_path, monkeypatch):
+    import pyarrow.fs as pa_fs
+
+    pl.DataFrame({"a": [1]}).write_parquet(tmp_path / "kept.parquet")
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [*real_glob(self, pattern), self / "ghost.parquet"])
+    mtimes = {}
+    assert lazy_cache_parquet._extract_existing_files(pa_fs.LocalFileSystem(), str(tmp_path), mtimes=mtimes) == {"kept"}
+    assert set(mtimes) == {"kept"}
+
+
+def test_unbounded_query_refreshes_expired_latest_partition(tmp_path, set_now):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1), "final_after": timedelta(days=1)}
+    set_now(T(2026, 10, 19, 12))
+    cache_parquet(_source(D(2026, 10, 19)), tmp_path, "date", **kwargs).filter(pl.col("date") >= D(2026, 10, 10)).collect()
+    _set_mtime(tmp_path, T(2026, 10, 21))
+    _set_mtime(tmp_path, T(2026, 10, 19, 12), "daily/2026-10-19.parquet")
+
+    set_now(T(2026, 10, 21, 1))
+    result = cache_parquet(_source(D(2026, 10, 20), value=2), tmp_path, "date", **kwargs).filter(pl.col("date") >= D(2026, 10, 10)).collect()
+    values = dict(zip(result["date"], result["value"], strict=True))
+    assert values[D(2026, 10, 18)] == 1
+    assert values[D(2026, 10, 19)] == 2
+    assert values[D(2026, 10, 20)] == 2
+
+
+def test_expired_empty_partition_still_bounds_gap_filling(tmp_path, set_now):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1)}
+    source = pl.LazyFrame({"date": [START], "value": [1]})
+    set_now(T(2026, 10, 19))
+    for day in [START, D(2026, 9, 5)]:
+        cache_parquet(source, tmp_path, "date", **kwargs).filter(pl.col("date") == day).collect()
+    _set_mtime(tmp_path, T(2026, 10, 18))
+
+    # Both files are expired and refreshed, but still bound the one-sided query: gaps up to the
+    # empty 2026-09-05 file are filled, and nothing is written after it.
+    result = cache_parquet(source, tmp_path, "date", **kwargs).filter(pl.col("date") >= START).collect()
+    assert result["date"].to_list() == [START]
+    assert sorted(_mtimes(tmp_path)) == [f"daily/2026-09-0{day}.parquet" for day in range(1, 6)]
+
+
+@pytest.mark.parametrize("predicate", [OCT, None])
+def test_read_only_reads_expired_partitions_from_upstream(tmp_path, set_now, predicate):
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 11, 1))
+    cache_parquet(_source(D(2026, 10, 31)), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 11, 1))
+    _set_mtime(tmp_path, T(2026, 10, 1), "monthly/2026-10.parquet")
+    before = _mtimes(tmp_path)
+
+    lf = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", cache_mode=CacheMode.READ_ONLY, **kwargs)
+    result = (lf.filter(predicate) if predicate is not None else lf).collect()
+    oct_rows = result.filter(OCT)
+    assert oct_rows.height == 31
+    assert oct_rows["value"].unique().to_list() == [2]
+    if predicate is None:
+        assert result.filter(~OCT)["value"].unique().to_list() == [1]
+    assert _mtimes(tmp_path) == before
+
+
+def test_read_only_n_rows_skips_expired_files(tmp_path, set_now):
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 11, 1))
+    cache_parquet(_source(D(2026, 10, 31)), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 11, 1))
+    _set_mtime(tmp_path, T(2026, 10, 1), "monthly/2026-09.parquet")
+
+    source = _source(D(2026, 10, 31), value=2, start=D(2026, 10, 1))
+    lf = cache_parquet(source, tmp_path, "date", cache_mode=CacheMode.READ_ONLY, read_kwargs={"n_rows": 1}, **kwargs)
+    assert lf.collect()["date"].to_list() == [D(2026, 10, 1)]
+
+
+def test_cache_only_serves_expired_files(tmp_path, set_now):
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 11, 1))
+    cache_parquet(_source(D(2026, 10, 31)), tmp_path, "date", **kwargs).filter(OCT).collect()
+    _set_mtime(tmp_path, T(2026, 10, 1))
+    result = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", cache_mode=CacheMode.CACHE_ONLY, **kwargs).filter(OCT).collect()
+    assert result["value"].unique().to_list() == [1]
+
+
+def test_rebuild_does_not_call_ttl(tmp_path):
+    def fail(*args):
+        raise AssertionError("REBUILD must not evaluate expiry")
+
+    cache_parquet(_source(D(2026, 10, 31)), tmp_path, "date").filter(OCT).collect()
+    result = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", ttl=fail, cache_mode=CacheMode.REBUILD).filter(OCT).collect()
+    assert result["value"].unique().to_list() == [2]
+
+
+def test_callable_ttl_receives_local_period_end(tmp_path, set_now):
+    calls = []
+
+    def policy(written_at, period_end, now):
+        calls.append((written_at.tzinfo, period_end, now))
+        return False
+
+    source = _source(D(2026, 10, 31)).with_columns(pl.col("date").cast(pl.Datetime("us", "America/New_York")))
+    set_now(T(2026, 11, 1))
+    lf = cache_parquet(source, tmp_path, "date", ttl=policy).filter(pl.col("date").dt.month() == 10)
+    lf.collect()
+    lf.collect()
+    assert {period_end for _, period_end, _ in calls} >= {T(2026, 11, 1, 4)}
+    assert all(tz is UTC and now == T(2026, 11, 1) for tz, _, now in calls)
+
+
+@pytest.mark.parametrize("dumps", [pickle.dumps, cloudpickle.dumps])
+def test_callable_ttl_pickles(tmp_path, dumps):
+    lf = cache_parquet(_source(D(2026, 10, 31)), tmp_path, "date", ttl=lambda written_at, period_end, now: False).filter(OCT)
+    assert pickle.loads(dumps(lf)).collect().height == 31
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"date_column": None, "final_after": timedelta(days=1)}, ValueError),
+        ({"ttl": lambda *args: True, "final_after": timedelta(days=1)}, ValueError),
+        ({"ttl": timedelta(hours=-1)}, ValueError),
+        ({"final_after": timedelta(days=-1)}, ValueError),
+        ({"ttl": 3600}, TypeError),
+    ],
+)
+def test_invalid_expiry_arguments(tmp_path, kwargs, error):
+    kwargs = {"date_column": "date", **kwargs}
+    with pytest.raises(error):
+        cache_parquet(_source(D(2026, 10, 31)), tmp_path, **kwargs)
+
+
+def test_refresh_intersects_listed_dates_with_bounds(tmp_path, set_now):
+    set_now(T(2026, 12, 1))
+    cache_parquet(_source(D(2026, 11, 30)), tmp_path, "date", ttl=timedelta(hours=1)).collect()
+    _set_mtime(tmp_path, T(2026, 12, 1))
+    set_now(T(2026, 12, 2))
+    predicate = pl.col("date").is_in([D(2026, 10, 5), D(2026, 11, 5)]) & (pl.col("date") < D(2026, 11, 1))
+    out = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", ttl=timedelta(hours=1)).filter(predicate).collect()
+    assert out["value"].to_list() == [2]
+    assert pl.read_parquet(tmp_path / "monthly" / "2026-11.parquet")["value"].unique().to_list() == [1]
+
+
+def test_refresh_null_partition_listed_in_is_in(tmp_path, set_now):
+    source = pl.LazyFrame({"date": [D(2026, 1, 5), D(2026, 1, 5)], "sym": ["A", None], "value": [1, 1]})
+    kwargs = {"time_unit": "monthly", "extra_partition_cols": "sym", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 3, 1))
+    cache_parquet(source, tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    set_now(T(2026, 3, 2))
+    predicate = pl.col("sym").is_in(["A", None], nulls_equal=True) & (pl.col("date") < D(2026, 2, 1))
+    out = cache_parquet(source.with_columns(value=pl.lit(2, pl.Int64)), tmp_path, "date", **kwargs).filter(predicate).collect()
+    assert out["value"].to_list() == [2, 2]
+
+
+@pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.READ_ONLY])
+@pytest.mark.parametrize("time_unit", ["daily", "monthly", "yearly"])
+@pytest.mark.parametrize("date_dtype", [pl.Date, pl.Datetime("us"), pl.Datetime("us", "America/New_York")])
+@pytest.mark.parametrize("null_state", ["expired", "fresh", "removed"])
+def test_refresh_nullable_date_membership_with_unbounded_or(tmp_path, set_now, cache_mode, time_unit, date_dtype, null_state):
+    source = pl.DataFrame(
+        {
+            "date": [D(2024, 1, 10), None, D(2024, 3, 10), None],
+            "sym": ["A", "A", "B", "B"],
+            "value": [10, 20, 30, 40],
+        }
+    ).with_columns(pl.col("date").cast(date_dtype))
+    kwargs = {"time_unit": time_unit, "extra_partition_cols": "sym"}
+    cache_parquet(source.lazy(), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    if null_state == "fresh":
+        for path in tmp_path.rglob("*.parquet"):
+            if pl.read_parquet(path)["value"].to_list() == [20]:
+                os.utime(path, (T(2026, 3, 2).timestamp(), T(2026, 3, 2).timestamp()))
+    before = _mtimes(tmp_path)
+    untouched = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*.parquet")
+        if pl.read_parquet(path)["value"].to_list() in ([[20], [40]] if null_state == "fresh" else [[40]])
+    }
+    set_now(T(2026, 3, 2))
+    predicate = (pl.col("date").is_in([source["date"][0], None], nulls_equal=True) & (pl.col("sym") == "A")) | (
+        (pl.col("date") >= source["date"][2]) & (pl.col("sym") == "B")
+    )
+    upstream = source.with_columns(pl.col("value") + 100)
+    if null_state == "removed":
+        upstream = upstream.filter(pl.col("value") != 120)
+    result = cache_parquet(upstream.lazy(), tmp_path, "date", ttl=timedelta(hours=1), cache_mode=cache_mode, **kwargs).filter(predicate).collect()
+    expected = {"expired": [110, 120, 130], "fresh": [20, 110, 130], "removed": [110, 130]}[null_state]
+    assert sorted(result["value"].to_list()) == expected
+    persisted = cache_parquet(upstream.lazy(), tmp_path, "date", cache_mode=CacheMode.CACHE_ONLY, **kwargs).collect()
+    assert sorted(persisted["value"].to_list()) == (sorted([40, *expected]) if cache_mode == CacheMode.CACHE else [10, 20, 30, 40])
+    if cache_mode == CacheMode.READ_ONLY:
+        assert _mtimes(tmp_path) == before
+    for relative_path, contents in untouched.items():
+        assert (tmp_path / relative_path).read_bytes() == contents
+        assert (tmp_path / relative_path).stat().st_mtime_ns == before[relative_path]
+
+
+@pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.READ_ONLY])
+def test_cold_cache_nullable_date_membership_with_unbounded_or(tmp_path, cache_mode):
+    source = pl.LazyFrame({"date": [D(2024, 1, 10), None, D(2024, 3, 10)], "sym": ["A", "A", "B"], "value": [10, 20, 30]})
+    predicate = (pl.col("date").is_in([D(2024, 1, 10), None], nulls_equal=True) & (pl.col("sym") == "A")) | (
+        (pl.col("date") >= D(2024, 3, 10)) & (pl.col("sym") == "B")
+    )
+    result = cache_parquet(source, tmp_path, "date", extra_partition_cols="sym", cache_mode=cache_mode).filter(predicate).collect()
+    assert sorted(result["value"].to_list()) == [10, 20, 30]
+
+
+@pytest.mark.parametrize("engine", ["auto", "streaming"])
+def test_read_only_unbounded_date_udf_rejecting_null(tmp_path, engine):
+    source = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 3, 11), D(2024, 3, 16)], "sym": ["A", "B", "B"], "value": [1, 2, 3]})
+
+    def weekday(value):
+        return value.weekday() < 5
+
+    predicate = (pl.col("date") >= D(2024, 3, 1)) & pl.col("date").map_elements(weekday, return_dtype=pl.Boolean, skip_nulls=False)
+    result = (
+        cache_parquet(source, tmp_path, "date", extra_partition_cols="sym", cache_mode=CacheMode.READ_ONLY).filter(predicate).collect(engine=engine)
+    )
+    assert result["value"].to_list() == [2]
+
+
+@pytest.mark.parametrize("error", [ComputeError("parquet: File out of specification"), OSError("range invalid"), PanicException("panicked")])
+def test_cache_read_retries_once_after_failure(tmp_path, monkeypatch, caplog, error):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    real = lazy_cache_parquet.collect_lf_in_io_source
+    calls = []
+
+    def flaky(lf, batch_size):
+        calls.append(batch_size)
+        if len(calls) == 1:
+            raise error
+        return real(lf, batch_size)
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", flaky)
+    assert cache_parquet(source, tmp_path, "date").collect().height == 30
+    assert len(calls) == 2
+    assert any("attempt 1/2" in r.getMessage() for r in caplog.records)
+
+
+def test_cache_read_retry_sees_replaced_file(tmp_path, monkeypatch):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    path = tmp_path / "monthly" / "2026-09.parquet"
+    real = lazy_cache_parquet.collect_lf_in_io_source
+    calls = []
+
+    def replaced_mid_read(lf, batch_size):
+        calls.append(lf)
+        if len(calls) == 1:
+            list(real(lf, batch_size))
+            source.with_columns(value=pl.lit(2, pl.Int64)).collect().write_parquet(path.with_suffix(".tmp"), compression="uncompressed")
+            os.replace(path.with_suffix(".tmp"), path)
+            raise ComputeError("parquet: File out of specification")
+        return real(lf, batch_size)
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", replaced_mid_read)
+    assert cache_parquet(source, tmp_path, "date").collect()["value"].unique().to_list() == [2]
+
+
+@pytest.mark.parametrize(("retries", "attempts"), [(None, 2), ("0", 1), ("3", 4), ("bad", 2)])
+def test_cache_read_raises_after_retries(tmp_path, monkeypatch, retries, attempts):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    calls = []
+
+    def broken(lf, batch_size):
+        calls.append(batch_size)
+        raise OSError("still broken")
+
+    if retries is not None:
+        monkeypatch.setenv("POLARS_IO_TOOLS_CACHE_READ_RETRIES", retries)
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", broken)
+    with pytest.raises(Exception, match="still broken"):
+        cache_parquet(source, tmp_path, "date").collect()
+    assert len(calls) == attempts
+
+
+def test_cache_read_not_retried_after_rows_returned(tmp_path, monkeypatch):
+    source = _source(D(2026, 9, 30))
+    cache_parquet(source, tmp_path, "date").collect()
+    real = lazy_cache_parquet.collect_lf_in_io_source
+    calls = []
+
+    def fails_after_first_batch(lf, batch_size):
+        calls.append(batch_size)
+        yield next(iter(real(lf, batch_size)))
+        raise OSError("broken mid-read")
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", fails_after_first_batch)
+    with pytest.raises(Exception, match="broken mid-read"):
+        cache_parquet(source, tmp_path, "date").collect()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(("case", "attempts"), [("cached", 2), ("missing", 1), ("expired", 1)])
+def test_read_only_retries_only_cache_reads(tmp_path, monkeypatch, set_now, caplog, case, attempts):
+    kwargs = {"time_unit": "monthly", "ttl": timedelta(hours=1)}
+    set_now(T(2026, 11, 1))
+    cache_parquet(_source(D(2026, 9, 30) if case == "missing" else D(2026, 10, 31)), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 11, 1))
+    if case == "expired":
+        _set_mtime(tmp_path, T(2026, 10, 1), "monthly/2026-10.parquet")
+    calls = []
+
+    def broken(lf, batch_size):
+        calls.append(batch_size)
+        raise OSError("still broken")
+
+    monkeypatch.setattr(lazy_cache_parquet, "collect_lf_in_io_source", broken)
+    lf = cache_parquet(_source(D(2026, 10, 31), value=2), tmp_path, "date", cache_mode=CacheMode.READ_ONLY, **kwargs)
+    with pytest.raises(Exception, match="still broken"):
+        lf.filter(pl.col("date").is_between(START, D(2026, 10, 31))).collect()
+    assert len(calls) == attempts
+    assert any("attempt 1/2" in r.getMessage() for r in caplog.records) == (attempts == 2)

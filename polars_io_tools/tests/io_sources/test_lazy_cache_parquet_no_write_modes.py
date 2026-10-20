@@ -107,9 +107,9 @@ def test_no_write_modes_never_call_cache_writers(jan_cached, monkeypatch, mode):
 
     listing = lazy_cache_parquet._extract_existing_files
 
-    def list_without_creating(fs, prefix, *, create_s3_dir=True):
+    def list_without_creating(fs, prefix, *, create_s3_dir=True, **kwargs):
         assert not create_s3_dir
-        return listing(fs, prefix, create_s3_dir=create_s3_dir)
+        return listing(fs, prefix, create_s3_dir=create_s3_dir, **kwargs)
 
     monkeypatch.setattr(lazy_cache_parquet, "_sink_cache_partitions", fail)
     monkeypatch.setattr(lazy_cache_parquet, "_write_empty_parquet_files_sequentially", fail)
