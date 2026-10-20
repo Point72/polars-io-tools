@@ -3708,6 +3708,74 @@ def test_refresh_null_partition_listed_in_is_in(tmp_path, set_now):
     assert out["value"].to_list() == [2, 2]
 
 
+@pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.READ_ONLY])
+@pytest.mark.parametrize("time_unit", ["daily", "monthly", "yearly"])
+@pytest.mark.parametrize("date_dtype", [pl.Date, pl.Datetime("us"), pl.Datetime("us", "America/New_York")])
+@pytest.mark.parametrize("null_state", ["expired", "fresh", "removed"])
+def test_refresh_nullable_date_membership_with_unbounded_or(tmp_path, set_now, cache_mode, time_unit, date_dtype, null_state):
+    source = pl.DataFrame(
+        {
+            "date": [D(2024, 1, 10), None, D(2024, 3, 10), None],
+            "sym": ["A", "A", "B", "B"],
+            "value": [10, 20, 30, 40],
+        }
+    ).with_columns(pl.col("date").cast(date_dtype))
+    kwargs = {"time_unit": time_unit, "extra_partition_cols": "sym"}
+    cache_parquet(source.lazy(), tmp_path, "date", **kwargs).collect()
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    if null_state == "fresh":
+        for path in tmp_path.rglob("*.parquet"):
+            if pl.read_parquet(path)["value"].to_list() == [20]:
+                os.utime(path, (T(2026, 3, 2).timestamp(), T(2026, 3, 2).timestamp()))
+    before = _mtimes(tmp_path)
+    untouched = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*.parquet")
+        if pl.read_parquet(path)["value"].to_list() in ([[20], [40]] if null_state == "fresh" else [[40]])
+    }
+    set_now(T(2026, 3, 2))
+    predicate = (pl.col("date").is_in([source["date"][0], None], nulls_equal=True) & (pl.col("sym") == "A")) | (
+        (pl.col("date") >= source["date"][2]) & (pl.col("sym") == "B")
+    )
+    upstream = source.with_columns(pl.col("value") + 100)
+    if null_state == "removed":
+        upstream = upstream.filter(pl.col("value") != 120)
+    result = cache_parquet(upstream.lazy(), tmp_path, "date", ttl=timedelta(hours=1), cache_mode=cache_mode, **kwargs).filter(predicate).collect()
+    expected = {"expired": [110, 120, 130], "fresh": [20, 110, 130], "removed": [110, 130]}[null_state]
+    assert sorted(result["value"].to_list()) == expected
+    persisted = cache_parquet(upstream.lazy(), tmp_path, "date", cache_mode=CacheMode.CACHE_ONLY, **kwargs).collect()
+    assert sorted(persisted["value"].to_list()) == (sorted([40, *expected]) if cache_mode == CacheMode.CACHE else [10, 20, 30, 40])
+    if cache_mode == CacheMode.READ_ONLY:
+        assert _mtimes(tmp_path) == before
+    for relative_path, contents in untouched.items():
+        assert (tmp_path / relative_path).read_bytes() == contents
+        assert (tmp_path / relative_path).stat().st_mtime_ns == before[relative_path]
+
+
+@pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.READ_ONLY])
+def test_cold_cache_nullable_date_membership_with_unbounded_or(tmp_path, cache_mode):
+    source = pl.LazyFrame({"date": [D(2024, 1, 10), None, D(2024, 3, 10)], "sym": ["A", "A", "B"], "value": [10, 20, 30]})
+    predicate = (pl.col("date").is_in([D(2024, 1, 10), None], nulls_equal=True) & (pl.col("sym") == "A")) | (
+        (pl.col("date") >= D(2024, 3, 10)) & (pl.col("sym") == "B")
+    )
+    result = cache_parquet(source, tmp_path, "date", extra_partition_cols="sym", cache_mode=cache_mode).filter(predicate).collect()
+    assert sorted(result["value"].to_list()) == [10, 20, 30]
+
+
+@pytest.mark.parametrize("engine", ["auto", "streaming"])
+def test_read_only_unbounded_date_udf_rejecting_null(tmp_path, engine):
+    source = pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 3, 11), D(2024, 3, 16)], "sym": ["A", "B", "B"], "value": [1, 2, 3]})
+
+    def weekday(value):
+        return value.weekday() < 5
+
+    predicate = (pl.col("date") >= D(2024, 3, 1)) & pl.col("date").map_elements(weekday, return_dtype=pl.Boolean, skip_nulls=False)
+    result = (
+        cache_parquet(source, tmp_path, "date", extra_partition_cols="sym", cache_mode=CacheMode.READ_ONLY).filter(predicate).collect(engine=engine)
+    )
+    assert result["value"].to_list() == [2]
+
+
 @pytest.mark.parametrize("error", [ComputeError("parquet: File out of specification"), OSError("range invalid"), PanicException("panicked")])
 def test_cache_read_retries_once_after_failure(tmp_path, monkeypatch, caplog, error):
     source = _source(D(2026, 9, 30))

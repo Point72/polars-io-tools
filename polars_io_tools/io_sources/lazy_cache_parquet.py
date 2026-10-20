@@ -1121,7 +1121,7 @@ def _build_write_plan(
         if date_column is not None and date_dtype is not None and effective_time_unit in _PARTITION_FORMATS:
             interval = _local_date_interval(predicate, date_column, date_dtype)
             if interval.empty:
-                filters.append(pl.lit(False))
+                date_filter = pl.lit(False)
             else:
                 lower, upper = -portion.inf, portion.inf
                 if interval.lower != -portion.inf:
@@ -1129,7 +1129,18 @@ def _build_write_plan(
                 if interval.upper != portion.inf:
                     upper = _widen_date(_bound_date((interval.upper, interval.right == portion.CLOSED), -1), effective_time_unit)
                     upper = _step_date(upper, effective_time_unit)
-                filters.append(_partition_dates_expr(portion.closedopen(lower, upper), date_column, date_dtype))
+                date_filter = _partition_dates_expr(portion.closedopen(lower, upper), date_column, date_dtype)
+            if date_filter is not None:
+                date_predicate = _restrict_predicate(predicate, [date_column])
+                null_row = pl.DataFrame({date_column: [None]}, schema={date_column: date_dtype})
+                try:
+                    includes_null_date = date_predicate is None or null_row.select(date_predicate).item() is True
+                except Exception:
+                    log.debug("Could not evaluate the date predicate on null; including null-date partitions", exc_info=True)
+                    includes_null_date = True
+                if includes_null_date:
+                    date_filter = date_filter | pl.col(date_column).is_null()
+            filters.append(date_filter)
     return WritePlan(True, _and_predicates(*filters), False)
 
 
