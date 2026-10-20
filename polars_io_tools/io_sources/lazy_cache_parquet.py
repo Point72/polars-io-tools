@@ -1870,6 +1870,7 @@ def cache_parquet(
     # Validate that date_column exists in schema if provided
     if date_column is not None and date_column not in schema.names():
         raise ValueError(f"date_column '{date_column}' not present in dataframe")
+    date_dtype = schema[date_column] if date_column else None
 
     # Process extra partition columns
     if extra_partition_cols is None:
@@ -1905,6 +1906,21 @@ def cache_parquet(
     if not key_exprs:
         key_exprs = [pl.lit("data").alias("__piot_key_single__")]
 
+    no_write = cache_mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY)
+
+    def list_cache(mtimes: dict[str, datetime.datetime] | None = None) -> tuple[set[str], pl.DataFrame]:
+        keys = _extract_existing_files(fs, fs_path_prefix, create_s3_dir=not no_write, mtimes=mtimes)
+        parts_df = _construct_partitions_df_from_existing(
+            keys,
+            schema,
+            all_partition_cols,
+            template_for_metadata,
+            date_column,
+            file_key_column=file_key_column,
+            decode_file_keys=windows_file_keys,
+        )
+        return keys, parts_df
+
     def source_generator(
         with_columns: list[str] | None,
         predicate: pl.Expr | None,
@@ -1913,7 +1929,6 @@ def cache_parquet(
     ) -> Iterator[pl.DataFrame]:
         log.debug("Running with %s against location %s with columns '%s' and predicate: '%s'", cache_mode, time_unit_dir, with_columns, predicate)
 
-        no_write = cache_mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY)
         # READ_ONLY plans like CACHE, but reads the missing partitions from upstream instead of writing them.
         plan_mode = CacheMode.CACHE if cache_mode == CacheMode.READ_ONLY else cache_mode
         read_schema = schema
@@ -1922,22 +1937,17 @@ def cache_parquet(
             if predicate is not None:
                 required_columns.update(predicate.meta.root_names())
             read_schema = pl.Schema({name: dtype for name, dtype in schema.items() if name in required_columns})
+
+        @functools.cache
+        def partition_key_scope() -> pl.Expr | None:
+            return _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
+
         with contextlib.ExitStack() as held_lock:
             for locked in (False, True):
                 mtimes: dict[str, datetime.datetime] | None = (
                     {} if is_expired is not None and cache_mode in (CacheMode.CACHE, CacheMode.READ_ONLY) else None
                 )
-                existing_parts = _extract_existing_files(fs, fs_path_prefix, create_s3_dir=not no_write, mtimes=mtimes)
-                existing_parts_df = _construct_partitions_df_from_existing(
-                    existing_files=existing_parts,
-                    schema=schema,
-                    all_partition_cols=all_partition_cols,
-                    template_for_metadata=template_for_metadata,
-                    date_column=date_column,
-                    time_unit=time_unit,
-                    file_key_column=file_key_column,
-                    decode_file_keys=windows_file_keys,
-                )
+                existing_parts, existing_parts_df = list_cache(mtimes)
 
                 # Expired files in the query's partition scope are planned as missing; all other files stay cached.
                 refresh_keys: set[str] = set()
@@ -1947,15 +1957,16 @@ def cache_parquet(
                         mtimes,
                         file_key_column=file_key_column,
                         date_column=date_column,
-                        date_dtype=schema[date_column] if date_column else None,
+                        date_dtype=date_dtype,
                         time_unit=time_unit,
                         is_expired=is_expired,  # type: ignore[arg-type]
                         now=_utcnow(),
                     )
                     if expired:
                         expired_df = existing_parts_df.filter(pl.col(file_key_column).is_in(sorted(expired)))
-                        scope = _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
-                        refresh_keys = set((expired_df if scope is None else expired_df.filter(scope))[file_key_column].to_list())
+                        scope = partition_key_scope()
+                        in_scope = expired_df if scope is None else expired_df.filter(scope)
+                        refresh_keys = set(in_scope[file_key_column].to_list())
                         log.debug("Refreshing %d expired partition(s) in scope: %s", len(refresh_keys), sorted(refresh_keys))
                 plan_parts = existing_parts - refresh_keys
                 plan_parts_df = existing_parts_df.filter(~pl.col(file_key_column).is_in(sorted(refresh_keys))) if refresh_keys else existing_parts_df
@@ -1978,7 +1989,7 @@ def cache_parquet(
                     date_column=date_column,
                     predicate=predicate,
                     effective_time_unit=effective_time_unit,
-                    date_dtype=schema[date_column] if date_column else None,
+                    date_dtype=date_dtype,
                 )
 
                 is_finite = part_info.enumerability == Enumerability.FINITE
@@ -2060,9 +2071,9 @@ def cache_parquet(
 
                 # Enumerated rebuild targets receive empty files; wildcard and unbounded targets require stale-file removal.
                 wildcard = not is_finite or _has_null_keys(partitions_to_write_df, part_info.join_cols)
+                rebuild_scope = partition_key_scope() if cache_mode == CacheMode.REBUILD else None
                 if cache_mode == CacheMode.REBUILD and wildcard and not existing_parts_df.is_empty():
-                    key_scope = _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
-                    stale = _stale_partition_keys(existing_parts_df, written_parts, key_scope, file_key_column)
+                    stale = _stale_partition_keys(existing_parts_df, written_parts, rebuild_scope, file_key_column)
                     for key in sorted(stale):
                         try:
                             fs.delete_file(f"{fs_path_prefix}/{key}.parquet")
@@ -2070,13 +2081,8 @@ def cache_parquet(
                         except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
                             log.warning("Failed to remove stale partition %s on REBUILD: %s", key, e)
 
-                key_scope = (
-                    _rebuild_partition_scope(predicate, date_column, _extra_cols, effective_time_unit, schema, partition_keys=True)
-                    if cache_mode == CacheMode.REBUILD
-                    else None
-                )
                 missing = _missing_empty_keys(
-                    part_info, write_plan, cache_mode, written_logical_parts, _extra_cols, date_column, partition_format, key_scope
+                    part_info, write_plan, cache_mode, written_logical_parts, _extra_cols, date_column, partition_format, rebuild_scope
                 )
                 empty_keys = {physical_key(key) for key in missing}
                 # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
@@ -2099,22 +2105,9 @@ def cache_parquet(
                             file_visitor(cache_file(key))
                     log.debug("Wrote %i empty partition(s): %s", len(empty_keys), sorted(empty_keys))
 
-            if upstream_lf is not None and not no_write:
                 # Refresh the file listing to avoid scanning an empty cache after writes.
-                existing_parts = _extract_existing_files(fs, fs_path_prefix)
-                part_info = replace(
-                    part_info,
-                    existing_parts_df=_construct_partitions_df_from_existing(
-                        existing_parts,
-                        schema,
-                        all_partition_cols,
-                        template_for_metadata,
-                        date_column,
-                        time_unit,
-                        file_key_column=file_key_column,
-                        decode_file_keys=windows_file_keys,
-                    ),
-                )
+                existing_parts, refreshed_parts_df = list_cache()
+                part_info = replace(part_info, existing_parts_df=refreshed_parts_df)
             elif refresh_keys and cache_mode == CacheMode.CACHE:
                 # Nothing was written, so read every cached file.
                 part_info = replace(part_info, existing_parts_df=existing_parts_df)
