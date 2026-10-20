@@ -145,10 +145,8 @@ def test_custom_partition_format_cache_hit(tmp_path, fmt, jan_file):
 
 def test_custom_partition_format_parsing():
     schema = pl.Schema({"sym": pl.String, "date": pl.Date})
-    df = _construct_partitions_df_from_existing(
-        {"A/2024/03", "B/2023/12"}, schema, ["sym", "date"], "$year/$month", date_column="date", time_unit="monthly"
-    )
-    expected = pl.DataFrame({"sym": ["A", "B"], "date": [D(2024, 3, 1), D(2023, 12, 1)]})
+    df = _construct_partitions_df_from_existing({"A/2024/03", "B/2023/12"}, schema, ["sym", "date"], "$year/$month", "date", "file")
+    expected = pl.DataFrame({"sym": ["A", "B"], "date": [D(2024, 3, 1), D(2023, 12, 1)], "file": ["A/2024/03", "B/2023/12"]})
     assert_frame_equal(_sorted(df), expected)
 
 
@@ -156,7 +154,7 @@ def test_boolean_key_parsing_drops_unrecognized_keys():
     # "true"/"null" are the spellings of the polars < 1.38 writer
     schema = pl.Schema({"flag": pl.Boolean, "n": pl.Int64})
     keys = {"True/1", "False/None", "true/2", "false/null", "False/x", "yes/3"}
-    df = _construct_partitions_df_from_existing(keys, schema, ["flag", "n"], None)
+    df = _construct_partitions_df_from_existing(keys, schema, ["flag", "n"], None, None, "file").drop("file")
     assert sorted(df.rows(), key=str) == sorted([(True, 1), (False, None), (True, 2), (False, None)], key=str)
 
 
@@ -452,8 +450,9 @@ def test_rebuild_removes_stale_null_partition(tmp_path, null_column):
             pl.Datetime("us"),
             ["2020-01-01 12:00:00.000000", "2020-01-02 00:00:00.000500"],
         ),
+        ([True, None], pl.Boolean, ["true", "null"]),
     ],
-    ids=["boolean", "datetime"],
+    ids=["boolean", "datetime", "null"],
 )
 @pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.REBUILD])
 def test_old_partition_key_spellings_are_reused(tmp_path, values, dtype, old_keys, cache_mode):
@@ -648,3 +647,52 @@ def test_rebuild_unbounded_query_drops_rows_upstream_no_longer_has(tmp_path, pre
     cache_parquet(old, tmp_path, "date", extra_partition_cols="sym").collect()
     out = cache_parquet(old.clear(), tmp_path, "date", extra_partition_cols="sym", cache_mode=CacheMode.REBUILD).filter(predicate).collect()
     assert out.is_empty()
+
+
+@pytest.mark.parametrize("dtype", [pl.Float32, pl.Float64])
+@pytest.mark.parametrize("source_value", [-0.0, 0.0])
+@pytest.mark.parametrize("layout", ["no-date", "default", "custom"])
+@pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.REBUILD])
+def test_equal_signed_zero_partition_does_not_create_false_gap(tmp_path, dtype, source_value, layout, cache_mode):
+    source = pl.DataFrame({"key": pl.Series([source_value], dtype=dtype), "value": [7]})
+    predicate = pl.col("key") == -source_value
+    options = {"extra_partition_cols": "key"}
+    expected_files = 1
+    if layout != "no-date":
+        source = source.with_columns(pl.lit(D(2024, 1, 10)).alias("date"))
+        options.update(date_column="date", partition_format="$year/$month" if layout == "custom" else None)
+        predicate &= pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29))
+        expected_files = 2
+    visited = []
+    result = cache_parquet(source.lazy(), tmp_path, cache_mode=cache_mode, file_visitor=visited.append, **options).filter(predicate).collect()
+    assert_frame_equal(result, source)
+    assert len(list(tmp_path.rglob("*.parquet"))) == expected_files
+    assert len(visited) == expected_files
+    assert len(set(visited)) == expected_files
+
+
+@pytest.mark.parametrize("dtype", [pl.Float32, pl.Float64])
+@pytest.mark.parametrize("source_value", [-0.0, 0.0])
+@pytest.mark.parametrize("layout", ["no-date", "default", "custom"])
+@pytest.mark.parametrize("refresh", ["rebuild", "ttl"])
+def test_equal_signed_zero_refresh_preserves_written_rows(tmp_path, dtype, source_value, layout, refresh):
+    source = pl.DataFrame({"key": pl.Series([source_value], dtype=dtype), "value": [7]})
+    predicate = pl.col("key") == -source_value
+    options = {"extra_partition_cols": "key"}
+    expected_files = 1
+    if layout != "no-date":
+        source = source.with_columns(pl.lit(D(2024, 1, 10)).alias("date"))
+        options.update(date_column="date", partition_format="$year/$month" if layout == "custom" else None)
+        predicate &= pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29))
+        expected_files = 2
+    cache_parquet(source.lazy(), tmp_path, **options).collect()
+    refresh_options = {"cache_mode": CacheMode.REBUILD} if refresh == "rebuild" else {"ttl": datetime.timedelta(0)}
+    for value in [107, 207]:
+        current = source.with_columns(pl.lit(value, pl.Int64).alias("value"))
+        visited = []
+        result = cache_parquet(current.lazy(), tmp_path, file_visitor=visited.append, **options, **refresh_options).filter(predicate).collect()
+        assert_frame_equal(result, current)
+        assert len(visited) == len(set(visited))
+    persisted = cache_parquet(source.lazy(), tmp_path, cache_mode=CacheMode.CACHE_ONLY, **options).collect()
+    assert_frame_equal(persisted, current)
+    assert len(list(tmp_path.rglob("*.parquet"))) == expected_files
