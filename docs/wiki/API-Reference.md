@@ -95,12 +95,31 @@ is visited once per write, so a file left unvisited by such an exception is visi
 when a later query rewrites it.
 
 A write keeps none of its partitions until all of them are written, so a backfill that fails
-or is killed partway starts again. `write_batch_size` writes at most that many partitions
-per upstream query, in partition order, and keeps each batch that completes. Each batch
-runs the source again with a filter for its own partitions, so the source must return the
-same data each time and should push the date filter down. Batching applies under
-`CacheMode.CACHE` when the query's partitions can be enumerated and none of its keys is null.
-It also keeps each write under Polars' open-sink cap (`POLARS_MAX_OPEN_SINKS`, default 128).
+or is killed partway starts again. With `write_batch_size`, the write saves its progress as
+it goes: it writes at most that many partitions per upstream query, in partition order, and
+each batch that completes stays in the cache. Running the same query again reads those
+partitions and fetches only the rest. To retry a backfill, run the query in a loop:
+
+```python
+lf = source.piot.cache_parquet(cache_path, "date", time_unit="daily", write_batch_size=30)
+query = lf.filter(pl.col("date").is_between(start, end))
+for attempt in range(3):
+    try:
+        df = query.collect()
+        break
+    except pl.exceptions.ComputeError:
+        if attempt == 2:
+            raise
+        time.sleep(60)
+```
+
+Errors raised by the source reach the caller as `ComputeError`, with the original message but
+not its type, so a loop like this retries every failure; check the message if only some should
+be retried. Each batch runs the source again with a filter for its own partitions, so the
+source must return the same data each time and should push the date filter down. Batching
+applies under `CacheMode.CACHE` when the query's partitions can be enumerated and none of its
+keys is null. It also keeps each write under Polars' open-sink cap (`POLARS_MAX_OPEN_SINKS`,
+default 128).
 
 ### `cache_memory`
 

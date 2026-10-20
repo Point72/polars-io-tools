@@ -1717,7 +1717,8 @@ def cache_parquet(
             its partitions until all of them are written. Batches follow partition order, and each runs the source again
             with a filter for its own partitions, so the source must return the same data each time it runs and should
             push the date filter down. Applies under ``CacheMode.CACHE`` when the query's partitions can be enumerated and
-            none of its keys is null; other writes are not split.
+            none of its keys is null; other writes are not split. To retry a failed write, run the query again; it fetches
+            only the partitions not yet written.
         aws_profile (str, optional): AWS profile name for S3 access. If None, uses the AWS_PROFILE environment variable.
             This is only relevant if the cache_path is an S3 URI.
         write_kwargs (dict, optional): Additional keyword arguments for writing Parquet files. Internally, this is passed
