@@ -1483,6 +1483,7 @@ def _missing_empty_keys(
     part_info: PartitionInfo,
     write_plan: WritePlan,
     cache_mode: CacheMode,
+    written_parts_df: pl.DataFrame,
     extra_cols: list[str],
     date_column: str | None,
     date_fmt: str | None,
@@ -1503,9 +1504,11 @@ def _missing_empty_keys(
     if rebuild_scope is not None:
         expected = expected.filter(rebuild_scope)
     expected = expected.drop_nulls()
+    known = written_parts_df.select(part_info.join_cols).cast(expected.schema)
     if cache_mode != CacheMode.REBUILD:
         existing_rows = part_info.existing_parts_df.select(part_info.join_cols).cast(expected.schema)
-        expected = expected.join(existing_rows, on=part_info.join_cols, how="anti")
+        known = pl.concat([known, existing_rows], how="vertical")
+    expected = expected.join(known, on=part_info.join_cols, how="anti")
     if expected.is_empty():
         return set()
     return set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls())
@@ -2051,13 +2054,24 @@ def cache_parquet(
                         except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
                             log.warning("Failed to remove stale partition %s on REBUILD: %s", key, e)
 
-                missing = _missing_empty_keys(part_info, write_plan, cache_mode, _extra_cols, date_column, partition_format, rebuild_scope)
-                empty_keys = {physical_key(key) for key in missing - written_logical_parts}
+                written_parts_df = _construct_partitions_df_from_existing(
+                    written_logical_parts,
+                    schema,
+                    all_partition_cols,
+                    template_for_metadata,
+                    date_column,
+                    file_key_column=file_key_column,
+                )
+                missing = _missing_empty_keys(
+                    part_info, write_plan, cache_mode, written_parts_df, _extra_cols, date_column, partition_format, rebuild_scope
+                )
+                empty_keys = {physical_key(key) for key in missing}
                 # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
                 emptied_expired = refresh_keys - written_parts
                 if emptied_expired:
                     log.warning("Replacing %d expired cache file(s) with empty files: %s", len(emptied_expired), sorted(emptied_expired))
                     empty_keys |= emptied_expired
+                empty_keys -= written_parts
                 if empty_keys:
                     log.debug("Writing %d empty partition(s) sequentially", len(empty_keys))
                     for key in sorted(empty_keys):
