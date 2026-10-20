@@ -1396,8 +1396,8 @@ def _sink_cache_partitions(
     physical_key: Callable[[str], str],
     fs: "pa_fs.FileSystem",
     fs_path_prefix: str,
-) -> tuple[set[str], set[str]]:
-    """Sink one file per partition and return its physical and logical keys.
+) -> set[str]:
+    """Sink one file per partition and return the logical keys written.
 
     If the sink fails, every file it opened is deleted (best effort), so a partially written partition is refetched rather than read as complete.
     """
@@ -1476,22 +1476,21 @@ def _sink_cache_partitions(
                 log.warning("Failed to delete partition %s after a failed cache write: %s", key, e)
         raise
     log.debug("Wrote %i new partition(s): %s", len(written), sorted(written))
-    return written, written_logical
+    return written_logical
 
 
 def _missing_empty_keys(
     part_info: PartitionInfo,
     write_plan: WritePlan,
     cache_mode: CacheMode,
-    written: set[str],
     extra_cols: list[str],
     date_column: str | None,
     date_fmt: str | None,
     rebuild_scope: pl.Expr | None,
 ) -> set[str]:
-    """Return enumerable gap keys, clipping unbounded queries to existing cache bounds.
+    """Return the logical keys of enumerable gaps, clipping unbounded queries to existing cache bounds.
 
-    ``written`` holds the logical keys just written, and ``rebuild_scope`` limits REBUILD targets.
+    ``rebuild_scope`` limits REBUILD targets.
     """
     if part_info.enumerability == Enumerability.UNBOUNDED:
         expected = part_info.clipped_expected_parts_df
@@ -1509,7 +1508,7 @@ def _missing_empty_keys(
         expected = expected.join(existing_rows, on=part_info.join_cols, how="anti")
     if expected.is_empty():
         return set()
-    return set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls()) - written
+    return set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls())
 
 
 def _stale_partition_keys(existing: pl.DataFrame, written: set[str], scope: pl.Expr | None, file_key_column: str) -> set[str]:
@@ -2022,7 +2021,7 @@ def cache_parquet(
                 def physical_key(logical_key: str) -> str:
                     return key_aliases.get(logical_key, _encode_partition_file_key(logical_key, windows_file_keys))
 
-                written_parts, written_logical_parts = _sink_cache_partitions(
+                written_logical_parts = _sink_cache_partitions(
                     upstream_lf,
                     time_unit_dir=time_unit_dir,
                     key_exprs=key_exprs,
@@ -2035,6 +2034,7 @@ def cache_parquet(
                     fs=fs,
                     fs_path_prefix=fs_path_prefix,
                 )
+                written_parts = {physical_key(key) for key in written_logical_parts}
                 if file_visitor is not None:
                     for key in sorted(written_parts):
                         file_visitor(cache_file(key))
@@ -2051,10 +2051,8 @@ def cache_parquet(
                         except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
                             log.warning("Failed to remove stale partition %s on REBUILD: %s", key, e)
 
-                missing = _missing_empty_keys(
-                    part_info, write_plan, cache_mode, written_logical_parts, _extra_cols, date_column, partition_format, rebuild_scope
-                )
-                empty_keys = {physical_key(key) for key in missing}
+                missing = _missing_empty_keys(part_info, write_plan, cache_mode, _extra_cols, date_column, partition_format, rebuild_scope)
+                empty_keys = {physical_key(key) for key in missing - written_logical_parts}
                 # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
                 emptied_expired = refresh_keys - written_parts
                 if emptied_expired:
