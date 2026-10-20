@@ -145,9 +145,7 @@ def test_custom_partition_format_cache_hit(tmp_path, fmt, jan_file):
 
 def test_custom_partition_format_parsing():
     schema = pl.Schema({"sym": pl.String, "date": pl.Date})
-    df = _construct_partitions_df_from_existing(
-        {"A/2024/03", "B/2023/12"}, schema, ["sym", "date"], "$year/$month", date_column="date", time_unit="monthly"
-    )
+    df = _construct_partitions_df_from_existing({"A/2024/03", "B/2023/12"}, schema, ["sym", "date"], "$year/$month", date_column="date")
     expected = pl.DataFrame({"sym": ["A", "B"], "date": [D(2024, 3, 1), D(2023, 12, 1)]})
     assert_frame_equal(_sorted(df), expected)
 

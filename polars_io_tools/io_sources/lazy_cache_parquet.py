@@ -101,24 +101,8 @@ def _storage_kwargs(storage_options: dict | None, credential_provider: pl.Creden
     return kwargs
 
 
-def _dataframe_write_parquet_kwargs(
-    *,
-    write_kwargs: dict,
-    metadata: dict[str, str],
-    storage_options: dict,
-    credential_provider: pl.CredentialProviderAWS | None,
-) -> dict:
-    parquet_kwargs = dict(write_kwargs)
-    for key in ("metadata", "lazy", "maintain_order"):
-        parquet_kwargs.pop(key, None)
-    parquet_kwargs["metadata"] = metadata
-    parquet_kwargs["mkdir"] = True
-    parquet_kwargs.update(_storage_kwargs(storage_options, credential_provider))
-    return parquet_kwargs
-
-
-def _write_empty_parquet_files_sequentially(
-    paths: list[str],
+def _write_empty_parquet_file(
+    path: str,
     *,
     schema: pl.Schema,
     metadata: dict[str, str],
@@ -126,15 +110,9 @@ def _write_empty_parquet_files_sequentially(
     credential_provider: pl.CredentialProviderAWS | None,
     write_kwargs: dict,
 ) -> None:
-    empty_df = pl.DataFrame(schema=schema)
-    parquet_kwargs = _dataframe_write_parquet_kwargs(
-        write_kwargs=write_kwargs,
-        metadata=metadata,
-        storage_options=storage_options,
-        credential_provider=credential_provider,
-    )
-    for path in paths:
-        empty_df.write_parquet(path, **parquet_kwargs)
+    parquet_kwargs = {k: v for k, v in write_kwargs.items() if k not in ("metadata", "lazy", "maintain_order")}
+    parquet_kwargs.update(metadata=metadata, mkdir=True, **_storage_kwargs(storage_options, credential_provider))
+    pl.DataFrame(schema=schema).write_parquet(path, **parquet_kwargs)
 
 
 class CacheMode(Enum):
@@ -259,25 +237,25 @@ def _build_partition_info(
     existing_parts_df: pl.DataFrame,
     date_column: str | None,
     extra_cols: list[str],
-    predicate: pl.Expr | None = None,
-    time_unit: Literal["daily", "monthly", "yearly"] | None = None,
-    schema: pl.Schema | None = None,
-    bounds_parts_df: pl.DataFrame | None = None,
+    predicate: pl.Expr | None,
+    time_unit: Literal["daily", "monthly", "yearly"],
+    schema: pl.Schema,
+    bounds_parts_df: pl.DataFrame,
 ) -> PartitionInfo:
     """Create a PartitionInfo snapshot to drive downstream planning decisions.
 
-    ``bounds_parts_df`` sets the cached date bounds that clip one-sided queries; it defaults to ``existing_parts_df``.
+    ``bounds_parts_df`` sets the cached date bounds that clip one-sided queries.
     """
     join_cols = extra_cols + ([date_column] if date_column else [])
     enumerability = _classify_enumerability(expected_parts_df, date_column)
 
     clipped_expected_parts_df = None
 
-    if enumerability == Enumerability.UNBOUNDED and date_column and time_unit and schema and predicate is not None:
+    if enumerability == Enumerability.UNBOUNDED and date_column and predicate is not None:
         date_interval = _local_date_interval(predicate, date_column, schema[date_column])
         clipped_expected_parts_df = _compute_clipped_expected_partitions(
             predicate_interval=date_interval,
-            existing_parts_df=existing_parts_df if bounds_parts_df is None else bounds_parts_df,
+            existing_parts_df=bounds_parts_df,
             date_column=date_column,
             extra_cols=extra_cols,
             time_unit=time_unit,
@@ -601,7 +579,6 @@ def _construct_partitions_df_from_existing(
     all_partition_cols: list[str],
     template_for_metadata: str | None,
     date_column: str | None = None,
-    time_unit: Literal["daily", "monthly", "yearly"] | None = None,
     file_key_column: str | None = None,
     decode_file_keys: bool = False,
 ) -> pl.DataFrame:
@@ -1068,7 +1045,7 @@ def _build_write_plan(
     date_column: str | None,
     predicate: pl.Expr | None,
     effective_time_unit: Literal["daily", "monthly", "yearly", "null"],
-    date_dtype: pl.DataType | None = None,
+    date_dtype: pl.DataType | None,
 ) -> WritePlan:
     """Decide whether to write and how to filter unbounded partitions."""
     if cache_mode not in {CacheMode.CACHE, CacheMode.REBUILD}:
@@ -1394,14 +1371,13 @@ def _write_partition_filter(
 ) -> pl.Expr | None:
     """Select complete target partitions, excluding existing ones in CACHE mode."""
     join_cols = part_info.join_cols
+    extra_cols = [c for c in join_cols if c != date_column]
     if cache_mode == CacheMode.REBUILD:
-        return _rebuild_partition_scope(predicate, date_column, [c for c in join_cols if c != date_column], time_unit, schema)
-    if date_column is None and _has_null_keys(partitions, join_cols) and cache_mode in (CacheMode.CACHE, CacheMode.REBUILD):
+        return _rebuild_partition_scope(predicate, date_column, extra_cols, time_unit, schema)
+    if date_column is None and _has_null_keys(partitions, join_cols) and cache_mode == CacheMode.CACHE:
         write_filter = _restrict_predicate(predicate, join_cols)
     elif not partitions.is_empty():
-        write_filter = _generate_write_predicate_from_partitions_df(
-            partitions, date_column, [c for c in join_cols if c != (date_column or "")], time_unit
-        )
+        write_filter = _generate_write_predicate_from_partitions_df(partitions, date_column, extra_cols, time_unit)
     else:
         return write_plan.filter_predicate
     if cache_mode == CacheMode.CACHE:
@@ -1416,6 +1392,7 @@ def _write_partition_filter(
 
 def _sink_cache_partitions(
     lf: pl.LazyFrame,
+    *,
     time_unit_dir: str,
     key_exprs: list[pl.Expr],
     n_partitions: int,
@@ -1978,7 +1955,7 @@ def cache_parquet(
                     date_column=date_column,
                     extra_cols=_extra_cols,
                     predicate=predicate,
-                    time_unit=time_unit if date_column else None,
+                    time_unit=time_unit,
                     schema=schema,
                     bounds_parts_df=existing_parts_df,
                 )
@@ -2054,16 +2031,16 @@ def cache_parquet(
 
                 written_parts, written_logical_parts = _sink_cache_partitions(
                     upstream_lf,
-                    time_unit_dir,
-                    key_exprs,
-                    len(partitions_to_write_df),
-                    cache_metadata,
-                    polars_opts,
-                    credential_provider,
-                    write_kwargs,
-                    physical_key,
-                    fs,
-                    fs_path_prefix,
+                    time_unit_dir=time_unit_dir,
+                    key_exprs=key_exprs,
+                    n_partitions=len(partitions_to_write_df),
+                    metadata=cache_metadata,
+                    storage_options=polars_opts,
+                    credential_provider=credential_provider,
+                    write_kwargs=write_kwargs,
+                    physical_key=physical_key,
+                    fs=fs,
+                    fs_path_prefix=fs_path_prefix,
                 )
                 if file_visitor is not None:
                     for key in sorted(written_parts):
@@ -2093,8 +2070,9 @@ def cache_parquet(
                 if empty_keys:
                     log.debug("Writing %d empty partition(s) sequentially", len(empty_keys))
                     for key in sorted(empty_keys):
-                        _write_empty_parquet_files_sequentially(
-                            [f"{time_unit_dir}/{key}.parquet"],
+                        # Unlike scans, write_parquet does not URL-decode the path, so the key is not quoted as in _cache_file_uri.
+                        _write_empty_parquet_file(
+                            f"{time_unit_dir}/{key}.parquet",
                             schema=schema,
                             metadata=cache_metadata,
                             storage_options=polars_opts,

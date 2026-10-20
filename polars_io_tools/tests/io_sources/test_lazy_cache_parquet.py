@@ -1987,14 +1987,14 @@ class TestHelperFunctions:
         result = _compute_partitions_to_write(part_info)
         assert_frame_equal(result, expected)
 
-    def test_write_empty_parquet_files_sequentially(self, tmp_path):
-        from polars_io_tools.io_sources.lazy_cache_parquet import _write_empty_parquet_files_sequentially
+    def test_write_empty_parquet_file(self, tmp_path):
+        from polars_io_tools.io_sources.lazy_cache_parquet import _write_empty_parquet_file
 
-        paths = [str(tmp_path / "one.parquet"), str(tmp_path / "nested" / "two.parquet")]
+        path = str(tmp_path / "nested" / "one.parquet")
         schema = pl.Schema({"value": pl.Int64})
 
-        _write_empty_parquet_files_sequentially(
-            paths,
+        _write_empty_parquet_file(
+            path,
             schema=schema,
             metadata={},
             storage_options={},
@@ -2002,9 +2002,8 @@ class TestHelperFunctions:
             write_kwargs={},
         )
 
-        for path in paths:
-            assert pl.read_parquet(path).schema == schema
-            assert pl.read_parquet(path).height == 0
+        assert pl.read_parquet(path).schema == schema
+        assert pl.read_parquet(path).height == 0
 
     def test_build_read_plan_falls_back_to_glob_for_many_paths(self):
         from polars_io_tools.io_sources.lazy_cache_parquet import (

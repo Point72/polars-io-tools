@@ -112,7 +112,7 @@ def test_no_write_modes_never_call_cache_writers(jan_cached, monkeypatch, mode):
         return listing(fs, prefix, create_s3_dir=create_s3_dir, **kwargs)
 
     monkeypatch.setattr(lazy_cache_parquet, "_sink_cache_partitions", fail)
-    monkeypatch.setattr(lazy_cache_parquet, "_write_empty_parquet_files_sequentially", fail)
+    monkeypatch.setattr(lazy_cache_parquet, "_write_empty_parquet_file", fail)
     monkeypatch.setattr(lazy_cache_parquet, "_extract_existing_files", list_without_creating)
     lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=mode)
     for predicate in [JAN_FEB, pl.col("date") >= D(2024, 1, 1), None]:
