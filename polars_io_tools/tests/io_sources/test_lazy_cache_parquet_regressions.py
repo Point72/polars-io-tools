@@ -653,7 +653,8 @@ def test_rebuild_unbounded_query_drops_rows_upstream_no_longer_has(tmp_path, pre
 @pytest.mark.parametrize("source_value", [-0.0, 0.0])
 @pytest.mark.parametrize("layout", ["no-date", "default", "custom"])
 @pytest.mark.parametrize("cache_mode", [CacheMode.CACHE, CacheMode.REBUILD])
-def test_equal_signed_zero_partition_does_not_create_false_gap(tmp_path, dtype, source_value, layout, cache_mode):
+@pytest.mark.parametrize("write_batch_size", [None, 1])
+def test_equal_signed_zero_partition_does_not_create_false_gap(tmp_path, dtype, source_value, layout, cache_mode, write_batch_size):
     source = pl.DataFrame({"key": pl.Series([source_value], dtype=dtype), "value": [7]})
     predicate = pl.col("key") == -source_value
     options = {"extra_partition_cols": "key"}
@@ -664,7 +665,11 @@ def test_equal_signed_zero_partition_does_not_create_false_gap(tmp_path, dtype, 
         predicate &= pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29))
         expected_files = 2
     visited = []
-    result = cache_parquet(source.lazy(), tmp_path, cache_mode=cache_mode, file_visitor=visited.append, **options).filter(predicate).collect()
+    result = (
+        cache_parquet(source.lazy(), tmp_path, cache_mode=cache_mode, file_visitor=visited.append, write_batch_size=write_batch_size, **options)
+        .filter(predicate)
+        .collect()
+    )
     assert_frame_equal(result, source)
     assert len(list(tmp_path.rglob("*.parquet"))) == expected_files
     assert len(visited) == expected_files

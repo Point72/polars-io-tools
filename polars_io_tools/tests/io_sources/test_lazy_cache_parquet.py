@@ -3534,6 +3534,79 @@ def test_sink_rejects_reopened_partition(tmp_path, monkeypatch, legacy):
         cache_parquet(_source(D(2026, 9, 30)), tmp_path, "date").collect()
 
 
+@pytest.mark.parametrize("syms", [[None], ["A", "B"]])
+def test_write_batch_size_splits_sinks_below_open_sink_cap(tmp_path, monkeypatch, syms):
+    monkeypatch.setattr(lazy_cache_parquet, "_max_open_sinks", lambda: 4)
+    days = [d for d in pl.date_range(START, D(2026, 9, 6), eager=True) if d != D(2026, 9, 2)]
+    source = pl.LazyFrame({"date": days}).join(pl.LazyFrame({"sym": syms}, schema={"sym": pl.String}), how="cross").with_columns(value=pl.lit(1))
+    kwargs = {"time_unit": "daily", "extra_partition_cols": "sym" if syms != [None] else None}
+    pred = pl.col("date").is_between(START, D(2026, 9, 6))
+    if syms != [None]:
+        pred &= pl.col("sym").is_in(syms)
+    real_sink = pl.LazyFrame.sink_parquet
+    sinks = []
+
+    def counting_sink(self, target, **sink_kwargs):
+        if not isinstance(target, (str, Path)):
+            sinks.append(1)
+        return real_sink(self, target, **sink_kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", counting_sink)
+    with pytest.raises(Exception, match="open-sink cap"):
+        cache_parquet(source, tmp_path / "unbatched", "date", **kwargs).filter(pred).collect()
+    out = cache_parquet(source, tmp_path / "batched", "date", write_batch_size=4, **kwargs).filter(pred).collect()
+    assert_frame_equal(out.sort("date", "sym"), source.collect().sort("date", "sym"), check_column_order=False)
+    assert len(sinks) == -(-6 * len(syms) // 4)
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_write_batch_size_keeps_batches_written_before_a_failure(tmp_path, set_now, monkeypatch, refresh):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1)}
+    pred = pl.col("date").is_between(START, D(2026, 9, 6))
+    if refresh:
+        set_now(T(2026, 9, 7))
+        cache_parquet(_source(D(2026, 9, 6)), tmp_path, "date", **kwargs).filter(pred).collect()
+        _set_mtime(tmp_path, T(2026, 9, 7))
+        set_now(T(2026, 9, 8))
+    real_sink = pl.LazyFrame.sink_parquet
+    sinks = []
+
+    def failing_second_sink(self, target, **sink_kwargs):
+        if isinstance(target, (str, Path)):
+            return real_sink(self, target, **sink_kwargs)
+        sinks.append(1)
+        if len(sinks) == 2:
+            real_sink(self.head(1), target, **sink_kwargs)
+            raise RuntimeError("sink failed")
+        return real_sink(self, target, **sink_kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", failing_second_sink)
+    # 2026-09-02 is missing upstream, so batch one leaves an empty file for it.
+    source = _source(D(2026, 9, 6), value=2).filter(pl.col("date") != D(2026, 9, 2))
+    with pytest.raises(Exception, match="sink failed"):
+        cache_parquet(source, tmp_path, "date", write_batch_size=3, **kwargs).filter(pred).collect()
+    # The failed batch deletes the file it opened; files it never opened keep their old data.
+    expected = {"01", "02", "03"} | ({"05", "06"} if refresh else set())
+    assert {p.stem[-2:] for p in (tmp_path / "daily").glob("*.parquet")} == expected
+    assert pl.read_parquet(tmp_path / "daily" / "2026-09-02.parquet").is_empty()
+    assert pl.read_parquet(tmp_path / "daily" / "2026-09-03.parquet")["value"].to_list() == [2]
+
+
+def test_write_filter_selects_only_target_partitions(tmp_path):
+    source = pl.LazyFrame({"date": [START, START, D(2026, 9, 2), D(2026, 9, 2)], "sym": ["A", "B", "A", "B"], "value": [1, 2, 3, 4]})
+    pred = ((pl.col("date") == START) & (pl.col("sym") == "A")) | ((pl.col("date") == D(2026, 9, 2)) & (pl.col("sym") == "B"))
+    out = cache_parquet(source, tmp_path, "date", time_unit="daily", extra_partition_cols="sym").filter(pred).collect()
+    assert sorted(out["value"].to_list()) == [1, 4]
+    assert len(list(tmp_path.glob("**/*.parquet"))) == 2
+
+
+def test_write_filter_keeps_unrestricted_null_date_target(tmp_path):
+    source = pl.LazyFrame({"date": [None, START], "sym": ["B", "A"], "value": [1, 2]}, schema_overrides={"date": pl.Date})
+    pred = pl.col("date").is_null() | ((pl.col("date") == START) & (pl.col("sym") == "A"))
+    out = cache_parquet(source, tmp_path, "date", time_unit="daily", extra_partition_cols="sym").filter(pred).collect()
+    assert sorted(out["value"].to_list()) == [1, 2]
+
+
 def test_listing_skips_file_deleted_after_glob(tmp_path, monkeypatch):
     import pyarrow.fs as pa_fs
 

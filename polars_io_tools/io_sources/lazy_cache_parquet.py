@@ -932,10 +932,7 @@ def _generate_write_predicate_from_partitions_df(
     extra_cols: list[str],
     time_unit: Literal["daily", "monthly", "yearly", "null"],
 ) -> pl.Expr | None:
-    """Return a predicate covering the target partitions, or None when unrestricted.
-
-    Within merged date ranges, extra-column values may cover more combinations than the target partitions.
-    """
+    """Return a predicate matching exactly the target partitions, or None when unrestricted."""
     if partitions_df.is_empty():
         return None
 
@@ -951,7 +948,7 @@ def _generate_write_predicate_from_partitions_df(
         return pl.Expr.or_(*all_extra_predicates) if all_extra_predicates else None
 
     date_dtype = partitions_df.schema[date_column]
-    partition_intervals: list[tuple[Interval, dict[str, Any]]] = []
+    combos_by_interval: dict[Interval, set[tuple[tuple[str, Any], ...]]] = {}
     for row_dict in partitions_df.with_columns(_stored_key_date_expr(date_column, date_dtype)).to_dicts():
         date_val = row_dict.get(date_column)
         interval = portion.open(-portion.inf, portion.inf)
@@ -960,34 +957,53 @@ def _generate_write_predicate_from_partitions_df(
                 raise ValueError(f"Unsupported time_unit: {time_unit}")
             start_date = _widen_date(date_val, time_unit)
             interval = portion.closedopen(start_date, _step_date(start_date, time_unit))
-        extra_values = {col: row_dict[col] for col in extra_cols if row_dict.get(col) is not None}
-        partition_intervals.append((interval, extra_values))
+        combo = tuple((col, row_dict[col]) for col in extra_cols if row_dict.get(col) is not None)
+        combos_by_interval.setdefault(interval, set()).add(combo)
 
-    merged_groups: list[tuple[Interval, list[dict[str, Any]]]] = []
-    partition_intervals.sort(key=lambda x: (x[0].lower, x[0].upper))
-    for interval, partition_values in partition_intervals:
-        if merged_groups and (merged_groups[-1][0].overlaps(interval) or merged_groups[-1][0].adjacent(interval)):
-            previous, values = merged_groups[-1]
-            values.append(partition_values)
-            merged_groups[-1] = (previous | interval, values)
-        else:
-            merged_groups.append((interval, [partition_values]))
+    # Periods are grouped by the extra-column values they target, so the predicate selects no other partitions.
+    periods_by_combos: dict[frozenset[tuple[tuple[str, Any], ...]], list[Interval]] = {}
+    for interval in sorted(combos_by_interval, key=lambda i: (i.lower, i.upper)):
+        periods_by_combos.setdefault(frozenset(combos_by_interval[interval]), []).append(interval)
+
     group_predicates = []
+    for combos, periods in periods_by_combos.items():
+        group_preds = [
+            p
+            for p in (_periods_predicate(periods, date_column, date_dtype, time_unit), _extra_combos_predicate(combos, partitions_df.schema))
+            if p is not None
+        ]
+        if not group_preds:
+            return None
+        group_predicates.append(pl.Expr.and_(*group_preds))
+    return pl.Expr.or_(*group_predicates)
 
-    for merged_interval, partition_list in merged_groups:
-        cur_date_expr = _partition_dates_expr(merged_interval, date_column, date_dtype)
-        group_preds = [cur_date_expr] if cur_date_expr is not None else []
-        for col in extra_cols:
-            if any(col not in partition_values for partition_values in partition_list):
-                continue
-            values = {partition_values[col] for partition_values in partition_list}
-            if len(values) == 1:
-                group_preds.append(pl.col(col) == next(iter(values)))
-            else:
-                group_preds.append(pl.col(col).is_in(_is_in_collection(list(values), partitions_df.schema[col])))
-        if group_preds:
-            group_predicates.append(pl.Expr.and_(*group_preds))
-    return pl.Expr.or_(*group_predicates) if group_predicates else None
+
+def _periods_predicate(
+    periods: list[Interval], date_column: str, dtype: pl.DataType, time_unit: Literal["daily", "monthly", "yearly"]
+) -> pl.Expr | None:
+    """Match rows whose partition period is one of ``periods``."""
+    merged = portion.Interval(*periods)
+    if merged.atomic:
+        return _partition_dates_expr(merged, date_column, dtype)
+    starts = sorted({period.lower for period in periods})
+    return _and_predicates(
+        _partition_dates_expr(merged.enclosure, date_column, dtype),
+        _partition_date_expr(date_column, dtype, time_unit).is_in(_is_in_collection(starts, pl.Date)),
+    )
+
+
+def _extra_combos_predicate(combos: frozenset[tuple[tuple[str, Any], ...]], schema: pl.Schema) -> pl.Expr | None:
+    """Match any of ``combos``, each a set of ``(column, value)`` equalities; None when one combo is unrestricted."""
+    if () in combos:
+        return None
+    columns = {tuple(col for col, _ in combo) for combo in combos}
+    if len(columns) == 1 and len(next(iter(columns))) == 1:
+        col = next(iter(columns))[0]
+        values = [combo[0][1] for combo in combos]
+        if len(values) == 1:
+            return pl.col(col) == values[0]
+        return pl.col(col).is_in(_is_in_collection(values, schema[col]))
+    return pl.Expr.or_(*(pl.Expr.and_(*(pl.col(col) == value for col, value in combo)) for combo in combos))
 
 
 def _schema_from_cache(
@@ -1460,7 +1476,7 @@ def _sink_cache_partitions(
             f"{max_open_sinks}. Exceeding the cap silently drops rows. Set the "
             "POLARS_MAX_OPEN_SINKS environment variable above the partition "
             "count BEFORE the process starts, or write fewer partitions per "
-            "call (e.g. a coarser time_unit or chunked date ranges)."
+            "sink with write_batch_size or a coarser time_unit."
         )
 
     sink_kwargs = dict(write_kwargs)
@@ -1523,6 +1539,14 @@ def _missing_empty_keys(
     if expected.is_empty():
         return set()
     return set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls())
+
+
+def _split_write_batches(partitions: pl.DataFrame, join_cols: list[str], size: int | None) -> list[pl.DataFrame]:
+    """Split ``partitions`` in key order into batches of at most ``size`` rows; one batch when ``size`` is None."""
+    if size is None or len(partitions) <= size:
+        return [partitions]
+    ordered = partitions.sort(join_cols)
+    return [ordered.slice(start, size) for start in range(0, len(ordered), size)]
 
 
 def _stale_partition_keys(existing: pl.DataFrame, written: set[str], scope: pl.Expr | None, file_key_column: str) -> set[str]:
@@ -1596,6 +1620,7 @@ def cache_parquet(
     final_after: timedelta | None = None,
     lock: Callable[[str], contextlib.AbstractContextManager[Any]] | None = None,
     file_visitor: Callable[[str], None] | None = None,
+    write_batch_size: int | None = None,
     aws_profile: str | None = None,
     write_kwargs: dict | None = None,
     read_kwargs: dict | None = None,
@@ -1687,6 +1712,12 @@ def cache_parquet(
             before the query returns, so a slow visitor delays both. An exception it raises propagates without undoing
             the write. Each file is visited once per write, so a file left unvisited by such an exception is visited only
             when a later query rewrites it.
+        write_batch_size (int, optional): Write at most this many partitions per upstream query, so a long backfill keeps
+            every batch that completes if a later batch fails or the process is killed. Without it, a write keeps none of
+            its partitions until all of them are written. Batches follow partition order, and each runs the source again
+            with a filter for its own partitions, so the source must return the same data each time it runs and should
+            push the date filter down. Applies under ``CacheMode.CACHE`` when the query's partitions can be enumerated and
+            none of its keys is null; other writes are not split.
         aws_profile (str, optional): AWS profile name for S3 access. If None, uses the AWS_PROFILE environment variable.
             This is only relevant if the cache_path is an S3 URI.
         write_kwargs (dict, optional): Additional keyword arguments for writing Parquet files. Internally, this is passed
@@ -1770,11 +1801,17 @@ def cache_parquet(
           of simultaneously open sinks (``POLARS_MAX_OPEN_SINKS``, default 128); exceeding it would
           silently drop rows, so ``cache_parquet`` raises instead. To write more partitions in one call,
           set ``POLARS_MAX_OPEN_SINKS`` above the partition count *before the process starts*, or reduce
-          the partition count per call (e.g. a coarser ``time_unit`` or chunked date ranges).
+          the partition count per write with ``write_batch_size`` or a coarser ``time_unit``.
         - Failed writes: if a write raises, the partition files it opened are deleted so the next query
           refetches them. Deletion is best effort; failures are logged, and a file that survives may need
-          manual removal. A killed process deletes nothing. Concurrent readers may fail or read incomplete
-          partitions.
+          manual removal. A killed process deletes nothing, and the next query refetches the partitions
+          it had not finished. Batches written before a failure or kill are kept. Concurrent readers may
+          fail or read incomplete partitions.
+        - Resumable rebuild: ``CacheMode.REBUILD`` ignores the cache, so a rebuild that stops partway must
+          start again. A ``ttl`` that expires files written before a fixed time, such as
+          ``ttl=lambda written_at, period_end, now: written_at < cutoff``, refreshes the same partitions
+          under ``CacheMode.CACHE``, and rerunning it with the same ``cutoff`` refetches only the files not
+          yet rewritten.
     """
     if cache_mode == CacheMode.IGNORE:
         return self_or_fn() if callable(self_or_fn) else self_or_fn
@@ -1793,6 +1830,8 @@ def cache_parquet(
         raise TypeError(f"lock must be a callable, got {type(lock).__name__}")
     if file_visitor is not None and not callable(file_visitor):
         raise TypeError(f"file_visitor must be a callable, got {type(file_visitor).__name__}")
+    if write_batch_size is not None and (isinstance(write_batch_size, bool) or not isinstance(write_batch_size, int) or write_batch_size < 1):
+        raise ValueError(f"write_batch_size must be a positive int, got {write_batch_size!r}")
     for name, value in (("ttl", ttl), ("final_after", final_after)):
         if isinstance(value, timedelta) and value < timedelta(0):
             raise ValueError(f"{name} must not be negative")
@@ -2000,18 +2039,24 @@ def cache_parquet(
 
             upstream_lf = None
             if fetch_upstream:
-                upstream_lf = get_source()
+                source_lf = get_source()
                 if cache_mode == CacheMode.READ_ONLY:
                     # Rows are returned rather than written, so partition filters must see the cached dtypes.
-                    upstream_lf = _conform_to_schema(upstream_lf, read_schema)
-                write_filter = _write_partition_filter(
-                    partitions_to_write_df, part_info, write_plan, plan_mode, predicate, date_column, effective_time_unit, schema
-                )
-                if write_filter is not None:
-                    upstream_lf = upstream_lf.filter(write_filter)
+                    source_lf = _conform_to_schema(source_lf, read_schema)
                 bounding_pred = _restrict_predicate(predicate, write_bounding_columns or [])
-                if bounding_pred is not None:
-                    upstream_lf = upstream_lf.filter(bounding_pred)
+
+                def upstream_for(partitions: pl.DataFrame) -> pl.LazyFrame:
+                    lf = source_lf
+                    write_filter = _write_partition_filter(
+                        partitions, part_info, write_plan, plan_mode, predicate, date_column, effective_time_unit, schema
+                    )
+                    if write_filter is not None:
+                        lf = lf.filter(write_filter)
+                    if bounding_pred is not None:
+                        lf = lf.filter(bounding_pred)
+                    return lf
+
+                upstream_lf = upstream_for(partitions_to_write_df)
 
             if upstream_lf is not None and not no_write:
                 cache_metadata = _build_cache_metadata(
@@ -2035,57 +2080,11 @@ def cache_parquet(
                 def physical_key(logical_key: str) -> str:
                     return key_aliases.get(logical_key, _encode_partition_file_key(logical_key, windows_file_keys))
 
-                written_logical_parts = _sink_cache_partitions(
-                    upstream_lf,
-                    time_unit_dir=time_unit_dir,
-                    key_exprs=key_exprs,
-                    n_partitions=len(partitions_to_write_df),
-                    metadata=cache_metadata,
-                    storage_options=polars_opts,
-                    credential_provider=credential_provider,
-                    write_kwargs=write_kwargs,
-                    physical_key=physical_key,
-                    fs=fs,
-                    fs_path_prefix=fs_path_prefix,
-                )
-                written_parts = {physical_key(key) for key in written_logical_parts}
-                if file_visitor is not None:
-                    for key in sorted(written_parts):
-                        file_visitor(cache_file(key))
-
-                # Enumerated rebuild targets receive empty files; wildcard and unbounded targets require stale-file removal.
-                wildcard = not is_finite or _has_null_keys(partitions_to_write_df, part_info.join_cols)
-                rebuild_scope = partition_key_scope() if cache_mode == CacheMode.REBUILD else None
-                if cache_mode == CacheMode.REBUILD and wildcard and not existing_parts_df.is_empty():
-                    stale = _stale_partition_keys(existing_parts_df, written_parts, rebuild_scope, file_key_column)
-                    for key in sorted(stale):
-                        try:
-                            fs.delete_file(f"{fs_path_prefix}/{key}.parquet")
-                            log.debug("Removed stale partition on REBUILD: %s", key)
-                        except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
-                            log.warning("Failed to remove stale partition %s on REBUILD: %s", key, e)
-
-                written_parts_df = _construct_partitions_df_from_existing(
-                    written_logical_parts,
-                    schema,
-                    all_partition_cols,
-                    template_for_metadata,
-                    date_column,
-                    file_key_column=file_key_column,
-                )
-                missing = _missing_empty_keys(
-                    part_info, write_plan, cache_mode, written_parts_df, _extra_cols, date_column, partition_format, rebuild_scope
-                )
-                empty_keys = {physical_key(key) for key in missing}
-                # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
-                emptied_expired = refresh_keys - written_parts
-                if emptied_expired:
-                    log.warning("Replacing %d expired cache file(s) with empty files: %s", len(emptied_expired), sorted(emptied_expired))
-                    empty_keys |= emptied_expired
-                empty_keys -= written_parts
-                if empty_keys:
-                    log.debug("Writing %d empty partition(s) sequentially", len(empty_keys))
-                    for key in sorted(empty_keys):
+                def write_empty(keys: set[str]) -> None:
+                    if not keys:
+                        return
+                    log.debug("Writing %d empty partition(s) sequentially", len(keys))
+                    for key in sorted(keys):
                         # Unlike scans, write_parquet does not URL-decode the path, so the key is not quoted as in _cache_file_uri.
                         _write_empty_parquet_file(
                             f"{time_unit_dir}/{key}.parquet",
@@ -2097,7 +2096,72 @@ def cache_parquet(
                         )
                         if file_visitor is not None:
                             file_visitor(cache_file(key))
-                    log.debug("Wrote %i empty partition(s): %s", len(empty_keys), sorted(empty_keys))
+                    log.debug("Wrote %i empty partition(s): %s", len(keys), sorted(keys))
+
+                def missing_keys(written_logical: set[str]) -> set[str]:
+                    written_df = _construct_partitions_df_from_existing(
+                        written_logical, schema, all_partition_cols, template_for_metadata, date_column, file_key_column=file_key_column
+                    )
+                    return _missing_empty_keys(
+                        part_info, write_plan, cache_mode, written_df, _extra_cols, date_column, partition_format, rebuild_scope
+                    )
+
+                can_batch = plan_mode == CacheMode.CACHE and is_finite and not _has_null_keys(partitions_to_write_df, part_info.join_cols)
+                batches = _split_write_batches(partitions_to_write_df, part_info.join_cols, write_batch_size if can_batch else None)
+                batched = len(batches) > 1
+                rebuild_scope = partition_key_scope() if cache_mode == CacheMode.REBUILD else None
+
+                written_logical_parts: set[str] = set()
+                emptied: set[str] = set()
+                for number, batch in enumerate(batches, start=1):
+                    if batched:
+                        log.debug("Writing batch %d of %d: %d partition(s)", number, len(batches), len(batch))
+                    batch_written = _sink_cache_partitions(
+                        upstream_for(batch),
+                        time_unit_dir=time_unit_dir,
+                        key_exprs=key_exprs,
+                        n_partitions=len(batch),
+                        metadata=cache_metadata,
+                        storage_options=polars_opts,
+                        credential_provider=credential_provider,
+                        write_kwargs=write_kwargs,
+                        physical_key=physical_key,
+                        fs=fs,
+                        fs_path_prefix=fs_path_prefix,
+                    )
+                    written_logical_parts |= batch_written
+                    batch_files = {physical_key(key) for key in batch_written}
+                    if file_visitor is not None:
+                        for key in sorted(batch_files):
+                            file_visitor(cache_file(key))
+                    if batched:
+                        # Empty each batch's gaps as it completes, so a later failure does not refetch them.
+                        batch_keys = set(_partition_keys(batch, _extra_cols, date_column, partition_format))
+                        batch_empty = {physical_key(key) for key in missing_keys(written_logical_parts) & batch_keys}
+                        batch_empty |= refresh_keys & {physical_key(key) for key in batch_keys}
+                        batch_empty -= batch_files
+                        write_empty(batch_empty)
+                        emptied |= batch_empty
+                written_parts = {physical_key(key) for key in written_logical_parts}
+
+                # Enumerated rebuild targets receive empty files; wildcard and unbounded targets require stale-file removal.
+                wildcard = not is_finite or _has_null_keys(partitions_to_write_df, part_info.join_cols)
+                if cache_mode == CacheMode.REBUILD and wildcard and not existing_parts_df.is_empty():
+                    stale = _stale_partition_keys(existing_parts_df, written_parts, rebuild_scope, file_key_column)
+                    for key in sorted(stale):
+                        try:
+                            fs.delete_file(f"{fs_path_prefix}/{key}.parquet")
+                            log.debug("Removed stale partition on REBUILD: %s", key)
+                        except Exception as e:  # noqa: BLE001 -- best-effort cleanup, non-fatal
+                            log.warning("Failed to remove stale partition %s on REBUILD: %s", key, e)
+
+                empty_keys = {physical_key(key) for key in missing_keys(written_logical_parts)}
+                # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
+                emptied_expired = refresh_keys - written_parts
+                if emptied_expired:
+                    log.warning("Replacing %d expired cache file(s) with empty files: %s", len(emptied_expired), sorted(emptied_expired))
+                    empty_keys |= emptied_expired
+                write_empty(empty_keys - written_parts - emptied)
 
                 # Refresh the file listing to avoid scanning an empty cache after writes.
                 existing_parts, refreshed_parts_df = list_cache()

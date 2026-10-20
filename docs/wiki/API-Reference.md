@@ -53,7 +53,7 @@ caches require rebuilding.
 lf.piot.cache_parquet(cache_path, date_column=None, *, time_unit="monthly",
                       partition_format=None, cache_mode=CacheMode.CACHE, ttl=None,
                       final_after=None, lock=None, file_visitor=None,
-                      aws_profile=None, write_kwargs=None, read_kwargs=None,
+                      write_batch_size=None, aws_profile=None, write_kwargs=None, read_kwargs=None,
                       extra_partition_cols=None, schema=None,
                       write_bounding_columns=None)
 ```
@@ -93,6 +93,14 @@ path or an `s3://` URI. Use it to set permissions or a group on new files, for e
 inside `lock`, and an exception it raises propagates without undoing the write. Each file
 is visited once per write, so a file left unvisited by such an exception is visited only
 when a later query rewrites it.
+
+A write keeps none of its partitions until all of them are written, so a backfill that fails
+or is killed partway starts again. `write_batch_size` writes at most that many partitions
+per upstream query, in partition order, and keeps each batch that completes. Each batch
+runs the source again with a filter for its own partitions, so the source must return the
+same data each time and should push the date filter down. Batching applies under
+`CacheMode.CACHE` when the query's partitions can be enumerated and none of its keys is null.
+It also keeps each write under Polars' open-sink cap (`POLARS_MAX_OPEN_SINKS`, default 128).
 
 ### `cache_memory`
 
