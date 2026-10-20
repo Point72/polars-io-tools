@@ -588,9 +588,10 @@ def _construct_partitions_df_from_existing(
     if not existing_files:
         return pl.DataFrame(schema={**partition_schema_dict, **({file_key_column: pl.String} if file_key_column else {})})
 
-    is_custom_format = bool(date_column and template_for_metadata)
-    if is_custom_format:
+    if date_column and template_for_metadata:
         df = _split_custom_partition_keys(existing_files, all_partition_cols, date_column, file_key_column, decode_file_keys)
+        df = _parse_date_keys(df, date_column, template_for_metadata)
+        df = df.select([*all_partition_cols, *([file_key_column] if file_key_column else [])])
     else:
         raw_schema = {k: pl.Utf8 for k in all_partition_cols}
         logical_keys = [(unquote(part) if decode_file_keys else part, part) for part in existing_files]
@@ -600,11 +601,6 @@ def _construct_partitions_df_from_existing(
         else:
             raw_data = [logical.split("/") for logical, _ in logical_keys]
         df = pl.DataFrame(raw_data, schema=raw_schema, orient="row")
-
-    if date_column and template_for_metadata and (is_custom_format or date_column in all_partition_cols):
-        df = _parse_date_keys(df, date_column, template_for_metadata)
-    if is_custom_format:
-        df = df.select([*all_partition_cols, *([file_key_column] if file_key_column else [])])
     return _cast_partition_keys(df, partition_schema_dict).cast(partition_schema_dict)
 
 
