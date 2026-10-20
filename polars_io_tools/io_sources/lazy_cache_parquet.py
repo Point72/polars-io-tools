@@ -1664,6 +1664,7 @@ def cache_parquet(
     ttl: timedelta | ExpiryPolicy | None = None,
     final_after: timedelta | None = None,
     lock: Callable[[str], contextlib.AbstractContextManager[Any]] | None = None,
+    file_visitor: Callable[[str], None] | None = None,
     aws_profile: str | None = None,
     write_kwargs: dict | None = None,
     read_kwargs: dict | None = None,
@@ -1749,6 +1750,12 @@ def cache_parquet(
             partitions cannot be enumerated, as for a query without date bounds; under ``CacheMode.REBUILD`` always.
             Other modes never take it. Once it is held, the cache is checked again, so a process that waited reads the
             partitions another process has just written instead of refetching them.
+        file_visitor (Callable, optional): Called with the path of each cache file after it is written, as a local path
+            or an ``s3://`` URI, for example to set file permissions. Each file is visible with default permissions
+            until it is visited, and directories the write creates are not visited. The visitor runs inside ``lock`` and
+            before the query returns, so a slow visitor delays both. An exception it raises propagates without undoing
+            the write. Each file is visited once per write, so a file left unvisited by such an exception is visited only
+            when a later query rewrites it.
         aws_profile (str, optional): AWS profile name for S3 access. If None, uses the AWS_PROFILE environment variable.
             This is only relevant if the cache_path is an S3 URI.
         write_kwargs (dict, optional): Additional keyword arguments for writing Parquet files. Internally, this is passed
@@ -1853,6 +1860,8 @@ def cache_parquet(
             raise ValueError("final_after cannot be combined with a callable ttl")
     if lock is not None and not callable(lock):
         raise TypeError(f"lock must be a callable, got {type(lock).__name__}")
+    if file_visitor is not None and not callable(file_visitor):
+        raise TypeError(f"file_visitor must be a callable, got {type(file_visitor).__name__}")
     for name, value in (("ttl", ttl), ("final_after", final_after)):
         if isinstance(value, timedelta) and value < timedelta(0):
             raise ValueError(f"{name} must not be negative")
@@ -1888,7 +1897,13 @@ def cache_parquet(
         fs = pa_fs.LocalFileSystem()
 
     windows_file_keys = os.name == "nt" and isinstance(fs, pa_fs.LocalFileSystem)
-    lock_name = fs_path_prefix if isinstance(fs, pa_fs.LocalFileSystem) else f"s3://{fs_path_prefix}"
+    cache_dir = fs_path_prefix if isinstance(fs, pa_fs.LocalFileSystem) else f"s3://{fs_path_prefix}"
+
+    def cache_file(key: str) -> str:
+        if isinstance(fs, pa_fs.LocalFileSystem):
+            return os.path.join(cache_dir, *f"{key}.parquet".split("/"))
+        return f"{cache_dir}/{key}.parquet"
+
     source_lf = self_or_fn if isinstance(self_or_fn, pl.LazyFrame) else None
 
     def get_source() -> pl.LazyFrame:
@@ -2037,9 +2052,9 @@ def cache_parquet(
                 if lock is None or locked or no_write or not fetch_upstream:
                     break
                 # Another process may have written while this one waited, so plan again under the lock.
-                log.debug("Waiting for cache lock for %s", lock_name)
-                held_lock.enter_context(lock(lock_name))
-                log.debug("Acquired cache lock for %s; planning again", lock_name)
+                log.debug("Waiting for cache lock for %s", cache_dir)
+                held_lock.enter_context(lock(cache_dir))
+                log.debug("Acquired cache lock for %s; planning again", cache_dir)
 
             upstream_lf = None
             if fetch_upstream:
@@ -2087,6 +2102,9 @@ def cache_parquet(
                     fs,
                     fs_path_prefix,
                 )
+                if file_visitor is not None:
+                    for key in sorted(written_parts):
+                        file_visitor(cache_file(key))
 
                 # Enumerated rebuild targets receive empty files; wildcard and unbounded targets require stale-file removal.
                 wildcard = not is_finite or _has_null_keys(partitions_to_write_df, part_info.join_cols)
@@ -2108,26 +2126,26 @@ def cache_parquet(
                 missing = _missing_empty_keys(
                     part_info, write_plan, cache_mode, written_logical_parts, plan_parts, _extra_cols, date_column, partition_format, key_scope
                 )
-                empty_paths = {
-                    f"{time_unit_dir}/{key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys))}.parquet" for key in missing
-                }
+                empty_keys = {key_aliases.get(key, _encode_partition_file_key(key, windows_file_keys)) for key in missing}
                 # Expired files that upstream no longer fills are emptied by physical key so their stale rows are not read.
                 emptied_expired = refresh_keys - written_parts
                 if emptied_expired:
                     log.warning("Replacing %d expired cache file(s) with empty files: %s", len(emptied_expired), sorted(emptied_expired))
-                    empty_paths.update(f"{time_unit_dir}/{key}.parquet" for key in emptied_expired)
-                if empty_paths:
-                    paths = sorted(empty_paths)
-                    log.debug("Writing %d empty partition(s) sequentially", len(paths))
-                    _write_empty_parquet_files_sequentially(
-                        paths,
-                        schema=schema,
-                        metadata=cache_metadata,
-                        storage_options=polars_opts,
-                        credential_provider=credential_provider,
-                        write_kwargs=write_kwargs,
-                    )
-                    log.debug("Wrote %i empty partition(s): %s", len(paths), paths)
+                    empty_keys |= emptied_expired
+                if empty_keys:
+                    log.debug("Writing %d empty partition(s) sequentially", len(empty_keys))
+                    for key in sorted(empty_keys):
+                        _write_empty_parquet_files_sequentially(
+                            [f"{time_unit_dir}/{key}.parquet"],
+                            schema=schema,
+                            metadata=cache_metadata,
+                            storage_options=polars_opts,
+                            credential_provider=credential_provider,
+                            write_kwargs=write_kwargs,
+                        )
+                        if file_visitor is not None:
+                            file_visitor(cache_file(key))
+                    log.debug("Wrote %i empty partition(s): %s", len(empty_keys), sorted(empty_keys))
 
             if upstream_lf is not None and not no_write:
                 # Refresh the file listing to avoid scanning an empty cache after writes.

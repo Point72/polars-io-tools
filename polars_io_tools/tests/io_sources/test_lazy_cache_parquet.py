@@ -3939,3 +3939,24 @@ def test_lock_held_only_while_writing(tmp_path, monkeypatch, fail):
         lf.collect()
         assert seen == [("write", True), ("read", False)]
     assert not held
+
+
+def test_file_visitor_sees_each_written_file(tmp_path):
+    events = []
+
+    @contextlib.contextmanager
+    def lock(name):
+        events.append("lock")
+        yield
+        events.append("unlock")
+
+    source = _source(D(2026, 9, 30)).with_columns(sym=pl.lit("a%b"))
+    predicate = pl.col("date").is_between(START, D(2026, 10, 31)) & (pl.col("sym") == "a%b")
+    kwargs = {"extra_partition_cols": "sym", "lock": lock, "file_visitor": events.append}
+    cache_parquet(source, tmp_path, "date", **kwargs).filter(predicate).collect()
+    files = sorted(str(p) for p in (tmp_path / "monthly").resolve().rglob("*.parquet"))
+    assert len(files) == 2
+    assert events == ["lock", *files, "unlock"]
+    events.clear()
+    cache_parquet(source, tmp_path, "date", **kwargs).filter(predicate).collect()
+    assert events == []
