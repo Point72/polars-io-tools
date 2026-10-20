@@ -145,8 +145,8 @@ def test_custom_partition_format_cache_hit(tmp_path, fmt, jan_file):
 
 def test_custom_partition_format_parsing():
     schema = pl.Schema({"sym": pl.String, "date": pl.Date})
-    df = _construct_partitions_df_from_existing({"A/2024/03", "B/2023/12"}, schema, ["sym", "date"], "$year/$month", date_column="date")
-    expected = pl.DataFrame({"sym": ["A", "B"], "date": [D(2024, 3, 1), D(2023, 12, 1)]})
+    df = _construct_partitions_df_from_existing({"A/2024/03", "B/2023/12"}, schema, ["sym", "date"], "$year/$month", "date", "file")
+    expected = pl.DataFrame({"sym": ["A", "B"], "date": [D(2024, 3, 1), D(2023, 12, 1)], "file": ["A/2024/03", "B/2023/12"]})
     assert_frame_equal(_sorted(df), expected)
 
 
@@ -154,7 +154,7 @@ def test_boolean_key_parsing_drops_unrecognized_keys():
     # "true"/"null" are the spellings of the polars < 1.38 writer
     schema = pl.Schema({"flag": pl.Boolean, "n": pl.Int64})
     keys = {"True/1", "False/None", "true/2", "false/null", "False/x", "yes/3"}
-    df = _construct_partitions_df_from_existing(keys, schema, ["flag", "n"], None)
+    df = _construct_partitions_df_from_existing(keys, schema, ["flag", "n"], None, None, "file").drop("file")
     assert sorted(df.rows(), key=str) == sorted([(True, 1), (False, None), (True, 2), (False, None)], key=str)
 
 

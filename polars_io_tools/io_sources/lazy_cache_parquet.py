@@ -482,8 +482,8 @@ def _split_custom_partition_keys(
     existing_files: set[str],
     all_partition_cols: list[str],
     date_column: str,
-    file_key_column: str | None = None,
-    decode_file_keys: bool = False,
+    file_key_column: str,
+    decode_file_keys: bool,
 ) -> pl.DataFrame:
     """Return raw extra-column and date keys from custom-format paths; the date key contains all segments after the extra-column ones."""
     extra_cols = [col for col in all_partition_cols if col != date_column]
@@ -495,11 +495,9 @@ def _split_custom_partition_keys(
         if len(path_parts) <= n_extra:
             continue
         row = [*path_parts[:n_extra], "/".join(path_parts[n_extra:])]
-        rows.append([*row, file_path] if file_key_column else row)
+        rows.append([*row, file_path])
 
-    key_schema = {**{c: pl.Utf8 for c in extra_cols}, date_column: pl.Utf8}
-    if file_key_column:
-        key_schema[file_key_column] = pl.String
+    key_schema = {**{c: pl.Utf8 for c in extra_cols}, date_column: pl.Utf8, file_key_column: pl.String}
     return pl.DataFrame(rows, schema=key_schema, orient="row")
 
 
@@ -578,28 +576,27 @@ def _construct_partitions_df_from_existing(
     schema: pl.Schema,
     all_partition_cols: list[str],
     template_for_metadata: str | None,
-    date_column: str | None = None,
-    file_key_column: str | None = None,
+    date_column: str | None,
+    file_key_column: str,
     decode_file_keys: bool = False,
 ) -> pl.DataFrame:
-    """Decode existing file keys to the partition schema, omitting malformed keys."""
+    """Decode existing file keys to the partition schema, omitting malformed keys.
+
+    ``file_key_column`` holds each row's file key as listed.
+    """
     partition_schema_dict = {k: schema[k] for k in all_partition_cols}
 
     if not existing_files:
-        return pl.DataFrame(schema={**partition_schema_dict, **({file_key_column: pl.String} if file_key_column else {})})
+        return pl.DataFrame(schema={**partition_schema_dict, file_key_column: pl.String})
 
     if date_column and template_for_metadata:
         df = _split_custom_partition_keys(existing_files, all_partition_cols, date_column, file_key_column, decode_file_keys)
         df = _parse_date_keys(df, date_column, template_for_metadata)
-        df = df.select([*all_partition_cols, *([file_key_column] if file_key_column else [])])
+        df = df.select([*all_partition_cols, file_key_column])
     else:
-        raw_schema = {k: pl.Utf8 for k in all_partition_cols}
+        raw_schema = {**{k: pl.Utf8 for k in all_partition_cols}, file_key_column: pl.String}
         logical_keys = [(unquote(part) if decode_file_keys else part, part) for part in existing_files]
-        if file_key_column:
-            raw_schema[file_key_column] = pl.String
-            raw_data = [[*logical.split("/"), physical] if all_partition_cols else [physical] for logical, physical in logical_keys]
-        else:
-            raw_data = [logical.split("/") for logical, _ in logical_keys]
+        raw_data = [[*logical.split("/"), physical] if all_partition_cols else [physical] for logical, physical in logical_keys]
         df = pl.DataFrame(raw_data, schema=raw_schema, orient="row")
     return _cast_partition_keys(df, partition_schema_dict).cast(partition_schema_dict)
 
@@ -1490,9 +1487,12 @@ def _missing_empty_keys(
     extra_cols: list[str],
     date_column: str | None,
     date_fmt: str | None,
-    scope: pl.Expr | None = None,
+    rebuild_scope: pl.Expr | None,
 ) -> set[str]:
-    """Return enumerable gap keys, clipping unbounded queries to existing cache bounds."""
+    """Return enumerable gap keys, clipping unbounded queries to existing cache bounds.
+
+    ``written`` holds the logical keys just written, and ``rebuild_scope`` limits REBUILD targets.
+    """
     if part_info.enumerability == Enumerability.UNBOUNDED:
         expected = part_info.clipped_expected_parts_df
     elif part_info.enumerability == Enumerability.FINITE and write_plan.write_empty_missing:
@@ -1501,18 +1501,15 @@ def _missing_empty_keys(
         return set()
     if expected is None:
         return set()
-    if cache_mode == CacheMode.REBUILD and scope is not None:
-        expected = expected.filter(scope)
+    if rebuild_scope is not None:
+        expected = expected.filter(rebuild_scope)
     expected = expected.drop_nulls()
-    if expected.is_empty():
-        return set()
-    known = _construct_partitions_df_from_existing(written, expected.schema, part_info.join_cols, date_fmt, date_column).cast(expected.schema)
     if cache_mode != CacheMode.REBUILD:
         existing_rows = part_info.existing_parts_df.select(part_info.join_cols).cast(expected.schema)
-        known = pl.concat([known, existing_rows], how="vertical")
-    expected = expected.join(known, on=part_info.join_cols, how="anti")
-    keys = set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls())
-    return keys
+        expected = expected.join(existing_rows, on=part_info.join_cols, how="anti")
+    if expected.is_empty():
+        return set()
+    return set(_partition_keys(expected, extra_cols, date_column, date_fmt).drop_nulls()) - written
 
 
 def _stale_partition_keys(existing: pl.DataFrame, written: set[str], scope: pl.Expr | None, file_key_column: str) -> set[str]:
