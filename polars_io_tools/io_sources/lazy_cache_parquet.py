@@ -1416,17 +1416,20 @@ def _sink_cache_partitions(
     time_unit_dir: str,
     key_exprs: list[pl.Expr],
     n_partitions: int,
+    materialize: bool,
     metadata: dict[str, str],
     storage_options: dict,
     credential_provider: pl.CredentialProviderAWS | None,
     write_kwargs: dict,
     physical_key: Callable[[str], str],
+    protected_keys: set[str],
     fs: "pa_fs.FileSystem",
     fs_path_prefix: str,
 ) -> set[str]:
     """Sink one file per partition and return the logical keys written.
 
     If the sink fails, every file it opened is deleted (best effort), so a partially written partition is refetched rather than read as complete.
+    Physical keys in ``protected_keys`` belong to completed batches and are never replaced or removed.
     """
     written: set[str] = set()
     written_logical: set[str] = set()
@@ -1450,6 +1453,8 @@ def _sink_cache_partitions(
             values = [unquote(k.str_value) for k in ctx.keys]
         logical_key = "/".join(values)
         key = physical_key(logical_key)
+        if key in protected_keys:
+            raise RuntimeError(f"cache_parquet: refusing to overwrite completed partition path {key!r} during this write")
         if key in written:
             raise reopened(logical_key)
         written_logical.add(logical_key)
@@ -1482,7 +1487,8 @@ def _sink_cache_partitions(
     sink_kwargs = dict(write_kwargs)
     sink_kwargs.pop("metadata", None)
     try:
-        _prepare_lf_for_sink_from_io_source(lf).sink_parquet(  # type: ignore[call-overload]
+        prepared = lf.collect().lazy() if materialize else _prepare_lf_for_sink_from_io_source(lf)
+        prepared.sink_parquet(  # type: ignore[call-overload]
             partition_obj,
             maintain_order=True,
             mkdir=True,
@@ -2081,11 +2087,15 @@ def cache_parquet(
                 def physical_key(logical_key: str) -> str:
                     return key_aliases.get(logical_key, _encode_partition_file_key(logical_key, windows_file_keys))
 
+                completed_keys: set[str] = set()
+
                 def write_empty(keys: set[str]) -> None:
                     if not keys:
                         return
                     log.debug("Writing %d empty partition(s) sequentially", len(keys))
                     for key in sorted(keys):
+                        if key in completed_keys:
+                            raise RuntimeError(f"cache_parquet: refusing to overwrite completed partition path {key!r} during this write")
                         # Unlike scans, write_parquet does not URL-decode the path, so the key is not quoted as in _cache_file_uri.
                         _write_empty_parquet_file(
                             f"{time_unit_dir}/{key}.parquet",
@@ -2095,6 +2105,7 @@ def cache_parquet(
                             credential_provider=credential_provider,
                             write_kwargs=write_kwargs,
                         )
+                        completed_keys.add(key)
                         if file_visitor is not None:
                             file_visitor(cache_file(key))
                     log.debug("Wrote %i empty partition(s): %s", len(keys), sorted(keys))
@@ -2122,16 +2133,19 @@ def cache_parquet(
                         time_unit_dir=time_unit_dir,
                         key_exprs=key_exprs,
                         n_partitions=len(batch),
+                        materialize=batched and not POLARS_HAS_PARTITION_BY,
                         metadata=cache_metadata,
                         storage_options=polars_opts,
                         credential_provider=credential_provider,
                         write_kwargs=write_kwargs,
                         physical_key=physical_key,
+                        protected_keys=completed_keys,
                         fs=fs,
                         fs_path_prefix=fs_path_prefix,
                     )
                     written_logical_parts |= batch_written
                     batch_files = {physical_key(key) for key in batch_written}
+                    completed_keys.update(batch_files)
                     if file_visitor is not None:
                         for key in sorted(batch_files):
                             file_visitor(cache_file(key))

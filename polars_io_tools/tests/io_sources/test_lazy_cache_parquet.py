@@ -4009,3 +4009,79 @@ def test_file_visitor_sees_each_written_file(tmp_path):
     events.clear()
     cache_parquet(source, tmp_path, "date", **kwargs).filter(predicate).collect()
     assert events == []
+
+
+@pytest.mark.parametrize("present_keys", [[1, 2], [1], [2]], ids=["data-data", "data-empty", "empty-data"])
+def test_write_batches_preserve_completed_physical_destinations(tmp_path, monkeypatch, present_keys):
+    source = pl.LazyFrame({"key": present_keys, "value": [key * 10 for key in present_keys]})
+    monkeypatch.setattr(lazy_cache_parquet, "_encode_partition_file_key", lambda key, windows: "collision")
+    completed = {}
+
+    def visitor(path):
+        physical = Path(path)
+        completed[path] = (physical.read_bytes(), physical.stat().st_mtime_ns)
+
+    query = cache_parquet(source, tmp_path, extra_partition_cols="key", write_batch_size=1, file_visitor=visitor).filter(pl.col("key").is_in([1, 2]))
+    with pytest.raises(Exception, match="completed partition path"):
+        query.collect()
+    assert len(completed) == 1
+    files = list(tmp_path.rglob("*.parquet"))
+    assert len(files) == 1
+    for path, snapshot in completed.items():
+        assert (Path(path).read_bytes(), Path(path).stat().st_mtime_ns) == snapshot
+    assert pl.read_parquet(files[0])["value"].to_list() == ([10] if 1 in present_keys else [])
+
+
+@pytest.mark.parametrize("layout", ["no-date", "default", "custom"])
+def test_write_batches_reject_colliding_legacy_time_keys(tmp_path, layout):
+    keys = [datetime.time(1, 2, 3, 100000), datetime.time(1, 2, 3, 200000)]
+    source = pl.LazyFrame({"key": pl.Series(keys, dtype=pl.Time), "value": [1, 2]})
+    predicate = pl.col("key").is_in(keys)
+    options = {"extra_partition_cols": "key", "write_batch_size": 1}
+    if layout != "no-date":
+        source = source.with_columns(pl.lit(D(2024, 1, 10)).alias("date"))
+        options.update(date_column="date", partition_format="$year/$month" if layout == "custom" else None)
+        predicate &= pl.col("date") == D(2024, 1, 10)
+    visited = []
+    query = cache_parquet(source, tmp_path, file_visitor=visited.append, **options).filter(predicate)
+    if lazy_cache_parquet.POLARS_HAS_PARTITION_BY:
+        assert sorted(query.collect()["value"].to_list()) == [1, 2]
+        assert len(visited) == 2
+    else:
+        with pytest.raises(Exception, match="completed partition path"):
+            query.collect()
+        assert len(visited) == 1
+    persisted = pl.concat([pl.read_parquet(path) for path in tmp_path.rglob("*.parquet")])
+    assert sorted(persisted["value"].to_list()) == ([1, 2] if lazy_cache_parquet.POLARS_HAS_PARTITION_BY else [1])
+
+
+def test_write_batch_preserves_data_when_empty_destination_collides(tmp_path, monkeypatch):
+    source = pl.LazyFrame({"key": [1, 3], "value": [10, 30]})
+    monkeypatch.setattr(lazy_cache_parquet, "_encode_partition_file_key", lambda key, windows: "collision")
+    visited = []
+    query = cache_parquet(source, tmp_path, extra_partition_cols="key", write_batch_size=2, file_visitor=visited.append).filter(
+        pl.col("key").is_in([1, 2, 3])
+    )
+    with pytest.raises(Exception, match="completed partition path"):
+        query.collect()
+    assert len(visited) == 1
+    assert pl.read_parquet(visited[0])["value"].to_list() == [10]
+
+
+def test_write_batch_checks_sink_cap_before_upstream_collection(tmp_path, monkeypatch):
+    from polars_io_tools.io_sources.util import register_io_source_with_is_pure
+
+    frame = pl.DataFrame({"key": [1, 2, 3, 4], "value": [10, 20, 30, 40]})
+    calls = []
+
+    def reader(with_columns, predicate, n_rows, batch_size):
+        calls.append(1)
+        yield frame.filter(predicate) if predicate is not None else frame
+
+    monkeypatch.setattr(lazy_cache_parquet, "_max_open_sinks", lambda: 2)
+    source = register_io_source_with_is_pure(reader, schema=frame.schema)
+    query = cache_parquet(source, tmp_path, extra_partition_cols="key", write_batch_size=3).filter(pl.col("key").is_in([1, 2, 3, 4]))
+    with pytest.raises(Exception, match="open-sink cap"):
+        query.collect()
+    assert calls == []
+    assert list(tmp_path.rglob("*.parquet")) == []
