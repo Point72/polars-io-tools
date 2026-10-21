@@ -3534,6 +3534,79 @@ def test_sink_rejects_reopened_partition(tmp_path, monkeypatch, legacy):
         cache_parquet(_source(D(2026, 9, 30)), tmp_path, "date").collect()
 
 
+@pytest.mark.parametrize("syms", [[None], ["A", "B"]])
+def test_write_batch_size_splits_sinks_below_open_sink_cap(tmp_path, monkeypatch, syms):
+    monkeypatch.setattr(lazy_cache_parquet, "_max_open_sinks", lambda: 4)
+    days = [d for d in pl.date_range(START, D(2026, 9, 6), eager=True) if d != D(2026, 9, 2)]
+    source = pl.LazyFrame({"date": days}).join(pl.LazyFrame({"sym": syms}, schema={"sym": pl.String}), how="cross").with_columns(value=pl.lit(1))
+    kwargs = {"time_unit": "daily", "extra_partition_cols": "sym" if syms != [None] else None}
+    pred = pl.col("date").is_between(START, D(2026, 9, 6))
+    if syms != [None]:
+        pred &= pl.col("sym").is_in(syms)
+    real_sink = pl.LazyFrame.sink_parquet
+    sinks = []
+
+    def counting_sink(self, target, **sink_kwargs):
+        if not isinstance(target, (str, Path)):
+            sinks.append(1)
+        return real_sink(self, target, **sink_kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", counting_sink)
+    with pytest.raises(Exception, match="open-sink cap"):
+        cache_parquet(source, tmp_path / "unbatched", "date", **kwargs).filter(pred).collect()
+    out = cache_parquet(source, tmp_path / "batched", "date", write_batch_size=4, **kwargs).filter(pred).collect()
+    assert_frame_equal(out.sort("date", "sym"), source.collect().sort("date", "sym"), check_column_order=False)
+    assert len(sinks) == -(-6 * len(syms) // 4)
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_write_batch_size_keeps_batches_written_before_a_failure(tmp_path, set_now, monkeypatch, refresh):
+    kwargs = {"time_unit": "daily", "ttl": timedelta(hours=1)}
+    pred = pl.col("date").is_between(START, D(2026, 9, 6))
+    if refresh:
+        set_now(T(2026, 9, 7))
+        cache_parquet(_source(D(2026, 9, 6)), tmp_path, "date", **kwargs).filter(pred).collect()
+        _set_mtime(tmp_path, T(2026, 9, 7))
+        set_now(T(2026, 9, 8))
+    real_sink = pl.LazyFrame.sink_parquet
+    sinks = []
+
+    def failing_second_sink(self, target, **sink_kwargs):
+        if isinstance(target, (str, Path)):
+            return real_sink(self, target, **sink_kwargs)
+        sinks.append(1)
+        if len(sinks) == 2:
+            real_sink(self.head(1), target, **sink_kwargs)
+            raise RuntimeError("sink failed")
+        return real_sink(self, target, **sink_kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", failing_second_sink)
+    # 2026-09-02 is missing upstream, so batch one leaves an empty file for it.
+    source = _source(D(2026, 9, 6), value=2).filter(pl.col("date") != D(2026, 9, 2))
+    with pytest.raises(Exception, match="sink failed"):
+        cache_parquet(source, tmp_path, "date", write_batch_size=3, **kwargs).filter(pred).collect()
+    # The failed batch deletes the file it opened; files it never opened keep their old data.
+    expected = {"01", "02", "03"} | ({"05", "06"} if refresh else set())
+    assert {p.stem[-2:] for p in (tmp_path / "daily").glob("*.parquet")} == expected
+    assert pl.read_parquet(tmp_path / "daily" / "2026-09-02.parquet").is_empty()
+    assert pl.read_parquet(tmp_path / "daily" / "2026-09-03.parquet")["value"].to_list() == [2]
+
+
+def test_write_filter_selects_only_target_partitions(tmp_path):
+    source = pl.LazyFrame({"date": [START, START, D(2026, 9, 2), D(2026, 9, 2)], "sym": ["A", "B", "A", "B"], "value": [1, 2, 3, 4]})
+    pred = ((pl.col("date") == START) & (pl.col("sym") == "A")) | ((pl.col("date") == D(2026, 9, 2)) & (pl.col("sym") == "B"))
+    out = cache_parquet(source, tmp_path, "date", time_unit="daily", extra_partition_cols="sym").filter(pred).collect()
+    assert sorted(out["value"].to_list()) == [1, 4]
+    assert len(list(tmp_path.glob("**/*.parquet"))) == 2
+
+
+def test_write_filter_keeps_unrestricted_null_date_target(tmp_path):
+    source = pl.LazyFrame({"date": [None, START], "sym": ["B", "A"], "value": [1, 2]}, schema_overrides={"date": pl.Date})
+    pred = pl.col("date").is_null() | ((pl.col("date") == START) & (pl.col("sym") == "A"))
+    out = cache_parquet(source, tmp_path, "date", time_unit="daily", extra_partition_cols="sym").filter(pred).collect()
+    assert sorted(out["value"].to_list()) == [1, 2]
+
+
 def test_listing_skips_file_deleted_after_glob(tmp_path, monkeypatch):
     import pyarrow.fs as pa_fs
 
@@ -3936,3 +4009,79 @@ def test_file_visitor_sees_each_written_file(tmp_path):
     events.clear()
     cache_parquet(source, tmp_path, "date", **kwargs).filter(predicate).collect()
     assert events == []
+
+
+@pytest.mark.parametrize("present_keys", [[1, 2], [1], [2]], ids=["data-data", "data-empty", "empty-data"])
+def test_write_batches_preserve_completed_physical_destinations(tmp_path, monkeypatch, present_keys):
+    source = pl.LazyFrame({"key": present_keys, "value": [key * 10 for key in present_keys]})
+    monkeypatch.setattr(lazy_cache_parquet, "_encode_partition_file_key", lambda key, windows: "collision")
+    completed = {}
+
+    def visitor(path):
+        physical = Path(path)
+        completed[path] = (physical.read_bytes(), physical.stat().st_mtime_ns)
+
+    query = cache_parquet(source, tmp_path, extra_partition_cols="key", write_batch_size=1, file_visitor=visitor).filter(pl.col("key").is_in([1, 2]))
+    with pytest.raises(Exception, match="completed partition path"):
+        query.collect()
+    assert len(completed) == 1
+    files = list(tmp_path.rglob("*.parquet"))
+    assert len(files) == 1
+    for path, snapshot in completed.items():
+        assert (Path(path).read_bytes(), Path(path).stat().st_mtime_ns) == snapshot
+    assert pl.read_parquet(files[0])["value"].to_list() == ([10] if 1 in present_keys else [])
+
+
+@pytest.mark.parametrize("layout", ["no-date", "default", "custom"])
+def test_write_batches_reject_colliding_legacy_time_keys(tmp_path, layout):
+    keys = [datetime.time(1, 2, 3, 100000), datetime.time(1, 2, 3, 200000)]
+    source = pl.LazyFrame({"key": pl.Series(keys, dtype=pl.Time), "value": [1, 2]})
+    predicate = pl.col("key").is_in(keys)
+    options = {"extra_partition_cols": "key", "write_batch_size": 1}
+    if layout != "no-date":
+        source = source.with_columns(pl.lit(D(2024, 1, 10)).alias("date"))
+        options.update(date_column="date", partition_format="$year/$month" if layout == "custom" else None)
+        predicate &= pl.col("date") == D(2024, 1, 10)
+    visited = []
+    query = cache_parquet(source, tmp_path, file_visitor=visited.append, **options).filter(predicate)
+    if lazy_cache_parquet.POLARS_HAS_PARTITION_BY:
+        assert sorted(query.collect()["value"].to_list()) == [1, 2]
+        assert len(visited) == 2
+    else:
+        with pytest.raises(Exception, match="completed partition path"):
+            query.collect()
+        assert len(visited) == 1
+    persisted = pl.concat([pl.read_parquet(path) for path in tmp_path.rglob("*.parquet")])
+    assert sorted(persisted["value"].to_list()) == ([1, 2] if lazy_cache_parquet.POLARS_HAS_PARTITION_BY else [1])
+
+
+def test_write_batch_preserves_data_when_empty_destination_collides(tmp_path, monkeypatch):
+    source = pl.LazyFrame({"key": [1, 3], "value": [10, 30]})
+    monkeypatch.setattr(lazy_cache_parquet, "_encode_partition_file_key", lambda key, windows: "collision")
+    visited = []
+    query = cache_parquet(source, tmp_path, extra_partition_cols="key", write_batch_size=2, file_visitor=visited.append).filter(
+        pl.col("key").is_in([1, 2, 3])
+    )
+    with pytest.raises(Exception, match="completed partition path"):
+        query.collect()
+    assert len(visited) == 1
+    assert pl.read_parquet(visited[0])["value"].to_list() == [10]
+
+
+def test_write_batch_checks_sink_cap_before_upstream_collection(tmp_path, monkeypatch):
+    from polars_io_tools.io_sources.util import register_io_source_with_is_pure
+
+    frame = pl.DataFrame({"key": [1, 2, 3, 4], "value": [10, 20, 30, 40]})
+    calls = []
+
+    def reader(with_columns, predicate, n_rows, batch_size):
+        calls.append(1)
+        yield frame.filter(predicate) if predicate is not None else frame
+
+    monkeypatch.setattr(lazy_cache_parquet, "_max_open_sinks", lambda: 2)
+    source = register_io_source_with_is_pure(reader, schema=frame.schema)
+    query = cache_parquet(source, tmp_path, extra_partition_cols="key", write_batch_size=3).filter(pl.col("key").is_in([1, 2, 3, 4]))
+    with pytest.raises(Exception, match="open-sink cap"):
+        query.collect()
+    assert calls == []
+    assert list(tmp_path.rglob("*.parquet")) == []
