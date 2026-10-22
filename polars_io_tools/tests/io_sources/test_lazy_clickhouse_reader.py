@@ -124,7 +124,7 @@ def duckdb_connection():
 
 def fake_get_batch_reader_http(query: str, url: str, params: dict, **kwargs):
     global _duckdb_conn
-    table = _duckdb_conn.execute(query).fetch_arrow_table()
+    table = _duckdb_conn.sql(query).to_arrow_table()
     sink = pa.BufferOutputStream()
     writer = pa.ipc.new_stream(sink, table.schema)
     for batch in table.to_batches():

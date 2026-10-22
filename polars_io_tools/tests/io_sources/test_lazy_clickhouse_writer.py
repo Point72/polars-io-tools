@@ -61,10 +61,7 @@ def fake_write_arrow_to_clickhouse(table: str, arrow_table: pa.Table, url: str, 
     global _duckdb_conn
 
     # Create DuckDB table from Arrow if it doesn't exist yet
-    try:
-        _duckdb_conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
-    except duckdb.CatalogException:
-        _duckdb_conn.execute(f"CREATE TABLE {table} AS SELECT * FROM arrow_table WHERE 1=0")
+    _duckdb_conn.execute(f"CREATE TABLE IF NOT EXISTS {table} AS SELECT * FROM arrow_table WHERE 1=0")
 
     _duckdb_conn.execute(f"INSERT INTO {table} SELECT * FROM arrow_table")
 
@@ -81,7 +78,7 @@ def patch_writer(monkeypatch, duckdb_connection):
 
 def read_duckdb_table(table: str) -> pl.DataFrame:
     global _duckdb_conn
-    arrow_table = _duckdb_conn.execute(f"SELECT * FROM {table}").fetch_arrow_table()
+    arrow_table = _duckdb_conn.sql(f"SELECT * FROM {table}").to_arrow_table()
     return pl.DataFrame(arrow_table)
 
 
