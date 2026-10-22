@@ -73,10 +73,14 @@ By default a cached partition is never refetched. `ttl` (a `timedelta`, or a cal
 and `final_after` stops refetching a partition once its file was written that long after
 the period ended. For example, `ttl=timedelta(hours=1), final_after=timedelta(days=3)`
 with monthly partitions refreshes the current month hourly until a rewrite at least three
-days after the month ends. Expiry uses file modification times, so it needs no catalog. A
-cache read that fails before returning any rows, for example because another process
-refreshed a file mid-read, is retried `POLARS_IO_TOOLS_CACHE_READ_RETRIES` times (default 1),
-unless the read also queries upstream.
+days after the month ends. A month whose file was written at least three days after it ended
+is never refetched, and a month last written before then is refetched until such a rewrite.
+To build a monthly cache from a daily one, see
+[Query Optimization](Query-Optimization#layer-a-monthly-cache-over-a-daily-cache). Expiry
+uses file modification times, so it needs no catalog. A cache read that fails before
+returning any rows, for example because another process refreshed a file mid-read, is
+retried `POLARS_IO_TOOLS_CACHE_READ_RETRIES` times (default 1), unless the read also queries
+upstream.
 
 When several processes write to the same cache, pass `lock`, a callable that takes the
 cache directory and returns a context manager, such as
