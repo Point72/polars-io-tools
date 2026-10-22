@@ -184,7 +184,7 @@ def _restrict_and_normalize_partition_filters(
     """
     if predicate is None:
         return None
-    dnf = convert_expr_to_dnf(get_parsed_expr(predicate))
+    dnf = convert_expr_to_dnf(get_parsed_expr(predicate), _compute_exposed_schema_from_dt(dt, mapping))
     if not dnf:
         return None
     # We do not restrict to partition columns; Delta may ignore non-partition filters.

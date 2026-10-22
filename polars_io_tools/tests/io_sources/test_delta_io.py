@@ -797,3 +797,30 @@ def test_delta_partition_pushdown_mixed_or_clause_unsafe_prune(_partitioned_delt
     assert set(out["p"].to_list()) == {"A", "B", None}
     # Verify that file_uris was called without partition_filters at least once (pf None)
     assert any(f is None for f in calls["filters"]) and len(calls["filters"]) >= 1
+
+
+@pytest.fixture()
+def _int_partitioned_delta_table(tmp_path):
+    """Delta table partitioned by an Int64 column 'a', including a null partition."""
+    table_path = os.path.join(tmp_path, "delta_int_partition")
+    df = pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]}, schema={"a": pl.Int64, "b": pl.String})
+    write_deltalake(table_path, df.to_arrow(), mode="overwrite", partition_by=["a"])
+    return table_path, df
+
+
+def test_scan_delta_ne_missing_keeps_null_partition(_int_partitioned_delta_table):
+    """End to end: ``ne_missing`` must not prune the null partition."""
+    table_path, df = _int_partitioned_delta_table
+    pred = pl.col("a").ne_missing(1)
+    got = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
+    assert got.height == df.filter(pred).height
+    assert got.height == 3  # rows a in {2, None, 257}
+
+
+def test_scan_delta_narrowing_cast_does_not_prune_wrapped_partition(_int_partitioned_delta_table):
+    """End to end: ``cast(Int8)`` wrapping must not prune the partition where a == 257 (257 -> 1)."""
+    table_path, df = _int_partitioned_delta_table
+    pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
+    got = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
+    assert got.height == df.filter(pred).height
+    assert got.height == 3  # a == 1 (two rows) and a == 257 (wraps to 1)

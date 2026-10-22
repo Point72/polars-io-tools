@@ -1,3 +1,4 @@
+import functools
 import itertools
 import logging
 import re
@@ -16,7 +17,7 @@ from .base import (
     ExprVisitor,
     FunctionNode,
     TernaryNode,
-    extract_column_name,
+    extract_value_preserving_column_name,
     get_parsed_expr,
 )
 from .enum import (
@@ -55,6 +56,15 @@ DNFOperator = Literal[
 DNFTuple = tuple[str, DNFOperator, Any]  # (column, op, value)
 DNFClause = list[DNFTuple]  # A single conjunction
 DNF = list[DNFClause]  # Full DNF expression
+
+
+# Rewrites ``lit(1) < col`` as ``col > 1``; operators not listed are symmetric.
+_FLIPPED_COMPARISON = {
+    OperatorType.GT: OperatorType.LT,
+    OperatorType.LT: OperatorType.GT,
+    OperatorType.GT_EQ: OperatorType.LT_EQ,
+    OperatorType.LT_EQ: OperatorType.GT_EQ,
+}
 
 
 __all__ = (
@@ -309,81 +319,126 @@ class DNFVisitor(ExprVisitor[DNF | None]):
     Visitor that converts expressions to DNF format.
     """
 
-    def __init__(self):
+    def __init__(self, schema: pl.Schema | dict[str, pl.DataType] | None = None):
         # Initialize state
         self.result_dnf: DNF | None = None
+        self.schema = schema
+        # A converted DNF may keep more rows than the predicate (e.g. an AND with an unconvertible side dropped).
+        # Negating such a superset gives a subset that drops rows, so NOT only negates results marked safe.
+        self.negation_safe: bool = False
+
+    def _subconvert(self, node: BaseExprNode) -> tuple[DNF | None, bool]:
+        """Convert a child node, returning its DNF and whether that DNF is safe to negate."""
+        sub = DNFVisitor(self.schema)
+        sub.visit(node)
+        return sub.result_dnf, sub.negation_safe
+
+    def _combine(self, nodes: list[BaseExprNode], is_and: bool) -> None:
+        """Combine the DNFs of ``nodes`` with AND or OR."""
+        if not nodes:
+            return
+        results = [self._subconvert(n) for n in nodes]
+        self.result_dnf = functools.reduce(combine_and_dnf if is_and else combine_or_dnf, (dnf for dnf, _ in results))
+        self.negation_safe = all(dnf is not None and safe for dnf, safe in results)
 
     def default_result(self) -> DNF | None:
         """Default result is None."""
         return None
 
+    def _set_comparison(self, column: str, op: OperatorType, value: Any) -> None:
+        """Record the DNF for a ``column <op> value`` comparison (value already extracted)."""
+        if op == OperatorType.EQ_VALIDITY:
+            # ``~eq_missing(v)`` keeps null rows but ``!=`` drops them, so ``=`` is not safe to negate.
+            if value is None:
+                self.result_dnf = [[(column, "is", None)]]
+                self.negation_safe = True
+            else:
+                self.result_dnf = [[(column, "=", value)]]
+            return
+
+        if op == OperatorType.NOT_EQ_VALIDITY:
+            # ``ne_missing(v)`` keeps null rows, which ``!=`` alone would drop.
+            if value is None:
+                self.result_dnf = [[(column, "is not", None)]]
+            else:
+                self.result_dnf = [[(column, "!=", value)], [(column, "is", None)]]
+            self.negation_safe = True
+            return
+
+        op_map = {
+            OperatorType.EQ: "=",
+            OperatorType.NOT_EQ: "!=",
+            OperatorType.GT: ">",
+            OperatorType.GT_EQ: ">=",
+            OperatorType.LT: "<",
+            OperatorType.LT_EQ: "<=",
+        }
+        if op in op_map:
+            op_str: DNFOperator = op_map[op]  # type: ignore[assignment]
+            self.result_dnf = [[(column, op_str, value)]]
+            # A comparison with a null literal is null on every row, so it has no well-defined negation.
+            self.negation_safe = value is not None
+
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         """Handle binary expressions (comparisons and logical operations)"""
         if node.op.is_comparison():
-            # Handle comparison operators (=, !=, etc.)
-            column = extract_column_name(node.left)
+            # Handle comparison operators (=, !=, etc.), with the column on either side
+            column = extract_value_preserving_column_name(node.left, self.schema)
             if column is not None and node.right.can_extract_literal:
-                value = node.right.value
-
-                # Map OperatorType to string operator for DNF
-                op_map = {
-                    OperatorType.EQ: "=",
-                    OperatorType.EQ_VALIDITY: "=",
-                    OperatorType.NOT_EQ: "!=",
-                    OperatorType.NOT_EQ_VALIDITY: "!=",
-                    OperatorType.GT: ">",
-                    OperatorType.GT_EQ: ">=",
-                    OperatorType.LT: "<",
-                    OperatorType.LT_EQ: "<=",
-                }
-
-                if node.op in op_map:
-                    op_str: DNFOperator = op_map[node.op]  # type: ignore[assignment]
-                    self.result_dnf = [[(column, op_str, value)]]
+                self._set_comparison(column, node.op, node.right.value)
+            else:
+                column = extract_value_preserving_column_name(node.right, self.schema)
+                if column is not None and node.left.can_extract_literal:
+                    self._set_comparison(column, _FLIPPED_COMPARISON.get(node.op, node.op), node.left.value)
 
         elif node.op.is_bitwise_or_logical():
             # Handle logical operations (AND, OR)
-            # Create sub-visitors for each branch
-            left_dnf = DNFVisitor().visit_and_process_results(node.left)
-            right_dnf = DNFVisitor().visit_and_process_results(node.right)
-
             if node.op in [OperatorType.AND, OperatorType.LOGICAL_AND]:
-                self.result_dnf = combine_and_dnf(left_dnf, right_dnf)
+                self._combine([node.left, node.right], is_and=True)
             elif node.op in [OperatorType.OR, OperatorType.LOGICAL_OR]:
-                self.result_dnf = combine_or_dnf(left_dnf, right_dnf)
+                self._combine([node.left, node.right], is_and=False)
 
     def visit_function(self, node: FunctionNode) -> None:
         """Handle function expressions (IS_NULL, IS_IN, etc.)"""
         # Handle IS_NULL function
         if node.function_type == BooleanFunctionType.IS_NULL:
             if len(node.inputs) > 0:
-                column = extract_column_name(node.inputs[0])
+                column = extract_value_preserving_column_name(node.inputs[0], self.schema)
                 if column is not None:
                     self.result_dnf = [[(column, "is", None)]]
+                    self.negation_safe = True
 
         # Handle IS_NOT_NULL function
         elif node.function_type == BooleanFunctionType.IS_NOT_NULL:
             if len(node.inputs) > 0:
-                column = extract_column_name(node.inputs[0])
+                column = extract_value_preserving_column_name(node.inputs[0], self.schema)
                 if column is not None:
                     self.result_dnf = [[(column, "is not", None)]]
+                    self.negation_safe = True
 
         # Handle IS_IN function
         elif node.function_type == BooleanFunctionType.IS_IN:
             if len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
-                column = extract_column_name(node.inputs[0])
+                column = extract_value_preserving_column_name(node.inputs[0], self.schema)
                 if column is not None:
                     values = node.inputs[1].value
                     if not isinstance(values, list):
                         # we do this for the case where the input is a single value
                         # and extracting that literal gives us a single value
                         values = [values]
-                    self.result_dnf = [[(column, "in", values)]]
+                    # With ``nulls_equal=True``, ``is_in`` and its negation can match null rows, which ``in``/``!in`` drop.
+                    nulls_equal = bool(node.options.get("nulls_equal", False))
+                    non_null = [v for v in values if v is not None]
+                    if nulls_equal and len(non_null) < len(values):
+                        self.result_dnf = ([[(column, "in", non_null)]] if non_null else []) + [[(column, "is", None)]]
+                    else:
+                        self.result_dnf = [[(column, "in", values)]]
+                    self.negation_safe = not nulls_equal
 
         # Handle IS_BETWEEN function
         elif node.function_type == BooleanFunctionType.IS_BETWEEN:
             if len(node.inputs) >= 3 and node.inputs[1].can_extract_literal and node.inputs[2].can_extract_literal:
-                column = extract_column_name(node.inputs[0])
+                column = extract_value_preserving_column_name(node.inputs[0], self.schema)
                 if column is not None:
                     lower = node.inputs[1].value
                     upper = node.inputs[2].value
@@ -397,80 +452,66 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
                     # Set DNF with two predicates
                     self.result_dnf = [[(column, lower_op, lower), (column, upper_op, upper)]]
+                    self.negation_safe = True
 
         # Handle NOT function
         elif node.function_type == BooleanFunctionType.NOT:
             if len(node.inputs) > 0:
-                inner_visitor = DNFVisitor()
-                inner_visitor.visit(node.inputs[0])
-                inner_dnf = inner_visitor.process_results()
-
-                if inner_dnf is not None:
+                inner_dnf, inner_safe = self._subconvert(node.inputs[0])
+                if inner_dnf is not None and inner_safe:
                     self.result_dnf = negate_dnf(inner_dnf)
+                    self.negation_safe = True
 
         # Handle ALL_HORIZONTAL function (ANDing all inputs)
         elif node.function_type == BooleanFunctionType.ALL_HORIZONTAL:
-            for input_node in node.inputs:
-                inner_visitor = DNFVisitor()
-                inner_visitor.visit(input_node)
-                inner_dnf = inner_visitor.process_results()
-                if inner_dnf is not None:
-                    self.result_dnf = combine_and_dnf(self.result_dnf, inner_dnf)
+            self._combine(node.inputs, is_and=True)
 
         # Handle ANY_HORIZONTAL function (ORing all inputs)
         elif node.function_type == BooleanFunctionType.ANY_HORIZONTAL:
-            combined_dnf: DNF | None = None
-            for input_node in node.inputs:
-                inner_visitor = DNFVisitor()
-                inner_visitor.visit(input_node)
-                inner_dnf = inner_visitor.process_results()
-                if inner_dnf is not None:
-                    combined_dnf = combine_or_dnf(combined_dnf, inner_dnf) if combined_dnf is not None else inner_dnf
-            self.result_dnf = combined_dnf
+            self._combine(node.inputs, is_and=False)
 
         # Handle string functions
         elif isinstance(node.function_type, StringFunctionType) and len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
-            column = extract_column_name(node.inputs[0])
+            column = extract_value_preserving_column_name(node.inputs[0], self.schema)
             if column is not None:
                 pattern = node.inputs[1].value
-
+                regex_pattern = None
                 if node.function_type == StringFunctionType.STARTS_WITH:
                     regex_pattern = f"^{re.escape(pattern)}"
-                    self.result_dnf = [[(column, "~", regex_pattern)]]
                 elif node.function_type == StringFunctionType.ENDS_WITH:
                     regex_pattern = f"{re.escape(pattern)}$"
-                    self.result_dnf = [[(column, "~", regex_pattern)]]
                 elif node.function_type == StringFunctionType.CONTAINS:
-                    regex_pattern = f".*{re.escape(pattern)}.*"
+                    regex_pattern = f".*{re.escape(pattern) if node.options.get('literal') else f'(?:{pattern})'}.*"
+                if regex_pattern is not None:
                     self.result_dnf = [[(column, "~", regex_pattern)]]
+                    self.negation_safe = True
 
     def visit_ternary(self, node: TernaryNode) -> None:
         """Visit ternary node"""
-        # pl.when(A).then(B).otherwise(C)
-        # same as (A & B) | (!A & C)
-        predicate_dnf = DNFVisitor().visit_and_process_results(node.predicate)
-        # If we can extract the literal, it will be a boolean
-        # (polars will complain otherwise.)
+        # pl.when(P).then(T).otherwise(F) is the same as (P & T) | (~P & F).
+        predicate_dnf, predicate_safe = self._subconvert(node.predicate)
+
+        # A literal arm is a boolean; the empty DNF is False.
         if node.truthy.can_extract_literal:
-            truthy_dnf_val = node.truthy.value
-            # we use empty list for False
-            predicate_and_truthy = predicate_dnf if truthy_dnf_val else []
+            predicate_and_truthy = predicate_dnf if node.truthy.value else []
         else:
-            truthy_dnf = DNFVisitor().visit_and_process_results(node.truthy)
+            truthy_dnf, _ = self._subconvert(node.truthy)
             predicate_and_truthy = combine_and_dnf(predicate_dnf, truthy_dnf)
 
+        # Without a safe ~P, combine_and_dnf falls back to F alone, a superset of ~P & F.
+        negated_predicate = None
+        if predicate_dnf is not None and predicate_safe:
+            # Polars also takes the otherwise branch where P is null, which happens only where a column in P is null.
+            columns = dict.fromkeys(c for clause in predicate_dnf for c, _, _ in clause)
+            negated_predicate = negate_dnf(predicate_dnf) + [[(c, "is", None)] for c in columns]
         if node.falsy.can_extract_literal:
-            falsy_dnf_val = node.falsy.value
-            # we use empty list for False
-            not_predicate_and_falsy = predicate_dnf if falsy_dnf_val else []
+            not_predicate_and_falsy = negated_predicate if node.falsy.value else []
         else:
-            falsy_dnf = DNFVisitor().visit_and_process_results(node.falsy)
-            # negate_dnf requires non-None DNF; if predicate_dnf is None, we cannot negate
-            if predicate_dnf is not None:
-                not_predicate_and_falsy = combine_and_dnf(negate_dnf(predicate_dnf), falsy_dnf)
-            else:
-                not_predicate_and_falsy = falsy_dnf
-        self.result_dnf = combine_or_dnf(predicate_and_truthy, not_predicate_and_falsy)
+            falsy_dnf, _ = self._subconvert(node.falsy)
+            not_predicate_and_falsy = combine_and_dnf(negated_predicate, falsy_dnf)
+
+        result = combine_or_dnf(predicate_and_truthy, not_predicate_and_falsy)
+        self.result_dnf = None if result is None else [clause for clause in result if not is_contradiction(clause)]
 
     def visit_cast(self, node: CastNode) -> None:
         """Handle cast expressions."""
@@ -557,14 +598,19 @@ def negate_dnf(dnf: DNF) -> DNF:
 
 
 ## public API
-def convert_expr_to_dnf(expr_or_node: pl.Expr | BaseExprNode) -> DNF | None:
+def convert_expr_to_dnf(expr_or_node: pl.Expr | BaseExprNode, schema: pl.Schema | dict[str, pl.DataType] | None = None) -> DNF | None:
     """
     Convert a Polars expression tree to DNF format.
     Returns the expression in DNF format, or None if conversion fails.
+
+    Args:
+        expr_or_node: The Polars expression (or already-parsed node) to convert.
+        schema: Optional column -> dtype mapping. Casts on a column are only looked through when the schema shows
+            them to be value- and order-preserving.
     """
     try:
         node = get_parsed_expr(expr_or_node)
-        visitor = DNFVisitor()
+        visitor = DNFVisitor(schema)
         visitor.visit(node)
         return visitor.process_results()
     except Exception:

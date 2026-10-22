@@ -638,7 +638,7 @@ def _enumerate_partitions_from_dnf(
     partition_schema = {col: schema[col] for col in all_partition_cols}
 
     try:
-        dnf_clauses = convert_expr_to_dnf(pred)
+        dnf_clauses = convert_expr_to_dnf(pred, schema)
         if not dnf_clauses:
             return pl.DataFrame([dict.fromkeys(all_partition_cols)], schema=partition_schema)
 
@@ -1306,7 +1306,7 @@ def _rebuild_partition_scope(
     date_predicate = _restrict_predicate(predicate, [date_column])
     null_row = pl.DataFrame({date_column: [None]}, schema={date_column: schema[date_column]})
     includes_null_date = date_predicate is not None and null_row.select(date_predicate).item() is True
-    clauses = convert_expr_to_dnf(restricted)
+    clauses = convert_expr_to_dnf(restricted, schema)
     if clauses is None:
         return _restrict_predicate(predicate, extra_cols)
     comparisons = {
