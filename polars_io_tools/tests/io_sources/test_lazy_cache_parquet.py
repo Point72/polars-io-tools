@@ -4085,3 +4085,13 @@ def test_write_batch_checks_sink_cap_before_upstream_collection(tmp_path, monkey
         query.collect()
     assert calls == []
     assert list(tmp_path.rglob("*.parquet")) == []
+
+
+@pytest.mark.parametrize("literal_left", [False, True])
+@pytest.mark.parametrize("tick", [1, 999])
+def test_time_partition_filter_preserves_nanoseconds(tmp_path, literal_left, tick):
+    source = pl.DataFrame({"time": pl.Series([1, 999, 1000], dtype=pl.Int64).cast(pl.Time)}).lazy()
+    literal = pl.lit(tick).cast(pl.Time)
+    predicate = literal == pl.col("time") if literal_left else pl.col("time") == literal
+    result = cache_parquet(source, tmp_path, extra_partition_cols="time").filter(predicate).collect()
+    assert result["time"].cast(pl.Int64).to_list() == [tick]

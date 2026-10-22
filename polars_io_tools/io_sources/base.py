@@ -39,6 +39,8 @@ FAILED_LITERAL_RESULT = object()
 __all__ = (
     "convert_datetime_to_polars",
     "extract_column_name",
+    "extract_value_preserving_column_name",
+    "is_value_order_preserving_cast",
 )
 
 
@@ -1356,6 +1358,68 @@ def extract_column_name(node: BaseExprNode) -> str | None:
             # ``col.dt.date()`` floors a Datetime to day granularity: order- and domain-preserving, hence equivalent
             # to ``col.cast(pl.Date)`` (unwrapped above). Treat it identically so it resolves wherever a cast would.
             cur = cur.inputs[0]
+        else:
+            return None
+
+
+def is_value_order_preserving_cast(src: pl.DataType, tgt: pl.DataType) -> bool:
+    """Whether casting ``src`` to ``tgt`` keeps every value distinct and in the same order.
+
+    True for an identity cast, an integer cast whose target range contains the source range, and a decimal cast that
+    keeps the scale and does not reduce precision. A predicate on ``col.cast(tgt)`` can only be applied to ``col`` itself
+    when this holds.
+    """
+    # ``is_`` rather than ``==``: an unparameterized dtype such as ``pl.Datetime`` compares equal to any time unit.
+    if src.is_(tgt):
+        return True
+    if src.is_integer() and tgt.is_integer():
+        (src_min, src_max), (tgt_min, tgt_max) = (pl.select(lo=d.min(), hi=d.max()).row(0) for d in (src, tgt))
+        return tgt_min <= src_min and src_max <= tgt_max
+    if isinstance(src, pl.Decimal) and isinstance(tgt, pl.Decimal):
+        if (src.scale or 0) != (tgt.scale or 0):
+            return False
+        return tgt.precision is None or (src.precision is not None and tgt.precision >= src.precision)
+    return False
+
+
+def extract_value_preserving_column_name(node: BaseExprNode, schema: pl.Schema | dict[str, pl.DataType] | None = None) -> str | None:
+    """Extract a column name through aliases and value- and order-preserving casts.
+
+    A cast can change values (``cast(pl.Int8, wrap_numerical=True)`` maps 257 to 1), so a predicate on a cast column
+    does not in general hold for the raw column. Casts are looked through only when ``schema`` gives the column's dtype
+    and every cast in the chain passes :func:`is_value_order_preserving_cast`, as with the supertype cast Polars inserts
+    when comparing a ``Decimal(10, 2)`` column with a literal.
+
+    Args:
+        node: The expression node to extract a column name from.
+        schema: Optional column-name to dtype mapping, required for any cast to be looked through.
+
+    Returns:
+        The column name, or ``None`` if the node is not a single column under such wrappers.
+    """
+    cur = node
+    cast_targets: list[pl.DataType] = []
+    while True:
+        col_names = cur.expr.meta.root_names()
+        if len(col_names) != 1:
+            return None
+
+        if isinstance(cur, ColumnNode):
+            column = col_names[0]
+            if not cast_targets:
+                return column
+            prev = (schema or {}).get(column)
+            # Check the cast chain from the column's dtype outward (innermost cast first).
+            for target in reversed(cast_targets):
+                if prev is None or not is_value_order_preserving_cast(prev, target):
+                    return None
+                prev = target
+            return column
+        elif isinstance(cur, AliasNode):
+            cur = cur.input
+        elif isinstance(cur, CastNode):
+            cast_targets.append(cur.dtype)
+            cur = cur.input
         else:
             return None
 

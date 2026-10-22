@@ -2676,3 +2676,14 @@ class TestSharedSourceColUnion:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPushdownCombineCastSafety:
+    """A narrowing cast on a filter column must not drop rows during pushdown."""
+
+    def test_narrowing_cast_does_not_drop_rows(self):
+        src = pl.DataFrame({"a": [1, 2, 257]}).lazy()
+        lf = pushdown_combine({"s": (src, {"a": FilterSpec()})}, lambda s: s["s"])
+        pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
+        # 257 wraps to 1 under Int8, so both 1 and 257 match; pushdown must keep them.
+        assert lf.filter(pred).collect().height == src.filter(pred).collect().height == 2

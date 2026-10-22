@@ -512,3 +512,28 @@ def test_alias_complex_mixed_operations():
     )
     result = convert_expr_to_valid_values(expr, "symbol")
     assert result == {"US", "EU", "JP"}
+
+
+def test_narrowing_cast_on_column_is_not_stripped():
+    """A narrowing/wrapping cast must not resolve to the raw column for valid-value extraction."""
+    expr = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
+    # Without a schema the source dtype is unknown, so the cast is refused (no value set).
+    assert convert_expr_to_valid_values(expr, "a") is None
+    # Int64 -> Int8 is narrowing even with a schema -> still refused (257 would wrap to 1).
+    assert convert_expr_to_valid_values(expr, "a", {"a": pl.Int64}) is None
+
+
+def test_value_preserving_widening_cast_still_extracts_values():
+    """A provably value- and order-preserving widening cast is unwrapped when a schema is supplied."""
+    expr = pl.col("a").cast(pl.Int64) == 1
+    assert convert_expr_to_valid_values(expr, "a") is None  # unknown source dtype -> safe refusal
+    assert convert_expr_to_valid_values(expr, "a", {"a": pl.Int8}) == {1}
+
+
+def test_not_over_relaxed_and_does_not_exclude_values():
+    """NOT must not exclude values when the inner AND ignored a side it could not convert."""
+    x = pl.col("x")
+    # The inner conjunctions can never hold for x == 1 alone, so both rows survive.
+    assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~((x == 1) & (x.cast(pl.Int64) == 2)), "x") == {1, 2}
+    assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~((x == 1) & (pl.col("y") == 2)), "x") == {1, 2}
+    assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~(x == 1), "x") == {2}

@@ -62,7 +62,7 @@ def function_exprs():
         "is_not_null": (pl.col("z").is_not_null(), [[("z", "is not", None)]]),
         "starts_with": (pl.col("s").str.starts_with("prefix"), [[("s", "~", "^prefix")]]),
         "ends_with": (pl.col("s").str.ends_with("suffix"), [[("s", "~", "suffix$")]]),
-        "contains": (pl.col("s").str.contains("substr"), [[("s", "~", ".*substr.*")]]),
+        "contains": (pl.col("s").str.contains("substr"), [[("s", "~", ".*(?:substr).*")]]),
     }
 
 
@@ -78,7 +78,7 @@ def complex_exprs():
             ((pl.col("a") > 5) & (pl.col("b") <= 10)) | (((pl.col("c") == "test") | (pl.col("d").ne(True))) & pl.col("e").is_null()),
             [[("a", ">", 5), ("b", "<=", 10)], [("c", "=", "test"), ("e", "is", None)], [("d", "!=", True), ("e", "is", None)]],
         ),
-        "complex_3": ((pl.col("e").is_in([1, 2, 3]) & pl.col("f").str.contains("xyz")), [[("e", "in", [1, 2, 3]), ("f", "~", ".*xyz.*")]]),
+        "complex_3": ((pl.col("e").is_in([1, 2, 3]) & pl.col("f").str.contains("xyz")), [[("e", "in", [1, 2, 3]), ("f", "~", ".*(?:xyz).*")]]),
     }
 
 
@@ -407,6 +407,8 @@ def test_ternary_basic():
     expected = [
         [("x", ">", 5), ("y", "=", 10)],  # predicate and truthy
         [("x", "<=", 5), ("z", "<", 3)],  # negated predicate and falsy
+        # A null when-condition takes the otherwise branch.
+        [("x", "is", None), ("z", "<", 3)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -427,6 +429,8 @@ def test_ternary_with_complex_predicate():
         [("x", ">", 5), ("y", "<", 10), ("z", "=", 15)],  # predicate and truthy
         [("x", "<=", 5), ("a", "!=", 0)],  # first negated predicate clause and falsy
         [("y", ">=", 10), ("a", "!=", 0)],  # second negated predicate clause and falsy
+        [("a", "!=", 0), ("x", "is", None)],
+        [("a", "!=", 0), ("y", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -443,6 +447,7 @@ def test_ternary_with_function_expressions():
     expected = [
         [("x", "in", [1, 2, 3]), ("y", ">", 5), ("z", "=", 0)],  # predicate and truthy
         [("x", "!in", [1, 2, 3]), ("w", "is", None)],  # negated predicate and falsy
+        [("w", "is", None), ("x", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -467,6 +472,8 @@ def test_ternary_nested():
         [("x", "<", 0), ("y", ">", 10), ("z", "=", 5)],  # outer predicate, inner predicate, inner truthy
         [("x", "<", 0), ("y", "<=", 10), ("z", "=", 0)],  # outer predicate, negated inner predicate, inner falsy
         [("x", ">=", 0), ("w", "is not", None)],  # negated outer predicate, outer falsy
+        [("x", "<", 0), ("y", "is", None), ("z", "=", 0)],
+        [("w", "is not", None), ("x", "is", None)],
     ]
 
     result = convert_expr_to_dnf(outer_ternary)
@@ -501,6 +508,8 @@ def test_ternary_chained_when():
         [("x", ">", 10), ("y", "<", 5), ("z", "=", 1)],  # outer condition true, inner condition true
         [("x", ">", 10), ("y", ">=", 5), ("z", "=", 2)],  # outer condition true, inner condition false
         [("x", "<=", 10), ("z", "=", 3)],  # outer condition false
+        [("x", ">", 10), ("y", "is", None), ("z", "=", 2)],
+        [("x", "is", None), ("z", "=", 3)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -534,6 +543,7 @@ def test_ternary_multiple_chained_when():
         [("x", "<=", 100), ("x", ">", 50), ("result", "=", "medium")],
         [("x", "<=", 100), ("x", "<=", 50), ("x", ">", 10), ("result", "=", "low")],
         [("x", "<=", 100), ("x", "<=", 50), ("x", "<=", 10), ("result", "=", "very low")],
+        [("result", "=", "very low"), ("x", "is", None), ("x", "is", None), ("x", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -563,6 +573,8 @@ def test_ternary_multiple_conditions_in_when():
         [("x", ">", 10), ("y", "<", 5), ("z", "=", 1)],  # All conditions true
         [("x", "<=", 10), ("z", "=", 2)],  # First condition false
         [("y", ">=", 5), ("z", "=", 2)],  # Second condition false
+        [("x", "is", None), ("z", "=", 2)],
+        [("y", "is", None), ("z", "=", 2)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -594,6 +606,16 @@ def test_ternary_multiple_when_with_multiple_conditions():
         [("x", "<=", 100), ("y", "!=", "B"), ("result", "=", "category_3")],
         [("y", "!=", "A"), ("x", "<=", 50), ("result", "=", "category_3")],
         [("y", "!=", "A"), ("y", "!=", "B"), ("result", "=", "category_3")],
+        [("result", "=", "category_3"), ("x", "<=", 100), ("y", "is", None)],
+        [("result", "=", "category_3"), ("x", "is", None), ("y", "!=", "A")],
+        [("result", "=", "category_3"), ("y", "!=", "A"), ("y", "is", None)],
+        [("result", "=", "category_3"), ("x", "is", None), ("y", "!=", "B")],
+        [("result", "=", "category_3"), ("x", "is", None), ("x", "is", None)],
+        [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
+        [("result", "=", "category_3"), ("x", "<=", 50), ("y", "is", None)],
+        [("result", "=", "category_3"), ("y", "!=", "B"), ("y", "is", None)],
+        [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
+        [("result", "=", "category_3"), ("y", "is", None), ("y", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -616,10 +638,12 @@ def test_ternary_complex_with_function_conditions():
     # ((y !~ .*test.*) AND (result == "no_match")) OR
     # ((z is null) AND (result == "no_match"))
     expected = [
-        [("x", "in", [1, 2, 3]), ("y", "~", ".*test.*"), ("z", "is not", None), ("result", "=", "match")],
+        [("x", "in", [1, 2, 3]), ("y", "~", ".*(?:test).*"), ("z", "is not", None), ("result", "=", "match")],
         [("x", "!in", [1, 2, 3]), ("result", "=", "no_match")],
-        [("y", "!~", ".*test.*"), ("result", "=", "no_match")],
+        [("y", "!~", ".*(?:test).*"), ("result", "=", "no_match")],
         [("z", "is", None), ("result", "=", "no_match")],
+        [("result", "=", "no_match"), ("x", "is", None)],
+        [("result", "=", "no_match"), ("y", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -653,6 +677,15 @@ def test_ternary_nested_with_multiple_conditions():
         # Path: (category!=A OR value<=100), category!=B -> other
         [("category", "!=", "A"), ("category", "!=", "B"), ("result", "=", "other")],
         [("value", "<=", 100), ("category", "!=", "B"), ("result", "=", "other")],
+        [("category", "=", "A"), ("result", "=", "normal_A"), ("subcategory", "is", None), ("value", ">", 100)],
+        [("category", "=", "A"), ("priority", "is", None), ("result", "=", "normal_A"), ("value", ">", 100)],
+        [("category", "!=", "A"), ("category", "is", None), ("result", "=", "other")],
+        [("category", "is", None), ("result", "=", "other"), ("value", "<=", 100)],
+        [("category", "!=", "B"), ("category", "is", None), ("result", "=", "other")],
+        [("category", "is", None), ("category", "is", None), ("result", "=", "other")],
+        [("category", "=", "B"), ("result", "=", "any_B"), ("value", "is", None)],
+        [("category", "!=", "B"), ("result", "=", "other"), ("value", "is", None)],
+        [("category", "is", None), ("result", "=", "other"), ("value", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -849,6 +882,7 @@ def test_boolean_cast_in_ternary_expression():
     expected = [
         [("x", ">", 5), ("y", "=", 10)],  # predicate and truthy
         [("x", "<=", 5), ("z", "<", 3)],  # negated predicate and falsy
+        [("x", "is", None), ("z", "<", 3)],
     ]
     assert_dnf_equal(result, expected)
 
@@ -941,3 +975,144 @@ def test_is_contradiction_obvious_bound_conflict():
     # Even with no schema, this should be detected as a contradiction
     result = is_contradiction(clause, schema=None)
     assert result is True
+
+
+_DNF_OPS = {
+    "=": lambda c, v: c == v,
+    "==": lambda c, v: c == v,
+    "!=": lambda c, v: c != v,
+    "<": lambda c, v: c < v,
+    "<=": lambda c, v: c <= v,
+    ">": lambda c, v: c > v,
+    ">=": lambda c, v: c >= v,
+    "~": lambda c, v: c.str.contains(v),
+}
+
+
+def _dnf_to_expr(dnf: list[list[tuple]]) -> pl.Expr:
+    """Materialise a DNF back into a Polars predicate (null -> drop, like a scan filter)."""
+
+    def term(col, op, value):
+        c = pl.col(col)
+        if op == "in":
+            return c.is_in(list(value))
+        if op in ("not in", "!in"):
+            return ~c.is_in(list(value))
+        if op == "is":
+            return c.is_null()
+        if op in ("is not", "!is"):
+            return c.is_not_null()
+        return _DNF_OPS[op](c, value)
+
+    return pl.any_horizontal([pl.all_horizontal([term(*t) for t in clause]) for clause in dnf]).fill_null(False)
+
+
+def _assert_dnf_keeps_all_rows(df: pl.DataFrame, pred: pl.Expr, dnf, schema=None):
+    """The DNF (if any) must be a superset of the predicate: it may keep extra rows but never drop one."""
+    rows = df.with_row_index()
+    kept_by_pred = set(rows.filter(pred)["index"].to_list())
+    if dnf is None:
+        return  # "no filter" is always safe
+    kept_by_dnf = set(rows.filter(_dnf_to_expr(dnf))["index"].to_list())
+    dropped = kept_by_pred - kept_by_dnf
+    assert not dropped, f"DNF {dnf} dropped rows {sorted(dropped)} that predicate keeps"
+
+
+@pytest.fixture
+def _null_mix_df() -> pl.DataFrame:
+    return pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]})
+
+
+def test_not_over_partially_converted_and_does_not_drop_rows(_null_mix_df):
+    """``~((a == 1) & <unconvertible>)`` must not negate the relaxed AND into a row-dropping DNF."""
+    pred = ~((pl.col("a") == 1) & (pl.col("b").str.len_chars() == 2))
+    dnf = convert_expr_to_dnf(pred)
+    # The inner AND dropped the unconvertible side, so negating is unsafe -> no filter.
+    assert dnf is None
+    _assert_dnf_keeps_all_rows(_null_mix_df, pred, dnf)
+
+
+def test_ne_missing_keeps_null_rows(_null_mix_df):
+    """``ne_missing(v)`` keeps nulls, so a bare ``!=`` would drop them."""
+    pred = pl.col("a").ne_missing(1)
+    dnf = convert_expr_to_dnf(pred)
+    assert_dnf_equal(dnf, [[("a", "!=", 1)], [("a", "is", None)]])
+    _assert_dnf_keeps_all_rows(_null_mix_df, pred, dnf)
+
+
+def test_eq_missing_and_ne_missing_with_null_literal():
+    """``eq_missing(None)`` is "is null"; ``ne_missing(None)`` is "is not null"."""
+    assert_dnf_equal(convert_expr_to_dnf(pl.col("a").eq_missing(None)), [[("a", "is", None)]])
+    assert_dnf_equal(convert_expr_to_dnf(pl.col("a").ne_missing(None)), [[("a", "is not", None)]])
+
+
+def test_negated_is_in_nulls_equal_keeps_nulls(_null_mix_df):
+    """``~is_in([1], nulls_equal=True)`` keeps nulls, so ``!in`` would drop them."""
+    pred = ~pl.col("a").is_in([1], nulls_equal=True)
+    dnf = convert_expr_to_dnf(pred)
+    assert dnf is None
+    _assert_dnf_keeps_all_rows(_null_mix_df, pred, dnf)
+
+
+def test_is_in_nulls_equal_with_null_value_keeps_nulls():
+    """``is_in([1, None], nulls_equal=True)`` matches nulls -> emit "in OR is null"."""
+    df = pl.DataFrame({"a": [1, 2, None]}, schema={"a": pl.Int64})
+    pred = pl.col("a").is_in([1, None], nulls_equal=True)
+    dnf = convert_expr_to_dnf(pred)
+    assert_dnf_equal(dnf, [[("a", "in", [1])], [("a", "is", None)]])
+    _assert_dnf_keeps_all_rows(df, pred, dnf)
+
+
+def test_narrowing_cast_on_column_is_not_stripped(_null_mix_df):
+    """A narrowing/wrapping cast must not resolve to the raw column (257 wraps to 1 under Int8)."""
+    pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
+    # Without a schema the source dtype is unknown -> refuse the cast.
+    assert convert_expr_to_dnf(pred) is None
+    # Even with a schema, Int64 -> Int8 is narrowing -> still refused.
+    assert convert_expr_to_dnf(pred, {"a": pl.Int64}) is None
+    _assert_dnf_keeps_all_rows(_null_mix_df, pred, convert_expr_to_dnf(pred, {"a": pl.Int64}))
+
+
+def test_value_preserving_widening_cast_still_pushes_down():
+    """A provably value- and order-preserving widening cast is unwrapped when a schema is supplied."""
+    pred = pl.col("a").cast(pl.Int64) == 1
+    assert convert_expr_to_dnf(pred) is None  # unknown source dtype -> safe refusal
+    assert_dnf_equal(convert_expr_to_dnf(pred, {"a": pl.Int8}), [[("a", "=", 1)]])
+
+
+def test_literal_on_left_is_flipped():
+    """``lit(1) < col`` should become ``col > 1`` rather than failing to convert."""
+    assert_dnf_equal(convert_expr_to_dnf(pl.lit(1) < pl.col("a")), [[("a", ">", 1)]])
+    assert_dnf_equal(convert_expr_to_dnf(pl.lit(5) >= pl.col("a")), [[("a", "<=", 5)]])
+
+
+def test_ternary_otherwise_keeps_rows_where_condition_is_null():
+    """Polars takes the ``otherwise`` branch when the condition is null, so those rows must be kept."""
+    df = pl.DataFrame({"a": [None, 1, 5]})
+    pred = pl.when(pl.col("a") >= 5).then(False).otherwise(True)
+    _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred))
+
+
+def test_regex_contains_is_not_escaped():
+    """``str.contains`` defaults to a regex, so ``"A|B"`` must match ``"A"`` and ``"B"``."""
+    df = pl.DataFrame({"s": ["A", "B", "A|B", "C"]})
+    for pred in (pl.col("s").str.contains("A|B"), pl.col("s").str.contains("A|B", literal=True)):
+        _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred))
+
+
+@pytest.mark.parametrize("dtype", [pl.Time, pl.Datetime("ns"), pl.Duration("ns")])
+@pytest.mark.parametrize("literal_left", [False, True])
+@pytest.mark.parametrize("operation", ["=", "!=", "<", "<=", ">", ">="])
+@pytest.mark.parametrize("tick", [1, 1000], ids=["submicrosecond", "microsecond"])
+def test_temporal_comparison_dnf_preserves_nanoseconds(dtype, literal_left, operation, tick):
+    frame = pl.DataFrame({"value": pl.Series([0, 1, 2, 1000, 1001], dtype=pl.Int64).cast(dtype)})
+    literal = pl.lit(tick).cast(dtype)
+    column = pl.col("value")
+    left, right = (literal, column) if literal_left else (column, literal)
+    predicate = _DNF_OPS[operation](left, right)
+    dnf = convert_expr_to_dnf(predicate)
+    if tick == 1000:
+        assert dnf is not None
+    if dnf is not None:
+        dnf = [[(name, comparison, pl.lit(value, dtype=frame.schema[name])) for name, comparison, value in clause] for clause in dnf]
+    _assert_dnf_keeps_all_rows(frame, predicate, dnf)

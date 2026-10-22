@@ -28,8 +28,10 @@ from polars_io_tools.io_sources.base import (
     UnknownNode,
     convert_datetime_to_polars,
     extract_column_name,
+    extract_value_preserving_column_name,
     get_literal_value,
     get_parsed_expr,
+    is_value_order_preserving_cast,
 )
 from polars_io_tools.io_sources.enum import (
     BooleanFunctionType,
@@ -86,6 +88,38 @@ def test_extract_column_name():
     assert "ts" == extract_column_name(get_parsed_expr(expr))
     expr = pl.col("ts").dt.date().alias("d")
     assert "ts" == extract_column_name(get_parsed_expr(expr))
+
+
+def test_extract_value_preserving_column_name():
+    """The strict extractor unwraps aliases always, but a cast only when a schema proves it value-preserving."""
+    # Aliases are always unwrapped (they only rename).
+    assert "b" == extract_value_preserving_column_name(get_parsed_expr(pl.col("b").alias("big_b")))
+
+    # Without a schema, the source dtype is unknown, so any cast is refused.
+    assert extract_value_preserving_column_name(get_parsed_expr(pl.col("a").cast(pl.Int32))) is None
+
+    # Narrowing / wrapping casts are refused even with a schema (Int64 -> Int8 can change 257 to 1).
+    narrowing = get_parsed_expr(pl.col("a").cast(pl.Int8, wrap_numerical=True))
+    assert extract_value_preserving_column_name(narrowing, {"a": pl.Int64}) is None
+
+    # Value- and order-preserving widening casts are unwrapped when the schema proves safety.
+    widening = get_parsed_expr(pl.col("a").cast(pl.Int64))
+    assert "a" == extract_value_preserving_column_name(widening, {"a": pl.Int8})
+
+    decimal_widen = get_parsed_expr(pl.col("x").cast(pl.Decimal(38, 2)))
+    assert "x" == extract_value_preserving_column_name(decimal_widen, {"x": pl.Decimal(10, 2)})
+
+
+def test_is_value_order_preserving_cast():
+    """Only identity, integer widening, and same-scale decimal widening preserve values and order."""
+    assert is_value_order_preserving_cast(pl.Int64, pl.Int64) is True
+    assert is_value_order_preserving_cast(pl.Int8, pl.Int64) is True
+    assert is_value_order_preserving_cast(pl.Int64, pl.Int8) is False
+    assert is_value_order_preserving_cast(pl.UInt8, pl.Int16) is True
+    assert is_value_order_preserving_cast(pl.Decimal(10, 2), pl.Decimal(38, 2)) is True
+    assert is_value_order_preserving_cast(pl.Decimal(10, 2), pl.Decimal(38, 4)) is False  # rescaling
+    assert is_value_order_preserving_cast(pl.Int64, pl.Float64) is False  # cross-family
+    assert is_value_order_preserving_cast(pl.Datetime, pl.Datetime("ms")) is False  # unparameterized dtype
 
 
 def test_parse_simple_column():
