@@ -179,7 +179,7 @@ class FakeBatchReader:
 def fake_read_arrow_batches_from_odbc(query: str, batch_size: int, connection_string: str, **kwargs):
     # Execute query and get arrow table
     global _duckdb_conn
-    table = _duckdb_conn.execute(query).fetch_arrow_table()
+    table = _duckdb_conn.sql(query).to_arrow_table()
     return FakeBatchReader(table, batch_size)
 
 
@@ -3246,7 +3246,7 @@ def _install_threadsafe_reader(monkeypatch):
 
     def _read(query, batch_size, connection_string, **kwargs):
         with lock:
-            table = _duckdb_conn.execute(query).fetch_arrow_table()
+            table = _duckdb_conn.sql(query).to_arrow_table()
         return FakeBatchReader(table, batch_size)
 
     monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
@@ -3423,7 +3423,7 @@ class TestScanDbPartitions:
         def _read(query, batch_size, connection_string, **kwargs):
             with lock:
                 captured.append(query)
-                table = _duckdb_conn.execute(query).fetch_arrow_table()
+                table = _duckdb_conn.sql(query).to_arrow_table()
             return FakeBatchReader(table, batch_size)
 
         monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
@@ -3445,7 +3445,7 @@ class TestScanDbPartitions:
             if "'GT'" in query:
                 raise RuntimeError("odbc boom")
             with lock:
-                table = _duckdb_conn.execute(query).fetch_arrow_table()
+                table = _duckdb_conn.sql(query).to_arrow_table()
             return FakeBatchReader(table, batch_size)
 
         monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
@@ -3479,7 +3479,7 @@ class TestScanDbPartitions:
 
         def _read(query, batch_size, connection_string, **kwargs):
             with lock:
-                table = _duckdb_conn.execute(query).fetch_arrow_table()
+                table = _duckdb_conn.sql(query).to_arrow_table()
             # Replicate rows so a slice has *many* one-row batches: this makes "streaming a few
             # batches" vs "reading the whole slice" a large, unambiguous difference on a tiny fixture.
             if table.num_rows:
@@ -3546,7 +3546,7 @@ class TestScanDbPartitions:
 
         def _read(query, batch_size, connection_string, **kwargs):
             with lock:
-                table = _duckdb_conn.execute(query).fetch_arrow_table()
+                table = _duckdb_conn.sql(query).to_arrow_table()
             if table.num_rows:
                 table = pa.concat_tables([table] * 50)  # many one-row batches, so workers stay mid-stream
             return _SlowReader(table)
@@ -3591,7 +3591,7 @@ def test_partition_worker_error_surfaces(monkeypatch):
         if "'RO'" in query:
             raise RuntimeError("odbc kaboom")
         with lock:
-            table = _duckdb_conn.execute(query).fetch_arrow_table()
+            table = _duckdb_conn.sql(query).to_arrow_table()
         return FakeBatchReader(table, batch_size)
 
     monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
@@ -3611,7 +3611,7 @@ def test_partial_submission_failure_does_not_leak_workers(monkeypatch):
 
     def _read(query, batch_size, connection_string, **kwargs):
         with lock:
-            table = _duckdb_conn.execute(query).fetch_arrow_table()
+            table = _duckdb_conn.sql(query).to_arrow_table()
         return FakeBatchReader(table, batch_size)
 
     monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
