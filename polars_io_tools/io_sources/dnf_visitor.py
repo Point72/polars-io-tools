@@ -314,6 +314,16 @@ def is_contradiction(clause: DNFClause, schema: pl.Schema | None = None) -> bool
     return False
 
 
+def _can_extract_lossless_literal(node: BaseExprNode) -> bool:
+    if not node.can_extract_literal:
+        return False
+    values = pl.select(node.expr).to_series()
+    if not values.dtype.is_temporal():
+        return True
+    restored = pl.Series(values.name, values.to_list(), dtype=values.dtype)
+    return values.equals(restored)
+
+
 class DNFVisitor(ExprVisitor[DNF | None]):
     """
     Visitor that converts expressions to DNF format.
@@ -384,11 +394,11 @@ class DNFVisitor(ExprVisitor[DNF | None]):
         if node.op.is_comparison():
             # Handle comparison operators (=, !=, etc.), with the column on either side
             column = extract_value_preserving_column_name(node.left, self.schema)
-            if column is not None and node.right.can_extract_literal:
+            if column is not None and _can_extract_lossless_literal(node.right):
                 self._set_comparison(column, node.op, node.right.value)
             else:
                 column = extract_value_preserving_column_name(node.right, self.schema)
-                if column is not None and node.left.can_extract_literal:
+                if column is not None and _can_extract_lossless_literal(node.left):
                     self._set_comparison(column, _FLIPPED_COMPARISON.get(node.op, node.op), node.left.value)
 
         elif node.op.is_bitwise_or_logical():

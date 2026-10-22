@@ -1098,3 +1098,21 @@ def test_regex_contains_is_not_escaped():
     df = pl.DataFrame({"s": ["A", "B", "A|B", "C"]})
     for pred in (pl.col("s").str.contains("A|B"), pl.col("s").str.contains("A|B", literal=True)):
         _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred))
+
+
+@pytest.mark.parametrize("dtype", [pl.Time, pl.Datetime("ns"), pl.Duration("ns")])
+@pytest.mark.parametrize("literal_left", [False, True])
+@pytest.mark.parametrize("operation", ["=", "!=", "<", "<=", ">", ">="])
+@pytest.mark.parametrize("tick", [1, 1000], ids=["submicrosecond", "microsecond"])
+def test_temporal_comparison_dnf_preserves_nanoseconds(dtype, literal_left, operation, tick):
+    frame = pl.DataFrame({"value": pl.Series([0, 1, 2, 1000, 1001], dtype=pl.Int64).cast(dtype)})
+    literal = pl.lit(tick).cast(dtype)
+    column = pl.col("value")
+    left, right = (literal, column) if literal_left else (column, literal)
+    predicate = _DNF_OPS[operation](left, right)
+    dnf = convert_expr_to_dnf(predicate)
+    if tick == 1000:
+        assert dnf is not None
+    if dnf is not None:
+        dnf = [[(name, comparison, pl.lit(value, dtype=frame.schema[name])) for name, comparison, value in clause] for clause in dnf]
+    _assert_dnf_keeps_all_rows(frame, predicate, dnf)
