@@ -220,6 +220,11 @@ S3. A monthly cache holds the same history in a few large files. Because the out
 monthly cache can be built from the daily one without querying the original source again,
 and readers can use monthly files where they exist and daily files for the rest.
 
+Before cache-only compaction, verify that the daily cache contains complete, current data
+for each whole month selected. `CACHE_ONLY` skips missing daily files; neither file
+presence nor `final_after` proves completeness. If coverage is uncertain, populate or
+rebuild the daily cache from the source first, or skip that month.
+
 ```python
 from datetime import timedelta
 
@@ -239,7 +244,7 @@ def monthly(upstream, cache_mode=CacheMode.CACHE):
 
 history = pl.col("date").is_between(pl.date(2020, 1, 1), pl.date(2024, 12, 31))
 
-# Compact: write monthly files from the daily cache alone.
+# Compact months with verified complete, current daily coverage.
 monthly(daily(CacheMode.CACHE_ONLY)).filter(history).collect()
 
 # Read: use monthly files where they exist, otherwise the daily cache, which fetches
@@ -258,8 +263,12 @@ that have ended. When both layers use `CacheMode.CACHE`, give the daily layer th
 settings, because the monthly layer requests whole months and days that have no data yet
 are cached empty.
 
-Once a month is compacted, its daily files can be deleted to save space, as long as nothing
-reads the daily cache directly for those dates.
+Keep daily files while the monthly partition can still refresh. Delete them only after
+verifying that the monthly file contains the complete month and was rewritten at least
+`final_after` after the month ended (one day here), so it is finalized under the unchanged
+policy. Waiting until that date without rewriting does not finalize an earlier file.
+Nothing else may need the daily files, including direct readers. Keep or restore complete
+upstream data before a later `REBUILD` or expiry-policy change.
 
 ## Cache in memory across a multi-branch evaluation
 

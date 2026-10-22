@@ -4127,3 +4127,45 @@ def test_monthly_cache_over_daily_cache(tmp_path):
     assert len(calls) == 1
     assert files("monthly") == 1
     assert files("daily") == 55
+
+
+@pytest.mark.parametrize("cached_through", [D(2026, 9, 15), D(2026, 9, 30)], ids=["partial-daily", "complete-daily"])
+def test_monthly_cache_retains_history_after_verified_finalization(tmp_path, set_now, cached_through):
+    calls = []
+    source = _source(D(2026, 9, 30))
+    expected = source.collect()
+    counted = source.map_batches(lambda frame: calls.append(1) or frame, schema=source.collect_schema())
+    history = pl.col("date").is_between(START, D(2026, 9, 30))
+    daily_root, monthly_root = tmp_path / "daily", tmp_path / "monthly"
+
+    def daily(cache_mode=CacheMode.CACHE):
+        return cache_parquet(counted, daily_root, "date", time_unit="daily", cache_mode=cache_mode)
+
+    def monthly():
+        return cache_parquet(
+            daily(CacheMode.CACHE_ONLY), monthly_root, "date", time_unit="monthly", ttl=timedelta(days=1), final_after=timedelta(days=1)
+        )
+
+    set_now(T(2026, 10, 1))
+    daily().filter(pl.col("date") <= cached_through).collect()
+    calls.clear()
+    assert_frame_equal(daily().filter(history).collect().sort("date"), expected)
+    assert len(calls) == (1 if cached_through < D(2026, 9, 30) else 0)
+    calls.clear()
+    assert_frame_equal(monthly().filter(history).collect().sort("date"), expected)
+    _set_mtime(monthly_root, T(2026, 10, 1))
+    before = _mtimes(monthly_root)
+
+    set_now(T(2026, 10, 2))
+    assert_frame_equal(monthly().filter(history).collect().sort("date"), expected)
+    assert _mtimes(monthly_root) != before
+    _set_mtime(monthly_root, T(2026, 10, 2))
+    finalized = _mtimes(monthly_root)
+    for path in daily_root.rglob("*.parquet"):
+        path.unlink()
+
+    set_now(T(2026, 10, 6))
+    assert_frame_equal(monthly().filter(history).collect().sort("date"), expected)
+    assert_frame_equal(pl.concat([pl.read_parquet(path) for path in monthly_root.rglob("*.parquet")]).sort("date"), expected)
+    assert _mtimes(monthly_root) == finalized
+    assert calls == []
