@@ -4095,3 +4095,35 @@ def test_time_partition_filter_preserves_nanoseconds(tmp_path, literal_left, tic
     predicate = literal == pl.col("time") if literal_left else pl.col("time") == literal
     result = cache_parquet(source, tmp_path, extra_partition_cols="time").filter(predicate).collect()
     assert result["time"].cast(pl.Int64).to_list() == [tick]
+
+
+def test_monthly_cache_over_daily_cache(tmp_path):
+    calls = []
+
+    def daily(end, cache_mode=CacheMode.CACHE):
+        source = _source(end)
+        counted = source.map_batches(lambda df: calls.append(1) or df, schema=source.collect_schema())
+        return cache_parquet(counted, tmp_path / "daily", "date", time_unit="daily", cache_mode=cache_mode)
+
+    def monthly(upstream, cache_mode=CacheMode.CACHE):
+        return cache_parquet(upstream, tmp_path / "monthly", "date", time_unit="monthly", cache_mode=cache_mode)
+
+    def files(name):
+        return len(list((tmp_path / name).rglob("*.parquet")))
+
+    daily(D(2026, 10, 20)).filter(pl.col("date").is_between(START, D(2026, 10, 20))).collect()
+    calls.clear()
+
+    # Compacting September reads the daily cache only.
+    september = monthly(daily(D(2026, 10, 20), CacheMode.CACHE_ONLY)).filter(pl.col("date").is_between(START, D(2026, 9, 30))).collect()
+    assert calls == []
+    assert files("monthly") == 1
+    assert_frame_equal(september, _source(D(2026, 9, 30)).collect())
+
+    # Reading through the monthly cache falls back to the daily cache for October, which fetches only the new days.
+    query = pl.col("date").is_between(D(2026, 9, 10), D(2026, 10, 25))
+    result = monthly(daily(D(2026, 10, 25)), CacheMode.READ_ONLY).filter(query).collect()
+    assert_frame_equal(result.sort("date"), _source(D(2026, 10, 25)).filter(query).collect())
+    assert len(calls) == 1
+    assert files("monthly") == 1
+    assert files("daily") == 55

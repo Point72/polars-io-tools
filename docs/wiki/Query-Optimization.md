@@ -211,6 +211,56 @@ lf.filter(pl.col("date").is_between(pl.date(2024, 1, 1), pl.date(2024, 3, 31))).
 Use `cache_mode=CacheMode.REBUILD` to refresh partitions in the query scope while leaving
 others intact, and `aws_profile=` to select S3 credentials.
 
+## Layer a monthly cache over a daily cache
+
+A daily cache is easy to keep current, since each day is written once it arrives, but years
+of history become thousands of small files that are slow to list and read, especially on
+S3. A monthly cache holds the same history in a few large files. Because the output of
+`cache_parquet` is a `LazyFrame`, it can be the upstream of another `cache_parquet`, so the
+monthly cache can be built from the daily one without querying the original source again,
+and readers can use monthly files where they exist and daily files for the rest.
+
+```python
+from datetime import timedelta
+
+from polars_io_tools import CacheMode
+
+def daily(cache_mode=CacheMode.CACHE):
+    return prices_lf.piot.cache_parquet(
+        "s3://bucket/cache/prices_daily", date_column="date", time_unit="daily",
+        cache_mode=cache_mode,
+    )
+
+def monthly(upstream, cache_mode=CacheMode.CACHE):
+    return upstream.piot.cache_parquet(
+        "s3://bucket/cache/prices_monthly", date_column="date", time_unit="monthly",
+        cache_mode=cache_mode, ttl=timedelta(hours=24), final_after=timedelta(days=1),
+    )
+
+history = pl.col("date").is_between(pl.date(2020, 1, 1), pl.date(2024, 12, 31))
+
+# Compact: write monthly files from the daily cache alone.
+monthly(daily(CacheMode.CACHE_ONLY)).filter(history).collect()
+
+# Read: use monthly files where they exist, otherwise the daily cache, which fetches
+# any missing days. Nothing is written to the monthly cache.
+monthly(daily(), CacheMode.READ_ONLY).filter(pl.col("date") >= pl.date(2024, 1, 1)).collect()
+```
+
+With both layers in `CacheMode.CACHE`, one query does both: it reads monthly files, falls
+back to daily files, fetches what neither has, and writes monthly files for the months it
+touched.
+
+The `ttl` and `final_after` settings keep the current month up to date. A month compacted
+before it ends is rebuilt from the daily cache once a day until a rewrite at least a day
+after the month ends, and is kept from then on. Without these settings, compact only months
+that have ended. When both layers use `CacheMode.CACHE`, give the daily layer the same
+settings, because the monthly layer requests whole months and days that have no data yet
+are cached empty.
+
+Once a month is compacted, its daily files can be deleted to save space, as long as nothing
+reads the daily cache directly for those dates.
+
 ## Cache in memory across a multi-branch evaluation
 
 Polars' common-subplan elimination does not deduplicate independent references to an
