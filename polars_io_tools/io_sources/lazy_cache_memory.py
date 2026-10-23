@@ -54,7 +54,14 @@ import polars as pl
 
 from .._compat import POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
 from .restrict_visitor import restrict_expr_to_columns
-from .util import PartitionKey, collect_lf_in_io_source, partition_exclusion_predicate, partition_key, register_io_source_with_is_pure
+from .util import (
+    PartitionKey,
+    _lossy_python_key,
+    collect_lf_in_io_source,
+    partition_exclusion_predicate,
+    partition_key,
+    register_io_source_with_is_pure,
+)
 
 __all__ = ("cache_memory",)
 
@@ -172,6 +179,8 @@ def cache_memory(
     # True once an unrestricted build has run: every partition is then known, so later demands
     # (any predicate) are served from ``buffers`` without rebuilding.
     full_built = False
+    # True once a partition column was keyed by physical value (see the build below).
+    physical_keys = False
     # A cached build failure, stored as a lightweight ``(exception_type_name, message)`` record
     # rather than the live exception object. Storing the object would pin its traceback — and
     # through it the whole failed DataFrame — alive for the instance's lifetime, and re-raising one
@@ -212,6 +221,9 @@ def cache_memory(
             return None
         if any(restricted_pred.meta.eq(built) for built in built_predicates):
             return _NOTHING
+        if physical_keys:
+            # The exclusion predicate cannot express physical-valued keys, so rebuild everything.
+            return None
         # Subtract already-built partitions so each partition is collected at most once.
         not_built = _exclude_built(built_keys)
         return restricted_pred if not_built is None else restricted_pred & not_built
@@ -223,7 +235,7 @@ def cache_memory(
         row-level correctness is still enforced by re-applying the full predicate in
         ``source_generator``, so returning a superset of buffers here is safe.
         """
-        nonlocal full_built, building, build_error
+        nonlocal full_built, building, build_error, physical_keys
         with build_cond:
             while True:
                 if build_error is not None:
@@ -268,10 +280,13 @@ def cache_memory(
                     raise ValueError(f"cache_memory: declared column '{name}' is missing from the constructed frame")
                 if actual[name] != declared[name]:
                     raise ValueError(f"cache_memory: column '{name}' declared as {declared[name]} but constructed frame has {actual[name]}")
+            # Columns whose distinct values can be equal as Python objects are keyed by physical value.
+            physical_cols = {c for c in partition_cols if _lossy_python_key(actual.get(c))}
             if partition_cols:
                 new_buffers = {}
-                for values, frame in built.partition_by(list(partition_cols), as_dict=True).items():
-                    key = partition_key(dict(zip(partition_cols, values)))
+                key_exprs = [pl.col(c).to_physical() if c in physical_cols else pl.col(c) for c in partition_cols]
+                for frame in built.partition_by(list(partition_cols)):
+                    key = partition_key(dict(zip(partition_cols, frame.select(key_exprs).row(0))))
                     new_buffers[key] = frame.select(declared.names())
             else:
                 new_buffers = {(): built.select(declared.names())}
@@ -297,6 +312,7 @@ def cache_memory(
             raise
 
         with build_cond:
+            physical_keys = physical_keys or bool(physical_cols)
             for key, frame in new_buffers.items():
                 buffers.setdefault(key, frame)
                 built_keys.add(key)

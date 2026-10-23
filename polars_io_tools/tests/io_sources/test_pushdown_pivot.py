@@ -15,6 +15,10 @@ Two ``dense_on`` modes are exercised:
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
+from zoneinfo import ZoneInfo
+
 import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
@@ -186,3 +190,41 @@ def test_aggregate_function_not_implemented():
             values="score",
             aggregate_function="sum",
         )
+
+
+_FOLD_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+
+
+@pytest.mark.parametrize(
+    ("df", "on_columns"),
+    [
+        # Null index value must survive the recovery join.
+        (pl.DataFrame({"id": [None, None, 1, 1], "kind": ["A", "B", "A", "B"], "v": [10, 20, 30, 40]}), ["A", "B"]),
+        # Null ``on`` category must survive the synthesized ``on`` filter.
+        (pl.DataFrame({"id": [1, 1], "kind": [None, "B"], "v": [10, 20]}), [None, "B"]),
+        (pl.DataFrame({"id": [1, 1], "kind": [None, "B"], "v": [10, 20]}), [None, "B", "C"]),
+        # DST-fold datetimes compare equal in Python but are distinct categories.
+        (
+            pl.DataFrame(
+                {"id": [1, 1], "kind": pl.Series([_FOLD_EARLY, _FOLD_EARLY.replace(fold=1)]).cast(pl.Datetime("us", "America/New_York")), "v": [1, 2]}
+            ),
+            [_FOLD_EARLY, _FOLD_EARLY.replace(fold=1)],
+        ),
+    ],
+)
+def test_filter_on_first_pivoted_column_matches_bare(df, on_columns):
+    kw = {"on": "kind", "on_columns": on_columns, "index": "id", "values": "v"}
+    col = df.lazy().pivot(**kw).collect_schema().names()[1]
+    bare = df.lazy().pivot(**kw).filter(pl.col(col) < 15).select("id", col).collect()
+    wrapped = pushdown_pivot(df.lazy(), **kw).filter(pl.col(col) < 15).select("id", col).collect()
+    assert_frame_equal(wrapped, bare, check_row_order=False)
+
+
+@pytest.mark.parametrize("extra", [[], [Decimal(1000)]], ids=["in_range", "out_of_range"])
+def test_decimal_on_values_filter_matches_bare(extra):
+    df = pl.DataFrame({"id": [1, 1, 1], "kind": pl.Series([1, 2, 3], dtype=pl.Decimal(3, 0)), "v": [10, 20, 30]})
+    kw = {"on": "kind", "on_columns": [Decimal(1), Decimal(2), Decimal(3), *extra], "index": "id", "values": "v"}
+    cols = ["id", "1", "2", *(["1000"] if extra else [])]
+    bare = df.lazy().pivot(**kw).filter(pl.col("1") < pl.col("2")).select(cols).collect()
+    wrapped = pushdown_pivot(df.lazy(), **kw).filter(pl.col("1") < pl.col("2")).select(cols).collect()
+    assert_frame_equal(wrapped, bare)

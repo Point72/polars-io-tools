@@ -152,7 +152,8 @@ def pushdown_unpivot(
                 internal_cols.append(c)
 
         if not internal_cols:
-            internal_cols = [index_cols[0]]
+            # Any column preserves the row count.
+            internal_cols = [source_cols[0]]
 
         subset = source
         if pred_index_safe is not None:
@@ -160,14 +161,13 @@ def pushdown_unpivot(
         subset = subset.select(internal_cols)
 
         if need_value:
-            result_lf = subset.unpivot(
+            # Cast before unpivoting: the supertype of a subset of columns can coerce values differently.
+            result_lf = subset.with_columns(pl.col(internal_on).cast(declared_value_dtype, strict=False)).unpivot(
                 index=[c for c in index_cols if c in internal_cols],
                 on=internal_on,
                 variable_name=variable_name,
                 value_name=value_name,
             )
-            if result_lf.collect_schema()[value_name] != declared_value_dtype:
-                result_lf = result_lf.with_columns(pl.col(value_name).cast(declared_value_dtype))
         else:
             base = subset.collect()
             if need_variable:

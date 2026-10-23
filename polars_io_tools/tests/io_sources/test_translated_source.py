@@ -8,6 +8,7 @@ from polars_io_tools.io_sources.translated_source import (
     TranslatedPredicateVisitor,
     mapping_to_metadata,
     metadata_to_mapping,
+    translate_polars_predicate,
 )
 
 
@@ -72,6 +73,23 @@ def test_translated_visitor_eq_datetime_literal_cast():
     rewritten = vis.process_results()
     out = df.filter(rewritten)
     assert out["ts"].to_list() == [_ns_epoch(t1)]
+
+
+def test_translated_visitor_keeps_cast_on_integer_literal():
+    # The cast gives the integer its time unit, so it must not be dropped when comparing against a ms column
+    t1 = datetime(2025, 1, 1, 0, 0, 1)
+    df = pl.DataFrame({"ts": [_ns_epoch(t1) // 10**6]})
+    pred = pl.col("ts") == pl.lit(_ns_epoch(t1)).cast(pl.Datetime("ns"))
+    rewritten = translate_polars_predicate(pred, {"ts": pl.Datetime("ms")})
+    assert df.filter(rewritten).height == 1
+
+
+def test_translate_predicate_drops_only_untranslatable_conjunct():
+    df = pl.DataFrame({"ts": [_ns_epoch(datetime(2025, 1, 1, h)) for h in (1, 2, 3)], "x": [1, 2, 3]})
+    pred = (pl.col("ts").dt.hour() == 2) & (pl.col("x") > 1)
+    rewritten = translate_polars_predicate(pred, {"ts": pl.Datetime("ns")})
+    assert df.filter(rewritten)["x"].to_list() == [2, 3]
+    assert translate_polars_predicate(~pred, {"ts": pl.Datetime("ns")}) is None
 
 
 def test_translated_visitor_between_datetime_ns():
@@ -292,6 +310,19 @@ def test_translated_visitor_datetime_not_in_unary():
     assert out["ts"].to_list() == [_ns_epoch(t1)]
 
 
+@pytest.mark.parametrize("negate", [False, True])
+def test_translated_visitor_in_datetime_ns_matches_polars(negate):
+    """Membership on a mapped column keeps every row that Polars keeps on the mapped frame."""
+    t0, t1 = datetime(2025, 1, 1), datetime(2025, 1, 2)
+    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1)]})
+    mapping = {"ts": pl.Datetime("ns")}
+    pred = pl.col("ts").is_in([t0])
+    pred = ~pred if negate else pred
+    rewritten = translate_polars_predicate(pred, mapping)
+    expected = df.cast(mapping).filter(pred)["ts"].dt.timestamp("ns").to_list()
+    assert set(expected) <= set(df.filter(rewritten)["ts"].to_list())
+
+
 def test_metadata_roundtrip_datetime_with_timezone():
     """Test that metadata_to_mapping correctly handles time_zone field.
 
@@ -341,3 +372,27 @@ def test_metadata_roundtrip_duration():
     assert recovered_mapping["dur_ns"].time_unit == "ns"
     assert recovered_mapping["dur_us"].time_unit == "us"
     assert recovered_mapping["dur_ms"].time_unit == "ms"
+
+
+@pytest.mark.parametrize(
+    ("stored", "mapping", "pred"),
+    [
+        ({"x": [257, 1], "ts": [0, 1]}, {"ts": pl.Datetime("ns")}, pl.col("x").cast(pl.UInt8, wrap_numerical=True) == 1),
+        ({"x": ["z", "a"]}, {"x": pl.Enum(["z", "a"])}, pl.col("x") < "a"),
+        ({"x": [0, 1]}, {"x": pl.Date}, pl.col("x").cast(pl.String) == "1970-01-02"),
+        ({"x": [2, 0]}, {"x": pl.Boolean}, pl.col("x") == True),
+    ],
+)
+def test_translated_predicate_matches_logical_filter(stored, mapping, pred):
+    df = pl.DataFrame(stored)
+    expected = df.cast(mapping).filter(pred)
+    rewritten = translate_polars_predicate(pred, mapping)
+    result = df if rewritten is None else df.filter(rewritten)
+    assert result.cast(mapping).filter(pred).equals(expected)
+    assert result.height >= expected.height and expected.height > 0
+
+
+@pytest.mark.parametrize("dtype", [pl.Date, pl.Decimal(10, 2), pl.Categorical, pl.Enum(["a"]), pl.Int8])
+def test_mapping_to_metadata_rejects_unsupported_dtype(dtype):
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        mapping_to_metadata({"c": dtype})

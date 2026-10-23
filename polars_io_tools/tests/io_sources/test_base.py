@@ -20,6 +20,7 @@ from polars_io_tools.io_sources.base import (
     ExplodeNode,
     ExprVisitor,
     FunctionNode,
+    KeepNameNode,
     LiteralNode,
     NodeTraverserParser,
     OperatorType,
@@ -31,6 +32,7 @@ from polars_io_tools.io_sources.base import (
     extract_value_preserving_column_name,
     get_literal_value,
     get_parsed_expr,
+    has_exact_value,
     is_value_order_preserving_cast,
 )
 from polars_io_tools.io_sources.enum import (
@@ -1646,3 +1648,45 @@ def test_node_traverser_parser_unsupported_expression_degrades_to_unknown() -> N
     expr = pl.col("x").map_batches(lambda s: s, return_dtype=pl.Boolean)
     node = NodeTraverserParser().parse(expr)
     assert isinstance(node, UnknownNode)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [pl.col("x").is_null().alias("p"), pl.col("x").is_null().name.keep(), (~pl.col("x").is_null()).alias("p").alias("q")],
+)
+def test_naming_wrapper_does_not_repeat_function(expr):
+    df = pl.DataFrame({"x": [None, 1]})
+    node = get_parsed_expr(expr)
+    while isinstance(node, AliasNode | KeepNameNode):
+        node = node.input
+    assert isinstance(node, FunctionNode)
+    assert df.select(node.expr).equals(df.select(expr.meta.undo_aliases()))
+    assert not isinstance(node.inputs[0], FunctionNode) or node.inputs[0].function_type != node.function_type
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "options"), [({"strict": True}, "Strict"), ({"strict": False}, "NonStrict"), ({"wrap_numerical": True}, "Overflowing")]
+)
+def test_cast_options_parsed(kwargs, options):
+    node = get_parsed_expr(pl.col("x").cast(pl.Int8, **kwargs))
+    assert isinstance(node, CastNode)
+    assert node.options == options
+
+
+@pytest.mark.parametrize(
+    ("value", "collection", "expected"),
+    [
+        (pl.lit(1), False, True),
+        (pl.lit([1, 2]), False, False),
+        (pl.lit([1, 2]), True, True),
+        (pl.lit(pl.Series(["a", "b"])), False, False),
+        (pl.lit(float("nan")), False, False),
+        (pl.lit([float("nan"), 1.0]), True, False),
+        # Valid in Polars, but outside Python's date range.
+        (pl.lit(4_000_000).cast(pl.Date), False, False),
+        (pl.lit(10**18).cast(pl.Datetime("us")), False, False),
+    ],
+)
+def test_has_exact_value(value, collection, expected):
+    node = get_parsed_expr(pl.col("x") == value).right
+    assert has_exact_value(node, collection=collection) is expected

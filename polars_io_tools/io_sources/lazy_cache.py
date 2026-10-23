@@ -12,6 +12,7 @@ from .util import (
     PartitionKey as _PartitionKey,
     _exclude_row_predicate,
     _exclusion_from_frame,
+    _lossy_python_key,
     _repeated_grouping as _shared_repeated_grouping,
     partition_exclusion_predicate,
     partition_key as _partition_key,
@@ -247,6 +248,11 @@ def cache(
     explicit_df_key = df_key is not None
     if explicit_df_key:
         _validate_explicit_key_ordering(schema, order_by)
+
+    if any(_lossy_python_key(schema[col]) for col in partition_cols):
+        # Partition keys are Python values, so distinct partitions would collide.
+        log.warning("cache: partition_cols %s include a nanosecond, Time or timezone-aware column; caching unpartitioned", partition_cols)
+        partition_cols = ()
 
     # Generate the schema of the partition columns, as we'll need to apply the partition predicate to a frame with this schema
     partition_schema = {p_col: schema[p_col] for p_col in partition_cols}

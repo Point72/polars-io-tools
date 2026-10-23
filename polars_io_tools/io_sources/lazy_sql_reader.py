@@ -263,7 +263,8 @@ def scan_db(
             so filters on the cast column push down to the database. Use this to correct a \
             mis-declared source type (e.g. a column stored as ``datetime`` that should be ``date``, \
             or a numeric id delivered as ``float`` that should be an integer) without abandoning \
-            ``select *`` — remaining columns pass through untouched. \
+            ``select *`` — remaining columns pass through untouched. A time-zone-aware ``Datetime`` \
+            target raises ``ValueError``. \
             Caveat: a predicate on a cast column is pushed down as ``CAST(col AS ...) <op> value``. \
             Wrapping the column in a function can prevent the database from using an index on it \
             (SARGability), so the effect on the query plan is backend dependent — some engines \

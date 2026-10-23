@@ -1,4 +1,5 @@
 import datetime
+import time
 from unittest.mock import patch
 
 import polars as pl
@@ -177,8 +178,8 @@ def test_interval_parameter(mock_metric_query):
 
     mock_metric_query.assert_called_once_with(
         query=query,
-        start=int(start_dt.timestamp()),
-        end=int(end_dt.timestamp()),
+        start=int(start_dt.replace(tzinfo=datetime.UTC).timestamp()),
+        end=int(end_dt.replace(tzinfo=datetime.UTC).timestamp()),
         api_key=DUMMY_API_KEY,
         app_key=DUMMY_APP_KEY,
         interval=custom_interval,
@@ -207,6 +208,42 @@ def test_chunking(mock_metric_query):
 
     assert mock_metric_query.call_count == 2
     assert len(df) == 4
+
+
+_POINT = datetime.datetime(2024, 1, 1, 12)
+
+
+@pytest.fixture
+def new_york_tz(monkeypatch):
+    """Run with a non-UTC host timezone; predicate bounds are naive UTC regardless."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is unavailable")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pl.col("timestamp").is_between(_POINT - datetime.timedelta(minutes=1), _POINT + datetime.timedelta(minutes=1)),
+        pl.col("timestamp") == _POINT,
+        pl.col("timestamp").is_between(_POINT, _POINT + datetime.timedelta(milliseconds=500)),
+        pl.col("timestamp") >= _POINT,
+    ],
+)
+def test_points_matching_predicate_are_fetched(new_york_tz, pred):
+    point_sec = int(_POINT.replace(tzinfo=datetime.UTC).timestamp())
+
+    def api_stub(**kwargs):
+        return {"series": [{"pointlist": [[point_sec * 1000, 7.0]] if kwargs["start"] <= point_sec <= kwargs["end"] else []}]}
+
+    df = pl.DataFrame({"timestamp": [_POINT], "value": [7.0]})
+    with patch("polars_io_tools.io_sources.lazy_datadog_reader.metric_query", side_effect=api_stub):
+        lf = cpl.scan_datadog("q", DUMMY_API_KEY, DUMMY_APP_KEY, additional_schema=dict(df.schema), overwrite_schema=True)
+        assert_frame_equal(lf.filter(pred).collect(), df.filter(pred))
 
 
 # These tests verify that scan_datadog LazyFrames can be serialized with cloudpickle,

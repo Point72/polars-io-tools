@@ -35,7 +35,7 @@ from typing import Any, Literal
 import polars as pl
 
 from .restrict_visitor import restrict_expr_to_columns
-from .util import register_io_source_with_is_pure
+from .util import _is_in_collection, register_io_source_with_is_pure
 
 __all__ = ("pushdown_pivot",)
 
@@ -130,22 +130,20 @@ def pushdown_pivot(
         declared_schema = source.pivot(on, on_columns=on_values, **pivot_kwargs).collect_schema()
         declared_cols = list(declared_schema.names())
         index_set = set(index_cols)
-        on_value_to_output_cols: dict[Any, list[str]] = {}
+        # Parallel to on_values rather than keyed by value: distinct values can compare equal in Python (e.g. DST-fold datetimes).
+        on_value_output_cols: list[list[str]] = []
         for v in on_values:
             sub_schema = source.pivot(on, on_columns=[v], **pivot_kwargs).collect_schema()
-            on_value_to_output_cols[v] = [c for c in sub_schema.names() if c not in index_set]
-        output_to_on_value: dict[str, Any] = {}
-        for v, cols in on_value_to_output_cols.items():
-            for c in cols:
-                output_to_on_value[c] = v
+            on_value_output_cols.append([c for c in sub_schema.names() if c not in index_set])
+        output_cols = list(dict.fromkeys(c for cols in on_value_output_cols for c in cols))
         _resolved.update(
             source_schema=source_schema,
             source_cols=source_cols,
             declared_schema=declared_schema,
             declared_cols=declared_cols,
-            on_value_to_output_cols=on_value_to_output_cols,
+            on_value_output_cols=on_value_output_cols,
             # Stored as a list so the pickled closure does not depend on PYTHONHASHSEED
-            output_cols=list(output_to_on_value),
+            output_cols=output_cols,
         )
         return _resolved
 
@@ -159,7 +157,7 @@ def pushdown_pivot(
         source_cols: list[str] = state["source_cols"]
         declared_schema: pl.Schema = state["declared_schema"]
         declared_cols: list[str] = state["declared_cols"]
-        on_value_to_output_cols: dict[Any, list[str]] = state["on_value_to_output_cols"]
+        on_value_output_cols: list[list[str]] = state["on_value_output_cols"]
         output_col_set: set[str] = set(state["output_cols"])
 
         pred_index_safe: pl.Expr | None = None
@@ -178,7 +176,7 @@ def pushdown_pivot(
             needed_output_materialized = output_col_set
 
         if needed_output_materialized:
-            needed_on = [v for v in on_values if set(on_value_to_output_cols[v]) & needed_output_materialized]
+            needed_on = [v for v, cols in zip(on_values, on_value_output_cols) if set(cols) & needed_output_materialized]
         else:
             needed_on = []
 
@@ -186,11 +184,20 @@ def pushdown_pivot(
 
         source_filter = pred_index_safe
         if push_on_filter:
-            on_filter_expr: pl.Expr
-            if len(needed_on) == 1:
-                on_filter_expr = pl.col(on) == needed_on[0]
-            else:
-                on_filter_expr = pl.col(on).is_in(needed_on)
+            non_null_on = [v for v in needed_on if v is not None]
+            on_filter_expr: pl.Expr = pl.col(on).is_null()
+            if non_null_on:
+                try:
+                    matched = (
+                        pl.col(on) == non_null_on[0]
+                        if len(non_null_on) == 1
+                        else pl.col(on).is_in(_is_in_collection(non_null_on, state["source_schema"][on]))
+                    )
+                except pl.exceptions.InvalidOperationError:
+                    # An ``on_columns`` value does not fit the Decimal ``on`` dtype.
+                    matched = pl.lit(True)
+                # ``==`` and ``is_in`` never match a null ``on`` value.
+                on_filter_expr = matched | on_filter_expr if len(non_null_on) < len(needed_on) else matched
             source_filter = on_filter_expr if source_filter is None else (source_filter & on_filter_expr)
 
         internal_cols: list[str] = list(index_cols)
@@ -221,7 +228,7 @@ def pushdown_pivot(
                 if pred_index_safe is not None:
                     recovery = recovery.filter(pred_index_safe)
                 full_index_df = recovery.select(index_cols).unique().collect()
-                result_df = full_index_df.join(result_df, on=index_cols, how="left")
+                result_df = full_index_df.join(result_df, on=index_cols, how="left", nulls_equal=True)
         else:
             result_df = subset.collect().unique(subset=index_cols, maintain_order=True)
 

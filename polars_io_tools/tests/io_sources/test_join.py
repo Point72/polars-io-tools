@@ -1,4 +1,5 @@
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import polars as pl
 import pytest
@@ -1211,3 +1212,42 @@ class TestJoinBetween:
         # Both A and B contain 10:00:04, but only B (nearest start) is returned
         assert len(result) == 1
         assert result["event_id"][0] == "B"
+
+
+_DT_LEFT = pl.DataFrame({"t": [datetime(2024, 1, 1, 0, 0, 0, 500), datetime(2024, 1, 1, 13)]})
+_DT_RIGHT = pl.DataFrame({"t": [datetime(2023, 12, 31, 23), datetime(2024, 1, 1, 0, 0, 0, 400), datetime(2024, 1, 1, 12, 30)], "y": [0, 1, 2]})
+_DATE_LEFT = pl.DataFrame({"t": [date(2024, 1, 1)]})
+_DATE_RIGHT = pl.DataFrame({"t": [date(2023, 12, 31), date(2024, 1, 1)], "y": [0, 1]})
+_UTC = {"t": pl.Datetime("us", "UTC")}
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "pred", "kwargs"),
+    [
+        (_DT_LEFT, _DT_RIGHT, pl.col("t").cast(pl.Date) < datetime(2024, 1, 1, 12), {"tolerance": timedelta(hours=1)}),
+        (_DT_LEFT, _DT_RIGHT, pl.col("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1), {"tolerance": timedelta(hours=1)}),
+        (_DATE_LEFT, _DATE_RIGHT, pl.col("t") < datetime(2024, 1, 1, 12), {"strategy": "forward", "tolerance": timedelta(hours=1)}),
+        (_DATE_LEFT, _DATE_RIGHT, pl.col("t") < datetime(2024, 1, 1, 12), {"strategy": "backward", "tolerance": timedelta(days=1)}),
+        (_DT_LEFT.cast(_UTC), _DT_RIGHT.cast(_UTC), pl.col("t") >= datetime(2024, 1, 1, tzinfo=UTC), {"tolerance": timedelta(hours=1)}),
+    ],
+)
+def test_filtered_join_asof_keeps_matches(left, right, pred, kwargs):
+    left, right = left.lazy().set_sorted("t"), right.lazy().set_sorted("t")
+    expected = left.join_asof(right, on="t", **kwargs).filter(pred).collect()
+    assert_frame_equal(left.piot.filtered_join_asof(right, on="t", **kwargs).filter(pred).collect(), expected)
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        pl.Series([1001, 2002]).cast(pl.Datetime("ns")),
+        pl.Series([1001, 2002]).cast(pl.Duration("ns")),
+        pl.Series([1001]).cast(pl.Time),
+        pl.Series([Decimal("1.25"), Decimal("2.50")], dtype=pl.Decimal(10, 2)),
+    ],
+)
+def test_filtered_join_keys_keep_dtype(keys):
+    """The right-side key filter must not lose key precision through Python values."""
+    left = pl.LazyFrame({"k": keys, "v": range(len(keys))})
+    right = pl.LazyFrame({"k": keys, "w": range(len(keys))})
+    assert_frame_equal(left.piot.filtered_join(right, on="k").collect(), left.join(right, on="k").collect(), check_row_order=False)

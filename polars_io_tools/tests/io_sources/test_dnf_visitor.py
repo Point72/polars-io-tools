@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -62,7 +63,7 @@ def function_exprs():
         "is_not_null": (pl.col("z").is_not_null(), [[("z", "is not", None)]]),
         "starts_with": (pl.col("s").str.starts_with("prefix"), [[("s", "~", "^prefix")]]),
         "ends_with": (pl.col("s").str.ends_with("suffix"), [[("s", "~", "suffix$")]]),
-        "contains": (pl.col("s").str.contains("substr"), [[("s", "~", ".*(?:substr).*")]]),
+        "contains": (pl.col("s").str.contains("substr"), [[("s", "~", "substr")]]),
     }
 
 
@@ -78,7 +79,7 @@ def complex_exprs():
             ((pl.col("a") > 5) & (pl.col("b") <= 10)) | (((pl.col("c") == "test") | (pl.col("d").ne(True))) & pl.col("e").is_null()),
             [[("a", ">", 5), ("b", "<=", 10)], [("c", "=", "test"), ("e", "is", None)], [("d", "!=", True), ("e", "is", None)]],
         ),
-        "complex_3": ((pl.col("e").is_in([1, 2, 3]) & pl.col("f").str.contains("xyz")), [[("e", "in", [1, 2, 3]), ("f", "~", ".*(?:xyz).*")]]),
+        "complex_3": ((pl.col("e").is_in([1, 2, 3]) & pl.col("f").str.contains("xyz")), [[("e", "in", [1, 2, 3]), ("f", "~", "xyz")]]),
     }
 
 
@@ -638,9 +639,9 @@ def test_ternary_complex_with_function_conditions():
     # ((y !~ .*test.*) AND (result == "no_match")) OR
     # ((z is null) AND (result == "no_match"))
     expected = [
-        [("x", "in", [1, 2, 3]), ("y", "~", ".*(?:test).*"), ("z", "is not", None), ("result", "=", "match")],
+        [("x", "in", [1, 2, 3]), ("y", "~", "test"), ("z", "is not", None), ("result", "=", "match")],
         [("x", "!in", [1, 2, 3]), ("result", "=", "no_match")],
-        [("y", "!~", ".*(?:test).*"), ("result", "=", "no_match")],
+        [("y", "!~", "test"), ("result", "=", "no_match")],
         [("z", "is", None), ("result", "=", "no_match")],
         [("result", "=", "no_match"), ("x", "is", None)],
         [("result", "=", "no_match"), ("y", "is", None)],
@@ -1116,3 +1117,62 @@ def test_temporal_comparison_dnf_preserves_nanoseconds(dtype, literal_left, oper
     if dnf is not None:
         dnf = [[(name, comparison, pl.lit(value, dtype=frame.schema[name])) for name, comparison, value in clause] for clause in dnf]
     _assert_dnf_keeps_all_rows(frame, predicate, dnf)
+
+
+def test_sub_microsecond_is_in_literal_is_not_pushed():
+    """A Python ``datetime`` cannot hold the literal's nanoseconds, so a truncated value would drop matching rows."""
+    ns_literal = pl.lit(1704198600000000500).cast(pl.Datetime("ns"))
+    assert convert_expr_to_dnf(pl.col("t").is_in(pl.concat_list(ns_literal)), {"t": pl.Datetime("ns")}) is None
+
+
+_NY = ZoneInfo("America/New_York")
+_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=_NY)
+_LATE = _EARLY.replace(fold=1)
+_NAN = float("nan")
+_X = pl.col("x")
+
+
+@pytest.mark.parametrize(
+    ("df", "pred"),
+    [
+        (pl.DataFrame({"x": [_NAN, 1.0, 2.0]}), (_X == _NAN) & (_X == _NAN)),
+        (pl.DataFrame({"x": [_NAN, 1.0, 2.0]}), _X.is_in([_NAN, 1.0]) & _X.is_in([_NAN, 2.0])),
+        (pl.DataFrame({"x": [_EARLY, _LATE]}), (_X == _EARLY) & (_X != _LATE)),
+        (pl.DataFrame({"x": pl.Series(["z", "a", "m"], dtype=pl.Enum(["z", "a", "m"]))}), _X.is_in(["z", "m"]) & (_X < "a")),
+        (pl.DataFrame({"x": [-1, 0, 1, None]}), pl.when(_X.is_between(None, 0)).then(False).otherwise(True)),
+        (pl.DataFrame({"x": [date(2024, 1, 1)]}), pl.when(_X == date(2024, 1, 1)).then(_X >= datetime(2024, 1, 1)).otherwise(False)),
+        (pl.DataFrame({"x": [date(2024, 1, 1)]}), (_X == date(2024, 1, 1)) & (_X == datetime(2024, 1, 1))),
+        (pl.DataFrame({"x": pl.Series([0.1], dtype=pl.Float32)}), (_X == 0.1) & (_X == 0.10000000149011612)),
+        (pl.DataFrame({"x": pl.Series([0.1], dtype=pl.Float32)}), pl.when(_X == 0.1).then(_X == 0.10000000149011612).otherwise(False)),
+        (pl.DataFrame({"x": [2]}), (_X > 1.5) & (_X < 2.5)),
+        (pl.DataFrame({"x": [2]}), (_X > float("-inf")) & (_X < float("inf"))),
+        (pl.DataFrame({"x": ["a", "b"]}), _X.str.contains("(?x)a # comment")),
+        (pl.DataFrame({"x": ["a", "["]}), _X.str.contains("[", strict=False)),
+        (
+            pl.DataFrame({"x": pl.Series([datetime(2024, 1, 1)], dtype=pl.Datetime("ms"))}),
+            (_X == datetime(2024, 1, 1, microsecond=1)) & (_X == datetime(2024, 1, 1, microsecond=2)),
+        ),
+        (pl.DataFrame({"x": [float(2**53)]}), (_X == 2**53 + 1) & (_X == float(2**53))),
+    ],
+    ids=[
+        "nan_eq",
+        "nan_is_in",
+        "dst_fold",
+        "enum_order",
+        "is_between_null_bound",
+        "date_vs_datetime_bound",
+        "date_vs_datetime_eq",
+        "float32_eq",
+        "float32_ternary",
+        "fractional_int_bounds",
+        "infinite_int_bounds",
+        "verbose_regex",
+        "non_strict_regex",
+        "literal_finer_than_unit",
+        "int_vs_float_beyond_2_53",
+    ],
+)
+def test_dnf_and_contradiction_keep_matching_rows(df, pred):
+    """Python value comparisons must not prove a contradiction or drop rows that Polars keeps."""
+    assert df.filter(pred).is_empty() or _is_contradiction(pred, df.schema) is False
+    _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred, df.schema))

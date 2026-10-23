@@ -45,6 +45,13 @@ def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     return tuple(sorted(partition_values.items()))
 
 
+def _lossy_python_key(dtype: pl.DataType) -> bool:
+    """Whether distinct ``dtype`` values can be equal as Python objects (truncated to microseconds, or ignoring DST ``fold``)."""
+    if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None:
+        return True
+    return dtype == pl.Time or (isinstance(dtype, (pl.Datetime, pl.Duration)) and dtype.time_unit == "ns")
+
+
 def _is_in_collection(values: list, dtype: pl.DataType) -> list | pl.Expr:
     """Collection for ``pl.col(...).is_in`` holding non-null ``values`` of a column of ``dtype``."""
     # A plain list of Decimals is inferred as Decimal(38, s), which is_in rejects
@@ -506,6 +513,23 @@ def _register_io_source_supports_explain_labels() -> bool:
     return {"explain_name", "explain_detail"} <= inspect.signature(register_io_source).parameters.keys()
 
 
+def _limit_before_filter(io_source):
+    """Read ``n_rows`` source rows before applying ``predicate`` when Polars passes both.
+
+    Polars passes both for ``head(n).filter(p)`` and does not re-apply either, so ``n_rows`` counts rows before the
+    filter. Readers apply their row limit after the predicate, so this wrapper never passes them both.
+    """
+
+    @functools.wraps(io_source)
+    def source(with_columns, predicate, n_rows, batch_size):
+        if predicate is None or n_rows is None:
+            return io_source(with_columns, predicate, n_rows, batch_size)
+        frames = (df.filter(predicate) for df in io_source(None, None, n_rows, batch_size))
+        return frames if with_columns is None else (df.select(with_columns) for df in frames)
+
+    return source
+
+
 def register_io_source_with_is_pure(
     io_source,
     schema,
@@ -585,7 +609,7 @@ def register_io_source_with_is_pure(
         )
     if wrap_with_error_catching:
         io_source = wrap_io_source_with_error_catching(io_source, error_type=pl.exceptions.ComputeError if POLARS_GE_2 else RuntimeError)
-    return register_io_source(io_source, schema=schema, **kwargs)
+    return register_io_source(_limit_before_filter(io_source), schema=schema, **kwargs)
 
 
 def with_columns_topo(lf: pl.LazyFrame, exprs: list[pl.Expr]) -> pl.LazyFrame:

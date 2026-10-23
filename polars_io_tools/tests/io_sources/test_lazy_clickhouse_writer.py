@@ -7,7 +7,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
-from polars_io_tools import io_sources as polars_utils
+from polars_io_tools.io_sources import lazy_clickhouse_writer
 
 """
 This module contains tests for the lazy ClickHouse writer (sink_clickhouse).
@@ -70,7 +70,7 @@ def fake_write_arrow_to_clickhouse(table: str, arrow_table: pa.Table, url: str, 
 def patch_writer(monkeypatch, duckdb_connection):
     """Monkeypatch the writer's HTTP functions to use DuckDB."""
     monkeypatch.setattr(
-        polars_utils.lazy_clickhouse_writer,
+        lazy_clickhouse_writer,
         "_write_arrow_to_clickhouse",
         fake_write_arrow_to_clickhouse,
     )

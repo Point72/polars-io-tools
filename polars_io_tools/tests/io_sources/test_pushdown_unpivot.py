@@ -179,3 +179,24 @@ def test_select_id_only_row_count_invariant_wrapped():
     t = PredicateTracker(df)
     out = pushdown_unpivot(t.lazy_frame, index=["id"]).select("id").collect()
     assert out.height == 3 * 2
+
+
+@pytest.mark.parametrize(
+    ("df", "index", "pred", "select"),
+    [
+        (pl.DataFrame({"A": [10, 20], "B": [30, 40]}), [], pl.col("variable") == "A", ["variable"]),
+        # The subset (i, f) has supertype Float64, but the full unpivot casts i straight to String.
+        (
+            pl.DataFrame({"id": [1], "i": [10], "f": [1.5], "s": ["abc"]}),
+            "id",
+            pl.col("variable").is_in(["i", "f"]) & (pl.col("value") == "10"),
+            None,
+        ),
+    ],
+)
+def test_restricted_unpivot_matches_bare(df, index, pred, select):
+    bare = df.lazy().unpivot(index=index).filter(pred)
+    wrapped = pushdown_unpivot(df.lazy(), index=index).filter(pred)
+    if select is not None:
+        bare, wrapped = bare.select(select), wrapped.select(select)
+    assert_frame_equal(wrapped.collect(), bare.collect(), check_row_order=False)

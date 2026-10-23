@@ -1,6 +1,10 @@
-import polars as pl
-from packaging import version
+from collections import Counter
 
+import polars as pl
+import pytest
+from polars.testing import assert_frame_equal
+
+import polars_io_tools as cpl
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, ExprParser, get_parsed_expr
 from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.restrict_visitor import RestrictPredicateVisitor, restrict_expr_to_columns
@@ -319,7 +323,7 @@ def test_ternary_nested():
     # Expected result when restricting to "region" and "price"
     #
     expected_true = (pl.col("region") == "US") & ((pl.col("price") * 1.1 > 1) | (pl.col("price") < 12))
-    expected_false = (pl.col("region") == "US").not_() & ((pl.col("price") * 0.9) > 1)
+    expected_false = (pl.col("region") == "US").not_().fill_null(True) & ((pl.col("price") * 0.9) > 1)
 
     expected = expected_true | expected_false
 
@@ -379,7 +383,7 @@ def test_ternary_combined_with_binary_op():
     # Since we ignore volume, we can drop that restriction
 
     expected = (pl.col("region") == "US") & (pl.col("price") > 100)
-    expected = expected | (pl.col("region") == "US").not_()
+    expected = expected | (pl.col("region") == "US").not_().fill_null(True)
     assert result.meta.eq(expected)
 
 
@@ -415,21 +419,9 @@ def test_ternary_predicate_str_function():
     expr = pl.when(pl.col("symbol").str.contains("HI").alias("hey")).then(pl.col("price") > 3).otherwise(pl.col("volume") != 13)
 
     result = restrict_expr_to_columns(expr, {"symbol", "price"})
-    lower_bound = version.parse("1.30.0")
-    upper_bound = version.parse("1.32.0")
-    cur_version = version.parse(pl.__version__)
-    if lower_bound < cur_version < upper_bound:
-        # In versions between 1.30.0 and 1.32.0, the alias is not preserved in the expression
-        # This is a bug
-        expected = (pl.col("symbol").str.contains("HI").alias("hey") & (pl.col("price") > 3)) | (
-            pl.col("symbol").str.contains("HI").alias("hey").not_()
-        )
-        assert result.meta.eq(expected)
-    else:
-        expected = ((pl.col("symbol").str.contains("HI").alias("hey")) & (pl.col("price") > 3)) | (
-            pl.col("symbol").str.contains("HI").alias("hey").not_()
-        )
-        assert result.meta.eq(expected)
+    expected = (pl.col("symbol").str.contains("HI") & (pl.col("price") > 3)) | pl.col("symbol").str.contains("HI").not_().fill_null(True)
+    # The default parser drops aliases, as they don't affect a filter.
+    assert result.meta.undo_aliases().meta.eq(expected)
 
 
 def test_ternary_complex_comparison():
@@ -468,7 +460,7 @@ def test_not_pred_valid_pred_invalid():
     # This ensures we include all rows that definitely match the original expression,
     # even if it means including some rows that might not have matched in the complete expression.
 
-    expected = (pl.col("A") > 15) | (pl.col("A").mod(2) == 0).not_()
+    expected = (pl.col("A") > 15) | (pl.col("A").mod(2) == 0).not_().fill_null(True)
     assert result.meta.eq(expected)
 
 
@@ -505,10 +497,9 @@ def test_cast_with_binary_expr():
     # Cast AND expression to boolean
     expr = (pl.col("flag") & pl.col("active")).cast(pl.Boolean)
 
-    # When restricting to just one column of a binary op that's cast to boolean
+    # The column dtypes are unknown, so the AND may be bitwise and cannot be restricted
     result = restrict_expr_to_columns(expr, {"flag"})
-    # Cannot represent the AND with just flag
-    assert result.meta.eq(pl.col("flag"))
+    assert result is None
 
     # Cast inside AND - this tests the specific functionality you added
     expr = pl.col("flag").cast(pl.Boolean) & pl.col("active")
@@ -569,7 +560,7 @@ def test_cast_in_ternary():
     # Restrict to "flag" and "value"
     result = restrict_expr_to_columns(expr, {"flag", "value"})
     # The expected result combines the predicate and truthy branch
-    expected = (pl.col("flag").cast(pl.Boolean) & (pl.col("value") > 0)) | (pl.col("flag").cast(pl.Boolean).not_())
+    expected = (pl.col("flag").cast(pl.Boolean) & (pl.col("value") > 0)) | (pl.col("flag").cast(pl.Boolean).not_().fill_null(True))
     assert result.meta.eq(expected)
 
     # Cast in both branches of ternary
@@ -577,7 +568,7 @@ def test_cast_in_ternary():
 
     # Restrict to "flag" and "value"
     result = restrict_expr_to_columns(expr, {"flag", "value"})
-    expected = (pl.col("flag") & (pl.col("value") > 0).cast(pl.Boolean)) | (pl.col("flag").not_())
+    expected = (pl.col("flag") & (pl.col("value") > 0).cast(pl.Boolean)) | (pl.col("flag").not_().fill_null(True))
     assert result.meta.eq(expected)
 
 
@@ -705,3 +696,50 @@ def test_all_horizontal_nested():
     result = restrict_expr_to_columns(outer, {"a", "b"})
     expected = pl.all_horizontal(pl.col("a") > 0, pl.col("b") > 0)
     assert_expr_equal(result, expected)
+
+
+_NULLABLE_DATA = pl.DataFrame(
+    {"a": [None, None, 5, 0, 5, 2], "b": [None, 1, 0, 1, 0, None], "ab": [1, 2, 300, 4, 0, 7]},
+    schema={"a": pl.Int64, "b": pl.Int64, "ab": pl.Int64},
+)
+
+
+@pytest.mark.parametrize(
+    ("expr", "columns"),
+    [
+        (pl.when(pl.col("a") > 1).then(pl.col("b") > 100).otherwise(pl.col("a").fill_null(0) < 3), {"a"}),
+        (~pl.when(pl.col("b") == 1).then(pl.col("a") > 1).otherwise((pl.col("a") > 0) & (pl.col("ab") > 100)), {"a", "b"}),
+        (~pl.all_horizontal(pl.col("a") > 1, pl.col("b") > 0), {"a"}),
+        ((pl.col("a") & pl.col("b")).cast(pl.Boolean), {"a"}),
+        (~((pl.col("a") | pl.col("b")).cast(pl.Boolean)), {"a"}),
+        (pl.when(pl.col("a") > 1).then(pl.col("b") * 2).otherwise(1).cast(pl.Boolean), {"a"}),
+        (pl.any_horizontal(pl.all() > 0), {"a"}),
+        (pl.any_horizontal(pl.col("^a.*$") > 0), {"a"}),
+        (pl.all_horizontal(pl.col("a", "b") > 0), {"a"}),
+        (pl.all_horizontal(pl.col("a"), pl.col("b") > 0), {"a"}),
+    ],
+)
+def test_restricted_predicate_keeps_all_matching_rows(expr, columns):
+    """The restricted predicate, evaluated on the kept columns only, must keep every row the original keeps."""
+    visitor = RestrictPredicateVisitor(columns)
+    visitor.visit(ExprParser().parse(expr))
+    cols = sorted(columns)
+    kept = Counter(_NULLABLE_DATA.filter(expr).select(cols).rows())
+    for restricted in (restrict_expr_to_columns(expr, columns), visitor.process_results()):
+        if restricted is not None:
+            restricted_kept = Counter(_NULLABLE_DATA.select(cols).filter(restricted).rows())
+            assert not kept - restricted_kept
+
+
+def test_ternary_with_null_condition_end_to_end():
+    data = pl.DataFrame({"k": [None, None, 5, 0], "x": [1, 2, 300, 4]})
+    pred = pl.when(pl.col("k") > 1).then(pl.col("x") > 100).otherwise(pl.col("k").fill_null(0) < 3)
+    result = cpl.cache_memory(lambda: data.lazy(), schema=data.schema, partition_cols="k").filter(pred).collect()
+    assert_frame_equal(result, data.filter(pred), check_row_order=False)
+
+
+def test_negated_ternary_end_to_end():
+    frames = {(None, 1): pl.DataFrame({"x": [1, 200]}), (5, 0): pl.DataFrame({"x": [2, 300]})}
+    pred = ~pl.when(pl.col("k2") == 1).then(pl.col("k") > 1).otherwise((pl.col("k") > 0) & (pl.col("x") > 100))
+    lf = cpl.concat_named({key: df.lazy() for key, df in frames.items()}, [("k", pl.Int64), ("k2", pl.Int64)])
+    assert_frame_equal(lf.filter(pred).collect(), lf.collect().filter(pred), check_row_order=False)

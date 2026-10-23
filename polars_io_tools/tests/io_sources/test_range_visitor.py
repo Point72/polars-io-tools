@@ -1,11 +1,17 @@
+import operator
 from datetime import UTC, date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import polars as pl
 import portion
 import pytest
+from polars.testing import assert_frame_equal
 from portion import Bound, Interval
 
+from polars_io_tools.io_sources.join import filtered_join_asof
+from polars_io_tools.io_sources.partitions import by_range, by_time
+from polars_io_tools.io_sources.pushdown_combine import FilterSpec, pushdown_combine
 from polars_io_tools.io_sources.range_visitor import (
     IntervalVisitor,
     _convert_atomic_interval_to_polars_expr,
@@ -16,6 +22,7 @@ from polars_io_tools.io_sources.range_visitor import (
     convert_expr_to_datetime_range,
     convert_expr_to_range,
 )
+from polars_io_tools.testing import PredicateTracker
 
 
 class TestRangeExtractor:
@@ -470,26 +477,15 @@ class TestDatetimeRangeExtractor:
         assert result.lower == datetime.combine(start_date, time())
         assert result.upper == datetime.combine(end_date, time())
         assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_cast_datetime_time_unit(self):
-        """Test casting date to datetime in a range."""
-        end_date = date(2023, 12, 31)
-        # Using >= and < operators to create a range
-        expr = pl.col("datetime_col").cast(pl.Datetime(time_unit="ns")) == end_date
-        result = convert_expr_to_datetime_range(expr, "datetime_col", coerce_date_to_datetime=True)
-        assert result.atomic
-        assert result.lower == datetime.combine(end_date, time())
-        assert result.upper == datetime.combine(end_date, time())
-        assert result.left is Bound.CLOSED
+        # Closed: Polars truncates a finer literal to a coarser column's unit.
         assert result.right is Bound.CLOSED
 
-        result = convert_expr_to_datetime_range(expr, "datetime_col", coerce_date_to_datetime=False)
-        assert result.atomic
-        assert result.lower == datetime.combine(end_date, time())
-        assert result.upper == datetime.combine((date(2023, 12, 31) + timedelta(1)), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
+    @pytest.mark.parametrize("coerce", [True, False])
+    def test_cast_datetime_time_unit(self, coerce):
+        """A ``date`` literal does not bound a column cast to a sub-day unit."""
+        expr = pl.col("datetime_col").cast(pl.Datetime(time_unit="ns")) == date(2023, 12, 31)
+        result = convert_expr_to_datetime_range(expr, "datetime_col", coerce_date_to_datetime=coerce)
+        assert result == portion.open(-portion.inf, portion.inf)
 
     def test_datetime_cast_time(self):
         """Test casting datetime to time"""
@@ -516,7 +512,7 @@ class TestDatetimeRangeExtractor:
         result = convert_expr_to_datetime_range(expr, "datetime_col", coerce_date_to_datetime=True)
         assert result.atomic
         assert result.lower == (end - timedelta(hours=1)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-        assert result.upper == (end + timedelta(hours=1)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        assert result.upper == (end + timedelta(hours=1)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None) + timedelta(microseconds=1)
         assert result.left is Bound.CLOSED
         assert result.right is Bound.CLOSED
 
@@ -1054,14 +1050,14 @@ class TestCastWithDatetimeRanges:
 
         assert result.atomic
         assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == end_datetime
+        assert result.upper == end_datetime + timedelta(microseconds=1)
         assert result.left is Bound.CLOSED
         assert result.right is Bound.CLOSED
 
     def test_cast_with_time_unit_and_timezone(self):
         """Test casting with time unit and timezone specifications."""
         # Cast with specific time unit and timezone
-        expr = pl.col("date_col").cast(pl.Datetime(time_unit="ms", time_zone="UTC")) >= datetime(2023, 1, 1, tzinfo=UTC)
+        expr = pl.col("date_col").cast(pl.Datetime(time_unit="us", time_zone="UTC")) >= datetime(2023, 1, 1, tzinfo=UTC)
         result = convert_expr_to_datetime_range(expr, "date_col")
         assert result.atomic
         assert result.lower == datetime(2023, 1, 1)
@@ -1191,14 +1187,14 @@ class TestRangeExtractorAliasHandling:
         test_value = 42
 
         # Test cast -> alias -> alias
-        expr1 = pl.col("original").cast(pl.Int64).alias("first").alias("second") == test_value
+        expr1 = pl.col("original").cast(pl.Float64).alias("first").alias("second") == test_value
         result1 = convert_expr_to_range(expr1, "original")
         assert result1.atomic
         assert result1.lower == test_value
         assert result1.upper == test_value
 
         # Test alias -> cast -> alias
-        expr2 = pl.col("original").alias("first").cast(pl.Int64).alias("second") == test_value
+        expr2 = pl.col("original").alias("first").cast(pl.Float64).alias("second") == test_value
         result2 = convert_expr_to_range(expr2, "original")
         assert result2.atomic
         assert result2.lower == test_value
@@ -1206,7 +1202,7 @@ class TestRangeExtractorAliasHandling:
 
         # Test with IS_BETWEEN and complex nesting
         start_val, end_val = 10, 20
-        expr3 = pl.col("value").cast(pl.Int64).alias("v1").alias("v2").is_between(start_val, end_val)
+        expr3 = pl.col("value").cast(pl.Float64).alias("v1").alias("v2").is_between(start_val, end_val)
         result3 = convert_expr_to_range(expr3, "value")
         assert result3.atomic
         assert result3.lower == start_val
@@ -1383,6 +1379,11 @@ class TestExtendToFullDates:
         result = _extend_to_full_dates(compound_interval)
         expected = portion.closed(date(2023, 1, 1), date(2023, 1, 3)) | portion.closed(date(2023, 1, 5), date(2023, 1, 7))
         assert result == expected
+
+    def test_open_upper_bound_keeps_date_after_midnight(self):
+        """A Date column value ``d`` satisfies ``d < upper`` when ``upper`` falls after midnight on ``d``."""
+        result = _extend_to_full_dates(portion.closedopen(datetime(2023, 12, 1), datetime(2024, 1, 1, 12)))
+        assert result == portion.closed(date(2023, 12, 1), date(2024, 1, 1))
 
 
 class TestConvertAtomicIntervalToPolarsExpr:
@@ -1632,3 +1633,172 @@ class TestDateWindows:
             (datetime(2024, 1, 1), datetime(2024, 2, 1)),
             (datetime(2024, 12, 1), datetime(2025, 1, 1)),
         ]
+
+
+_NAN = float("nan")
+_NS_LITERAL = pl.lit(1704103200000000500).cast(pl.Datetime("ns"))  # 2024-01-01 10:00:00.000000500
+
+
+class TestUnusableLiteralsLeaveColumnUnconstrained:
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            pl.col("t") > None,
+            pl.col("t").eq_missing(None),
+            pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True),
+            pl.col("t").is_in([None], nulls_equal=True),
+            pl.col("t") < _NS_LITERAL,
+            pl.col("t").is_in(pl.concat_list(_NS_LITERAL)),
+        ],
+    )
+    def test_datetime(self, expr):
+        assert convert_expr_to_datetime_range(expr, "t") == portion.open(-portion.inf, portion.inf)
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            pl.col("x") == _NAN,
+            pl.col("x").is_in([1.0, _NAN]),
+            pl.col("x").is_between(0, _NAN),
+            pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN),
+        ],
+    )
+    def test_nan(self, expr):
+        assert convert_expr_to_range(expr, "x") == portion.open(-portion.inf, portion.inf)
+
+    def test_single_element_series_is_in(self):
+        expr = pl.col("t").is_in(pl.Series([datetime(2024, 1, 1)]))
+        assert convert_expr_to_datetime_range(expr, "t") == portion.singleton(datetime(2024, 1, 1))
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pl.col("t").dt.date() == date(2024, 1, 1),
+        pl.col("t").dt.date() <= date(2024, 1, 1),
+        pl.col("t").cast(pl.Date).is_in([date(2024, 1, 1)]),
+        pl.col("t").dt.date().is_between(date(2023, 12, 1), date(2024, 1, 1)),
+    ],
+)
+def test_day_floored_column_bound_covers_whole_day(pred):
+    df = pl.DataFrame({"t": [datetime(2023, 12, 31, 23), datetime(2024, 1, 1, 13), datetime(2024, 1, 2, 1)]})
+    interval = convert_expr_to_datetime_range(pred, "t")
+    assert all(t in interval for t in df.filter(pred)["t"])
+
+
+@pytest.mark.parametrize("op", [operator.eq, operator.le])
+def test_microsecond_cast_bound_covers_sub_microseconds(op):
+    """``cast(pl.Datetime("us"))`` floors a nanosecond column, so ``<=``/``==`` 12:30 also holds at 12:30 plus 500 ns."""
+    interval = convert_expr_to_datetime_range(op(pl.col("t").cast(pl.Datetime("us")), datetime(2024, 1, 2, 12, 30)), "t")
+    assert interval.upper == datetime(2024, 1, 2, 12, 30, 0, 1) and interval.right == portion.CLOSED
+
+
+def test_floored_membership_at_maximum_is_unbounded():
+    pred = pl.col("t").cast(pl.Datetime("us")).is_in([datetime.max])
+    assert convert_expr_to_datetime_range(pred, "t").upper == portion.inf
+
+
+@pytest.mark.parametrize(
+    ("dtype", "t", "pred", "kwargs"),
+    [
+        # A ``Datetime("ms")`` column cast to ``us`` is exact; its bound must survive truncation to milliseconds.
+        (
+            pl.Datetime("ms"),
+            datetime(2024, 1, 1, 12),
+            pl.col("t").cast(pl.Datetime("us")) == datetime(2024, 1, 1, 12),
+            {"tolerance": timedelta(seconds=1)},
+        ),
+        (pl.Datetime("us"), datetime(9999, 12, 31), pl.col("t") == datetime(9999, 12, 31), {"strategy": "forward", "tolerance": timedelta(days=1)}),
+        (pl.Datetime("us"), datetime(1, 1, 1), pl.col("t") == datetime(1, 1, 1), {"strategy": "backward", "tolerance": timedelta(days=1)}),
+    ],
+)
+def test_filtered_join_asof_keeps_matches(dtype, t, pred, kwargs):
+    left = pl.DataFrame({"t": pl.Series([t], dtype=dtype)}).lazy().set_sorted("t")
+    right = left.with_columns(v=pl.lit(7)).set_sorted("t")
+    pred = pred & (pl.col("v") == 7)
+    expected = left.join_asof(right, on="t", **kwargs).filter(pred).collect()
+    assert_frame_equal(filtered_join_asof(left, right, on="t", log_explain=False, **kwargs).filter(pred).collect(), expected)
+
+
+@pytest.mark.parametrize(
+    ("value", "pred", "spec"),
+    [
+        (date.max, pl.col("d") <= date.max, FilterSpec(lookahead=timedelta(days=1))),
+        (date.max, pl.col("d") == date.max, FilterSpec(lookahead=timedelta(days=1))),
+        (date.min, pl.col("d") >= date.min, FilterSpec(lookback=timedelta(days=1))),
+        (datetime(9999, 12, 31), pl.col("d") == datetime(9999, 12, 31), FilterSpec(lookahead=timedelta(days=1))),
+    ],
+)
+def test_pushdown_combine_expansion_past_extremes(value, pred, spec):
+    df = pl.DataFrame({"d": [value], "v": [1]})
+    lf = pushdown_combine(sources={"data": (df.lazy(), {"d": spec})}, combine=lambda s: s["data"])
+    assert_frame_equal(lf.filter(pred).collect(), df.filter(pred))
+
+
+_ENUM = pl.Enum(["b", "a"])
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pl.col("x") > pl.lit("b", dtype=_ENUM),
+        pl.col("x") > "b",
+        pl.col("x") < "a",
+        pl.col("x").is_between(pl.lit("b", dtype=_ENUM), pl.lit("a", dtype=_ENUM)),
+    ],
+)
+def test_enum_ordering_comparison_keeps_rows(pred):
+    """Enum values order by category, so ``"a" > "b"`` for ``Enum(["b", "a"])``."""
+    df = pl.DataFrame({"x": pl.Series(["b", "a"], dtype=_ENUM)})
+    interval = convert_expr_to_range(pred, "x")
+    assert all(x in interval for x in df.filter(pred)["x"])
+
+
+def _partitioned_rows(df: pl.DataFrame, partitioner, pred: pl.Expr) -> pl.DataFrame:
+    """Rows of ``df`` matching ``pred`` when read through the partitions built from the pushed-down predicate."""
+    tracker = PredicateTracker(df)
+    tracker.lazy_frame.filter(pred).collect()
+    parts = partitioner.build(tracker.last_predicate)
+    if parts is None:  # unpartitioned read
+        return df.filter(pred)
+    return pl.concat([df.clear(), *(df.filter(p.predicate) for p in parts)]).filter(pred)
+
+
+class TestPartitionsKeepMatchingRows:
+    """Partitions built from the pushed-down predicate must contain every row the predicate keeps."""
+
+    @pytest.mark.parametrize(
+        ("values", "pred"),
+        [
+            ([1, 5, 257, -3], pl.col("x").cast(pl.Int8, wrap_numerical=True).is_between(0, 10)),
+            ([1, 5, 257, -3], pl.col("x").cast(pl.UInt8, wrap_numerical=True).is_between(0, 1)),
+            ([-0.5, 1.0, 3.5, 7.0], pl.col("x").cast(pl.Int64).is_between(0, 4)),
+            ([1, 2, 7], pl.col("x").cast(pl.String).is_between(pl.lit("1"), pl.lit("3"))),
+            ([1, None, 7], pl.col("x").is_in([1, None], nulls_equal=True)),
+            ([1.0, _NAN, 3.0], pl.col("x") == _NAN),
+            ([1.0, _NAN, 3.0], pl.col("x").is_in([1.0, _NAN])),
+            ([1.0, _NAN, 3.0], pl.col("x").is_between(0, _NAN)),
+            ([1.0, _NAN, 3.0], pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN)),
+            ([1, 2, 7], pl.col("x").is_in([1, 2])),
+        ],
+    )
+    def test_by_range(self, values, pred):
+        df = pl.DataFrame({"x": values})
+        assert_frame_equal(_partitioned_rows(df, by_range("x", 5), pred), df.filter(pred), check_row_order=False)
+
+    def test_by_range_decimal_bounds_with_float_width(self):
+        df = pl.DataFrame({"x": pl.Series([Decimal("1.0"), Decimal("1.5"), Decimal("3.0")], dtype=pl.Decimal(10, 1))})
+        pred = pl.col("x").is_between(Decimal("1.0"), Decimal("2.0"))
+        parts = by_range("x", 0.5).build(pred)
+        assert_frame_equal(pl.concat([df.filter(p.predicate) for p in parts]).filter(pred), df.filter(pred), check_row_order=False)
+
+    @pytest.mark.parametrize(("value", "every"), [(datetime(9999, 12, 31), "1d"), (date(9999, 12, 31), "1d"), (date(9999, 12, 31), "1mo")])
+    def test_by_time_window_past_maximum(self, value, every):
+        df = pl.DataFrame({"t": [value]})
+        pred = pl.col("t") == value
+        assert_frame_equal(_partitioned_rows(df, by_time("t", every), pred), df.filter(pred))
+
+    def test_by_time_null_membership(self):
+        df = pl.DataFrame({"t": [datetime(2024, 1, 1), None, datetime(2024, 1, 2)]})
+        pred = pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True)
+        assert_frame_equal(_partitioned_rows(df, by_time("t", "1d"), pred), df.filter(pred), check_row_order=False)

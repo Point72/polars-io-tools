@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import reduce
 from typing import Literal
 
 import polars as pl
 from pydantic import BaseModel
 
 from polars_io_tools.io_sources.base import (
+    AliasNode,
     BaseExprNode,
     BinaryExprNode,
     CastNode,
     ExprVisitor,
     FunctionNode,
     LiteralNode,
-    extract_column_name,
 )
 from polars_io_tools.io_sources.enum import (
     BooleanFunctionType,
@@ -30,23 +31,24 @@ log = logging.getLogger(__name__)
 __all__ = ("TranslatedPredicateVisitor", "translate_polars_predicate")
 
 
-def _to_target_expr(col: pl.Expr, m: pl.DataType | None) -> pl.Expr:
-    if m is None:
-        return col
-    # Cast mapped columns to their target logical dtype; layering of any
-    # additional user casts is handled in visit_cast by re-applying the
-    # original cast on top of the mapped base.
-    if isinstance(m, pl.Datetime):
-        tu = m.time_unit
-        tz = m.time_zone
-        target_dt = pl.Datetime(time_unit=tu, time_zone=tz)
-        return col.cast(target_dt, strict=False)
-    if isinstance(m, pl.Duration):
-        target_dt = pl.Duration(time_unit=m.time_unit)
-        return col.cast(target_dt, strict=False)
-    if (m == pl.Time) or isinstance(m, pl.Time):
-        return col.cast(pl.Time, strict=False)
-    return col
+_BINARY_OPS = {
+    OperatorType.AND: pl.Expr.and_,
+    OperatorType.OR: pl.Expr.or_,
+    OperatorType.EQ: pl.Expr.eq,
+    OperatorType.EQ_VALIDITY: pl.Expr.eq_missing,
+    OperatorType.NOT_EQ: pl.Expr.ne,
+    OperatorType.NOT_EQ_VALIDITY: pl.Expr.ne_missing,
+    OperatorType.GT: pl.Expr.gt,
+    OperatorType.GT_EQ: pl.Expr.ge,
+    OperatorType.LT: pl.Expr.lt,
+    OperatorType.LT_EQ: pl.Expr.le,
+}
+
+_UNARY_FUNCTIONS = {
+    BooleanFunctionType.IS_NULL: pl.Expr.is_null,
+    BooleanFunctionType.IS_NOT_NULL: pl.Expr.is_not_null,
+    BooleanFunctionType.NOT: pl.Expr.not_,
+}
 
 
 class TranslatedPredicateVisitor(ExprVisitor[pl.Expr | None]):
@@ -68,35 +70,16 @@ class TranslatedPredicateVisitor(ExprVisitor[pl.Expr | None]):
         return self._result
 
     def default_visit(self, node: BaseExprNode) -> None:
-        # Fallback to the original expression when we cannot or do not rewrite
-        self._result = node.expr
-
-    def _strip_literal_casts(self, node: BaseExprNode) -> BaseExprNode:
-        """
-        Remove cast/strict_cast wrappers that sit on top of literal nodes.
-
-        Why: Polars can automatically apply implicit casts to align the types
-        of both sides of a comparison. However, when a literal is explicitly
-        wrapped in a cast (e.g. `2025-01-01.strict_cast(Datetime('us'))`), that
-        cast may prevent the optimizer from pushing the predicate down into a
-        custom IO source. By unwrapping casts that are on top of literals only,
-        we minimize the surface area of this rewrite and let Polars handle the
-        type alignment. We do NOT touch casts that sit on top of columns or any
-        non-literal expressions.
-
-        This function peels off a chain of CastNode(s) as long as the child is
-        an extractable-literal node. If the cast wraps a column or anything that
-        is not a literal, it is left intact.
-        """
-        cur = node
-        # Only peel when the child subtree can provide a literal value
-        while isinstance(cur, CastNode) and getattr(cur.input, "can_extract_literal", False):
-            cur = cur.input
-        return cur
+        # An untranslated expression is only valid on the stored frame if it reads no mapped column.
+        self._result = None if set(node.expr.meta.root_names()) & self.mapping.keys() else node.expr
 
     # Leaf nodes
     def visit_literal(self, node: LiteralNode) -> None:
-        self._result = pl.lit(node.value)
+        # Keep the typed literal: converting through Python values truncates sub-microsecond precision.
+        self._result = node.expr
+
+    def visit_alias(self, node: AliasNode) -> None:
+        self._result = self._eval(node.input)
 
     def visit_column(self, node: BaseExprNode) -> None:  # ColumnNode
         # type: ignore[override]
@@ -106,10 +89,8 @@ class TranslatedPredicateVisitor(ExprVisitor[pl.Expr | None]):
             self._result = node.expr
             return
         m = self.mapping.get(name)
-        if m is not None:
-            self._result = _to_target_expr(pl.col(name), m)
-            return
-        self._result = pl.col(name)
+        # Same cast the reader applies to mapped columns; user casts are layered on top in visit_cast.
+        self._result = pl.col(name) if m is None else pl.col(name).cast(m, strict=False)
 
     def visit_cast(self, node: CastNode) -> None:
         # Re-apply user casts on top of mapped base columns without undoing
@@ -117,132 +98,57 @@ class TranslatedPredicateVisitor(ExprVisitor[pl.Expr | None]):
         # mapping, first cast that column to the target logical dtype, then
         # apply the user cast on top.
         base = self._eval(node.input)
-        if base is None:
-            self._result = node.expr
+        # Unknown options may hide wrap_numerical=True, which changes values.
+        if base is None or node.options is None:
+            self._result = None
             return
         # If input is a simple column with mapping, _eval already applied
-        # _to_target_expr. So we simply cast the resulting expression to
+        # the mapped cast. So we simply cast the resulting expression to
         # the requested dtype, preserving the layering.
         try:
-            self._result = base.cast(node.dtype, strict=False)
+            self._result = base.cast(node.dtype, strict=False, wrap_numerical=node.options == "Overflowing")
         except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
             log.warning(f"Recevied error {e!s} when applying a cast on {base!s}")
-            self._result = node.expr
+            self._result = None
 
     # Binary expressions
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
-        # Short-circuit boolean connectors by visiting children
-        if node.op in (OperatorType.AND, OperatorType.OR):
-            left_expr = self._eval(node.left)
-            right_expr = self._eval(node.right)
-            log.debug(f"Resolved AND/OR left={left_expr} right={right_expr}")
-            if left_expr is None or right_expr is None:
-                self._result = None
-                return
-            self._result = (left_expr & right_expr) if node.op == OperatorType.AND else (left_expr | right_expr)
-            return
-
-        # Strip casts that sit on top of literals so that Polars can do
-        # implicit casting and we can maximize pushdown opportunities.
-        left_node = self._strip_literal_casts(node.left)
-        right_node = self._strip_literal_casts(node.right)
-
-        # Note: we intentionally avoid integer-lowering of temporal literals.
-        # Casts on columns are kept, and casts on literals are stripped above.
-
-        # Fallback: evaluate both sides with casting applied to mapped columns
-        left_expr = self._eval(left_node)
-        right_expr = self._eval(right_node)
-        log.debug(f"Resolved comparison left={left_expr} right={right_expr}")
+        # Casts on literals are kept, as they can change the value.
+        left_expr = self._eval(node.left)
+        right_expr = self._eval(node.right)
+        log.debug(f"Resolved binary operands left={left_expr} right={right_expr}")
         if left_expr is None or right_expr is None:
             self._result = None
             return
-        # Ensure literals are cast to the mapped dtype when comparing against a mapped column
-        left_col = extract_column_name(left_node)
-        right_col = extract_column_name(right_node)
-        mapped_dtype = None
-        col_side = None
-        if left_col and left_col in self.mapping:
-            mapped_dtype = self.mapping.get(left_col)
-            col_side = "left"
-        elif right_col and right_col in self.mapping:
-            mapped_dtype = self.mapping.get(right_col)
-            col_side = "right"
-        if mapped_dtype is not None:
-            # If the opposite side is a literal, cast it to the mapped dtype
-            if left_node.can_extract_literal and col_side == "right":
-                right_expr = _to_target_expr(pl.col(right_col), mapped_dtype)  # ensure column cast first
-                lv = pl.lit(left_node.value).cast(mapped_dtype, strict=False)
-                left_expr = lv
-            elif right_node.can_extract_literal and col_side == "left":
-                left_expr = _to_target_expr(pl.col(left_col), mapped_dtype)
-                rv = pl.lit(right_node.value).cast(mapped_dtype, strict=False)
-                right_expr = rv
-        if node.op in (OperatorType.EQ, OperatorType.EQ_VALIDITY):
-            self._result = left_expr == right_expr
+        op = _BINARY_OPS.get(node.op)
+        if op is None:
+            self.default_visit(node)
             return
-        if node.op in (OperatorType.NOT_EQ, OperatorType.NOT_EQ_VALIDITY):
-            self._result = left_expr != right_expr
-            return
-        if node.op == OperatorType.GT:
-            self._result = left_expr > right_expr
-            return
-        if node.op == OperatorType.GT_EQ:
-            self._result = left_expr >= right_expr
-            return
-        if node.op == OperatorType.LT:
-            self._result = left_expr < right_expr
-            return
-        if node.op == OperatorType.LT_EQ:
-            self._result = left_expr <= right_expr
-            return
-        self._result = node.expr
+        self._result = op(left_expr, right_expr)
 
     # Functions
     def visit_function(self, node: FunctionNode) -> None:
         ft = node.function_type
-        if isinstance(ft, BooleanFunctionType):
-            # is_null / is_not_null
-            if ft == BooleanFunctionType.IS_NULL:
-                col_name = extract_column_name(node.inputs[0])
-                self._result = pl.col(col_name).is_null() if col_name else node.expr
-                return
-            if ft == BooleanFunctionType.IS_NOT_NULL:
-                col_name = extract_column_name(node.inputs[0])
-                self._result = pl.col(col_name).is_not_null() if col_name else node.expr
-                return
-            if ft == BooleanFunctionType.NOT and len(node.inputs) >= 1:
-                # Negation: rewrite inner expression, then negate
-                inner = self._eval(node.inputs[0])
-                self._result = (~inner) if inner is not None else node.expr
-                return
-            if ft == BooleanFunctionType.IS_IN and len(node.inputs) >= 2:
-                # Evaluate the column/input side with mapping-applied casts,
-                # and explicitly align RHS literal list to the same logical dtype.
-                base_expr = self._eval(node.inputs[0])
-                col_name = extract_column_name(node.inputs[0])
-                vals = node.inputs[1].value if getattr(node.inputs[1], "can_extract_literal", False) else None
-                if base_expr is not None and isinstance(vals, (list, tuple, set)):
-                    self._result = base_expr.is_in(list(vals))
-                    return
-                self._result = node.expr
-                return
-            if ft == BooleanFunctionType.IS_BETWEEN and len(node.inputs) >= 3:
-                # Use mapped base column expression and let Polars do type alignment
-                base_expr = self._eval(node.inputs[0])
-                lower = node.inputs[1].value if getattr(node.inputs[1], "can_extract_literal", False) else None
-                upper = node.inputs[2].value if getattr(node.inputs[2], "can_extract_literal", False) else None
-                closed_str = str(node.options.get("closed", "both")).lower()
-                # Validate closed parameter
-                closed_val: Literal["left", "right", "both", "none"] = closed_str if closed_str in ("left", "right", "both", "none") else "both"  # type: ignore[assignment]
-                if base_expr is not None and lower is not None and upper is not None:
-                    self._result = base_expr.is_between(lower, upper, closed=closed_val)
-                    return
-                self._result = node.expr
-                return
-
-        # default: keep original
-        self._result = node.expr
+        if ft in _UNARY_FUNCTIONS and len(node.inputs) == 1:
+            inner = self._eval(node.inputs[0])
+            self._result = None if inner is None else _UNARY_FUNCTIONS[ft](inner)
+            return
+        if ft == BooleanFunctionType.IS_IN and len(node.inputs) == 2:
+            base_expr, values = self._eval(node.inputs[0]), self._eval(node.inputs[1])
+            if base_expr is None or values is None:
+                self._result = None
+            else:
+                # Polars 1.8 has no ``nulls_equal`` keyword.
+                self._result = base_expr.is_in(values, nulls_equal=True) if node.options.get("nulls_equal") else base_expr.is_in(values)
+            return
+        if ft == BooleanFunctionType.IS_BETWEEN and len(node.inputs) == 3:
+            base_expr, lower, upper = (self._eval(n) for n in node.inputs)
+            closed_str = str(node.options.get("closed", "both")).lower()
+            # Validate closed parameter
+            closed_val: Literal["left", "right", "both", "none"] = closed_str if closed_str in ("left", "right", "both", "none") else "both"  # type: ignore[assignment]
+            self._result = None if base_expr is None or lower is None or upper is None else base_expr.is_between(lower, upper, closed=closed_val)
+            return
+        self.default_visit(node)
 
 
 def translate_polars_predicate(predicate: pl.Expr | None, mapping: dict[str, pl.DataType]) -> pl.Expr | None:
@@ -252,8 +158,15 @@ def translate_polars_predicate(predicate: pl.Expr | None, mapping: dict[str, pl.
     if node is None:
         return None
     visitor = TranslatedPredicateVisitor(mapping)
-    node.accept(visitor)
-    return visitor.process_results()
+    # The original predicate is re-applied after the scan, so an untranslatable top-level conjunct can be dropped.
+    conjuncts, parts = [node], []
+    while conjuncts:
+        cur = conjuncts.pop()
+        if isinstance(cur, BinaryExprNode) and cur.op == OperatorType.AND:
+            conjuncts += [cur.left, cur.right]
+        elif (expr := visitor._eval(cur)) is not None:
+            parts.append(expr)
+    return reduce(pl.Expr.and_, parts) if parts else None
 
 
 LOGICAL_MAPPING_META_KEY = b"cpl.logical_mapping.v1"
@@ -274,6 +187,8 @@ def mapping_to_metadata(mapping: dict[str, pl.DataType]) -> bytes:
     cols: dict[str, LogicalSpec] = {}
     for name, dt in mapping.items():
         ed = DataType.from_polars_dtype(dt)
+        if ed == DataType.UNKNOWN:
+            raise ValueError(f"Unsupported dtype {dt} for column {name!r} in logical mapping metadata")
         unit = TimeUnit.from_string(getattr(dt, "time_unit", None))
         tz = getattr(dt, "time_zone", None)
         cols[name] = LogicalSpec(dtype=ed, unit=unit, time_zone=tz)

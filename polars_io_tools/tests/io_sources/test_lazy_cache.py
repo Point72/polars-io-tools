@@ -1379,3 +1379,22 @@ def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(key_expr
     first.piot.cache(cache, **options).select("left").collect()
     out = second.piot.cache(cache, **options).select("left", "right").collect()
     assert_frame_equal(out, pl.DataFrame({"left": [10, 20], "right": [100, 200]}))
+
+
+_FOLD_US = 1_730_611_800_000_000  # 2024-11-03 05:30 UTC, 01:30 EDT; one hour later is 01:30 EST
+
+
+@pytest.mark.parametrize(
+    "dtype, start, step",
+    [
+        (pl.Datetime("ns"), 1000, 1),
+        (pl.Duration("ns"), 1000, 1),
+        (pl.Time, 1000, 1),
+        (pl.Datetime("us", "America/New_York"), _FOLD_US, 3_600_000_000),
+    ],
+)
+def test_lossy_key_partitions_do_not_collide(dtype, start, step):
+    df = pl.DataFrame({"k": pl.Series([start, start + step, start + 2 * step, None]).cast(dtype), "v": [1, 2, 3, 4]})
+    lf = df.lazy().piot.cache({}, order_by="v", partition_cols=["k"])
+    for pred in [pl.col("k") == pl.lit(start + step).cast(dtype), pl.col("k") == pl.lit(start).cast(dtype), pl.col("v") > 0]:
+        assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))

@@ -3,7 +3,17 @@ from typing import Any
 
 import polars as pl
 
-from .base import AliasNode, BaseExprNode, BinaryExprNode, CastNode, ExprVisitor, FunctionNode, extract_value_preserving_column_name, get_parsed_expr
+from .base import (
+    AliasNode,
+    BaseExprNode,
+    BinaryExprNode,
+    CastNode,
+    ExprVisitor,
+    FunctionNode,
+    extract_value_preserving_column_name,
+    get_parsed_expr,
+)
+from .dnf_visitor import _has_comparable_value
 from .enum import BooleanFunctionType, OperatorType
 
 # Configure logging
@@ -32,7 +42,7 @@ class SetVisitor(ExprVisitor[set[Any] | None]):
         if node.op.is_comparison():
             # Handle comparison operators (=, !=, etc.)
             column = extract_value_preserving_column_name(node.left, self.schema)
-            if column == self.target_column and node.right.can_extract_literal:
+            if column == self.target_column and _has_comparable_value(node.right, column, self.schema):
                 # Try to extract value from right side
                 value = node.right.value
 
@@ -117,9 +127,9 @@ class SetVisitor(ExprVisitor[set[Any] | None]):
 
         # Handle IS_IN function
         elif node.function_type == BooleanFunctionType.IS_IN:
-            if len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
+            if len(node.inputs) >= 2:
                 column = extract_value_preserving_column_name(node.inputs[0], self.schema)
-                if column == self.target_column:
+                if column == self.target_column and _has_comparable_value(node.inputs[1], column, self.schema, collection=True):
                     try:
                         # Get the values
                         values = node.inputs[1].value
