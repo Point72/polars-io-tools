@@ -221,12 +221,14 @@ def _restrict_and_normalize_partition_filters(
             if op2 in {"in", "not in"}:
                 seq = list(val2) if isinstance(val2, (list, tuple, set)) else [val2]
                 out_vals = [_convert_literal_for_partition(v, dtype) for v in seq]
-                out_clause.append((col, op2, out_vals))
                 if op2 == "not in":
+                    # delta-rs prunes every file for a "not in" containing the null token, so drop it (keeps extra files)
+                    out_vals = [v for v in out_vals if v is not None and v not in null_tokens]
                     # We make sure we include null tokens
-                    for tok in null_tokens:
-                        if tok not in out_vals:
-                            normalized.append([(col, "=", tok)])
+                    normalized.extend([(col, "=", tok)] for tok in null_tokens)
+                    if not out_vals:
+                        continue
+                out_clause.append((col, op2, out_vals))
             else:
                 out_val = _convert_literal_for_partition(val2, dtype)
                 # Ensure we only keep supported ops to avoid over-pruning

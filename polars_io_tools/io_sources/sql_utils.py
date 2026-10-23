@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
@@ -7,7 +8,19 @@ import polars as pl
 import sqlglot
 from sqlglot.dialects.dialect import Dialect, Dialects
 
-from .base import AliasNode, BinaryExprNode, CastNode, ColumnNode, ExprVisitor, FunctionNode, LiteralNode, TernaryNode, get_parsed_expr
+from .base import (
+    AliasNode,
+    BaseExprNode,
+    BinaryExprNode,
+    CastNode,
+    ColumnNode,
+    ExprVisitor,
+    FunctionNode,
+    LiteralNode,
+    TernaryNode,
+    get_parsed_expr,
+    has_exact_value,
+)
 from .enum import ArrayFunctionType, BooleanFunctionType, ListFunctionType, OperatorType, StringFunctionType, TemporalFunctionType
 from .sql_dialects import MSSQL
 
@@ -79,6 +92,10 @@ def polars_dtype_to_sqlglot_type(dtype: pl.DataType | type[pl.DataType], *, stri
             raise ValueError(f"No SQL type mapping for Polars dtype {dtype!r}. Supported dtypes: {supported}.")
         return sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.VARCHAR)
 
+    # TIMESTAMP has no time zone, so labelling the local wall-clock times it returns with one would shift them.
+    if strict and key is pl.Datetime and not isinstance(dtype, type) and dtype.time_zone is not None:
+        raise ValueError(f"No SQL type mapping for time-zone-aware {dtype!r}. Cast to a naive Datetime instead.")
+
     # Preserve decimal precision/scale so the cast keeps the fractional part.
     if key is pl.Decimal and not isinstance(dtype, type):
         precision = getattr(dtype, "precision", None)
@@ -125,6 +142,29 @@ def _clickhouse_datetime_literal(expr: pl.Expr) -> sqlglot.exp.Expression | None
         return None
     text = instant.strftime("%Y-%m-%d %H:%M:%S") + (f".{fraction:0{precision}d}" if fraction else "")
     return _to_datetime64(text, precision, tz_aware=dtype.time_zone is not None)
+
+
+def _is_pushable_value(value: Any) -> bool:
+    """Return False for literal values with no portable SQL spelling (non-finite floats, durations, binary, strings with NUL)."""
+    if isinstance(value, str):
+        return "\x00" not in value
+    return not isinstance(value, (timedelta, bytes)) and not (isinstance(value, float) and not math.isfinite(value))
+
+
+_PREDICATE_TYPES = (sqlglot.exp.Predicate, sqlglot.exp.Connector, sqlglot.exp.Not)
+
+
+def _is_boolean_sql(expr: sqlglot.exp.Expression) -> bool:
+    """Return True if ``expr`` is known to produce a boolean in SQL."""
+    return isinstance(expr.unnest(), (*_PREDICATE_TYPES, sqlglot.exp.Boolean))
+
+
+def _like(column: sqlglot.exp.Expression, text: str, prefix: str = "", suffix: str = "") -> sqlglot.exp.Expression | None:
+    """Build ``column LIKE '<prefix><text><suffix>'``, or None if ``text`` has characters LIKE would treat specially."""
+    # Escaping these is dialect-specific (backslash, ESCAPE clause, T-SQL brackets), so skip pushdown instead.
+    if any(char in text for char in "%_\\["):
+        return None
+    return sqlglot.exp.Like(this=column, expression=create_sqlglot_literal(f"{prefix}{text}{suffix}"))
 
 
 def create_sqlglot_literal(value: Any, dialect: str | Dialects | type[Dialect] | None = None) -> sqlglot.exp.Expression:
@@ -203,6 +243,10 @@ def _is_malformed_three_part_identifier(identifier):
     )
 
 
+# Dialects whose LIKE is case-sensitive by default.
+_CASE_SENSITIVE_LIKE_DIALECTS = (Dialects.DUCKDB, Dialects.POSTGRES, Dialects.CLICKHOUSE)
+
+
 class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
     """
     Visitor that converts Polars expressions to SQLGlot expressions.
@@ -239,6 +283,19 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         else:
             self.dialect = Dialects.TSQL
         self.result: sqlglot.exp.Expression | None = None
+        # True while this node only feeds AND/OR up to the root of the predicate, so dropping part of it
+        # can only widen the SQL filter. Under NOT, comparisons, CASE, etc. it must be translated exactly.
+        self._monotone = True
+
+    def _visit_child(self, node: BaseExprNode, monotone: bool = False) -> sqlglot.exp.Expression | None:
+        """Translate a sub-expression, parenthesising boolean results so they nest with the right precedence."""
+        visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
+        visitor._monotone = monotone
+        visitor.visit(node)
+        result = visitor.process_results()
+        if isinstance(result, _PREDICATE_TYPES):
+            result = sqlglot.exp.Paren(this=result)
+        return result
 
     def default_result(self) -> sqlglot.exp.Expression | None:
         """Default result is None."""
@@ -252,6 +309,9 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         """Convert literal value to SQL literal."""
 
         value = node.value
+        if not _is_pushable_value(value):
+            self.result = None
+            return
 
         # ClickHouse DateTime64 keeps up to nanoseconds, but ``node.value`` is microsecond-max;
         # render the literal from its source expression so nanosecond-column filters stay exact.
@@ -259,45 +319,35 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         if self.dialect == Dialects.CLICKHOUSE and isinstance(value, datetime):
             self.result = _clickhouse_datetime_literal(node.expr)
             return
+        if not has_exact_value(node):
+            self.result = None
+            return
 
         # Handle different literal types via central helper
         self.result = create_sqlglot_literal(value, self.dialect)
 
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         """Convert binary expression to SQL expression."""
-        # Visit left and right nodes
-        left_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-        left_visitor.visit(node.left)
-        left_expr = left_visitor.process_results()
+        monotone = self._monotone and node.op in (OperatorType.AND, OperatorType.OR, OperatorType.LOGICAL_AND, OperatorType.LOGICAL_OR)
+        left_expr = self._visit_child(node.left, monotone)
+        right_expr = self._visit_child(node.right, monotone)
 
-        right_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-        right_visitor.visit(node.right)
-        right_expr = right_visitor.process_results()
+        if node.op == OperatorType.AND and self._monotone and (left_expr is None) != (right_expr is None):
+            # Dropping an untranslatable side of an AND only widens the filter; Polars re-applies the full predicate.
+            self.result = left_expr if left_expr is not None else right_expr
+            return
+        if left_expr is None or right_expr is None:
+            self.result = None
+            return
+        if node.op in (OperatorType.AND, OperatorType.OR) and not self._monotone and not (_is_boolean_sql(left_expr) and _is_boolean_sql(right_expr)):
+            # ``&`` and ``|`` are bitwise on integers; outside the filter's top level the operands may not be booleans.
+            self.result = None
+            return
 
-        if node.op == OperatorType.AND:
-            if left_expr is None and right_expr is not None:
-                self.result = right_expr
-                return
-            elif right_expr is None and left_expr is not None:
-                self.result = left_expr
-                return
-            elif left_expr is None and right_expr is None:
-                self.result = None
-                return
-        else:
-            # For other operators, if either expression is None, result should be None
-            # This is the same as before (when the following conditional block was
-            # the only thing here)
-            if left_expr is None or right_expr is None:
-                self.result = None
-                return
-
-        # Map operators to SQLGlot expressions
+        # Arithmetic is not translated: Polars integers wrap on overflow and ``/`` is always true division.
         op_map = {
             OperatorType.EQ: sqlglot.exp.EQ,
-            OperatorType.EQ_VALIDITY: sqlglot.exp.EQ,
             OperatorType.NOT_EQ: sqlglot.exp.NEQ,
-            OperatorType.NOT_EQ_VALIDITY: sqlglot.exp.NEQ,
             OperatorType.GT: sqlglot.exp.GT,
             OperatorType.GT_EQ: sqlglot.exp.GTE,
             OperatorType.LT: sqlglot.exp.LT,
@@ -306,12 +356,6 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             OperatorType.OR: sqlglot.exp.Or,
             OperatorType.LOGICAL_AND: sqlglot.exp.And,
             OperatorType.LOGICAL_OR: sqlglot.exp.Or,
-            OperatorType.PLUS: sqlglot.exp.Add,
-            OperatorType.MINUS: sqlglot.exp.Sub,
-            OperatorType.MULTIPLY: sqlglot.exp.Mul,
-            OperatorType.DIVIDE: sqlglot.exp.Div,
-            OperatorType.MODULUS: sqlglot.exp.Mod,
-            OperatorType.FLOOR_DIVIDE: lambda x, y: sqlglot.exp.Floor(this=sqlglot.exp.Div(this=x, expression=y)),
         }
 
         if node.op in op_map:
@@ -327,10 +371,10 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         """Convert function calls to SQL functions."""
         # Process function inputs
         input_exprs = []
-        for input_node in node.inputs:
-            input_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-            input_visitor.visit(input_node)
-            input_expr = input_visitor.process_results()
+        # The ``is_in`` collection is rendered from its literal value, not visited as a scalar.
+        inputs = node.inputs[:1] if node.function_type == BooleanFunctionType.IS_IN else node.inputs
+        for input_node in inputs:
+            input_expr = self._visit_child(input_node)
             if input_expr is None:
                 self.result = None
                 return
@@ -359,25 +403,11 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             self.result = sqlglot.exp.Is(this=input_exprs[0], expression=sqlglot.exp.Null())
         elif node.function_type == BooleanFunctionType.IS_NOT_NULL:
             self.result = sqlglot.exp.Not(this=sqlglot.exp.Is(this=input_exprs[0], expression=sqlglot.exp.Null()))
-        elif node.function_type == BooleanFunctionType.IS_IN and len(input_exprs) >= 2:
-            if isinstance(node.inputs[1].value, (list, tuple, set)):
-                in_values = node.inputs[1].value
-                if len(in_values) > self.max_in_predicate_size:
-                    # Oversized ``IN (...)`` lists can exceed a backend's expression
-                    # limits (e.g. SQL Server error 8632). Skip pushdown; the IO source
-                    # re-applies the full predicate to the fetched rows for correctness.
-                    log.debug(
-                        f"Skipping IN-list pushdown for column with {len(in_values)} values "
-                        f"(exceeds max_in_predicate_size={self.max_in_predicate_size})"
-                    )
-                    self.result = None
-                    return
-                values = [create_sqlglot_literal(v, self.dialect) for v in in_values]
-                self.result = sqlglot.exp.In(this=input_exprs[0], expressions=values)
-            else:
-                self.result = sqlglot.exp.In(this=input_exprs[0], expressions=[input_exprs[1]])
+        elif node.function_type == BooleanFunctionType.IS_IN and len(node.inputs) >= 2:
+            self.result = self._is_in(node, input_exprs[0])
         elif node.function_type == BooleanFunctionType.NOT:
-            self.result = sqlglot.exp.Not(this=input_exprs[0])
+            # ``~`` is bitwise on integers; at the top level of a filter the operand must be boolean.
+            self.result = sqlglot.exp.Not(this=input_exprs[0]) if self._monotone or _is_boolean_sql(input_exprs[0]) else None
         elif node.function_type == BooleanFunctionType.IS_BETWEEN and len(input_exprs) >= 3:
             # Get closed parameter from options
             closed = node.options.get("closed", "Both")
@@ -400,68 +430,58 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             log.warning(f"Unsupported boolean function: {node.function_type}")
             self.result = None
 
-    def _dialect_supports_regexp(self) -> bool:
-        """Check if the current dialect supports RegexpLike.
-
-        Returns True for ClickHouse (match()), PostgreSQL (~), DuckDB (REGEXP_MATCHES), etc.
-        Returns False for TSQL and SQLite which have no native regex support.
-        """
-        gen_class = type(sqlglot.Dialect.get_or_raise(self.dialect).generator())
-        return sqlglot.exp.RegexpLike in gen_class.TRANSFORMS
+    def _is_in(self, node: FunctionNode, column: sqlglot.exp.Expression) -> sqlglot.exp.Expression | None:
+        """Translate ``is_in`` against a literal collection."""
+        nulls_equal = node.options.get("nulls_equal", False)
+        if nulls_equal and not self._monotone:
+            # Polars returns False on null rows where SQL ``IN`` returns null, so NOT would drop them.
+            return None
+        in_values = node.inputs[1].value
+        if not isinstance(in_values, (list, tuple, set)):
+            return None
+        if len(in_values) > self.max_in_predicate_size:
+            # Oversized ``IN (...)`` lists can exceed a backend's expression
+            # limits (e.g. SQL Server error 8632). Skip pushdown; the IO source
+            # re-applies the full predicate to the fetched rows for correctness.
+            log.debug(
+                f"Skipping IN-list pushdown for column with {len(in_values)} values (exceeds max_in_predicate_size={self.max_in_predicate_size})"
+            )
+            return None
+        # A NULL in a SQL ``IN`` list turns non-matches into null, so drop it and match null rows explicitly for ``nulls_equal``.
+        non_null = [v for v in in_values if v is not None]
+        if not non_null or not all(_is_pushable_value(v) for v in non_null) or not has_exact_value(node.inputs[1], collection=True):
+            return None
+        floats = [v for v in non_null if isinstance(v, float)]
+        if floats and not self._monotone and pl.Series(floats).cast(pl.Float32).cast(pl.Float64).to_list() != floats:
+            # Polars matches a Float32 column against these as Float64, but a database may round them to FLOAT.
+            return None
+        result = sqlglot.exp.In(this=column, expressions=[create_sqlglot_literal(v, self.dialect) for v in non_null])
+        if nulls_equal and len(non_null) < len(in_values):
+            return sqlglot.exp.Or(this=sqlglot.exp.Paren(this=result), expression=sqlglot.exp.Is(this=column.copy(), expression=sqlglot.exp.Null()))
+        return result
 
     def _handle_string_function(self, node: FunctionNode, input_exprs: list[sqlglot.exp.Expression]) -> None:
         """Handle string functions."""
-        if not input_exprs:
+        like_affixes = {StringFunctionType.CONTAINS: ("%", "%"), StringFunctionType.STARTS_WITH: ("", "%"), StringFunctionType.ENDS_WITH: ("%", "")}
+        if node.function_type not in like_affixes or len(input_exprs) < 2:
+            # Not translated: strip_chars (Polars strips all whitespace or given characters, SQL TRIM only spaces),
+            # concat_str (separator, and null handling of SQL CONCAT varies by dialect) and to_uppercase/to_lowercase
+            # (Unicode case mapping, e.g. "ß" -> "SS", varies by database), among others.
+            log.warning(f"Unsupported string function: {node.function_type}")
             self.result = None
             return
 
-        if node.function_type == StringFunctionType.CONTAINS and len(input_exprs) >= 2:
-            if isinstance(node.inputs[1].value, str):
-                pattern_str = node.inputs[1].value
-                is_literal = node.options.get("literal", False)
-                # If regex mode and pattern has regex metacharacters, `LIKE` can't represent it.
-                # Use RegexpLike for dialects that support it. Otherwise, skip pushdown - the database returns all rows and Polars applies the regex filter in-memory.
-                if not is_literal and re.escape(pattern_str) != pattern_str:
-                    if self._dialect_supports_regexp():
-                        pattern_expr = create_sqlglot_literal(pattern_str)
-                        self.result = sqlglot.exp.RegexpLike(this=input_exprs[0], expression=pattern_expr)
-                    else:
-                        self.result = None
-                    return
-                like_pattern = f"%{pattern_str}%"
-                literal_expr = create_sqlglot_literal(like_pattern)
-                self.result = sqlglot.exp.Like(this=input_exprs[0], expression=literal_expr)
-            else:
-                self.result = None
-        elif node.function_type == StringFunctionType.STARTS_WITH and len(input_exprs) >= 2:
-            if isinstance(node.inputs[1].value, str):
-                pattern = f"{node.inputs[1].value}%"
-                literal_expr = create_sqlglot_literal(pattern)
-                self.result = sqlglot.exp.Like(this=input_exprs[0], expression=literal_expr)
-            else:
-                self.result = None
-        elif node.function_type == StringFunctionType.ENDS_WITH and len(input_exprs) >= 2:
-            if isinstance(node.inputs[1].value, str):
-                pattern = f"%{node.inputs[1].value}"
-                literal_expr = create_sqlglot_literal(pattern)
-                self.result = sqlglot.exp.Like(this=input_exprs[0], expression=literal_expr)
-            else:
-                self.result = None
-        elif node.function_type == StringFunctionType.UPPERCASE:
-            self.result = sqlglot.exp.Upper(this=input_exprs[0])
-        elif node.function_type == StringFunctionType.LOWERCASE:
-            self.result = sqlglot.exp.Lower(this=input_exprs[0])
-        elif node.function_type == StringFunctionType.STRIP_CHARS:
-            self.result = sqlglot.exp.Trim(this=input_exprs[0])
-        elif node.function_type == StringFunctionType.STRIP_CHARS_START:
-            self.result = sqlglot.exp.Trim(this=input_exprs[0], position="LEADING")
-        elif node.function_type == StringFunctionType.STRIP_CHARS_END:
-            self.result = sqlglot.exp.Trim(this=input_exprs[0], position="TRAILING")
-        elif node.function_type == StringFunctionType.CONCAT_HORIZONTAL and input_exprs:
-            self.result = sqlglot.exp.Concat(expressions=input_exprs)
-        else:
-            log.warning(f"Unsupported string function: {node.function_type}")
+        text = node.inputs[1].value
+        if not self._monotone and self.dialect not in _CASE_SENSITIVE_LIKE_DIALECTS:
+            # LIKE may ignore case (SQLite, case-insensitive collations), which is only safe where extra rows are allowed.
             self.result = None
+        elif not isinstance(text, str) or (
+            # Regex syntax and semantics (e.g. Unicode ``\d``) differ between Polars and databases, so only plain text is pushed.
+            node.function_type == StringFunctionType.CONTAINS and not node.options.get("literal", False) and re.escape(text) != text
+        ):
+            self.result = None
+        else:
+            self.result = _like(input_exprs[0], text, *like_affixes[node.function_type])
 
     def _handle_temporal_function(self, node: FunctionNode, input_exprs: list[sqlglot.exp.Expression]) -> None:
         """Handle temporal functions."""
@@ -512,13 +532,17 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                 return sqlglot.exp.Date(this=x)
             return sqlglot.exp.Cast(this=x, to=sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DATE))
 
+        def _extract(part: str):
+            # SQLite has no ``EXTRACT``.
+            return lambda x: None if self.dialect == Dialects.SQLITE else sqlglot.exp.Extract(this=sqlglot.exp.Var(this=part), expression=x)
+
+        # SECOND is left out: some dialects (e.g. PostgreSQL) return fractional seconds where Polars returns an integer.
         func_map = {
-            TemporalFunctionType.YEAR: lambda x: sqlglot.exp.Extract(this="YEAR", expression=x),
-            TemporalFunctionType.MONTH: lambda x: sqlglot.exp.Extract(this="MONTH", expression=x),
-            TemporalFunctionType.DAY: lambda x: sqlglot.exp.Extract(this="DAY", expression=x),
-            TemporalFunctionType.HOUR: lambda x: sqlglot.exp.Extract(this="HOUR", expression=x),
-            TemporalFunctionType.MINUTE: lambda x: sqlglot.exp.Extract(this="MINUTE", expression=x),
-            TemporalFunctionType.SECOND: lambda x: sqlglot.exp.Extract(this="SECOND", expression=x),
+            TemporalFunctionType.YEAR: _extract("YEAR"),
+            TemporalFunctionType.MONTH: _extract("MONTH"),
+            TemporalFunctionType.DAY: _extract("DAY"),
+            TemporalFunctionType.HOUR: _extract("HOUR"),
+            TemporalFunctionType.MINUTE: _extract("MINUTE"),
             TemporalFunctionType.DATE: _date_floor,
         }
 
@@ -552,27 +576,30 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
 
     def visit_cast(self, node: CastNode) -> None:
         """Convert cast operations to SQL CAST."""
-        # Visit the input node
-        input_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-        input_visitor.visit(node.input)
-        input_expr = input_visitor.process_results()
+        # Boolean and Unknown casts pass the input through unchanged (Narwhals wraps predicates in a boolean cast).
+        if node.dtype == pl.Unknown:
+            self.result = self._visit_child(node.input, monotone=self._monotone)
+            return
+        if node.dtype == pl.Boolean:
+            # A boolean cast of a number tests for non-zero, so it is only dropped when the input is exactly a boolean.
+            result = self._visit_child(node.input)
+            self.result = result if result is not None and _is_boolean_sql(result) else None
+            return
 
-        if input_expr is None:
+        # Only strict float casts are translated. Others differ from SQL: non-strict casts give null on failure, integer and
+        # Decimal targets round differently, string formatting varies by database, and Polars reads integers as epoch
+        # offsets when casting to temporal types.
+        if node.options != "Strict" or not node.dtype.is_float():
+            self.result = None
+            return
+        try:
+            sql_type = polars_dtype_to_sqlglot_type(node.dtype, strict=True)
+        except ValueError:
             self.result = None
             return
 
-        # This is a fast-path for boolean casts
-        # Narwhals always wraps casts to boolean
-        # We ignore if the cast is to `Unknown`, and
-        # let the underlying SQL engine handle it
-        if node.dtype in (pl.Boolean, pl.Unknown):
-            self.result = input_expr
-            return
-
-        sql_type = polars_dtype_to_sqlglot_type(node.dtype)
-
-        # Create the CAST expression
-        self.result = sqlglot.exp.Cast(this=input_expr, to=sql_type)
+        input_expr = self._visit_child(node.input)
+        self.result = None if input_expr is None else sqlglot.exp.Cast(this=input_expr, to=sql_type)
 
     def visit_alias(self, node: AliasNode) -> None:
         """Convert alias expressions to SQL aliases."""
@@ -584,42 +611,17 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
 
     def visit_ternary(self, node: TernaryNode) -> None:
         """Convert ternary expressions to SQL CASE expressions."""
-        # Visit the predicate, truthy, and falsy nodes
-        pred_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-        pred_visitor.visit(node.predicate)
-        pred_expr = pred_visitor.process_results()
-
-        true_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-        true_visitor.visit(node.truthy)
-        true_expr = true_visitor.process_results()
-
-        false_visitor = SQLExpressionVisitor(self.dialect, self.max_in_predicate_size)
-        false_visitor.visit(node.falsy)
-        false_expr = false_visitor.process_results()
-
-        if pred_expr is None:
+        # T-SQL and Oracle have no boolean values, so a CASE cannot return a predicate there.
+        if self.dialect in (Dialects.TSQL, Dialects.ORACLE):
             self.result = None
             return
-
-        # We need to effectively handle Polars ternary syntax
-        # Observe that pl.when(A).then(B).otherwise(C) is the
-        # same as (A AND B) OR (NOT A AND C)
-
-        # When both true and false branches are available, combine them.
-        # If only the true branch is available --> enforce the condition "A AND B"
-        # If only the false branch is available --> enforce the condition "NOT A AND C"
-        # Return `None` if both branches are uknown
-        if true_expr is not None and false_expr is not None:
-            self.result = sqlglot.exp.Or(
-                this=sqlglot.exp.And(this=pred_expr, expression=true_expr),
-                expression=sqlglot.exp.And(this=sqlglot.exp.Not(this=pred_expr), expression=false_expr),
-            )
-        elif true_expr is not None:
-            self.result = sqlglot.exp.And(this=pred_expr, expression=true_expr)
-        elif false_expr is not None:
-            self.result = sqlglot.exp.And(this=sqlglot.exp.Not(this=pred_expr), expression=false_expr)
-        else:
+        parts = [self._visit_child(child) for child in (node.predicate, node.truthy, node.falsy)]
+        if any(part is None for part in parts):
             self.result = None
+            return
+        pred_expr, true_expr, false_expr = parts
+        # A null condition falls through to ELSE, matching Polars ``otherwise``.
+        self.result = sqlglot.exp.Case(ifs=[sqlglot.exp.If(this=pred_expr, true=true_expr)], default=false_expr)
 
 
 def convert_predicate_to_sql(
@@ -647,7 +649,7 @@ def convert_predicate_to_sql(
         visitor = SQLExpressionVisitor(dialect, max_in_predicate_size)
         visitor.visit(node)
         return visitor.process_results()
-    except Exception:
+    except (Exception, pl.exceptions.PanicException):
         log.exception("Error converting predicate to SQL")
         return None
 

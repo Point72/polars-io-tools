@@ -22,13 +22,36 @@ log = logging.getLogger(__name__)
 
 __all__ = ("restrict_expr_to_columns",)
 
+_LOGICAL_OPS = {OperatorType.AND, OperatorType.OR, OperatorType.LOGICAL_AND, OperatorType.LOGICAL_OR}
+_LOGICAL_FUNCTIONS = {BooleanFunctionType.NOT, BooleanFunctionType.ALL_HORIZONTAL, BooleanFunctionType.ANY_HORIZONTAL}
+
 
 def _is_relevant(expr: pl.Expr, columns: AbstractSet[str]) -> bool:
     """
     Check if the expression is relevant to the specified columns.
     It checks if all root names of the expression are in the set of columns.
+    Expressions without root names or with selectors (``pl.all()``, regex, multiple columns) are not relevant.
     """
-    return set(expr.meta.root_names()).issubset(columns)
+    root_names = expr.meta.root_names()
+    return bool(root_names) and not expr.meta.has_multiple_outputs() and set(root_names).issubset(columns)
+
+
+def _is_boolean(node: BaseExprNode) -> bool:
+    """Check if the node is known to produce booleans, so its AND/OR/NOT are logical rather than bitwise."""
+    if isinstance(node, BinaryExprNode):
+        if node.op.is_comparison():
+            return True
+        return node.op in _LOGICAL_OPS and _is_boolean(node.left) and _is_boolean(node.right)
+    if isinstance(node, FunctionNode) and isinstance(node.function_type, BooleanFunctionType):
+        return node.function_type not in _LOGICAL_FUNCTIONS or all(_is_boolean(input_node) for input_node in node.inputs)
+    return isinstance(node, CastNode) and node.dtype == pl.Boolean
+
+
+def _as_boolean(result: pl.Expr | None, node: BaseExprNode) -> pl.Expr | None:
+    """Coerce a restricted operand of a horizontal AND/OR to Boolean, as the original operation would."""
+    if result is None or _is_boolean(node):
+        return result
+    return pl.all_horizontal(result)
 
 
 def _combine_and(expr1: pl.Expr | None, expr2: pl.Expr | None) -> pl.Expr | None:
@@ -101,76 +124,39 @@ class RestrictPredicateVisitor(ExprVisitor[pl.Expr | None]):
         else:
             self.result = None
 
+    def _restrict(self, node: BaseExprNode, negated: bool) -> pl.Expr | None:
+        visitor = RestrictPredicateVisitor(self.columns, negated)
+        visitor.visit(node)
+        return visitor.process_results()
+
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         # If the entire expression only references our columns, handle it directly
         self.default_visit(node)
         if self.result is not None:
             return
 
-        # For AND/OR operators, apply De Morgan's laws when negated
-        if node.op in [OperatorType.AND, OperatorType.OR, OperatorType.LOGICAL_AND, OperatorType.LOGICAL_OR]:
-            is_and_op = node.op in [OperatorType.AND, OperatorType.LOGICAL_AND]
-
-            # Visit both sides
-            left_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-            left_visitor.visit(node.left)
-            left_result = left_visitor.process_results()
-
-            right_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-            right_visitor.visit(node.right)
-            right_result = right_visitor.process_results()
-
-            # Apply the appropriate combination based on op and negation
-            if is_and_op:
-                if not self.negated:
-                    # Regular AND: both sides must be true
-                    self.result = _combine_and(left_result, right_result)
-                else:
-                    # Negated AND: NOT(A AND B) = NOT(A) OR NOT(B)
-                    # But our visitors already handled the negation, so we use OR
-                    self.result = _combine_or(left_result, right_result)
-            else:  # OR operation
-                if not self.negated:
-                    # Regular OR: either side can be true
-                    self.result = _combine_or(left_result, right_result)
-                else:
-                    # Negated OR: NOT(A OR B) = NOT(A) AND NOT(B)
-                    # But our visitors already handled the negation, so we use AND
-                    self.result = _combine_and(left_result, right_result)
+        if node.op in _LOGICAL_OPS:
+            left_result = self._restrict(node.left, self.negated)
+            right_result = self._restrict(node.right, self.negated)
+            if node.op in (OperatorType.LOGICAL_AND, OperatorType.LOGICAL_OR):
+                left_result = _as_boolean(left_result, node.left)
+                right_result = _as_boolean(right_result, node.right)
+            # The operands already carry the negation, so by De Morgan a negated AND combines as OR and vice versa.
+            is_and_op = node.op in (OperatorType.AND, OperatorType.LOGICAL_AND)
+            self.result = _combine_and(left_result, right_result) if is_and_op != self.negated else _combine_or(left_result, right_result)
 
     def visit_function(self, node: FunctionNode) -> None:
         self.default_visit(node)
         if self.result is not None:
             return
         if node.function_type == BooleanFunctionType.NOT:
-            inner_visitor = RestrictPredicateVisitor(self.columns, not self.negated)
-            inner_visitor.visit(node.inputs[0])
-            inner_result = inner_visitor.process_results()
-            self.result = None if inner_result is None else inner_result
-        elif node.function_type == BooleanFunctionType.ALL_HORIZONTAL:
-            results = []
-            for input_node in node.inputs:
-                inner_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-                inner_visitor.visit(input_node)
-                inner_result = inner_visitor.process_results()
-                if inner_result is not None:
-                    results.append(inner_result)
-            if not self.negated:
-                self.result = _combine_all(results)
-            else:
-                self.result = _combine_any(results)
-        elif node.function_type == BooleanFunctionType.ANY_HORIZONTAL:
-            results = []
-            for input_node in node.inputs:
-                inner_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-                inner_visitor.visit(input_node)
-                inner_result = inner_visitor.process_results()
-                if inner_result is not None:
-                    results.append(inner_result)
-            if not self.negated:
-                self.result = _combine_any(results) if len(results) == len(node.inputs) else None
-            else:
-                self.result = _combine_all(results) if len(results) == len(node.inputs) else None
+            self.result = self._restrict(node.inputs[0], not self.negated)
+        elif node.function_type in (BooleanFunctionType.ALL_HORIZONTAL, BooleanFunctionType.ANY_HORIZONTAL):
+            results = [r for n in node.inputs if (r := _as_boolean(self._restrict(n, self.negated), n)) is not None]
+            is_all = node.function_type == BooleanFunctionType.ALL_HORIZONTAL
+            # Only a plain conjunction may drop operands that cannot be restricted.
+            if len(results) == len(node.inputs) or (is_all and not self.negated):
+                self.result = _combine_all(results) if is_all != self.negated else _combine_any(results)
 
     def visit_ternary(self, node: TernaryNode) -> None:
         # pl.when(A).then(B).otherwise(C)
@@ -185,22 +171,15 @@ class RestrictPredicateVisitor(ExprVisitor[pl.Expr | None]):
             return
 
         # For a ternary op: if(pred, true_expr, false_expr)
-        # When negated: if(pred, ~true_expr, ~false_expr)
-        pred_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-        pred_visitor.visit(node.predicate)
-        pred_result = pred_visitor.process_results()
+        # When negated: if(pred, ~true_expr, ~false_expr), so the predicate itself is never negated
+        pred_result = self._restrict(node.predicate, negated=False)
+        opp_pred_result = self._restrict(node.predicate, negated=True)
+        if opp_pred_result is not None:
+            # A null predicate selects the falsy branch, so those rows must be kept as well
+            opp_pred_result = opp_pred_result.fill_null(True)
 
-        opp_pred_visitor = RestrictPredicateVisitor(self.columns, not self.negated)
-        opp_pred_visitor.visit(node.predicate)
-        opp_pred_result = opp_pred_visitor.process_results()
-
-        true_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-        true_visitor.visit(node.truthy)
-        true_result = true_visitor.process_results()
-
-        false_visitor = RestrictPredicateVisitor(self.columns, self.negated)
-        false_visitor.visit(node.falsy)
-        false_result = false_visitor.process_results()
+        true_result = self._restrict(node.truthy, self.negated)
+        false_result = self._restrict(node.falsy, self.negated)
 
         if true_result is None and false_result is None:
             # This means we need to do an OR of the predicate
@@ -221,8 +200,8 @@ class RestrictPredicateVisitor(ExprVisitor[pl.Expr | None]):
         self.default_visit(node)
         if self.result is not None:
             return
-        if node.dtype == pl.Boolean:
-            # If casting to boolean, process the underlying expression for restriction.
+        if node.dtype == pl.Boolean and _is_boolean(node.input):
+            # If casting a boolean expression to boolean, process the underlying expression for restriction.
             # The result of visiting node.input will be stored in self.result.
             self.visit(node.input)
         else:

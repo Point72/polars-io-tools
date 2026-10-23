@@ -266,6 +266,22 @@ class TestRegisterIoSourceWithIsPure:
         if POLARS_GE_2:
             assert isinstance(error.value.__cause__, error_type)
 
+    @pytest.mark.parametrize("project", [False, True])
+    def test_head_then_filter(self, project):
+        df = pl.DataFrame({"a": range(10), "b": range(10, 20)})
+
+        def source(with_columns, predicate, n_rows, batch_size):
+            out = df if predicate is None else df.filter(predicate)
+            out = out if n_rows is None else out.head(n_rows)
+            yield out if with_columns is None else out.select(with_columns)
+
+        def query(lf):
+            lf = lf.head(5).filter(pl.col("a") > 2)
+            return lf.select("b") if project else lf
+
+        lf = register_io_source_with_is_pure(source, schema=df.schema)
+        assert_frame_equal(query(lf).collect(), query(df.lazy()).collect())
+
     def test_kwargs_passthrough(self):
         """Test that additional kwargs are passed through correctly."""
 

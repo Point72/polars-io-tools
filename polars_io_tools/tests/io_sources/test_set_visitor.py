@@ -1,4 +1,8 @@
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
 import polars as pl
+import pytest
 
 from polars_io_tools.io_sources.base import (
     ExprParser,
@@ -537,3 +541,31 @@ def test_not_over_relaxed_and_does_not_exclude_values():
     assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~((x == 1) & (x.cast(pl.Int64) == 2)), "x") == {1, 2}
     assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~((x == 1) & (pl.col("y") == 2)), "x") == {1, 2}
     assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~(x == 1), "x") == {2}
+
+
+def test_sub_microsecond_literal_is_not_pushed():
+    ns_literal = pl.lit(1704198600000000500).cast(pl.Datetime("ns"))
+    assert convert_expr_to_valid_values(pl.col("t") == ns_literal, "t", {"t": pl.Datetime("ns")}) is None
+
+
+_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+
+
+@pytest.mark.parametrize(
+    ("df", "pred"),
+    [
+        (pl.DataFrame({"x": [float("nan"), 1.0, 2.0]}), pl.col("x").is_in([float("nan"), 1.0]) & pl.col("x").is_in([float("nan"), 2.0])),
+        (pl.DataFrame({"x": [_EARLY, _EARLY.replace(fold=1)]}), pl.col("x").is_in([_EARLY, _EARLY.replace(fold=1)])),
+        (pl.DataFrame({"x": pl.Series([0.1], dtype=pl.Float32)}), pl.col("x") == 0.1),
+        (pl.DataFrame({"x": [date(2024, 1, 1)]}), (pl.col("x") == date(2024, 1, 1)) & (pl.col("x") == datetime(2024, 1, 1))),
+    ],
+    ids=["nan", "dst_fold", "float32", "date_vs_datetime"],
+)
+def test_valid_values_cover_matching_rows(df, pred):
+    """Every kept row's value must be in the extracted set, both by Python and by Polars comparison."""
+    kept = df.filter(pred)["x"]
+    assert not kept.is_empty()
+    values = convert_expr_to_valid_values(pred, "x", df.schema)
+    if values is not None:
+        assert all(v in values for v in kept.to_list())
+        assert kept.is_in(pl.Series(list(values), dtype=df.schema["x"])).all()

@@ -134,7 +134,6 @@ def concat_named(
     index_lf = {col: [] for col in col_names}
     lf_id_col = "__lf_id"
     index_lf[lf_id_col] = []
-    schema = None
 
     for keys, lf in lf_dict.items():
         expr_list = []
@@ -168,20 +167,26 @@ def concat_named(
                             expected_microseconds = pl.select(expr.str.strptime(microsecond_dtype).dt.epoch("us")).item()
                         expr = expr.str.strptime(resolved_dtype)
                 expr = expr.cast(dtype)
-                value = pl.select(expr.alias(col_name)).to_series()
-                if expected_microseconds is not None and value.dt.epoch("ns").item() // 1000 != expected_microseconds:
-                    raise pl.exceptions.InvalidOperationError("Datetime nanosecond identifier is out of range")
+            # Evaluated so the pruning index has the identifier column's dtype (e.g. Int32 for a small int literal).
+            value = pl.select(expr.alias(col_name)).to_series()
+            if expected_microseconds is not None and value.dt.epoch("ns").item() // 1000 != expected_microseconds:
+                raise pl.exceptions.InvalidOperationError("Datetime nanosecond identifier is out of range")
             index_lf[col_name].append(value)
             expr = expr.alias(col_name)
             expr_list.append(expr)
         lf = lf.with_columns(expr_list)
-        if schema is None:
-            schema = lf.collect_schema()
         id_ = id(lf)
         index_lf[lf_id_col].append(id_)
         data_dict[id_] = lf
 
-    index_df = pl.DataFrame({name: pl.concat(values) if isinstance(values[0], pl.Series) else values for name, values in index_lf.items()})
+    schema = pl.concat(data_dict.values(), **kwargs).collect_schema()
+    # Relaxed so identifiers of differing dtypes (e.g. Int32 and Int64) take their supertype, as in a relaxed data concat.
+    index_df = pl.DataFrame(
+        {
+            name: values if name == lf_id_col else pl.concat([v.to_frame() for v in values], how="vertical_relaxed").to_series()
+            for name, values in index_lf.items()
+        }
+    )
 
     def source_gen(
         with_columns: list[str] | None,
@@ -194,6 +199,9 @@ def concat_named(
         if restricted_predicate is not None:
             lf_ids = set(index_df.filter(restricted_predicate).select(lf_id_col).to_series().to_list())
             lf_to_concat = [lf for lf_id, lf in data_dict.items() if lf_id in lf_ids]
+            if lf_to_concat and kwargs.get("how", "vertical").startswith(("vertical", "diagonal")):
+                # An empty frame with the full schema keeps the columns and supertypes of pruned branches.
+                lf_to_concat.insert(0, pl.LazyFrame(schema=schema))
             true_lf = pl.concat(lf_to_concat, **kwargs) if lf_to_concat else pl.LazyFrame(schema=schema)
         else:
             true_lf = pl.concat(data_dict.values(), **kwargs)  # type: ignore[assignment]

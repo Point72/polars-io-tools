@@ -2,7 +2,7 @@ import functools
 import itertools
 import logging
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any, Literal
 
 import polars as pl
@@ -17,8 +17,10 @@ from .base import (
     ExprVisitor,
     FunctionNode,
     TernaryNode,
+    _exact_literal,
     extract_value_preserving_column_name,
     get_parsed_expr,
+    has_exact_value,
 )
 from .enum import (
     BooleanFunctionType,
@@ -65,6 +67,40 @@ _FLIPPED_COMPARISON = {
     OperatorType.GT_EQ: OperatorType.LT_EQ,
     OperatorType.LT_EQ: OperatorType.GT_EQ,
 }
+
+
+def _has_comparable_value(
+    node: BaseExprNode,
+    column: str,
+    schema: pl.Schema | dict[str, pl.DataType] | None,
+    *,
+    collection: bool = False,
+    ordered: bool = False,
+) -> bool:
+    """Whether ``node`` is an exact literal whose Python value compares with ``column`` as Polars compares them.
+
+    Polars casts a literal to a Float32 column or to the column's time unit, compares integers with floats as Float64,
+    and orders Enum and Categorical columns by category. Python treats a date and a datetime as unequal, and compares
+    datetimes sharing a time zone by wall time, ignoring ``fold``.
+    """
+    literal = _exact_literal(node, collection=collection)
+    if literal is None:
+        return False
+    dtype = (schema or {}).get(column)
+    if ordered and any(d is not None and d.base_type() in (pl.Enum, pl.Categorical) for d in (dtype, literal.dtype)):
+        return False
+    if dtype is not None and literal.dtype != pl.Null:
+        if dtype == pl.Float32 and literal.dtype != pl.Float32:
+            return False
+        if not ordered and (dtype.is_temporal() or literal.dtype.is_temporal()) and dtype.base_type() != literal.dtype.base_type():
+            return False
+        if dtype.is_temporal() and dtype.base_type() == literal.dtype.base_type() and not literal.cast(dtype).cast(literal.dtype).equals(literal):
+            return False
+        if dtype.is_numeric() and literal.dtype.is_numeric() and dtype.is_float() != literal.dtype.is_float() and (literal.abs() >= 2**53).any():
+            return False
+    if isinstance(literal.dtype, pl.Datetime) and literal.dtype.time_zone is not None:
+        return not any(v is not None and v.utcoffset() != v.replace(fold=1 - v.fold).utcoffset() for v in literal.to_list())
+    return True
 
 
 __all__ = (
@@ -211,7 +247,7 @@ class ColumnConstraintAnalyzer:
                 if value < min_val or (value == min_val and not min_inclusive):
                     return False
             except TypeError:
-                return False
+                return True  # Uncomparable in Python, but Polars may cast one side and match
 
         if self.max_bound:
             max_val, max_inclusive = self.max_bound
@@ -219,7 +255,7 @@ class ColumnConstraintAnalyzer:
                 if value > max_val or (value == max_val and not max_inclusive):
                     return False
             except TypeError:
-                return False
+                return True
 
         return True
 
@@ -252,20 +288,23 @@ class ColumnConstraintAnalyzer:
             return True
 
         # If we have not errored yet, then we can check the schema, and see if
-        # we can iterate over the values in the bounds.
-        if schema is not None and self.min_bound and self.max_bound:
+        # we can iterate over the values in the bounds. Exact and inclusion values were already checked above.
+        if schema is not None and self.min_bound and self.max_bound and not self.exact_values and self.inclusion_set is None:
             col_typ = schema.get(self.column_name)
             if col_typ is None:
                 return False
             if col_typ.is_integer():
-                jump = 1
+                jump, kind = 1, int
             elif col_typ == pl.Date:
-                jump = timedelta(days=1)
+                jump, kind = timedelta(days=1), date
             else:
                 # We cannot iterate over the values in the bounds, so we cannot say if we have a contradiction at this point.
                 return False
             min_val, min_inclusive = self.min_bound
             max_val, max_inclusive = self.max_bound
+            # Bounds of another type (1.5 on an Int64 column, a datetime on a Date column) do not lie on the column's lattice.
+            if type(min_val) is not kind or type(max_val) is not kind:
+                return False
 
             left_bound = Bound.CLOSED if min_inclusive else Bound.OPEN
             right_bound = Bound.CLOSED if max_inclusive else Bound.OPEN
@@ -312,16 +351,6 @@ def is_contradiction(clause: DNFClause, schema: pl.Schema | None = None) -> bool
             return True
 
     return False
-
-
-def _can_extract_lossless_literal(node: BaseExprNode) -> bool:
-    if not node.can_extract_literal:
-        return False
-    values = pl.select(node.expr).to_series()
-    if not values.dtype.is_temporal():
-        return True
-    restored = pl.Series(values.name, values.to_list(), dtype=values.dtype)
-    return values.equals(restored)
 
 
 class DNFVisitor(ExprVisitor[DNF | None]):
@@ -393,12 +422,13 @@ class DNFVisitor(ExprVisitor[DNF | None]):
         """Handle binary expressions (comparisons and logical operations)"""
         if node.op.is_comparison():
             # Handle comparison operators (=, !=, etc.), with the column on either side
+            ordered = node.op in _FLIPPED_COMPARISON
             column = extract_value_preserving_column_name(node.left, self.schema)
-            if column is not None and _can_extract_lossless_literal(node.right):
+            if column is not None and _has_comparable_value(node.right, column, self.schema, ordered=ordered):
                 self._set_comparison(column, node.op, node.right.value)
             else:
                 column = extract_value_preserving_column_name(node.right, self.schema)
-                if column is not None and _can_extract_lossless_literal(node.left):
+                if column is not None and _has_comparable_value(node.left, column, self.schema, ordered=ordered):
                     self._set_comparison(column, _FLIPPED_COMPARISON.get(node.op, node.op), node.left.value)
 
         elif node.op.is_bitwise_or_logical():
@@ -428,9 +458,9 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
         # Handle IS_IN function
         elif node.function_type == BooleanFunctionType.IS_IN:
-            if len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
+            if len(node.inputs) >= 2:
                 column = extract_value_preserving_column_name(node.inputs[0], self.schema)
-                if column is not None:
+                if column is not None and _has_comparable_value(node.inputs[1], column, self.schema, collection=True):
                     values = node.inputs[1].value
                     if not isinstance(values, list):
                         # we do this for the case where the input is a single value
@@ -447,9 +477,9 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
         # Handle IS_BETWEEN function
         elif node.function_type == BooleanFunctionType.IS_BETWEEN:
-            if len(node.inputs) >= 3 and node.inputs[1].can_extract_literal and node.inputs[2].can_extract_literal:
+            if len(node.inputs) >= 3:
                 column = extract_value_preserving_column_name(node.inputs[0], self.schema)
-                if column is not None:
+                if column is not None and all(_has_comparable_value(n, column, self.schema, ordered=True) for n in node.inputs[1:3]):
                     lower = node.inputs[1].value
                     upper = node.inputs[2].value
 
@@ -462,7 +492,8 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
                     # Set DNF with two predicates
                     self.result_dnf = [[(column, lower_op, lower), (column, upper_op, upper)]]
-                    self.negation_safe = True
+                    # A null bound makes the predicate null on every row, so it has no well-defined negation.
+                    self.negation_safe = lower is not None and upper is not None
 
         # Handle NOT function
         elif node.function_type == BooleanFunctionType.NOT:
@@ -481,7 +512,7 @@ class DNFVisitor(ExprVisitor[DNF | None]):
             self._combine(node.inputs, is_and=False)
 
         # Handle string functions
-        elif isinstance(node.function_type, StringFunctionType) and len(node.inputs) >= 2 and node.inputs[1].can_extract_literal:
+        elif isinstance(node.function_type, StringFunctionType) and len(node.inputs) >= 2 and has_exact_value(node.inputs[1]):
             column = extract_value_preserving_column_name(node.inputs[0], self.schema)
             if column is not None:
                 pattern = node.inputs[1].value
@@ -491,7 +522,11 @@ class DNFVisitor(ExprVisitor[DNF | None]):
                 elif node.function_type == StringFunctionType.ENDS_WITH:
                     regex_pattern = f"{re.escape(pattern)}$"
                 elif node.function_type == StringFunctionType.CONTAINS:
-                    regex_pattern = f".*{re.escape(pattern) if node.options.get('literal') else f'(?:{pattern})'}.*"
+                    # A non-strict invalid regex is not an error in Polars, but would be one in the DNF.
+                    if node.options.get("literal"):
+                        regex_pattern = re.escape(pattern)
+                    elif node.options.get("strict") is True:
+                        regex_pattern = pattern
                 if regex_pattern is not None:
                     self.result_dnf = [[(column, "~", regex_pattern)]]
                     self.negation_safe = True
@@ -640,7 +675,7 @@ def _is_contradiction(expr: pl.Expr, schema: pl.Schema | None = None) -> bool:
     # to avoid the DNF conversion.
     if parsed_expr.can_extract_literal and parsed_expr.value is False:
         return True
-    dnf_clause = convert_expr_to_dnf(parsed_expr)
+    dnf_clause = convert_expr_to_dnf(parsed_expr, schema)
 
     if not dnf_clause:
         # No dnf clause, so we have no contradiction

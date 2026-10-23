@@ -12,6 +12,8 @@ including:
 """
 
 from datetime import date, datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -2663,15 +2665,10 @@ class TestSharedSourceColUnion:
             "group1": FilterSpec(source_col="group"),
             "group2": FilterSpec(source_col="group"),
         }
-        tracker = PredicateTracker(df)
         # group1 in {None, "A"} unions with group2 == "B" -> {None, "A", "B"} (unorderable set).
-        pushdown_combine(sources={"src": (tracker.lazy_frame, specs)}, combine=combine).filter(
-            (pl.col("group1").is_null() | (pl.col("group1") == "A")) & (pl.col("group2") == "B")
-        ).collect()
-        analyzer = tracker.get_analyzer()
-        f = analyzer.find_discrete_filter("group")
-        assert f is not None
-        assert analyzer.extract_discrete_values(f) == {None, "A", "B"}
+        pred = (pl.col("group1").is_null() | (pl.col("group1") == "A")) & (pl.col("group2") == "B")
+        result = pushdown_combine(sources={"src": (df.lazy(), specs)}, combine=combine).filter(pred).collect()
+        assert_frame_equal(result, combine({"src": df.lazy()}).filter(pred).collect(), check_row_order=False)
 
 
 if __name__ == "__main__":
@@ -2687,3 +2684,95 @@ class TestPushdownCombineCastSafety:
         pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
         # 257 wraps to 1 under Int8, so both 1 and 257 match; pushdown must keep them.
         assert lf.filter(pred).collect().height == src.filter(pred).collect().height == 2
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pl.col("a").is_null(),
+        pl.col("a").eq_missing(None),
+        pl.col("a").is_in([1, None], nulls_equal=True),
+    ],
+)
+def test_discrete_filter_keeps_null_rows(pred):
+    """A value set containing ``None`` must keep null rows, including when two output columns share a source column."""
+    src = pl.DataFrame({"a": [1, None, 3], "b": [1, None, 3]}).lazy()
+    single = pushdown_combine({"s": (src, {"a": FilterSpec()})}, lambda s: s["s"])
+    shared = pushdown_combine({"s": (src, {"a": FilterSpec(), "b": FilterSpec(source_col="a")})}, lambda s: s["s"])
+    expected = src.filter(pred).collect()
+    assert_frame_equal(single.filter(pred).collect(), expected, check_row_order=False)
+    assert_frame_equal(shared.filter(pred).collect(), expected, check_row_order=False)
+
+
+_TS = pl.DataFrame({"t": [datetime(2023, 12, 31, 23), datetime(2024, 1, 1), datetime(2024, 1, 1, 0, 0, 0, 500), datetime(2024, 1, 1, 13), None]})
+_DATES = pl.DataFrame({"t": [date(2023, 12, 31), date(2024, 1, 1), date(2024, 1, 2)]})
+_DEC = pl.DataFrame({"t": pl.Series([Decimal("1.25"), Decimal("2.50"), Decimal("3.75")], dtype=pl.Decimal(10, 2))})
+_NY = ZoneInfo("America/New_York")
+_TS_NY = _TS.with_columns(pl.col("t").dt.replace_time_zone("UTC").dt.convert_time_zone("America/New_York"))
+
+
+class TestPushdownCombineMatchesFilter:
+    """Pushdown must keep every row the predicate keeps."""
+
+    @pytest.mark.parametrize(
+        ("df", "pred", "spec"),
+        [
+            (_TS, pl.col("t").cast(pl.Date) < datetime(2024, 1, 1, 12), FilterSpec()),
+            (_TS, pl.col("t").dt.date() < datetime(2024, 1, 1, 12), FilterSpec()),
+            (_TS, pl.col("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1), FilterSpec()),
+            (_TS, pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True), FilterSpec()),
+            (_TS, pl.col("t").is_in([None], nulls_equal=True), FilterSpec()),
+            (_DATES, pl.col("t") < datetime(2024, 1, 1, 12), FilterSpec()),
+            (_DATES, pl.col("t") < datetime(2024, 1, 1, 12), FilterSpec(lookback=timedelta(days=1))),
+            (_DATES, pl.col("t").is_between(datetime(2023, 12, 1), datetime(2024, 1, 1, 12), closed="left"), FilterSpec()),
+            (_TS_NY, pl.col("t") >= datetime(2024, 1, 1, tzinfo=_NY), FilterSpec()),
+            (_TS_NY, pl.col("t") < datetime(2024, 1, 1, tzinfo=_NY), FilterSpec()),
+            (_TS_NY, pl.col("t").is_between(datetime(2023, 12, 31, tzinfo=_NY), datetime(2024, 1, 1, tzinfo=_NY)), FilterSpec()),
+            (_TS_NY, pl.col("t") == datetime(2023, 12, 31, 19, tzinfo=_NY), FilterSpec()),
+            (_TS_NY, pl.col("t").is_in([datetime(2023, 12, 31, 19, tzinfo=_NY)]), FilterSpec()),
+            (_TS_NY, pl.col("t").cast(pl.Date) <= date(2023, 12, 31), FilterSpec()),
+            (_TS_NY, pl.col("t").dt.date() == date(2024, 1, 1), FilterSpec()),
+            (_DEC, pl.col("t").is_in(pl.lit([Decimal("1.25"), Decimal("2.50")], dtype=pl.List(pl.Decimal(10, 2)))), FilterSpec()),
+        ],
+    )
+    def test_matches_filter(self, df, pred, spec):
+        lf = pushdown_combine({"s": (df.lazy(), {"t": spec})}, lambda s: s["s"])
+        assert_frame_equal(lf.filter(pred).collect(), df.filter(pred), check_row_order=False)
+
+
+@pytest.mark.parametrize("value_mapping", [{date(2024, 1, 2): date(2024, 1, 1)}, lambda d: d - timedelta(days=1)])
+def test_temporal_filter_applies_value_mapping(value_mapping):
+    src = pl.LazyFrame({"d": [date(2024, 1, 1), date(2024, 1, 2)]})
+
+    def combine(s):
+        return s["s"].with_columns(pl.col("d") + timedelta(days=1))
+
+    pred = pl.col("d") == date(2024, 1, 2)
+    lf = pushdown_combine({"s": (src, {"d": FilterSpec(value_mapping=value_mapping)})}, combine)
+    assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect())
+
+
+def test_interval_filter_with_tz_aware_endpoints():
+    t = datetime(2024, 1, 2, tzinfo=ZoneInfo("UTC"))
+    spine = pl.LazyFrame({"d": [t]})
+    sched = pl.LazyFrame({"start": [t - timedelta(days=1)], "end": [t + timedelta(days=1)], "x": [1]})
+
+    def combine(s):
+        return s["spine"].join_where(s["sched"], pl.col("d") >= pl.col("start"), pl.col("d") <= pl.col("end")).select("d", "x")
+
+    sources = {"spine": (spine, {"d": FilterSpec()}), "sched": (sched, {"d": IntervalFilterSpec("start", "end")})}
+    pred = pl.col("d") == t
+    assert_frame_equal(pushdown_combine(sources, combine).filter(pred).collect(), combine({"spine": spine, "sched": sched}).filter(pred).collect())
+
+
+@pytest.mark.parametrize("pred", [pl.col("v").is_null(), pl.col("v").is_null() | (pl.col("v") == 5)])
+def test_null_accepting_filter_not_pushed_below_left_join(pred):
+    """Filtering the right side of a left join would null-extend rows that then satisfy the predicate."""
+    left = pl.LazyFrame({"id": [1, 2]})
+    right = pl.LazyFrame({"id": [1, 2], "v": [10, None]})
+
+    def combine(s):
+        return s["l"].join(s["r"], on="id", how="left")
+
+    lf = pushdown_combine({"l": (left, {}), "r": (right, {"v": FilterSpec()})}, combine)
+    assert_frame_equal(lf.filter(pred).collect(), combine({"l": left, "r": right}).filter(pred).collect(), check_row_order=False)

@@ -1,4 +1,5 @@
 import datetime
+import math
 import warnings
 from collections.abc import Iterator
 
@@ -9,6 +10,15 @@ from .range_visitor import convert_expr_to_datetime_range
 from .util import _convert_interval_to_slices, register_io_source_with_is_pure
 
 __all__ = ("metric_query", "scan_datadog")
+
+
+def _epoch_seconds(value: datetime.date) -> float:
+    """Unix time of a predicate bound; naive bounds are UTC."""
+    if not isinstance(value, datetime.datetime):
+        value = datetime.datetime.combine(value, datetime.time.min)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.UTC)
+    return value.timestamp()
 
 
 def metric_query(query: str, start: int, end: int, api_key: str, app_key: str, interval: int | None = None) -> dict:
@@ -158,6 +168,13 @@ def scan_datadog(
                     "Please apply a filter with a lower bound on the 'timestamp' column "
                     "(e.g., pl.col('timestamp') > my_datetime_object)."
                 )
+            # Datadog takes whole seconds; starting on one keeps chunk boundaries whole so adjacent chunks do not overlap.
+            # It has no future points, so an open-ended query stops at the current time.
+            upper = time_interval_from_predicate.upper
+            time_interval_from_predicate = portion.closed(
+                time_interval_from_predicate.lower.replace(microsecond=0),
+                datetime.datetime.now(datetime.UTC).replace(tzinfo=None) if upper == portion.inf else upper,
+            )
         else:
             raise ValueError(
                 "Query start time could not be determined. "
@@ -188,26 +205,9 @@ def scan_datadog(
                 # Single point in time - use same time for start and end
                 start_time = end_time = time_slice
 
-            # Convert to timestamps (handle both date and datetime)
-            if isinstance(start_time, datetime.datetime):
-                start_ts_seconds = int(start_time.timestamp())
-            elif isinstance(start_time, datetime.date):
-                # Convert date to datetime at midnight
-                start_ts_seconds = int(datetime.datetime.combine(start_time, datetime.time.min).timestamp())
-            else:
-                # Fallback for other types with timestamp() method
-                start_ts_seconds = int(start_time.timestamp())  # type: ignore[union-attr]
-            if isinstance(end_time, datetime.datetime):
-                end_ts_seconds = int(end_time.timestamp())
-            elif isinstance(end_time, datetime.date):
-                # Convert date to datetime at midnight
-                end_ts_seconds = int(datetime.datetime.combine(end_time, datetime.time.min).timestamp())
-            else:
-                # Fallback for other types with timestamp() method
-                end_ts_seconds = int(end_time.timestamp())  # type: ignore[union-attr]
-
-            if start_ts_seconds >= end_ts_seconds:
-                continue
+            # Widen to whole seconds; a point or sub-second window still spans one second.
+            start_ts_seconds = math.floor(_epoch_seconds(start_time))
+            end_ts_seconds = max(math.ceil(_epoch_seconds(end_time)), start_ts_seconds + 1)
 
             try:
                 results = metric_query(

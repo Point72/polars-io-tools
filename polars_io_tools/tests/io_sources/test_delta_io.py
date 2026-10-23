@@ -1,6 +1,6 @@
 import base64
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -432,6 +432,18 @@ def test_delta_partition_pushdown_not_in(_partitioned_delta_table):
     assert set(df["x"].to_list()) == {10, 20, 100}
 
 
+@pytest.mark.parametrize(
+    "pred",
+    [~pl.col("p").is_in([""]), ~pl.col("p").is_in(["", "B"]), (pl.col("p") == "A") | ~pl.col("p").is_in([""])],
+    ids=["empty", "empty-and-value", "or-empty"],
+)
+def test_delta_partition_pushdown_not_in_empty_string(_partitioned_delta_table, pred):
+    # "" is Delta's null partition token, so it must not reach file_uris inside a "not in"
+    expected = pl.DataFrame({"x": [1, 2, 10, 20, 100], "p": ["A", "A", "B", "B", None]}).filter(pred)
+    out = cpl.scan_delta(_partitioned_delta_table, credential_provider=None).filter(pred).collect()
+    assert set(expected["x"]) <= set(out["x"])
+
+
 def test_delta_partition_pushdown_is_null(_partitioned_delta_table):
     lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
     # Match the null partition using is_null, and equality against None
@@ -824,3 +836,70 @@ def test_scan_delta_narrowing_cast_does_not_prune_wrapped_partition(_int_partiti
     got = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
     assert got.height == df.filter(pred).height
     assert got.height == 3  # a == 1 (two rows) and a == 257 (wraps to 1)
+
+
+_NS_BASE = 1704198600000000000  # 2024-01-02 12:30:00
+_NOON_30 = datetime(2024, 1, 2, 12, 30)
+_MAPPED_PREDICATES = {
+    "arithmetic": (pl.col("d") * 2) < timedelta(minutes=5),
+    "column_difference": (pl.col("t") - pl.col("tm")) <= timedelta(0),
+    "cast_to_string": pl.col("t").cast(pl.String).str.starts_with("2024-01-02"),
+    "epoch": pl.col("t").dt.epoch("s") <= 1704198600,
+    "year": pl.col("t").dt.year() == 2024,
+    "time_hour": pl.col("tt").dt.hour() == 12,
+    "total_seconds": pl.col("d").dt.total_seconds() >= 60,
+    "truncate": pl.col("t").dt.truncate("1h") == datetime(2024, 1, 2, 12),
+    "offset_by": pl.col("t").dt.offset_by("1h") > _NOON_30,
+    "strftime": pl.col("t").dt.strftime("%Y") == "2024",
+    "replace_time_zone": pl.col("t").dt.replace_time_zone("UTC") >= datetime(2024, 1, 1).astimezone(),
+    "subtract_literal": (pl.col("tm") - _NOON_30) >= timedelta(0),
+    "date_is_in": pl.col("t").dt.date().is_in([date(2024, 1, 2)]),
+    "date_is_between": pl.col("t").dt.date().is_between(date(2024, 1, 1), date(2024, 1, 3)),
+    "date_eq": pl.col("t").dt.date() == date(2024, 1, 2),
+    "cast_date_le": pl.col("t").cast(pl.Date) <= date(2024, 1, 2),
+    "cast_ms_eq": pl.col("t").cast(pl.Datetime("ms")) == _NOON_30,
+    "cast_duration_us_eq": pl.col("d").cast(pl.Duration("us")) == timedelta(minutes=1),
+    "cast_time_to_duration": pl.col("tt").cast(pl.Duration("ns")) <= timedelta(hours=13),
+    "ns_upper_bound": pl.col("t") <= _NOON_30,
+    "ns_literal_eq": pl.col("t") == pl.lit(_NS_BASE + 500).cast(pl.Datetime("ns")),
+    "ns_is_in": pl.col("t").is_in(pl.Series([_NS_BASE + 500]).cast(pl.Datetime("ns")).implode()),
+    "duration_upper_bound": pl.col("d") <= timedelta(minutes=1),
+    "ne_missing": pl.col("x").ne_missing(1),
+    "not_eq_missing": ~pl.col("x").eq_missing(1),
+    "eq_missing_column": pl.col("x").eq_missing(pl.col("x")),
+    "is_in_nulls_equal": pl.col("x").is_in([1, None], nulls_equal=True),
+    "is_between_string_literals": pl.col("s").is_between(pl.lit("a"), pl.lit("b")),
+    "is_between_string_not_columns": pl.col("s").is_between(pl.lit("q"), pl.lit("r")),
+    "is_null_non_strict_cast": pl.col("ss").cast(pl.Int64, strict=False).is_null(),
+    "and_untranslatable_side": (pl.col("t").dt.hour() == 12) & (pl.col("x") > 1),
+    "or_untranslatable_side": (pl.col("t").dt.hour() == 12) | (pl.col("x") > 1),
+    "not_untranslatable": ~((pl.col("t").dt.hour() == 12) & (pl.col("x") > 1)),
+}
+
+
+@pytest.fixture(scope="module")
+def _mapped_delta_table(tmp_path_factory):
+    df = pl.DataFrame(
+        {
+            "t": pl.Series([_NS_BASE, _NS_BASE + 500, _NS_BASE + 1500, None]).cast(pl.Datetime("ns")),
+            "tm": pl.Series([_NS_BASE // 10**6, _NS_BASE // 10**6 - 1, _NS_BASE // 10**6 + 1, _NS_BASE // 10**6]).cast(pl.Datetime("ms")),
+            "d": pl.Series([60 * 10**9, 60 * 10**9 + 500, 30 * 10**9, None]).cast(pl.Duration("ns")),
+            "tt": pl.Series([45000 * 10**9, 45000 * 10**9 + 500, 46800 * 10**9, None]).cast(pl.Time),
+            "x": [1, 2, None, 3],
+            "s": ["a", "ab", "b", "c"],
+            "ss": ["1", "x", None, "2"],
+            "a": ["zz"] * 4,
+            "b": ["zzz"] * 4,
+        }
+    )
+    table_path = str(tmp_path_factory.mktemp("mapped") / "table")
+    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
+    return table_path, df
+
+
+@pytest.mark.parametrize("pred", list(_MAPPED_PREDICATES.values()), ids=list(_MAPPED_PREDICATES))
+def test_scan_delta_mapped_predicate_matches_eager(_mapped_delta_table, pred):
+    table_path, df = _mapped_delta_table
+    # Disable Delta file pruning so only the translated predicate pushed to the Parquet scan is exercised.
+    got = cpl.scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False).filter(pred).collect()
+    assert_frame_equal(got, df.filter(pred), check_row_order=False)

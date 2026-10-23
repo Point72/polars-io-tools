@@ -40,6 +40,7 @@ __all__ = (
     "convert_datetime_to_polars",
     "extract_column_name",
     "extract_value_preserving_column_name",
+    "has_exact_value",
     "is_value_order_preserving_cast",
 )
 
@@ -154,7 +155,8 @@ class CastNode(ExtractableLiteralNode):
 
     input: BaseExprNode
     dtype: pl.DataType
-    # options: Dict[str, Any] = Field(default_factory=dict)
+    options: str | None = None
+    """One of ``"Strict"``, ``"NonStrict"`` or ``"Overflowing"`` (``wrap_numerical=True``)."""
 
     def accept(self, visitor: "ExprVisitor[T]") -> None:
         visitor.visit_cast(self)
@@ -798,7 +800,9 @@ class ExprParser:
                 return ErrorNode(expr=expr, error="Invalid dtype format")
 
             dtype = DataType(dtype).get_class()
-            if dtype is pl.Datetime and pos_args:
+            if isinstance(pos_args, str):
+                pos_args = [pos_args]
+            if dtype in (pl.Datetime, pl.Duration) and pos_args:
                 # TODO: This is a hack to handle datetime parsing
                 pos_args[0] = TimeUnit(pos_args[0]).to_datetime_conversion()
             # pl.Unknown cannot be called with arguments
@@ -811,6 +815,7 @@ class ExprParser:
                 expr=expr,
                 input=input_node,
                 dtype=dtype,
+                options=cast_info.get("options") if isinstance(cast_info, dict) else None,
             )
 
         except Exception as e:
@@ -1090,6 +1095,7 @@ _FUNCTION_CATEGORY_MAP: list[tuple[type, str]] = [
 # NodeTraverser returns lowercase `closed` strings; downstream visitors (range_visitor, dnf_visitor, sql_utils, translated_source) expect
 # capitalized variants matching the legacy JSON parser's output.
 _CLOSED_MAP = {"both": "Both", "left": "Left", "right": "Right", "none": "None"}
+_CAST_OPTIONS_MAP = {0: "Strict", 1: "NonStrict", 2: "Overflowing"}
 
 
 class NodeTraverserParser:
@@ -1141,7 +1147,7 @@ class NodeTraverserParser:
             return None
         try:
             return visitor.view_expression(node_id)
-        except NotImplementedError:
+        except (NotImplementedError, pl.exceptions.PanicException):
             return None
 
     def _parse(self, expr: pl.Expr, visitor: Any) -> BaseExprNode:
@@ -1150,6 +1156,10 @@ class NodeTraverserParser:
         Per-subtree errors are isolated here (matching the legacy ``ExprParser``'s per-method try/except behavior): a failure in one
         ``_parse_<kind>`` method collapses that subtree to an :class:`ErrorNode` rather than the whole top-level expression.
         """
+        # The typed view skips naming wrappers (alias, name.keep, ...), so skip them here too, or the children taken from
+        # ``meta.pop()`` would belong to the wrapper.
+        while len(children := expr.meta.pop()) == 1 and children[0].meta.undo_aliases().meta.eq(expr.meta.undo_aliases()):
+            expr = children[0]
         obj = self._view(visitor, expr)
         if obj is None:
             # polars' NodeTraverser has no typed view for a few IR nodes that can appear in a pushed-down
@@ -1181,7 +1191,7 @@ class NodeTraverserParser:
     # Single-input wrappers
     def _parse_cast(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
         (input_expr,) = expr.meta.pop()
-        return CastNode(expr=expr, input=self._parse(input_expr, visitor), dtype=obj.dtype)
+        return CastNode(expr=expr, input=self._parse(input_expr, visitor), dtype=obj.dtype, options=_CAST_OPTIONS_MAP.get(obj.options))
 
     def _parse_alias(self, expr: pl.Expr, obj: Any, visitor: Any) -> BaseExprNode:
         (input_expr,) = expr.meta.pop()
@@ -1324,9 +1334,37 @@ def get_literal_value(expr: pl.Expr) -> Any:
         if len(res) != 1:
             return res
         return res[0]
-    except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
+    except (Exception, pl.exceptions.PanicException) as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
         log.warning(f"Error getting literal value: {e}")
         return FAILED_LITERAL_RESULT  # Use a sentinel to indicate failure
+
+
+def has_exact_value(node: BaseExprNode, *, collection: bool = False) -> bool:
+    """Whether ``node`` is a literal whose ``value`` holds it exactly.
+
+    With ``collection=False`` the literal must be a single scalar; with ``collection=True`` it may be a list or Series of values.
+    Literals containing NaN are rejected, as Python NaNs never compare equal. Python temporal values hold microseconds, so a
+    nanosecond literal with a sub-microsecond part is not held exactly.
+    """
+    return _exact_literal(node, collection=collection) is not None
+
+
+def _exact_literal(node: BaseExprNode, *, collection: bool = False) -> pl.Series | None:
+    """The values of ``node`` as a Series if :func:`has_exact_value` holds, else None."""
+    if not node.can_extract_literal or node.value is FAILED_LITERAL_RESULT:
+        return None
+    series = pl.select(node.expr).to_series()
+    if isinstance(series.dtype, pl.List):
+        if not collection or len(series) != 1:
+            return None
+        series = series[0]
+    elif not collection and len(series) != 1:
+        return None
+    if series.dtype.is_float() and series.is_nan().any():
+        return None
+    if series.dtype.is_temporal() and not series.equals(pl.Series(series.to_list(), dtype=series.dtype)):
+        return None
+    return series
 
 
 def extract_column_name(node: BaseExprNode) -> str | None:

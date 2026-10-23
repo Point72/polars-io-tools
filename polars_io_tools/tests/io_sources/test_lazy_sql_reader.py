@@ -1,12 +1,15 @@
 import concurrent.futures
 import io
 import logging
+import sqlite3
 import sys
 import threading
 from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 
 import duckdb
+import numpy as np
 import polars as pl
 import pyarrow as pa
 import pytest
@@ -1081,6 +1084,18 @@ def test_dt_date_pushdown_sqlite_selects_non_midnight_row():
     assert rows == [("2024-05-06 12:34:56",)]
 
 
+def test_dt_year_pushdown_sqlite_runs():
+    import sqlite3
+
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE t (ts TEXT, x INTEGER)")
+    con.execute("INSERT INTO t VALUES ('2024-05-06 12:34:56', 1), ('2023-05-07 00:00:00', 2)")
+
+    where = convert_predicate_to_sql((pl.col("ts").dt.year() == 2024) & (pl.col("x") > 0), "sqlite").sql(dialect="sqlite")
+    rows = con.execute(f"SELECT x FROM t WHERE {where}").fetchall()
+    assert (1,) in rows
+
+
 def test_dt_date_pushdown_oracle_uses_trunc():
     """Oracle pushdown uses TRUNC, not CAST(... AS DATE) (PR #53 review).
 
@@ -1131,6 +1146,159 @@ def test_oversized_in_predicate_is_not_pushed_down():
     # An explicit override raises the ceiling so the same list is pushed.
     raised = convert_predicate_to_sql(pl.col("id").is_in(big_values), "tsql", max_in_predicate_size=len(big_values))
     assert raised is not None and "IN" in raised.sql("tsql")
+
+
+def _visit_predicate(predicate: pl.Expr, dialect: str) -> exp.Expression | None:
+    """Translate without the exception guard of ``convert_predicate_to_sql`` so failures surface."""
+    visitor = SQLExpressionVisitor(dialect)
+    visitor.visit(get_parsed_expr(predicate))
+    return visitor.process_results()
+
+
+_PUSHDOWN_DF = pl.DataFrame(
+    {
+        "id": range(7),
+        "a": [3, None, -7, 4, 1, 2, 5],
+        "b": [30, 1, 200, 0, 5, None, 150],
+        "s": ["abc", "\tabc", "a\\b", "x_b", "xab", None, "a%c"],
+        "f": [2.7, 1.0, None, -0.5, 2.0, 1.5, 3.2],
+        "ts": [
+            datetime(2024, 1, 1, 0, 0, 0, 500),
+            datetime(2023, 6, 1),
+            None,
+            datetime(2024, 3, 1),
+            datetime(2024, 1, 1),
+            None,
+            datetime(2022, 1, 1),
+        ],
+    }
+)
+_UNTRANSLATABLE = pl.col("s").str.len_chars() == 3
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        ~pl.when(pl.col("a") > 2).then(pl.col("b") > 100).otherwise(pl.col("b") > 0),
+        pl.col("a").is_between(2, 4).is_null(),
+        pl.col("a").is_between(2, 4) == False,
+        ((pl.col("a") > 1) & _UNTRANSLATABLE) == False,
+        ((pl.col("a") > 1) & _UNTRANSLATABLE).is_null(),
+        ~((pl.col("a") > 1) & _UNTRANSLATABLE),
+        pl.when(pl.col("a") > 2).then(pl.col("b") > 100).otherwise(_UNTRANSLATABLE),
+        pl.when(pl.col("a") > 2).then(1).otherwise(0) == 0,
+        pl.col("a").ne_missing(2),
+        ~pl.col("a").eq_missing(2),
+        pl.col("a").is_in([1, None], nulls_equal=True),
+        ~pl.col("a").is_in([1, None]),
+        pl.col("a") % 2 == 1,
+        pl.col("f").cast(pl.Int64) == 2,
+        (pl.col("a") & 3) == 0,
+        pl.col("s").str.strip_chars() == "abc",
+        pl.col("s").str.strip_chars("x") == "ab",
+        pl.concat_str([pl.col("s"), pl.col("s")], separator="-") == "abc-abc",
+        ~pl.col("s").str.ends_with("_b"),
+        pl.col("ts").dt.year() == 2024,
+        pl.col("ts").cast(pl.Datetime("ms")) == datetime(2024, 1, 1),
+        pl.col("f") < float("inf"),
+        pl.col("f").is_in([float("nan")]),
+        pl.col("ts") < pl.col("ts") + timedelta(days=1),
+    ],
+    ids=str,
+)
+def test_pushed_predicate_keeps_all_matching_rows(duckdb_connection, predicate):
+    """The SQL WHERE may return extra rows (Polars re-filters) but must run and must not drop a matching row."""
+    expected = _PUSHDOWN_DF.filter(predicate)
+    where = _visit_predicate(predicate, "duckdb")
+    if where is None:
+        return
+    duckdb_connection.register("pushdown_tbl", _PUSHDOWN_DF.to_arrow())
+    fetched = pl.from_arrow(duckdb_connection.sql(f"SELECT * FROM pushdown_tbl WHERE {where.sql('duckdb')}").to_arrow_table())
+    assert_frame_equal(fetched.filter(predicate).sort("id"), expected)
+
+
+@pytest.mark.parametrize(
+    ("predicate", "dialect"),
+    [
+        (pl.col("ts").dt.second() == 0, "postgres"),
+        (pl.col("a").cast(pl.UInt8) > 3, "postgres"),
+        (pl.col("a").cast(pl.Int128) > 3, "duckdb"),
+        (pl.col("f").cast(pl.String) == "1.0", "duckdb"),
+        (pl.col("s").str.starts_with("a\\"), "postgres"),
+        (pl.col("s").str.contains("a_b", literal=True), "tsql"),
+        (pl.col("a") // 2 == 1, "duckdb"),
+    ],
+    ids=str,
+)
+def test_predicate_without_exact_sql_translation_is_not_pushed_down(predicate, dialect):
+    assert _visit_predicate(predicate, dialect) is None
+
+
+@pytest.mark.parametrize(
+    ("data", "predicate", "dialect"),
+    [
+        ({"x": [2]}, pl.col("x").cast(pl.Boolean) == True, "duckdb"),
+        ({"x": [1]}, (~pl.col("x")).cast(pl.Boolean), "duckdb"),
+        ({"x": [1]}, (~pl.col("x")) == -2, "duckdb"),
+        ({"x": [2**63 - 1]}, (pl.col("x") + 1) < 0, "duckdb"),
+        ({"x": [b"ab"]}, pl.col("x") == b"ab", "duckdb"),
+        ({"x": [b"ab"]}, pl.col("x").is_in([b"ab"]), "duckdb"),
+        ({"x": ["straße"]}, pl.col("x").str.to_uppercase() == "STRASSE", "duckdb"),
+        ({"x": ["A"]}, ~pl.col("x").str.starts_with("a"), "sqlite"),
+        ({"x": ["A"]}, ~pl.col("x").str.contains("a", literal=True), "sqlite"),
+        ({"x": ["\u0663"]}, pl.col("x").str.contains(r"^\d$"), "duckdb"),
+        ({"x": ["a"]}, pl.col("x").str.contains(r"\u{61}"), "duckdb"),
+        ({"x": ["bad"]}, pl.col("x").cast(pl.Float64, strict=False).is_null(), "duckdb"),
+        ({"x": [0]}, pl.col("x").cast(pl.Datetime("us")).dt.year() == 1970, "duckdb"),
+        ({"x": pl.Series([datetime(2024, 1, 1, 23)]).dt.replace_time_zone("UTC")}, pl.col("x").cast(pl.Datetime("us")).dt.hour() == 23, "duckdb"),
+        ({"x": [1], "ys": [[1]]}, pl.col("x").is_in(pl.col("ys")), "duckdb"),
+        ({"x": ["a\x00b"]}, pl.col("x") == "a\x00b", "duckdb"),
+        ({"x": ["a", "b"]}, pl.col("x") == pl.lit(pl.Series(["a", "b"])), "duckdb"),
+        ({"x": [1.25]}, pl.col("x").cast(pl.Decimal(4, 1)) == Decimal("1.2"), "duckdb"),
+        ({"x": pl.Series([0.1], dtype=pl.Float32)}, ~pl.col("x").is_in([0.1, 0.2]), "duckdb"),
+    ],
+    ids=str,
+)
+def test_pushed_predicate_keeps_polars_semantics(data, predicate, dialect):
+    """The WHERE clause must run and return every row ``df.filter`` keeps, where Polars and SQL semantics differ."""
+    df = pl.DataFrame(data)
+    where = _visit_predicate(predicate, dialect)
+    if where is None:
+        return
+    sql = f"SELECT * FROM t WHERE {where.sql(dialect)}"
+    if dialect == "sqlite":
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE t (x)")
+        con.executemany("INSERT INTO t VALUES (?)", df.rows())
+        fetched = len(con.execute(sql).fetchall())
+    else:
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'America/New_York'")
+        con.register("t", df.to_arrow())
+        fetched = len(con.sql(sql).fetchall())
+    assert fetched >= df.filter(predicate).height
+
+
+def test_nanosecond_numpy_literal_in_is_in_is_not_pushed_down():
+    """Polars panics while exposing this literal; the panic must not escape predicate conversion."""
+    assert convert_predicate_to_sql(pl.col("ts").is_in([np.datetime64("2024-01-01T00:00:00.000000001", "ns")]), "duckdb") is None
+
+
+@pytest.mark.parametrize("dialect", ["tsql", "snowflake", "duckdb"])
+def test_dt_year_renders_in_dialect(dialect):
+    assert "2024" in _visit_predicate(pl.col("ts").dt.year() == 2024, dialect).sql(dialect)
+
+
+def test_nanosecond_equality_is_not_truncated(duckdb_connection):
+    """Equality on a nanosecond column becomes an ``is_between`` whose upper bound has sub-microsecond digits."""
+    duckdb_connection.execute(
+        "CREATE TABLE ns_tbl AS SELECT * FROM (VALUES (1, TIMESTAMP_NS '2024-01-01 00:00:00'), (2, TIMESTAMP_NS '2024-01-01 00:00:00.000000500')) t(id, ts)"
+    )
+    predicate = pl.col("ts") == datetime(2024, 1, 1)
+    expected = cpl.scan_db("SELECT id, ts FROM ns_tbl", "fake_connection_string").collect().filter(predicate)
+    actual = cpl.scan_db("SELECT id, ts FROM ns_tbl", "fake_connection_string").filter(predicate).collect()
+    assert expected.height == 2
+    assert_frame_equal(actual.sort("id"), expected.sort("id"))
 
 
 def test_rename_with_filter_integration():
@@ -1341,17 +1509,8 @@ class TestHeadPushdownBehavior:
     """
     Tests verifying head() behavior with filters in scan_db.
 
-    Current Polars behavior (safe):
-    - When a predicate is passed, n_rows is NOT pushed to the IO source
-    - head() is applied locally after the source returns filtered data
-    - This prevents the bug where LIMIT would be applied before filtering
-
-    Potential bug scenario (if both n_rows and predicate are passed):
-    - If predicate can't convert to SQL but n_rows is pushed
-    - SQL gets: SELECT ... LIMIT N (no WHERE)
-    - Database returns N rows (some may not match filter)
-    - Filter applied locally → fewer than N matching rows
-    - But user expected N matching rows!
+    For ``filter(p).head(n)`` Polars passes the predicate without ``n_rows`` and applies head() itself. For
+    ``head(n).filter(p)`` it passes both, and the first ``n`` rows must be read before filtering.
     """
 
     def test_polars_does_not_push_n_rows_with_predicate(self, duckdb_connection):
@@ -1465,91 +1624,16 @@ class TestHeadPushdownBehavior:
         assert result.height == expected, f"Expected {expected} rows, got {result.height}"
         assert all(result["score"] > 80)
 
-    def test_source_generator_bug_if_n_rows_and_predicate_both_passed(self, duckdb_connection):
-        """
-        Demonstrate the POTENTIAL BUG in scan_db's source_generator.
+    @pytest.mark.parametrize("sql_convertible", [True, False])
+    def test_head_then_filter(self, duckdb_connection, sql_convertible):
+        predicate = pl.col("score") > 80
+        if not sql_convertible:
+            predicate = pl.col("score").map_elements(lambda x: x > 80, return_dtype=pl.Boolean)
 
-        This test directly invokes the source_generator with both n_rows and a
-        non-SQL-convertible predicate to show what WOULD happen if Polars ever
-        passed both parameters together.
+        lf = cpl.scan_db("SELECT * FROM EmployeeTbl", "fake_connection_string")
+        result = lf.head(10).filter(predicate).collect()
 
-        Current state: Polars doesn't pass n_rows when there's a predicate, so this
-        bug doesn't manifest in normal usage. But it could if:
-        - Future Polars versions change behavior
-        - Someone directly calls the source_generator
-        - Edge cases in optimizer
-
-        The fix would be: if predicate can't be converted to SQL, don't push n_rows.
-        """
-        import arrow_odbc
-
-        # Capture SQL to verify the bug mechanism
-        executed_queries = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(query, *args, **kwargs):
-            executed_queries.append(query)
-            return original_func(query, *args, **kwargs)
-
-        arrow_odbc.read_arrow_batches_from_odbc = capturing_func
-
-        try:
-            # Set up a non-SQL filter
-            non_sql_filter = pl.col("score").map_elements(lambda x: x > 80, return_dtype=pl.Boolean)
-
-            # Verify filter can't be converted
-            from polars_io_tools.io_sources.sql_utils import convert_predicate_to_sql
-
-            assert convert_predicate_to_sql(non_sql_filter) is None
-
-            # Get the source_generator by creating a scan_db LazyFrame
-            # We need to access the internal source function
-            query = "SELECT * FROM EmployeeTbl"
-
-            # Instead of calling through Polars (which won't pass n_rows with predicate),
-            # we test the logic directly by checking the SQL that would be generated
-
-            # Create the LazyFrame to set up the source
-            lf = cpl.scan_db(query, "fake_connection_string")
-
-            # Simulate what WOULD happen if both were passed:
-            # The SQL would be: SELECT * FROM EmployeeTbl LIMIT 10 (no WHERE!)
-            # Then filter applied locally
-
-            # First verify current behavior is safe
-            executed_queries.clear()
-            result = lf.filter(non_sql_filter).head(10).collect()
-
-            data_queries = [q for q in executed_queries if "LIMIT 0" not in q]
-            sql = data_queries[0] if data_queries else ""
-
-            print(f"\nActual SQL executed: {sql}")
-            print(f"Result rows: {result.height}")
-
-            # Current behavior: no LIMIT in SQL (safe!)
-            has_limit = "LIMIT" in sql.upper() and "LIMIT 0" not in sql.upper()
-            if not has_limit:
-                print("SAFE: Polars did not push LIMIT with predicate")
-            else:
-                print("WARNING: LIMIT was pushed to SQL!")
-
-            # The bug scenario would be:
-            # SQL: SELECT ... LIMIT 10 (no WHERE because predicate can't convert)
-            # Returns first 10 rows
-            # Filter locally: only 7 of first 10 have score > 80
-            # Result: 7 rows instead of 10!
-
-            emp_df = get_employee_df()
-            total_matching = emp_df.filter(pl.col("score") > 80).height
-            first_10_matching = emp_df.head(10).filter(pl.col("score") > 80).height
-
-            print("\nIf bug were present:")
-            print(f"  Total matching rows: {total_matching}")
-            print(f"  Matching in first 10: {first_10_matching}")
-            print(f"  Would get: {first_10_matching} rows instead of {min(10, total_matching)}")
-
-        finally:
-            arrow_odbc.read_arrow_batches_from_odbc = original_func
+        assert_frame_equal(result, get_employee_df().head(10).filter(pl.col("score") > 80), check_dtypes=False)
 
     def test_workaround_collect_then_head(self):
         """
@@ -2729,8 +2813,9 @@ def test_head_zero_with_column_selection(monkeypatch):
     assert calls["n"] == 0
 
 
-def test_str_contains_regex_skips_pushdown_for_tsql():
-    """str.contains with regex metacharacters should skip pushdown for TSQL (MSSQL has no regex)."""
+@pytest.mark.parametrize("dialect", ["tsql", "postgres", "clickhouse", "duckdb"])
+def test_str_contains_regex_skips_pushdown(dialect):
+    """str.contains with regex metacharacters skips pushdown: database regex dialects differ from Polars."""
     regex_patterns = [
         "^(CL|GC|SI|HO)",  # anchored alternation
         ".*abc",  # wildcard
@@ -2740,18 +2825,8 @@ def test_str_contains_regex_skips_pushdown_for_tsql():
     ]
     for pattern in regex_patterns:
         expr = pl.col("Centre").str.contains(pattern)
-        result = convert_predicate_to_sql(expr, dialect="tsql")
-        assert result is None, f"Expected None for regex pattern {pattern!r}, got {result}"
-
-
-def test_str_contains_regex_pushes_regexp_like_for_non_tsql():
-    """str.contains with regex metacharacters should push RegexpLike for dialects that support it."""
-    expr = pl.col("Centre").str.contains("^(CL|GC|SI|HO)")
-    for dialect in ["clickhouse", "postgres"]:
         result = convert_predicate_to_sql(expr, dialect=dialect)
-        assert result is not None, f"Expected RegexpLike for {dialect}, got None"
-        sql = result.sql(dialect=dialect)
-        assert "LIKE" not in sql, f"Expected regex function, not LIKE, for {dialect}: {sql}"
+        assert result is None, f"Expected None for regex pattern {pattern!r}, got {result}"
 
 
 def test_str_contains_regex_with_and_partial_pushdown():
@@ -3207,6 +3282,12 @@ def test_cast_map_rejects_unsupported_dtype(duckdb_connection):
     # emitting VARCHAR would misrepresent the data, so it must be rejected.
     with pytest.raises(ValueError, match="No SQL type mapping"):
         cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Boolean})
+
+
+def test_cast_map_rejects_time_zone_aware_datetime(duckdb_connection):
+    _make_record_table(duckdb_connection)
+    with pytest.raises(ValueError, match="time-zone-aware"):
+        cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Datetime("us", "UTC")})
 
 
 class TestIntervalStr:

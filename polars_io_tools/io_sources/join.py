@@ -26,6 +26,8 @@ log = logging.getLogger(__name__)
 # In polars versions >1.31.0
 # polars will push down filters on join columns for us.
 _POLARS_PUSHDOWN_FILTERS_JOIN_COLUMNS = version.parse(pl.__version__) > version.parse("1.31.0")
+# Polars >= 1.28 deprecates is_in with a same-dtype Series in favour of an imploded list, which older versions do not broadcast.
+_POLARS_IS_IN_IMPLODE = version.parse(pl.__version__) >= version.parse("1.28.0")
 
 
 def _normalize_join_columns(
@@ -213,13 +215,12 @@ def filtered_join(
         new_filters = []
         for left_col, right_col in zip(left_on, right_on):
             left_col_ser = left_df[left_col].drop_nulls().unique()
-            if len(left_col_ser) == 1:
-                # We need this to make sure we treat the single value as a list
+            # Polars does not push down ``== Series``, so a single value is compared as a Python scalar when that is lossless.
+            if len(left_col_ser) == 1 and pl.Series([left_col_ser[0]], dtype=left_col_ser.dtype).equals(left_col_ser):
                 new_filters.append(pl.col(right_col) == left_col_ser[0])
             else:
-                # We convert to a list because otherwise polars 1.28.0 doesnt
-                # push any filters down if we passed the series directly.
-                new_filters.append(pl.col(right_col).is_in(left_col_ser.to_list()))
+                # A typed Series: Python values would truncate ns temporals and widen Decimal precision.
+                new_filters.append(pl.col(right_col).is_in(left_col_ser.implode() if _POLARS_IS_IN_IMPLODE else left_col_ser))
 
         extra_filter = pl.all_horizontal(*new_filters) if len(left_on) > 1 else new_filters[0]
         # Filter the right lazyframe based on the join column in the materialized left df
@@ -443,6 +444,10 @@ def filtered_join_asof(
                 else:
                     raise ValueError(f"Unknown strategy: {strategy}. Must be one of 'backward', 'forward', or 'nearest'.")
                 for left_col, right_col in zip(left_on, right_on):
+                    index_col_typ = l2_schema[right_col]
+                    if getattr(index_col_typ, "time_zone", None) is not None:
+                        # Interval bounds are naive, so they cannot be compared with a timezone-aware column.
+                        continue
                     try:
                         index_col_interval = convert_expr_to_datetime_range(parsed_predicate, left_col, get_enclosure=False, preserve_dates=True)
                     except TypeError:
@@ -450,7 +455,6 @@ def filtered_join_asof(
                         # can produce uncomparable bounds. Fall back to coercing to datetime — pushdown may be slightly
                         # looser but the original predicate is still reapplied by the caller for correctness.
                         index_col_interval = convert_expr_to_datetime_range(parsed_predicate, left_col, get_enclosure=False)
-                    index_col_typ = l2_schema[right_col]
                     if index_col_typ == pl.Date:
                         # Date right column: promote preserved date bounds to midnight datetimes so sub-day tolerances
                         # still cross day boundaries; floored back below.

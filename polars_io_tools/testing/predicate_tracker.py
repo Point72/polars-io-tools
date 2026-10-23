@@ -101,12 +101,12 @@ class PredicateTracker:
 
             result = tracker.df.clone()
 
+            if n_rows is not None:
+                result = result.head(n_rows)
             if with_columns is not None:
                 result = result.select(with_columns)
             if predicate is not None:
                 result = result.filter(predicate)
-            if n_rows is not None:
-                result = result.head(n_rows)
 
             yield result
 
@@ -764,12 +764,12 @@ def io_source_assert(df: pl.DataFrame, assert_func: Callable[[pl.Expr | None], N
 
         result = df.clone()
 
+        if n_rows is not None:
+            result = result.head(n_rows)
         if predicate is not None:
             result = result.filter(predicate)
         if with_columns is not None:
             result = result.select(with_columns)
-        if n_rows is not None:
-            result = result.head(n_rows)
 
         yield result
 

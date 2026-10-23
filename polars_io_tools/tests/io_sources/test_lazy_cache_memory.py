@@ -748,3 +748,22 @@ def test_exclude_built_infers_dtype_with_null_first_keys():
     # Keep only rows not matching a built partition: (a=7,b=999) and every (a=None, b in 0..149)
     # are excluded; (a=7,b=1) and (a=3,b=5) are kept.
     assert frame.filter(expr).to_dicts() == [{"a": 7, "b": 1}, {"a": 3, "b": 5}]
+
+
+_FOLD_US = 1_730_611_800_000_000  # 2024-11-03 05:30 UTC, 01:30 EDT; one hour later is 01:30 EST
+
+
+@pytest.mark.parametrize(
+    "dtype, start, step",
+    [
+        (pl.Datetime("ns"), 1000, 1),
+        (pl.Duration("ns"), 1000, 1),
+        (pl.Time, 1000, 1),
+        (pl.Datetime("us", "America/New_York"), _FOLD_US, 3_600_000_000),
+    ],
+)
+def test_lossy_key_partitions_do_not_collide(dtype, start, step):
+    df = pl.DataFrame({"k": pl.Series([start, start + step, start + 2 * step, None]).cast(dtype), "v": [1, 2, 3, 4]})
+    lf = cache_memory(df.lazy(), schema=df.schema, partition_cols="k")
+    for pred in [pl.col("k") == pl.lit(start + step).cast(dtype), pl.col("k") == pl.lit(start).cast(dtype), pl.col("v") > 0]:
+        assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))

@@ -14,7 +14,13 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from polars_io_tools._compat import POLARS_HAS_PARTITION_BY
-from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _construct_partitions_df_from_existing, _extract_existing_files, cache_parquet
+from polars_io_tools.io_sources.lazy_cache_parquet import (
+    CacheMode,
+    _construct_partitions_df_from_existing,
+    _extract_existing_files,
+    _rebuild_partition_scope,
+    cache_parquet,
+)
 
 D = datetime.date
 DT = datetime.datetime
@@ -701,3 +707,20 @@ def test_equal_signed_zero_refresh_preserves_written_rows(tmp_path, dtype, sourc
     persisted = cache_parquet(source.lazy(), tmp_path, cache_mode=CacheMode.CACHE_ONLY, **options).collect()
     assert_frame_equal(persisted, current)
     assert len(list(tmp_path.rglob("*.parquet"))) == expected_files
+
+
+def test_rebuild_scope_with_date_predicate_failing_on_null():
+    pred = pl.col("date").map_elements(lambda d: d.weekday() < 5, return_dtype=pl.Boolean, skip_nulls=False)
+    scope = _rebuild_partition_scope(pred, "date", [], "daily", pl.Schema({"date": pl.Date}))
+    partitions = pl.DataFrame({"date": [D(2024, 3, 11), None]})
+    assert scope is None or partitions.filter(scope).height == 2
+
+
+@pytest.mark.parametrize("time_unit", ["daily", "monthly", "yearly"])
+@pytest.mark.parametrize("cache_mode", [CacheMode.READ_ONLY, CacheMode.CACHE])
+def test_last_representable_date_partition(tmp_path, time_unit, cache_mode):
+    src = pl.LazyFrame({"date": [D.max, D(9999, 1, 5)], "value": [0, 1]})
+    pred = pl.col("date") == D.max
+    for _ in range(2):  # cold, then warm with expiry checks
+        out = cache_parquet(src, tmp_path, "date", time_unit=time_unit, cache_mode=cache_mode, ttl=datetime.timedelta(days=1)).filter(pred).collect()
+        assert_frame_equal(out, src.filter(pred).collect())

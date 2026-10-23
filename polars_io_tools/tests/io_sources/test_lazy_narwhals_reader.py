@@ -1,5 +1,6 @@
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import narwhals as nw
 import narwhals.stable.v1 as nw_stable
@@ -142,7 +143,6 @@ def test_from_narwhals_with_predicate_pushdown():
         pl.col("x").eq_missing(pl.col("y")),
         pl.col("x").ne_missing(pl.col("y")),
         pl.col("x").is_in([None, 1], nulls_equal=True),
-        pl.col("x").is_in([1], nulls_equal=True).eq_missing(False),
         pl.col("x").is_in(None, nulls_equal=True),
         pl.col("x").is_in(pl.lit(1, dtype=pl.Int64), nulls_equal=True),
     ],
@@ -151,12 +151,127 @@ def test_from_narwhals_null_aware_predicate_matches_polars(predicate: pl.Expr):
     source = pa.table({"id": [0, 1, 2, 3], "x": [None, 1, 2, None], "y": [None, 1, None, 2]})
     expected = pl.from_arrow(source).filter(predicate)
     nw_source = nw.from_native(source).lazy()
-    translated = polars_to_nw(predicate)
+    translated = polars_to_nw(predicate, expected.schema)
     assert translated is not None
     assert nw_source.filter(translated).collect().to_arrow()["id"].to_pylist() == expected["id"].to_list()
 
     actual = cpl.from_narwhals(nw_source).filter(predicate).collect()
     assert_frame_equal(actual, expected)
+
+
+_PUSHDOWN_DATA = pl.DataFrame(
+    {
+        "id": [0, 1, 2, 3, 4],
+        "a": [1, 2, 3, 10, 1000],
+        "b": [5, 4, 3, 9, 1],
+        "n": [1.0, None, 3.0, 0.0, 2.0],
+        "f": [1.5, float("nan"), 0.5, None, 2.0],
+        "s": ["x", "y", None, "x", "3"],
+        "ts": [datetime(2020, 1, 1, 0, 0, 0, 123456)] * 5,
+        "dur": [timedelta(microseconds=1500)] * 5,
+        "ns": pl.Series([0, 500, 1000, 1500, None]).cast(pl.Datetime("ns")),
+        "d": pl.Series([0, 1, 2, 3, None]).cast(pl.Date),
+        "u": pl.Series([2**63, None, 1, 2, 3], dtype=pl.UInt64),
+    }
+)
+
+
+def _pushdown_source(backend: str):
+    pdf = _PUSHDOWN_DATA.to_pandas()
+    if backend == "pandas":
+        return pdf
+    if backend == "pandas_pyarrow":
+        return _PUSHDOWN_DATA.to_pandas(use_pyarrow_extension_array=True)
+    if backend == "pyarrow":
+        return _PUSHDOWN_DATA.to_arrow()
+    return pytest.importorskip("dask.dataframe").from_pandas(pdf, npartitions=2)
+
+
+@pytest.mark.parametrize("backend", ["pandas", "pandas_pyarrow", "pyarrow", "dask"])
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("a") > pl.when(pl.col("b") > 2).then(pl.col("b")).otherwise(0),
+        (pl.col("a") > 4) | pl.when(pl.col("b") > 2).then(True).otherwise(False),
+        pl.col("a") > pl.col("b").map_elements(lambda v: v - 10, return_dtype=pl.Int64),
+        pl.col("n").cast(pl.Boolean) == True,
+        pl.col("ts").cast(pl.Datetime("ms")) == datetime(2020, 1, 1, 0, 0, 0, 123000),
+        pl.col("dur").cast(pl.Duration("ms")) == timedelta(milliseconds=1),
+        pl.col("a").cast(pl.Int128) > pl.col("b").cast(pl.Int128),
+        pl.col("a").cast(pl.Int128) > 5,
+        pl.col("a").cast(pl.Int8, strict=False).is_null(),
+        pl.col("s").cast(pl.Int64, strict=False) >= 3,
+        pl.col("f").cast(pl.Int64, strict=False) > 0,
+        (pl.col("n") > 2).is_null(),
+        (pl.col("n") > 2).ne_missing(False),
+        pl.col("n").is_in([3.0]).is_null(),
+        pl.col("n").is_in([3.0]).ne_missing(False),
+        pl.col("n").is_in([1.0], nulls_equal=True).eq_missing(False),
+        pl.col("f") > 1,
+        pl.col("f") >= 1,
+        pl.col("f") <= pl.col("f"),
+        (pl.col("f") < 1) == False,
+        (pl.col("f") < 1).is_in([False]),
+        pl.col("ns") <= pl.lit(500).cast(pl.Datetime("ns")),
+        pl.col("ns").is_in(pl.concat_list(pl.lit(500).cast(pl.Datetime("ns")))),
+        pl.col("f") == pl.lit(float("nan")),
+        pl.col("f").eq_missing(float("nan")),
+        pl.col("f").ne_missing(float("nan")),
+        pl.col("s").ne_missing("x"),
+        pl.col("ns") == 500,
+        pl.col("d") == 1,
+        pl.col("dur") == 1500,
+        pl.col("u") > 2**63 - 1,
+    ],
+)
+def test_from_narwhals_predicate_pushdown_matches_polars(backend: str, predicate: pl.Expr):
+    lf = cpl.from_narwhals(nw.from_native(_pushdown_source(backend)).lazy())
+    expected = lf.collect().filter(predicate)
+    assert_frame_equal(lf.filter(predicate).collect(), expected)
+
+
+@pytest.mark.parametrize(
+    "source, predicate",
+    [
+        (pl.DataFrame({"x": pl.Series(["z", "a"]).cast(pl.Enum(["z", "a"]))}).to_arrow(), pl.col("x") > "z"),
+        (pd.DataFrame({"x": pd.Categorical(["lo", "hi"], categories=["lo", "hi"], ordered=True)}), pl.col("x").is_in(["hi"])),
+        (pl.DataFrame({"x": [datetime(2020, 1, 1, tzinfo=UTC)]}).to_pandas(), pl.col("x").is_in([datetime(2020, 1, 1)])),
+        (pd.DataFrame({"x": [date(2020, 1, 1), None]}), pl.col("x") == date(2020, 1, 2)),
+        (pd.DataFrame({"x": pd.date_range("2020-01-01", periods=2, tz="America/New_York")}), pl.col("x") > date(2020, 1, 1)),
+        (pa.table({"x": pa.array([datetime(2020, 1, 1), datetime(2020, 1, 2)], pa.timestamp("s"))}), pl.col("x") > datetime(2020, 1, 1)),
+        (pa.table({"x": pa.array([[date(2020, 1, 1)], []], pa.list_(pa.date64()))}), pl.col("x").list.len() > 0),
+        (pd.DataFrame({"x": [True, False, None], "u": [1.0, 1.0, 1.0]}), pl.col("x") | (pl.col("u") > 0)),
+        (pd.DataFrame({"x": [True, None], "u": [1, 2]}), pl.col("x").is_null()),
+        (pd.DataFrame({"x": [None, date(2020, 1, 1)]}), pl.col("x") == date(2020, 1, 1)),
+        (pd.DataFrame({"x": [None, date(2020, 1, 1)], "y": [date(2020, 1, 1), None]}), pl.col("x").is_not_null()),
+        (pd.DataFrame({"x": [[], [1]], "u": [1, 2]}), pl.col("u") == 2),
+        (pd.DataFrame({"x": [Decimal("1.5"), Decimal("2.25")], "u": [1, 2]}), pl.col("u") == 1),
+    ],
+)
+def test_from_narwhals_native_source_matches_polars(source, predicate: pl.Expr):
+    df = pl.from_arrow(source) if isinstance(source, pa.Table) else pl.from_pandas(source)
+    lf = cpl.from_narwhals(nw.from_native(source).lazy())
+    try:
+        expected = df.filter(predicate)
+    except pl.exceptions.PolarsError:
+        with pytest.raises(pl.exceptions.PolarsError):
+            lf.filter(predicate).collect()
+        return
+    assert_frame_equal(lf.filter(predicate).collect(), expected)
+
+
+def test_from_narwhals_unconvertible_object_column():
+    pdf = pd.DataFrame({"x": pd.Series([1, "a"], dtype=object), "u": [0, 1]})
+    lf = cpl.from_narwhals(nw.from_native(pdf).lazy())
+    assert_frame_equal(lf.select("u").filter(pl.col("u") > 0).collect(), pl.DataFrame({"u": [1]}))
+
+
+def test_from_narwhals_duckdb_hugeint():
+    duckdb = pytest.importorskip("duckdb")
+    pytest.importorskip("narwhals._duckdb.utils", reason="narwhals does not support this duckdb version")
+    rel = duckdb.sql("SELECT 1::HUGEINT AS x UNION ALL SELECT 2")
+    lf = cpl.from_narwhals(nw.from_native(rel).lazy())
+    assert_frame_equal(lf.filter(pl.col("x") > 1).collect(), rel.pl().filter(pl.col("x") > 1))
 
 
 def test_from_narwhals_custom_batch_size():
@@ -479,10 +594,10 @@ def test_sql_lazy_frame():
     nw_frame = nw.from_native(my_scan(raw_lf))
     lf_frame = cpl.from_narwhals(nw_frame)
 
-    my_scan(raw_lf).filter(pl.col("e").cast(pl.Int64, strict=False) > 1).collect()
-    res = lf_frame.filter(pl.col("e").cast(pl.Int64, strict=False) > 1).collect()
+    my_scan(raw_lf).filter(pl.col("a").cast(pl.Float64) > 1).collect()
+    res = lf_frame.filter(pl.col("a").cast(pl.Float64) > 1).collect()
 
-    assert_frame_equal(res, my_scan(raw_lf).filter(pl.col("e").cast(pl.Int64, strict=False) > 1).collect())
+    assert_frame_equal(res, my_scan(raw_lf).filter(pl.col("a").cast(pl.Float64) > 1).collect())
 
 
 # These tests verify that from_narwhals LazyFrames can be serialized with cloudpickle,

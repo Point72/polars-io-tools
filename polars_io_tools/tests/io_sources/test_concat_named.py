@@ -499,3 +499,18 @@ def test_concat_named_filter_with_inequality():
     assert_frame_equal(result, expected)
     assert queried["df1"]
     assert not queried["df2"]
+
+
+@pytest.mark.parametrize(
+    ("lf_dict", "kwargs", "pred"),
+    [
+        # 2**31 - 1 is an Int32 literal, so ``k + 1`` wraps in the data and must wrap in the pruning index too.
+        ({(2**31 - 1,): pl.LazyFrame({"v": [42]})}, {}, (pl.col("k") + 1) < 0),
+        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"y": [2]})}, {"how": "diagonal"}, pl.col("y") == 2),
+        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"y": [2]})}, {"how": "diagonal"}, pl.col("k") == "b"),
+        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"x": [2.5]})}, {"how": "vertical_relaxed"}, pl.col("k") == "a"),
+    ],
+)
+def test_concat_named_pruning_matches_concat(lf_dict, kwargs, pred):
+    expected = pl.concat([lf.with_columns(k=pl.lit(key[0])) for key, lf in lf_dict.items()], **kwargs).filter(pred).collect()
+    assert_frame_equal(cpl.concat_named(lf_dict, ["k"], **kwargs).filter(pred).collect(), expected)

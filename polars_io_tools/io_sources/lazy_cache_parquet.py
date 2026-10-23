@@ -811,16 +811,16 @@ def _partition_dates(lower: date, upper: date, time_unit: Literal["daily", "mont
         current = _step_date(current, time_unit)
 
 
-def _step_date(d: date, time_unit: Literal["daily", "monthly", "yearly"]) -> date:
-    """Step to next partition boundary."""
+def _step_date(d: date, time_unit: Literal["daily", "monthly", "yearly"]) -> Any:
+    """Step to next partition boundary, or ``portion.inf`` when it would be past ``date.max``."""
     if time_unit == "daily":
-        return d + timedelta(days=1)
+        return portion.inf if d == date.max else d + timedelta(days=1)
     elif time_unit == "monthly":
         if d.month == 12:
-            return d.replace(year=d.year + 1, month=1)
+            return portion.inf if d.year == date.max.year else d.replace(year=d.year + 1, month=1)
         return d.replace(month=d.month + 1)
     else:  # yearly
-        return d.replace(year=d.year + 1)
+        return portion.inf if d.year == date.max.year else d.replace(year=d.year + 1)
 
 
 def _extract_finite_values(
@@ -1305,7 +1305,11 @@ def _rebuild_partition_scope(
     extra_predicate = _restrict_predicate(predicate, extra_cols)
     date_predicate = _restrict_predicate(predicate, [date_column])
     null_row = pl.DataFrame({date_column: [None]}, schema={date_column: schema[date_column]})
-    includes_null_date = date_predicate is not None and null_row.select(date_predicate).item() is True
+    try:
+        includes_null_date = date_predicate is not None and null_row.select(date_predicate).item() is True
+    except Exception:
+        log.debug("Could not evaluate the date predicate on null; including null-date partitions", exc_info=True)
+        includes_null_date = True
     clauses = convert_expr_to_dnf(restricted, schema)
     if clauses is None:
         return _restrict_predicate(predicate, extra_cols)
@@ -1605,10 +1609,8 @@ def _expired_file_keys(
         if written_at is None:
             continue
         period_end = None
-        if start is not None:
-            period_end = datetime.datetime.combine(_step_date(_widen_date(start, time_unit), time_unit), datetime.time(), zone).astimezone(
-                datetime.UTC
-            )
+        if start is not None and (end_date := _step_date(_widen_date(start, time_unit), time_unit)) is not portion.inf:
+            period_end = datetime.datetime.combine(end_date, datetime.time(), zone).astimezone(datetime.UTC)
         if is_expired(written_at, period_end, now):
             expired.add(key)
     return expired

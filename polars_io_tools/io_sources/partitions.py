@@ -22,6 +22,7 @@ reject it rather than silently drop the slice.
 from __future__ import annotations
 
 import datetime
+import decimal
 import itertools
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -115,8 +116,11 @@ def _date_windows(interval: portion.Interval, every: str | int) -> list[tuple[An
         lower, upper = atomic.lower, atomic.upper
         if lower == -portion.inf or upper == portion.inf:
             return None
-        start = pl.Series([lower]).dt.truncate(iv).item()
-        end = pl.Series([upper]).dt.offset_by(iv).item()  # one step past ``upper`` closes the final window
+        try:
+            start = pl.Series([lower]).dt.truncate(iv).item()
+            end = pl.Series([upper]).dt.offset_by(iv).item()  # one step past ``upper`` closes the final window
+        except (ValueError, OverflowError):
+            return None  # a window boundary falls outside Python's date range
         is_date = isinstance(start, datetime.date) and not isinstance(start, datetime.datetime)
         make_range = pl.date_range if is_date else pl.datetime_range
         bounds = make_range(start, end, interval=iv, closed="both", eager=True)
@@ -233,14 +237,16 @@ class _ByRange:
         for atomic in interval:  # bucket each selected range; skip the gaps between disjoint ranges
             if atomic.lower == -portion.inf or atomic.upper == portion.inf:
                 return None  # unbounded range -- cannot partition
-            inclusive_upper = atomic.right == portion.CLOSED
             lo = atomic.lower
-            while (lo <= atomic.upper) if inclusive_upper else (lo < atomic.upper):
-                hi = lo + self.every
+            every = decimal.Decimal(str(self.every)) if isinstance(lo, decimal.Decimal) else self.every
+            while (hi := lo + every) < atomic.upper:
                 parts.append(ReadPartition(predicate=(col >= lo) & (col < hi), key=(lo, hi)))
                 lo = hi
                 if len(parts) > _MAX_WINDOWS:
                     return None
+            # Clip the last bucket to this range so it does not overlap the next range's buckets.
+            upper_pred = (col <= atomic.upper) if atomic.right == portion.CLOSED else (col < atomic.upper)
+            parts.append(ReadPartition(predicate=(col >= lo) & upper_pred, key=(lo, atomic.upper)))
         return parts or None
 
 

@@ -9,10 +9,22 @@ from portion import Bound, Interval
 from pydantic import AfterValidator, Field, TypeAdapter
 
 # Import from original code
-from .base import BaseExprNode, BinaryExprNode, CastNode, ExprVisitor, FunctionNode, TernaryNode, extract_column_name, get_parsed_expr
+from .base import (
+    AliasNode,
+    BaseExprNode,
+    BinaryExprNode,
+    CastNode,
+    ColumnNode,
+    ExprVisitor,
+    FunctionNode,
+    TernaryNode,
+    get_parsed_expr,
+    has_exact_value,
+)
 from .enum import (
     BooleanFunctionType,
     OperatorType,
+    TemporalFunctionType,
 )
 
 # Configure logging
@@ -73,6 +85,64 @@ def _create_point_interval(value) -> Interval:
     return portion.singleton(value)
 
 
+_DAY = datetime.timedelta(days=1)
+
+
+def _extract_column(node: BaseExprNode) -> tuple[str | None, datetime.timedelta]:
+    """Column under aliases and monotonic casts, and the unit (or zero) that a cast or ``dt.date()`` floored it to.
+
+    Other casts can wrap or reorder values, so no bound on the raw column follows from them.
+    """
+    floor = datetime.timedelta(0)
+    cur = node
+    while len(cur.expr.meta.root_names()) == 1:
+        if isinstance(cur, ColumnNode):
+            return cur.expr.meta.root_names()[0], floor
+        if isinstance(cur, FunctionNode) and cur.function_type == TemporalFunctionType.DATE and len(cur.inputs) == 1:
+            floor, cur = _DAY, cur.inputs[0]
+        elif isinstance(cur, CastNode) and cur.dtype == pl.Date:
+            floor, cur = _DAY, cur.input
+        elif isinstance(cur, CastNode) and isinstance(cur.dtype, pl.Datetime) and cur.dtype.time_unit in ("us", "ns"):
+            # A cast to us floors an ns column, and a cast from a coarser unit makes literals finer than the column.
+            floor = max(floor, datetime.timedelta(microseconds=1))
+            cur = cur.input
+        elif isinstance(cur, AliasNode) or (isinstance(cur, CastNode) and cur.dtype == pl.Float64):
+            cur = cur.input
+        else:
+            break
+    return None, datetime.timedelta(0)
+
+
+def _is_bound(value, floor: datetime.timedelta) -> bool:
+    """Whether a non-null literal can bound the column: a ``date`` or ``datetime`` matching the column's floor, if any."""
+    if value is None:
+        return False
+    if floor == _DAY:
+        return isinstance(value, datetime.date) and not isinstance(value, datetime.datetime)
+    return not floor or isinstance(value, datetime.datetime)
+
+
+def _unfloor(interval: Interval, floor: datetime.timedelta) -> Interval:
+    """Widen bounds on a column floored to ``floor`` to bounds on the column: a closed upper bound ``v`` becomes ``< v + floor``.
+
+    Under a sub-day floor the upper bound is kept closed (``<= v + floor``): the column may have a coarser unit than the
+    literal, and Polars truncates the literal to the column's unit, which would turn ``< t + 1us`` into ``< t``.
+    """
+
+    def widen(atomic: Interval) -> Interval:
+        if not floor or atomic.upper == portion.inf:
+            return atomic
+        upper = atomic.upper
+        if atomic.right == Bound.CLOSED:
+            try:
+                upper = upper + floor
+            except OverflowError:
+                upper = portion.inf
+        return atomic.replace(upper=upper, right=Bound.OPEN if floor == _DAY else Bound.CLOSED)
+
+    return interval.apply(widen)
+
+
 class IntervalVisitor(ExprVisitor[Interval]):
     """
     Visitor that extracts interval constraints for a specific column from expressions.
@@ -110,13 +180,13 @@ class IntervalVisitor(ExprVisitor[Interval]):
 
         if node.op.is_comparison():
             # Handle comparisons between column and literal
-            column = extract_column_name(node.left)
-            if column is None or not node.right.can_extract_literal:
-                return
-
-            if column != self.target_column:
+            column, floor = _extract_column(node.left)
+            if column != self.target_column or not _is_bound(node.right.value, floor) or not has_exact_value(node.right):
                 return
             raw_value = node.right.value
+            if node.op not in (OperatorType.EQ, OperatorType.EQ_VALIDITY) and isinstance(raw_value, str):
+                # An Enum column orders strings by category, not lexically.
+                return
 
             try:
                 if self.validate_value_func is not None:
@@ -128,28 +198,25 @@ class IntervalVisitor(ExprVisitor[Interval]):
                     # Use create_point to handle date expansion when needed
                     # We use the raw value here to allow for custom behavior
                     # before validation
-                    point_interval = self.create_point(raw_value)
-                    # Apply constraint via intersection
-                    self.constraints &= point_interval
+                    interval = self.create_point(raw_value)
                 elif node.op == OperatorType.GT:
                     # x > value (exclusive lower bound)
-                    gt_interval = Interval.from_atomic(Bound.OPEN, value, portion.inf, Bound.OPEN)
-                    self.constraints &= gt_interval
+                    interval = Interval.from_atomic(Bound.OPEN, value, portion.inf, Bound.OPEN)
                 elif node.op == OperatorType.GT_EQ:
                     # x >= value (inclusive lower bound)
-                    gte_interval = Interval.from_atomic(Bound.CLOSED, value, portion.inf, Bound.CLOSED)
-                    self.constraints &= gte_interval
+                    interval = Interval.from_atomic(Bound.CLOSED, value, portion.inf, Bound.CLOSED)
                 elif node.op == OperatorType.LT:
                     # x < value (exclusive upper bound)
-                    lt_interval = Interval.from_atomic(Bound.CLOSED, -portion.inf, value, Bound.OPEN)
-                    self.constraints &= lt_interval
+                    interval = Interval.from_atomic(Bound.CLOSED, -portion.inf, value, Bound.OPEN)
                 elif node.op == OperatorType.LT_EQ:
                     # x <= value (inclusive upper bound)
-                    lte_interval = Interval.from_atomic(Bound.CLOSED, -portion.inf, value, Bound.CLOSED)
-                    self.constraints &= lte_interval
+                    interval = Interval.from_atomic(Bound.CLOSED, -portion.inf, value, Bound.CLOSED)
+                else:
+                    return
+                self.constraints &= _unfloor(interval, floor)
 
             except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
-                log.info(f"Failed to create comparison constraint for value {value}: {e}")
+                log.info(f"Failed to create comparison constraint for value {raw_value}: {e}")
 
         elif node.op in [OperatorType.AND, OperatorType.LOGICAL_AND]:
             # For AND, visit both sides with the current constraints
@@ -189,12 +256,10 @@ class IntervalVisitor(ExprVisitor[Interval]):
 
         if node.function_type == BooleanFunctionType.IS_BETWEEN:
             # Handle BETWEEN function
-            column = extract_column_name(node.inputs[0])
-
-            if column is None or not node.inputs[1].can_extract_literal or not node.inputs[2].can_extract_literal:
-                return
-
-            if column != self.target_column:
+            column, floor = _extract_column(node.inputs[0])
+            if column != self.target_column or not all(
+                _is_bound(n.value, floor) and has_exact_value(n) and not isinstance(n.value, str) for n in node.inputs[1:3]
+            ):
                 return
 
             try:
@@ -206,7 +271,6 @@ class IntervalVisitor(ExprVisitor[Interval]):
                     upper = node.inputs[2].value
                 closed = node.options.get("closed", "Both")
                 # Create range based on closed parameter
-                between_interval = None
                 if closed == "Both":
                     between_interval = Interval.from_atomic(Bound.CLOSED, lower, upper, Bound.CLOSED)
                 elif closed == "Left":
@@ -216,28 +280,28 @@ class IntervalVisitor(ExprVisitor[Interval]):
                 else:  # "Neither"
                     between_interval = Interval.from_atomic(Bound.OPEN, lower, upper, Bound.OPEN)
 
-                if between_interval is not None:
-                    # Apply constraint via intersection
-                    self.constraints &= between_interval
+                self.constraints &= _unfloor(between_interval, floor)
 
             except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                 log.info(f"Failed to create BETWEEN constraint: {e}")
 
         elif node.function_type == BooleanFunctionType.IS_IN:
             # Handle IN function
-            column = extract_column_name(node.inputs[0])
-            if column is None or not node.inputs[1].can_extract_literal:
-                return
-
-            if column != self.target_column:
+            column, floor = _extract_column(node.inputs[0])
+            if column != self.target_column or not node.inputs[1].can_extract_literal:
                 return
 
             # We do not validate the values here since we pass them to
             # create_point directly
             values = node.inputs[1].value
+            # A one-element series literal extracts as a scalar.
+            values = values if isinstance(values, list) else [values]
             if not values:
                 # Empty IN list is always false - set to empty
                 self.constraints = portion.empty()
+                return
+            # A null (matched by ``nulls_equal=True``) or NaN value has no interval, so leave the column unconstrained.
+            if not all(_is_bound(value, floor) for value in values) or not has_exact_value(node.inputs[1], collection=True):
                 return
 
             # Create union of point intervals for each value
@@ -249,9 +313,9 @@ class IntervalVisitor(ExprVisitor[Interval]):
                     in_interval |= point_interval
                 except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
                     log.info(f"Failed to add IN value {value}: {e}")
+                    return
 
-            # Apply constraint by intersection
-            self.constraints &= in_interval
+            self.constraints &= _unfloor(in_interval, floor)
 
     def visit_ternary(self, node: TernaryNode) -> None:
         """
@@ -353,7 +417,10 @@ def _lookback_interval(interval: Interval, lookback: datetime.timedelta) -> Inte
     def _internal_apply(atomic_interval: Interval) -> Interval:
         if atomic_interval.lower == -portion.inf:
             return atomic_interval  # return as unchanged
-        lower = atomic_interval.lower - lookback
+        try:
+            lower = atomic_interval.lower - lookback
+        except OverflowError:
+            lower = -portion.inf
         return atomic_interval.replace(lower=lower)
 
     return interval.apply(_internal_apply)
@@ -372,19 +439,26 @@ def _lookahead_interval(interval: Interval, lookahead: datetime.timedelta) -> In
     def _internal_apply(atomic_interval: Interval) -> Interval:
         if atomic_interval.upper == portion.inf:
             return atomic_interval  # return as unchanged
-        upper = atomic_interval.upper + lookahead
+        try:
+            upper = atomic_interval.upper + lookahead
+        except OverflowError:
+            upper = portion.inf
         return atomic_interval.replace(upper=upper)
 
     return interval.apply(_internal_apply)
 
 
 def _extend_to_full_dates(interval: Interval) -> Interval:
-    """Extend closed intervals to cover full dates, ensuring that the lower bound is inclusive and the upper bound is exclusive."""
+    """Floor datetime bounds to dates for a ``Date`` column, closing an open upper bound after midnight so its date is kept."""
 
     def _internal_apply(atomic_interval: Interval) -> Interval:
         lower = atomic_interval.lower.date() if isinstance(atomic_interval.lower, datetime.datetime) else atomic_interval.lower
-        upper = atomic_interval.upper.date() if isinstance(atomic_interval.upper, datetime.datetime) else atomic_interval.upper
-        return atomic_interval.replace(lower=lower, upper=upper)
+        upper, right = atomic_interval.upper, atomic_interval.right
+        if isinstance(upper, datetime.datetime):
+            if upper.time() != datetime.time.min:
+                right = portion.CLOSED  # ``d < 2024-01-01 12:00`` keeps the date 2024-01-01.
+            upper = upper.date()
+        return atomic_interval.replace(lower=lower, upper=upper, right=right)
 
     return interval.apply(_internal_apply)
 
