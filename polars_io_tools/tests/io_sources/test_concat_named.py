@@ -1,13 +1,174 @@
 import datetime
 import decimal
+import io
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from statistics import median
+from time import perf_counter
 
 import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
+from polars_io_tools.io_sources.concat_named import concat_named
 
 from .conftest import io_source_assert
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["legacy", "resolver"])
+def use_resolver(request, monkeypatch):
+    monkeypatch.setattr(cpl, "concat_named", partial(cpl.concat_named, use_resolver=request.param))
+    return request.param
+
+
+@pytest.mark.benchmark
+@pytest.mark.skipif(not hasattr(pl.LazyFrame, "from_lazyframe_resolver"), reason="Requires both concat backends")
+@pytest.mark.parametrize("partition_count", [8, 64])
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("fresh_plan", [True, False], ids=["fresh", "reused"])
+def test_concat_named_benchmark(tmp_path, use_resolver, partition_count, workers, fresh_plan, capsys):
+    sources = {}
+    for partition in range(partition_count):
+        path = tmp_path / f"part-{partition}.parquet"
+        pl.DataFrame({"value": range(10000), "unused": range(10000)}).write_parquet(path)
+        sources[(partition,)] = pl.scan_parquet(path)
+    selected = list(range(0, partition_count, 4))
+    expected = pl.DataFrame({"value": list(range(7500, 10000)) * len(selected)})
+    worker_sources = [{key: frame.clone() for key, frame in sources.items()} for worker in range(workers)]
+
+    def build_query(inputs):
+        return cpl.concat_named(inputs, ["partition"]).filter(pl.col("partition").is_in(selected), pl.col("value") >= 7500).select("value")
+
+    queries = [build_query(inputs) for inputs in worker_sources]
+
+    def collect(worker):
+        query = build_query(worker_sources[worker]) if fresh_plan else queries[worker]
+        return query.collect()
+
+    timings = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for repetition in range(17):
+            started = perf_counter()
+            results = list(executor.map(collect, range(workers)))
+            elapsed_ms = (perf_counter() - started) * 1000
+            for result in results:
+                assert_frame_equal(result, expected)
+            if repetition >= 2:
+                timings.append(elapsed_ms)
+
+    with capsys.disabled():
+        print(
+            f"\nconcat_named benchmark: polars={pl.__version__} threads={pl.thread_pool_size()} "
+            f"backend={'resolver' if use_resolver else 'legacy'} partitions={partition_count} "
+            f"workers={workers} plan={'fresh' if fresh_plan else 'reused'} "
+            f"median_batch_ms={median(timings):.3f} min_batch_ms={min(timings):.3f} "
+            f"max_batch_ms={max(timings):.3f} samples={len(timings)} rows_per_query={expected.height}"
+        )
+
+
+@pytest.mark.skipif(not hasattr(pl.LazyFrame, "from_lazyframe_resolver"), reason="Requires the Polars resolver API")
+def test_concat_named_exposes_pruned_plan(tmp_path, use_resolver):
+    if not use_resolver:
+        pytest.skip("The legacy callback hides its inner plan")
+    selected_path = tmp_path / "selected.parquet"
+    rejected_path = tmp_path / "rejected.parquet"
+    pl.DataFrame({"value": [1, 2], "unused": [10, 20]}).write_parquet(selected_path)
+    pl.DataFrame({"value": [3, 4], "unused": [30, 40]}).write_parquet(rejected_path)
+    frame = (
+        cpl.concat_named(
+            {("selected",): pl.scan_parquet(selected_path), ("rejected",): pl.scan_parquet(rejected_path)},
+            ["source"],
+        )
+        .filter(pl.col("source") == "selected")
+        .select("value")
+    )
+
+    plan = frame.explain()
+    assert str(selected_path) in plan
+    assert str(rejected_path) not in plan
+    assert "PROJECT 1/2 COLUMNS" in plan
+    assert_frame_equal(frame.collect(), pl.DataFrame({"value": [1, 2]}))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param(lambda frame: frame.select(pl.len()), id="count"),
+        pytest.param(lambda frame: frame.filter(pl.col("source") == "bar").select(pl.len()), id="pruned-count"),
+        pytest.param(lambda frame: frame.filter(pl.col("source") == "bar").head(2), id="filter-before-limit"),
+        pytest.param(lambda frame: frame.slice(2, 3), id="cross-source-slice"),
+        pytest.param(lambda frame: frame.tail(2), id="negative-slice"),
+        pytest.param(lambda frame: frame.with_row_index().filter(pl.col("source") == "bar"), id="row-index-before-filter"),
+        pytest.param(lambda frame: frame.filter(pl.col("value") > 2).select("source"), id="filter-only-column"),
+        pytest.param(lambda frame: frame.filter((pl.col("source") == "foo") | (pl.col("value") > 5)), id="mixed-or"),
+        pytest.param(lambda frame: frame.filter(pl.col("source") == "missing").select(pl.len()), id="empty-count"),
+    ],
+)
+def test_concat_named_matches_native_query(query):
+    frame = cpl.concat_named(
+        {("foo",): pl.LazyFrame({"value": [1, 2, 3]}), ("bar",): pl.LazyFrame({"value": [4, 5, 6]})},
+        ["source"],
+    )
+    native = pl.LazyFrame({"value": [1, 2, 3, 4, 5, 6], "source": ["foo", "foo", "foo", "bar", "bar", "bar"]})
+    actual = query(frame)
+    expected = query(native).collect()
+
+    for repeat in range(2):
+        assert_frame_equal(actual.collect(), expected)
+
+
+def test_concat_named_limit_before_filter(use_resolver, request):
+    if not (use_resolver and hasattr(pl.LazyFrame, "from_lazyframe_resolver")):
+        request.applymarker(pytest.mark.xfail(reason="Legacy IO callback applies filters before the pushed limit", strict=True))
+    frame = cpl.concat_named(
+        {("foo",): pl.LazyFrame({"value": [1, 2, 3]}), ("bar",): pl.LazyFrame({"value": [4, 5, 6]})},
+        ["source"],
+    )
+    assert_frame_equal(frame.head(4).filter(pl.col("source") == "bar").collect(), pl.DataFrame({"value": [4], "source": ["bar"]}))
+
+
+def test_concat_named_serialized_queries_keep_independent_filters():
+    pytest.importorskip("cloudpickle")
+    frame = cpl.concat_named(
+        {("foo",): pl.LazyFrame({"value": [1, 2]}), ("bar",): pl.LazyFrame({"value": [3, 4]})},
+        ["source"],
+    )
+    selected = frame.filter(pl.col("source") == "foo").select("value")
+    assert_frame_equal(selected.collect(), pl.DataFrame({"value": [1, 2]}))
+
+    restored = pl.LazyFrame.deserialize(io.BytesIO(frame.serialize()))
+    assert_frame_equal(restored.filter(pl.col("source") == "bar").select("value").collect(), pl.DataFrame({"value": [3, 4]}))
+    assert_frame_equal(selected.collect(), pl.DataFrame({"value": [1, 2]}))
+
+
+def test_concat_named_shared_query_branches():
+    pytest.importorskip("cloudpickle")
+    frame = cpl.concat_named(
+        {("foo",): pl.LazyFrame({"value": [1, 2]}), ("bar",): pl.LazyFrame({"value": [3, 4]})},
+        ["source"],
+    )
+    combined = pl.concat([frame.filter(pl.col("source") == "foo"), frame.filter(pl.col("source") == "bar")]).select("value")
+    expected = pl.DataFrame({"value": [1, 2, 3, 4]})
+    for repeat in range(2):
+        assert_frame_equal(combined.collect(), expected)
+    restored = pl.LazyFrame.deserialize(io.BytesIO(combined.serialize()))
+    assert_frame_equal(restored.collect(), expected)
+
+
+def test_concat_named_default_wraps_source_errors():
+    source = pl.LazyFrame({"value": ["invalid"]}).select(pl.col("value").cast(pl.Int64))
+    with pytest.raises(pl.exceptions.ComputeError, match="Failed to collect lazy frame in concat_named"):
+        concat_named({("foo",): source}, ["source"]).collect()
+
+
+def test_concat_named_source_error_type(use_resolver):
+    source = pl.LazyFrame({"value": ["invalid"]}).select(pl.col("value").cast(pl.Int64))
+    expected_error = (
+        pl.exceptions.InvalidOperationError if use_resolver and hasattr(pl.LazyFrame, "from_lazyframe_resolver") else pl.exceptions.ComputeError
+    )
+    with pytest.raises(expected_error):
+        cpl.concat_named({("foo",): source}, ["source"]).collect()
 
 
 def test_concat_named_basic():
