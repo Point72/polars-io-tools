@@ -109,6 +109,38 @@ def test_complex_dnf():
     assert negate_dnf(dnf) == expected
 
 
+def test_boolean_column_predicate():
+    """A bare Boolean column and its negation are read as ``== True`` / ``== False``.
+
+    Polars >= 2.1 lowers ``col == True`` on a Boolean column to a bare column reference and
+    ``col == False`` to ``col.not()``; both forms must still enumerate a single partition value.
+    """
+    schema = pl.Schema({"flag": pl.Boolean})
+    assert convert_expr_to_dnf(pl.col("flag"), schema=schema) == [[("flag", "=", True)]]
+    assert convert_expr_to_dnf(pl.col("flag").not_(), schema=schema) == [[("flag", "=", False)]]
+    assert convert_expr_to_dnf(~pl.col("flag"), schema=schema) == [[("flag", "=", False)]]
+    assert convert_expr_to_dnf(pl.col("flag") == True, schema=schema) == [[("flag", "=", True)]]
+    assert convert_expr_to_dnf(pl.col("flag") == False, schema=schema) == [[("flag", "=", False)]]
+    # Without a schema a bare column predicate is still Boolean by definition.
+    assert convert_expr_to_dnf(pl.col("flag")) == [[("flag", "=", True)]]
+
+
+def test_non_boolean_cast_to_boolean_not_misread():
+    """``col.cast(Boolean)`` on a non-Boolean column is ``int != 0``, not ``col == True``.
+
+    The cast must not be read as ``col == True`` whether or not a schema is supplied, otherwise valid
+    non-1 integer rows would be excluded and a false contradiction could be reported.
+    """
+    schema = pl.Schema({"x": pl.Int64})
+    assert convert_expr_to_dnf(pl.col("x").cast(pl.Boolean), schema=schema) is None
+    # Without a schema the integer column must still not be assumed Boolean.
+    assert convert_expr_to_dnf(pl.col("x").cast(pl.Boolean)) is None
+    # A row with x == 2 satisfies ``x.cast(Boolean) & (x == 2)``; it must not be flagged a contradiction.
+    dnf = convert_expr_to_dnf(pl.col("x").cast(pl.Boolean) & (pl.col("x") == 2))
+    assert dnf == [[("x", "=", 2)]]
+    assert not is_contradiction(dnf[0])
+
+
 def test_equal_date():
     """Test equality with date objects."""
     # Create a date object
