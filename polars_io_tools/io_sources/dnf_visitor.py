@@ -14,6 +14,7 @@ from .base import (
     BaseExprNode,
     BinaryExprNode,
     CastNode,
+    ColumnNode,
     ExprVisitor,
     FunctionNode,
     TernaryNode,
@@ -418,6 +419,17 @@ class DNFVisitor(ExprVisitor[DNF | None]):
             # A comparison with a null literal is null on every row, so it has no well-defined negation.
             self.negation_safe = value is not None
 
+    def visit_column(self, node: ColumnNode) -> None:
+        """Handle a bare column reference used as a predicate."""
+        # A column standing alone in a predicate is a Boolean mask, equivalent to ``col == True``
+        # (Polars >= 2.1 lowers ``col == True`` on a Boolean column to this bare form). A non-Boolean
+        # column here comes from a cast-to-Boolean predicate (``int != 0``), so skip it when the schema
+        # shows the column is not Boolean.
+        if self.schema is not None and (self.schema or {}).get(node.name) != pl.Boolean:
+            return
+        self.result_dnf = [[(node.name, "=", True)]]
+        self.negation_safe = True
+
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         """Handle binary expressions (comparisons and logical operations)"""
         if node.op.is_comparison():
@@ -498,7 +510,15 @@ class DNFVisitor(ExprVisitor[DNF | None]):
         # Handle NOT function
         elif node.function_type == BooleanFunctionType.NOT:
             if len(node.inputs) > 0:
-                inner_dnf, inner_safe = self._subconvert(node.inputs[0])
+                inner = node.inputs[0]
+                if isinstance(inner, ColumnNode) and (self.schema is None or (self.schema or {}).get(inner.name) == pl.Boolean):
+                    # ``col.not()`` on a Boolean column keeps only the False rows (nulls are dropped), matching
+                    # ``col == False``. Polars >= 2.1 lowers ``col == False`` to this form. Emit the positive
+                    # equality rather than ``!= True`` so the value stays enumerable for partition pruning.
+                    self.result_dnf = [[(inner.name, "=", False)]]
+                    self.negation_safe = True
+                    return
+                inner_dnf, inner_safe = self._subconvert(inner)
                 if inner_dnf is not None and inner_safe:
                     self.result_dnf = negate_dnf(inner_dnf)
                     self.negation_safe = True
@@ -561,8 +581,12 @@ class DNFVisitor(ExprVisitor[DNF | None]):
     def visit_cast(self, node: CastNode) -> None:
         """Handle cast expressions."""
         if node.dtype == pl.Boolean:
-            # If casting to boolean, process the underlying expression,
-            # since it might be a duplicative expression.
+            # Only look through a ``cast(Boolean)`` when it is a no-op over an already-Boolean input.
+            # A non-Boolean cast (e.g. an integer, meaning ``!= 0``) must not be read as ``== True``, so
+            # when the input is a bare column, unwrap only if the schema proves the column is Boolean.
+            col = extract_value_preserving_column_name(node.input, self.schema)
+            if col is not None and (self.schema or {}).get(col) != pl.Boolean:
+                return
             self.visit(node.input)
 
     def visit_alias(self, node: AliasNode) -> None:

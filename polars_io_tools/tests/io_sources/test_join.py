@@ -6,10 +6,24 @@ import pytest
 from packaging import version
 from polars.testing import assert_frame_equal
 
-from polars_io_tools.io_sources.base import BinaryExprNode, get_literal_value, get_parsed_expr
+from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, LiteralNode, get_literal_value, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
 
 from .conftest import io_source_assert
+
+# Polars 2.1.0 pushes the post-join filter into the right side of a (forward) asof join itself and
+# lowers ``col == True`` on a Boolean column to a bare column reference. Both change the shape of the
+# predicate the right source observes, without changing results.
+_POLARS_PUSHES_ASOF_FILTER = version.parse(pl.__version__) >= version.parse("2.1.0")
+
+
+def _flatten_conjuncts(node):
+    """Yield the atomic (non-AND) nodes of an AND-tree of predicates."""
+    if isinstance(node, BinaryExprNode) and node.op in (OperatorType.AND, OperatorType.LOGICAL_AND):
+        yield from _flatten_conjuncts(node.left)
+        yield from _flatten_conjuncts(node.right)
+    else:
+        yield node
 
 
 def test_filtered_join_basic():
@@ -238,6 +252,9 @@ def test_filtered_join_multiple_columns_with_extra_filter():
                 if cond.left.expr.meta == pl.col("active"):
                     assert get_literal_value(cond.right.expr) is True
                     found["active_eq"] = True
+            elif isinstance(cond, ColumnNode) and cond.name == "active":
+                # Polars >= 2.1 lowers ``active == True`` on a Boolean column to a bare column reference.
+                found["active_eq"] = True
 
         # Ensure we found all expected conditions
         for condition_name, was_found in found.items():
@@ -656,20 +673,27 @@ def test_filtered_join_asof_basic_backward(include_id, filters, on_same_column, 
             # Order does not matter, so we use set to compare
             assert {filter_left_value, filter_right_value} == {expr_left_value, expr_right_value}
             return
-        # If we only have 1 filter, we should have 1 value pushed down.
-        parsed_value = parsed_expr.right.value
-        if filter_right_binary:
-            if strategy in ["forward", "nearest"]:
-                # then we shift the upper bound in the 2 filters case
-                parsed_value -= tolerance
-        else:
-            if strategy in ["backward", "nearest"]:
-                # We shift the lower bound in the 1 filter case
-                parsed_value += tolerance
-
-        assert parsed_value in filter_values
+        # If we only have 1 filter, we should have 1 value pushed down. Polars >= 2.1 may AND its own
+        # pushdown of the outer filter alongside ours, so search the conjuncts for our tolerance bound.
         target_col = right_on if right_on is not None else on
-        assert parsed_expr.left.name == target_col
+
+        def is_our_bound(atom) -> bool:
+            if not (isinstance(atom, BinaryExprNode) and isinstance(atom.right, LiteralNode)):
+                return False
+            if atom.left.name != target_col:
+                return False
+            parsed_value = atom.right.value
+            if filter_right_binary:
+                if strategy in ["forward", "nearest"]:
+                    # then we shift the upper bound in the 2 filters case
+                    parsed_value -= tolerance
+            else:
+                if strategy in ["backward", "nearest"]:
+                    # We shift the lower bound in the 1 filter case
+                    parsed_value += tolerance
+            return parsed_value in filter_values
+
+        assert any(is_our_bound(atom) for atom in _flatten_conjuncts(parsed_expr)), f"tolerance bound not pushed: {predicate!r}"
 
     right_lf = io_source_assert(df_right, assert_func)
 
@@ -775,8 +799,10 @@ def test_filtered_join_asof_no_tolerance(strategy):
     """Test filtered_join_asof without tolerance parameter."""
     df_left = pl.DataFrame(
         {
-            "timestamp": [datetime(2023, 1, 1, 9, 5, 0)],
-            "id": [1],
+            # 09:05 is dropped by the filter; 09:06 survives and its backward/nearest match (09:03)
+            # sits below the filter threshold, so unsafe right-side pruning would change the result.
+            "timestamp": [datetime(2023, 1, 1, 9, 5, 0), datetime(2023, 1, 1, 9, 6, 0)],
+            "id": [1, 2],
         }
     ).with_columns(pl.col("timestamp").set_sorted())
 
@@ -794,8 +820,18 @@ def test_filtered_join_asof_no_tolerance(strategy):
     filters = [pl.col("timestamp") > datetime(2023, 1, 1, 9, 5, 0)]
 
     def assert_func(predicate):
-        # Without tolerance, we do not push down on the right side.
-        assert predicate is None
+        # Without tolerance we add no right-side bound. Polars >= 2.1 may itself push the post-join filter
+        # into the right side of a *forward* asof join (where the matched right key is >= the left key);
+        # that is unsound for backward/nearest, so only forward may carry a pushed bound, and it must be a
+        # lower bound on the raw filter value (never tolerance-widened).
+        if predicate is None:
+            return
+        assert _POLARS_PUSHES_ASOF_FILTER and strategy == "forward", f"unexpected right-side predicate for {strategy}: {predicate!r}"
+        for atom in _flatten_conjuncts(get_parsed_expr(predicate)):
+            assert isinstance(atom, BinaryExprNode) and isinstance(atom.right, LiteralNode)
+            assert atom.left.name == "timestamp"
+            assert atom.op in (OperatorType.GT, OperatorType.GT_EQ)
+            assert atom.right.value == datetime(2023, 1, 1, 9, 5, 0)
 
     right_lf = io_source_assert(df_right, assert_func)
 
