@@ -10,6 +10,7 @@ from pydantic import AfterValidator, Field, TypeAdapter
 
 # Import from original code
 from .base import (
+    FAILED_LITERAL_RESULT,
     AliasNode,
     BaseExprNode,
     BinaryExprNode,
@@ -116,6 +117,16 @@ def _extract_column(node: BaseExprNode) -> tuple[str | None, datetime.timedelta]
 _US = datetime.timedelta(microseconds=1)
 
 
+def _next_microsecond(value: datetime.datetime) -> datetime.datetime:
+    """The instant one microsecond after ``value``, added on the UTC timeline when ``value`` is timezone-aware.
+
+    Aware arithmetic in Python is wall-clock and resets ``fold``, so inside a repeated DST hour it would move the instant.
+    """
+    if value.tzinfo is not None:
+        value = value.astimezone(datetime.UTC)
+    return value + _US
+
+
 def _is_bound(value, floor: datetime.timedelta) -> bool:
     """Whether a non-null literal can bound the column: a ``date`` or ``datetime`` matching the column's floor, if any."""
     if value is None:
@@ -139,7 +150,7 @@ def _rounded_bound_value(node: BaseExprNode, *, round_up: bool):
         return node.value
     value = node.value
     if isinstance(value, datetime.datetime):
-        return value + _US if round_up else value
+        return _next_microsecond(value) if round_up else value
     return None
 
 
@@ -202,7 +213,8 @@ class IntervalVisitor(ExprVisitor[Interval]):
         """
         if not isinstance(value, datetime.datetime):
             return None
-        lower, upper = value, value + _US
+        lower = value.astimezone(datetime.UTC) if value.tzinfo is not None else value
+        upper = _next_microsecond(value)
         if self.validate_value_func is not None:
             lower, upper = self.validate_value_func(lower), self.validate_value_func(upper)
         return Interval.from_atomic(Bound.CLOSED, lower, upper, Bound.CLOSED)
@@ -339,7 +351,7 @@ class IntervalVisitor(ExprVisitor[Interval]):
         elif node.function_type == BooleanFunctionType.IS_IN:
             # Handle IN function
             column, floor = _extract_column(node.inputs[0])
-            if column != self.target_column or not node.inputs[1].can_extract_literal:
+            if column != self.target_column or not node.inputs[1].can_extract_literal or node.inputs[1].value is FAILED_LITERAL_RESULT:
                 return
 
             # We do not validate the values here since we pass them to

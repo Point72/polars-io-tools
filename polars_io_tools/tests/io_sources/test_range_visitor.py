@@ -1795,6 +1795,40 @@ class TestNanosecondInexactBoundStaysFiniteSuperset:
         kept_by_range = df if range_expr is None or range_expr is True else df.filter(range_expr)
         assert df.filter(pred).join(kept_by_range, on="d", how="anti").is_empty()
 
+    # 2024-11-03 06:30:00 UTC plus 999 ns: 01:30 in the repeated (fall-back) hour in New York, the second pass (fold=1).
+    _NY = pl.Datetime("ns", "America/New_York")
+    _NY_REPEATED = pl.lit(pl.Series([datetime(2024, 11, 3, 6, 30)], dtype=pl.Datetime("ns")).to_physical()[0] + 999).cast(_NY)
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            pl.col("t") == _NY_REPEATED,
+            pl.col("t").is_in(pl.concat_list(_NY_REPEATED)),
+            pl.col("t") < _NY_REPEATED,
+            pl.col("t") <= _NY_REPEATED,
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="both"),
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="left"),
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="right"),
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="none"),
+        ],
+    )
+    def test_rounding_up_in_repeated_dst_hour_keeps_matching_rows(self, pred):
+        """Adding a microsecond to an aware datetime is wall-clock arithmetic that resets ``fold``; it must not move the bound back an hour."""
+        times = [datetime(2024, 11, 3, h, m, tzinfo=UTC) for h, m in [(4, 30), (5, 0), (5, 30), (6, 0), (6, 29), (6, 30)]]
+        df = pl.DataFrame({"t": pl.Series(times).cast(self._NY).dt.offset_by("999ns")}).vstack(pl.DataFrame({"t": pl.Series(times).cast(self._NY)}))
+        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+        matching = df.filter(pred)["t"].to_physical().to_list()
+        assert matching
+        # Compare in UTC nanoseconds: the range holds naive UTC bounds.
+        to_ns = lambda b: (b - datetime(1970, 1, 1)) // timedelta(microseconds=1) * 1000
+        interval_ns = interval.apply(lambda a: a.replace(lower=to_ns, upper=to_ns))
+        assert all(t in interval_ns for t in matching)
+
+    def test_is_in_with_failed_literal_leaves_column_unconstrained(self):
+        # A ``Datetime("us")`` value outside Python's year range: extracting it fails, which must not raise.
+        members = pl.Series([1_704_153_600_000_000_000], dtype=pl.Int64).cast(pl.Datetime("us"))
+        assert convert_expr_to_datetime_range(pl.col("t").is_in(members), "t") == portion.open(-portion.inf, portion.inf)
+
 
 @pytest.mark.parametrize(
     ("dtype", "t", "pred", "kwargs"),
