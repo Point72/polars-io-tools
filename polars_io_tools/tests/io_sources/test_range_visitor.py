@@ -1647,8 +1647,6 @@ class TestUnusableLiteralsLeaveColumnUnconstrained:
             pl.col("t").eq_missing(None),
             pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True),
             pl.col("t").is_in([None], nulls_equal=True),
-            pl.col("t") < _NS_LITERAL,
-            pl.col("t").is_in(pl.concat_list(_NS_LITERAL)),
         ],
     )
     def test_datetime(self, expr):
@@ -1696,6 +1694,140 @@ def test_microsecond_cast_bound_covers_sub_microseconds(op):
 def test_floored_membership_at_maximum_is_unbounded():
     pred = pl.col("t").cast(pl.Datetime("us")).is_in([datetime.max])
     assert convert_expr_to_datetime_range(pred, "t").upper == portion.inf
+
+
+class TestNanosecondInexactBoundStaysFiniteSuperset:
+    """A nanosecond bound with a sub-microsecond part is not exactly representable as a Python ``datetime``.
+
+    Polars holds microseconds, so such a bound floors to the microsecond. Rather than discard it (which loses the whole
+    ``is_between`` window and leaves the range unbounded, issue #92), it is rounded to microseconds away from the kept
+    side — down for a lower bound, up for an upper bound — so the range stays finite and keeps every matching row. An
+    equality or ``is_in`` member against such a literal widens to its enclosing microsecond window rather than dropping
+    to unbounded.
+    """
+
+    # 2024-01-02 00:00:00 plus 999 ns, the widened upper bound Polars pushes for an inclusive ``<=`` on a ns column.
+    _NS_UPPER = pl.lit(pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0] + 999).cast(pl.Datetime("ns"))
+
+    def test_is_between_window_is_not_lost(self):
+        pred = pl.col("t").is_between(datetime(2024, 1, 1), self._NS_UPPER)
+        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+        assert interval.lower == datetime(2024, 1, 1) and interval.upper == datetime(2024, 1, 2, 0, 0, 0, 1)
+
+    def test_equality_widens_to_microsecond_window(self):
+        interval = convert_expr_to_datetime_range(pl.col("t") == self._NS_UPPER, "t", get_enclosure=False)
+        assert interval.lower == datetime(2024, 1, 2) and interval.upper == datetime(2024, 1, 2, 0, 0, 0, 1)
+        assert interval.left == portion.CLOSED and interval.right == portion.CLOSED
+
+    def test_is_in_keeps_exact_member_as_point_and_widens_sub_microsecond_member(self):
+        base = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
+        exact = base - 1_000_000_000  # one second earlier, an exact microsecond
+        members = pl.Series([exact, base + 999], dtype=pl.Int64).cast(pl.Datetime("ns"))
+        interval = convert_expr_to_datetime_range(pl.col("t").is_in(members), "t", get_enclosure=False)
+        assert interval == portion.singleton(datetime(2024, 1, 1, 23, 59, 59)) | portion.closed(
+            datetime(2024, 1, 2), datetime(2024, 1, 2, 0, 0, 0, 1)
+        )
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            pl.col("t").is_between(datetime(2024, 1, 1), _NS_UPPER),
+            pl.col("t").is_between(datetime(2024, 1, 1), _NS_UPPER, closed="right"),
+            pl.col("t") <= _NS_UPPER,
+            pl.col("t") < _NS_UPPER,
+            pl.col("t") >= _NS_UPPER,
+            pl.col("t") > _NS_UPPER,
+            pl.col("t") == _NS_UPPER,
+        ],
+    )
+    def test_range_keeps_every_matching_row(self, pred):
+        base = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
+        offsets = [-2000, -1, 0, 1, 500, 999, 1000, 2000]
+        t = pl.Series([base + o for o in offsets], dtype=pl.Int64).cast(pl.Datetime("ns"))
+        df = pl.DataFrame({"t": t})
+        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+        assert not interval.empty and interval != portion.open(-portion.inf, portion.inf)
+        range_expr = _convert_interval_to_polars_expr(interval, "t")
+        kept_by_range = df if range_expr is None else df.filter(range_expr)
+        dropped = df.filter(pred).join(kept_by_range, on="t", how="anti")
+        assert dropped.is_empty()
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            ~(pl.col("t") < _NS_UPPER),
+            ~(pl.col("t") <= _NS_UPPER),
+            ~(pl.col("t") > _NS_UPPER),
+            ~(pl.col("t") >= _NS_UPPER),
+            pl.col("t") != _NS_UPPER,
+            ~pl.col("t").is_between(datetime(2024, 1, 1), _NS_UPPER),
+            ~(~(pl.col("t") < _NS_UPPER)),
+        ],
+    )
+    def test_negation_does_not_narrow_below_matching_rows(self, pred):
+        """Widening a bound must not invert into a too-narrow range under ``NOT``.
+
+        The visitor never complements an interval, so a negated subexpression collapses to the universe (the safe
+        superset) rather than an inverted-narrow range. The extracted range must still keep every matching row.
+        """
+        base = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
+        offsets = [-2000, -1, 0, 1, 500, 999, 1000, 2000]
+        t = pl.Series([base + o for o in offsets], dtype=pl.Int64).cast(pl.Datetime("ns"))
+        df = pl.DataFrame({"t": t})
+        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+        range_expr = _convert_interval_to_polars_expr(interval, "t")
+        kept_by_range = df if range_expr is None else df.filter(range_expr)
+        dropped = df.filter(pred).join(kept_by_range, on="t", how="anti")
+        assert dropped.is_empty()
+
+    @pytest.mark.parametrize("op", [operator.ge, operator.gt, operator.eq, operator.le, operator.lt])
+    def test_sub_microsecond_negative_duration_bound_keeps_matching_rows(self, op):
+        """Polars converts a negative ``Duration("ns")`` toward zero, not flooring like a datetime.
+
+        Rounding such a literal like a datetime would push a lower bound past matching rows and drop them. A sub-
+        microsecond duration bound must instead stay unusable (unconstrained), preserving the superset guarantee.
+        """
+        d = pl.Series([-1200, -1001, -1, 0, 1, 1200], dtype=pl.Int64).cast(pl.Duration("ns"))
+        df = pl.DataFrame({"d": d})
+        pred = op(pl.col("d"), pl.lit(-1200).cast(pl.Duration("ns")))
+        interval = convert_expr_to_range(pred, "d")
+        range_expr = _convert_interval_to_polars_expr(interval, "d")
+        kept_by_range = df if range_expr is None or range_expr is True else df.filter(range_expr)
+        assert df.filter(pred).join(kept_by_range, on="d", how="anti").is_empty()
+
+    # 2024-11-03 06:30:00 UTC plus 999 ns: 01:30 in the repeated (fall-back) hour in New York, the second pass (fold=1).
+    _NY = pl.Datetime("ns", "America/New_York")
+    _NY_REPEATED = pl.lit(pl.Series([datetime(2024, 11, 3, 6, 30)], dtype=pl.Datetime("ns")).to_physical()[0] + 999).cast(_NY)
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            pl.col("t") == _NY_REPEATED,
+            pl.col("t").is_in(pl.concat_list(_NY_REPEATED)),
+            pl.col("t") < _NY_REPEATED,
+            pl.col("t") <= _NY_REPEATED,
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="both"),
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="left"),
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="right"),
+            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="none"),
+        ],
+    )
+    def test_rounding_up_in_repeated_dst_hour_keeps_matching_rows(self, pred):
+        """Adding a microsecond to an aware datetime is wall-clock arithmetic that resets ``fold``; it must not move the bound back an hour."""
+        times = [datetime(2024, 11, 3, h, m, tzinfo=UTC) for h, m in [(4, 30), (5, 0), (5, 30), (6, 0), (6, 29), (6, 30)]]
+        df = pl.DataFrame({"t": pl.Series(times).cast(self._NY).dt.offset_by("999ns")}).vstack(pl.DataFrame({"t": pl.Series(times).cast(self._NY)}))
+        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+        matching = df.filter(pred)["t"].to_physical().to_list()
+        assert matching
+        # Compare in UTC nanoseconds: the range holds naive UTC bounds.
+        to_ns = lambda b: (b - datetime(1970, 1, 1)) // timedelta(microseconds=1) * 1000
+        interval_ns = interval.apply(lambda a: a.replace(lower=to_ns, upper=to_ns))
+        assert all(t in interval_ns for t in matching)
+
+    def test_is_in_with_failed_literal_leaves_column_unconstrained(self):
+        # A ``Datetime("us")`` value outside Python's year range: extracting it fails, which must not raise.
+        members = pl.Series([1_704_153_600_000_000_000], dtype=pl.Int64).cast(pl.Datetime("us"))
+        assert convert_expr_to_datetime_range(pl.col("t").is_in(members), "t") == portion.open(-portion.inf, portion.inf)
 
 
 @pytest.mark.parametrize(
