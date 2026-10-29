@@ -83,7 +83,9 @@ class FilterSpec:
         value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform filter values before applying to source.
             Used when the source uses different values than the output column.
             Can be a dict for direct mapping or a callable for custom logic.
-            Only applies to equality (==) and is_in() filters; range filters on a mapped column are not pushed down.
+            A dict applies only to equality (==) and is_in() filters. A callable also maps the bounds of a
+            date/datetime range filter, before lookback/lookahead; it must then be non-decreasing (e.g. a date
+            offset), or the pushed range may drop rows.
 
     Examples:
         Same column name, no transformation::
@@ -186,6 +188,27 @@ def _map_bound(value: Any, mapping: dict | Callable | None) -> tuple[Any, bool]:
     if value in mapping:
         return mapping[value], True
     return value, False
+
+
+def _map_interval(interval: portion.Interval, mapping: Callable[[Any], Any]) -> portion.Interval | None:
+    """Map the finite bounds of each atomic interval through a callable ``value_mapping``.
+
+    The mapping is assumed non-decreasing (e.g. a date offset), so ``[f(lo), f(hi)]`` covers the image of
+    ``[lo, hi]``. Mapped bounds are closed because a non-decreasing map can send an open bound's neighbours
+    onto the mapped bound. Returns ``None`` (do not push) if the callable raises or maps a lower bound above its
+    upper bound, since the mapping then decreases.
+    """
+    mapped = portion.empty()
+    try:
+        for atomic in interval:
+            lo = atomic.lower if atomic.lower == -portion.inf else mapping(atomic.lower)
+            hi = atomic.upper if atomic.upper == portion.inf else mapping(atomic.upper)
+            if lo > hi:
+                return None
+            mapped |= portion.Interval.from_atomic(portion.CLOSED, lo, hi, portion.CLOSED)
+    except Exception:  # noqa: BLE001 -- intentional broad catch: an arbitrary user callable defers to the post-combine filter
+        return None
+    return mapped
 
 
 def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> tuple[set[Any], set[Any]]:
@@ -517,6 +540,10 @@ def pushdown_combine(
         2. combine() runs and creates ``region`` column from ``region_code``
         3. Original filter ``region == "NORTH_AMERICA"`` applied, ensuring correctness
 
+        A callable ``value_mapping`` on a date/datetime column also maps the bounds of a range filter, then
+        applies lookback/lookahead: with ``FilterSpec(source_col="data_date", value_mapping=lambda d: d - timedelta(days=1))``,
+        ``date >= 2024-01-06`` pushes ``data_date >= 2024-01-05``.
+
         **Shared source column (union of discrete filters):**
 
         When multiple output columns map to the same ``source_col`` (e.g. a self-join that exposes
@@ -698,8 +725,17 @@ def pushdown_combine(
 
                     # Only apply lookback/lookahead to temporal columns. Bounds are naive UTC while date bounds stand for
                     # local days, so neither can be compared with a timezone-aware column and it is left unfiltered.
-                    # value_mapping is applied only to discrete values, so a mapped column is left to the discrete pass.
-                    if _is_temporal_dtype(source_dtype) and getattr(source_dtype, "time_zone", None) is None and spec.value_mapping is None:
+                    if not _is_temporal_dtype(source_dtype) or getattr(source_dtype, "time_zone", None) is not None:
+                        date_range = None
+                    # A callable value_mapping maps the range bounds before lookback/lookahead. A dict cannot map the
+                    # values inside a range, so a dict-mapped column (or one whose bounds fail to map) is left to the
+                    # discrete pass.
+                    elif callable(spec.value_mapping):
+                        date_range = _map_interval(date_range, spec.value_mapping)
+                    elif spec.value_mapping is not None:
+                        date_range = None
+
+                    if date_range is not None:
                         expanded_range = date_range
                         has_expansion = bool(spec.lookback) or bool(spec.lookahead)
 

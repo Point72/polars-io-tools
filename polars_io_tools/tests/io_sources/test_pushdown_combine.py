@@ -2776,3 +2776,83 @@ def test_null_accepting_filter_not_pushed_below_left_join(pred):
 
     lf = pushdown_combine({"l": (left, {}), "r": (right, {"v": FilterSpec()})}, combine)
     assert_frame_equal(lf.filter(pred).collect(), combine({"l": left, "r": right}).filter(pred).collect(), check_row_order=False)
+
+
+class TestCallableValueMappingRange:
+    """A callable value_mapping maps temporal range bounds onto the source column, then applies lookback."""
+
+    SOURCE = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(10))})
+
+    @staticmethod
+    def _offset(d):
+        return d - timedelta(days=1)
+
+    @staticmethod
+    def _combine(s):
+        return s["s"].with_columns((pl.col("data_date") + pl.duration(days=1)).alias("date"))
+
+    def _run(self, specs, pred):
+        tracker = PredicateTracker(self.SOURCE)
+        result = pushdown_combine({"s": (tracker.lazy_frame, specs)}, self._combine).filter(pred).collect()
+        assert_frame_equal(result, self._combine({"s": self.SOURCE.lazy()}).filter(pred).collect())
+        return tracker
+
+    def test_lower_bound_with_lookback(self):
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=3), value_mapping=self._offset)
+        analyzer = self._run({"date": spec}, pl.col("date") >= date(2024, 1, 6)).get_analyzer()
+        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(2024, 1, 2), None)
+
+    def test_closed_range(self):
+        spec = FilterSpec(source_col="data_date", value_mapping=self._offset)
+        analyzer = self._run({"date": spec}, pl.col("date").is_between(date(2024, 1, 4), date(2024, 1, 7))).get_analyzer()
+        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(2024, 1, 3), date(2024, 1, 6))
+
+    @pytest.mark.parametrize(
+        ("pred", "bounds"),
+        [
+            (pl.col("date") == date(2024, 1, 6), (date(2024, 1, 5), date(2024, 1, 5))),
+            (pl.col("date") <= date(2024, 1, 6), (None, date(2024, 1, 5))),
+        ],
+    )
+    def test_unconstrained_identity_sibling_does_not_void_mapped_pushdown(self, pred, bounds):
+        specs = {"data_date": FilterSpec(), "date": FilterSpec(source_col="data_date", value_mapping=self._offset)}
+        analyzer = self._run(specs, pred).get_analyzer()
+        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == bounds
+
+    def test_decreasing_mapping_is_not_pushed(self):
+        spec = FilterSpec(source_col="data_date", value_mapping=lambda d: date(2024, 1, 11) - (d - date(2024, 1, 1)))
+        tracker = self._run({"date": spec}, pl.col("date").is_between(date(2024, 1, 4), date(2024, 1, 7)))
+        assert tracker.last_predicate is None
+
+    def test_datetime_source_maps_date_literal_before_full_day_widening(self):
+        src = pl.DataFrame({"ts": [datetime(2024, 1, d, h) for d in range(3, 8) for h in (0, 12, 23)]})
+
+        def combine(s):
+            return s["s"].with_columns((pl.col("ts").dt.date() + pl.duration(days=1)).alias("date"))
+
+        tracker = PredicateTracker(src)
+        spec = FilterSpec(source_col="ts", value_mapping=self._offset)
+        pred = pl.col("date") == date(2024, 1, 6)
+        result = pushdown_combine({"s": (tracker.lazy_frame, {"date": spec})}, combine).filter(pred).collect()
+        assert_frame_equal(result, combine({"s": src.lazy()}).filter(pred).collect())
+        assert result.height == 3
+        assert tracker.get_analyzer().find_temporal_filter("ts") is not None
+
+    def test_open_bound_is_closed_after_mapping(self):
+        # A non-strict mapping (calendar date -> capped source date) sends values just above an open bound onto the
+        # mapped bound itself, so ``date > Jan 6`` must push ``data_date >= Jan 5``, not ``> Jan 5``.
+        spine = pl.LazyFrame({"date": [date(2024, 1, d) for d in range(1, 11)]})
+        src = pl.LazyFrame({"data_date": [date(2024, 1, d) for d in range(1, 6)], "v": list(range(5))})
+        cap = date(2024, 1, 5)
+
+        def combine(s):
+            return s["spine"].with_columns(pl.min_horizontal("date", pl.lit(cap)).alias("data_date")).join(s["src"], on="data_date")
+
+        sources = {
+            "spine": (spine, {"date": FilterSpec()}),
+            "src": (src, {"date": FilterSpec(source_col="data_date", value_mapping=lambda d: min(d, cap))}),
+        }
+        pred = pl.col("date") > date(2024, 1, 6)
+        result = pushdown_combine(sources, combine).filter(pred).collect()
+        assert_frame_equal(result, combine({"spine": spine, "src": src}).filter(pred).collect(), check_row_order=False)
+        assert result.height == 4
