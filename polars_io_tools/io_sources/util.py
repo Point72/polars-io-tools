@@ -15,7 +15,7 @@ import polars as pl
 import portion
 from packaging import version
 
-from .._compat import POLARS_GE_2, POLARS_HAS_COLLECT_BATCHES
+from .._compat import POLARS_GE_2, POLARS_HAS_COLLECT_BATCHES, POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
 
 log = logging.getLogger(__name__)
 
@@ -220,10 +220,11 @@ def collect_lf_in_io_source(
 
     Yields a single DataFrame when ``batch_size`` is ``None`` and one or more DataFrames of approximately ``batch_size`` rows otherwise.
 
-    This helper centralizes the streaming-vs-non-streaming choice for io_source callbacks. It avoids ``LazyFrame.collect_batches`` whenever the polars
-    thread pool only has a single worker, because calling ``collect_batches`` from inside an io_source callback under ``POLARS_MAX_THREADS=1`` deadlocks
-    polars' Rayon scheduler when the outer plan involves a join with a pushed-down predicate. See
-    ``polars_io_tools/tests/io_sources/test_single_thread_deadlock.py`` for the regression test that pins this behavior.
+    This helper centralizes the streaming-vs-non-streaming choice for io_source callbacks. On older polars runtimes it avoids
+    ``LazyFrame.collect_batches`` whenever the polars thread pool only has a single worker, because calling ``collect_batches`` from inside an io_source
+    callback under ``POLARS_MAX_THREADS=1`` deadlocked polars' Rayon scheduler when the outer plan involved a join with a pushed-down predicate. That
+    deadlock is fixed on verified runtimes (``POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN``, polars >= 1.43.2), where ``collect_batches`` is used
+    regardless of thread count. See ``polars_io_tools/tests/io_sources/test_single_thread_deadlock.py`` for the regression test that pins this behavior.
 
     When the fallback path is taken, ``LazyFrame.collect`` materializes the whole frame and ``DataFrame.iter_slices`` yields zero-copy views. Callers
     that need each yielded DataFrame to be a single contiguous chunk should apply ``.rechunk()`` themselves on the yielded values.
@@ -234,13 +235,14 @@ def collect_lf_in_io_source(
     ``batch_size``; for typical io_sources whose upstream already streams in row-bounded chunks the
     inner frame is comparable to ``batch_size`` and the difference is negligible.
 
-    Note that the ``thread_pool_size() > 1`` gate is necessary but not provably sufficient: with multiple concurrent io_source callbacks the pool can
-    still be saturated. It does, however, eliminate the only deadlock we have actually observed in production.
+    On an unfixed runtime, the ``thread_pool_size() > 1`` gate is necessary but not provably sufficient: with multiple concurrent io_source callbacks the
+    pool can still be saturated. It does, however, eliminate the only deadlock we have actually observed in production.
     """
     if batch_size is None:
         yield lf.collect()
         return
-    if POLARS_HAS_COLLECT_BATCHES and pl.thread_pool_size() > 1:
+    use_collect_batches = POLARS_HAS_COLLECT_BATCHES and (POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN or pl.thread_pool_size() > 1)
+    if use_collect_batches:
         yield from lf.collect_batches(chunk_size=batch_size, maintain_order=True)
     else:
         yield from lf.collect().iter_slices(n_rows=batch_size)
