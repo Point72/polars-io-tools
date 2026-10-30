@@ -1287,3 +1287,21 @@ def test_filtered_join_keys_keep_dtype(keys):
     left = pl.LazyFrame({"k": keys, "v": range(len(keys))})
     right = pl.LazyFrame({"k": keys, "w": range(len(keys))})
     assert_frame_equal(left.piot.filtered_join(right, on="k").collect(), left.join(right, on="k").collect(), check_row_order=False)
+
+
+def test_filtered_join_pushes_integer_keys_as_a_list():
+    """Keys a Python list holds exactly are pushed as a list, so the pushed predicate shows the values."""
+    seen = []
+    right_df = pl.DataFrame({"k": [1, 2, 3, 4], "w": [10, 20, 30, 40]})
+    right = io_source_assert(right_df, seen.append)
+    left = pl.LazyFrame({"k": [2, 3], "v": [0, 1]})
+    result = left.piot.filtered_join(right, on="k").collect()
+    assert sorted(result["w"].to_list()) == [20, 30]
+    pushed = [str(p) for p in seen if p is not None]
+    assert any("2" in p and "3" in p and "Series" not in p for p in pushed)
+
+
+def test_filtered_join_keys_beyond_python_datetime_range():
+    keys = pl.Series("k", [253402318799999998, 253402318799999999], dtype=pl.Datetime("us", "UTC"))
+    left = keys.to_frame().lazy()
+    assert_frame_equal(left.piot.filtered_join(left, on="k").collect(), left.join(left, on="k").collect(), check_row_order=False)

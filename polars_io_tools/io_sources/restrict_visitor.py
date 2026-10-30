@@ -9,6 +9,7 @@ from .base import (
     CastNode,
     ExprVisitor,
     FunctionNode,
+    LiteralNode,
     TernaryNode,
     get_parsed_expr,
 )
@@ -123,6 +124,13 @@ class RestrictPredicateVisitor(ExprVisitor[pl.Expr | None]):
             self.result = ~node.expr if self.negated else node.expr
         else:
             self.result = None
+
+    def visit_literal(self, node: LiteralNode) -> None:
+        # A constant boolean (or null) holds on any frame, so it is kept: ``false`` keeps no rows anywhere.
+        if node.can_extract_literal and (node.value is None or isinstance(node.value, bool)):
+            self.result = ~node.expr if self.negated else node.expr
+        else:
+            self.default_visit(node)
 
     def _restrict(self, node: BaseExprNode, negated: bool) -> pl.Expr | None:
         visitor = RestrictPredicateVisitor(self.columns, negated)
