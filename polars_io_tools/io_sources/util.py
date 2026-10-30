@@ -58,6 +58,24 @@ def _is_in_collection(values: list, dtype: pl.DataType) -> list | pl.Expr:
     return pl.lit(values, dtype=pl.List(dtype)) if isinstance(dtype, pl.Decimal) else values
 
 
+def _membership_supported(values: list, dtype: pl.DataType) -> bool:
+    """Whether ``is_in`` with these Python ``values`` means, on a column of ``dtype``, what the original predicate meant.
+
+    Python datetimes and timedeltas are microsecond values. Against a column of another time unit Polars either rejects
+    the membership or compares the values with semantics that depend on the original literal's dtype, which the Python
+    values no longer carry; such memberships are not pushed.
+    """
+    if isinstance(dtype, (pl.Datetime, pl.Duration)) and dtype.time_unit != "us":
+        return False
+    if not dtype.is_temporal():
+        return True
+    try:
+        pl.DataFrame(schema={"c": dtype}).filter(pl.col("c").is_in(_is_in_collection(values, dtype)))
+    except Exception:  # noqa: BLE001 -- any rejection means no membership can be pushed
+        return False
+    return True
+
+
 def _not_in(col: str, values: list, dtype: pl.DataType) -> pl.Expr:
     """Expression true for rows whose ``col`` value is *not* in ``values`` (null-aware).
 

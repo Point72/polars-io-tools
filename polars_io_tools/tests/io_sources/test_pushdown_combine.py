@@ -11,7 +11,7 @@ including:
 - Edge cases (empty filters, empty results, schema inference)
 """
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -2776,3 +2776,229 @@ def test_null_accepting_filter_not_pushed_below_left_join(pred):
 
     lf = pushdown_combine({"l": (left, {}), "r": (right, {"v": FilterSpec()})}, combine)
     assert_frame_equal(lf.filter(pred).collect(), combine({"l": left, "r": right}).filter(pred).collect(), check_row_order=False)
+
+
+def _assert_matches_native(sources, combine, pred):
+    raw = {name: lf for name, (lf, _) in sources.items()}
+    expected = combine(raw).filter(pred).collect()
+    result = pushdown_combine(sources, combine).filter(pred).collect()
+    assert_frame_equal(result, expected, check_row_order=False)
+    return result
+
+
+class TestMappedWindow:
+    """A ``value_mapping`` with a lookback must push a window, never only the exact mapped value."""
+
+    DAYS = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 21)], "v": list(range(20))})
+
+    @staticmethod
+    def _previous_weekday(d):
+        return d - timedelta(days=3 if d.weekday() == 0 else 1)
+
+    @staticmethod
+    def _combine(s):
+        # The output date is the next day; the rolling sum needs the preceding source rows.
+        return s["s"].with_columns(pl.col("v").rolling_sum(3).alias("r"), (pl.col("data_date") + pl.duration(days=1)).alias("date"))
+
+    def _sources(self, lf, **specs):
+        return {"s": (lf, specs)}
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            pl.col("date") == date(2024, 1, 8),
+            pl.col("date").is_in([date(2024, 1, 8), date(2024, 1, 15)]),
+            pl.col("date").is_between(date(2024, 1, 8), date(2024, 1, 10)),
+        ],
+    )
+    def test_window_pushed_around_mapped_values(self, pred):
+        tracker = PredicateTracker(self.DAYS)
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=7), value_mapping=self._previous_weekday)
+        _assert_matches_native(self._sources(tracker.lazy_frame, date=spec), self._combine, pred)
+        assert tracker.get_analyzer().find_temporal_filter("data_date") is not None
+
+    def test_open_range_through_callable_pushes_window_around_requested_range(self):
+        tracker = PredicateTracker(self.DAYS)
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=7), value_mapping=self._previous_weekday)
+        _assert_matches_native(self._sources(tracker.lazy_frame, date=spec), self._combine, pl.col("date") >= date(2024, 1, 8))
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(2024, 1, 1), None)
+
+    @pytest.mark.parametrize("mapping", [{date(2024, 1, 9): date(2024, 1, 8)}, lambda d: None, lambda d: 1 / 0])
+    def test_incomplete_or_failing_mapping_keeps_rows(self, mapping):
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=mapping)
+        _assert_matches_native(self._sources(self.DAYS.lazy(), date=spec), self._combine, pl.col("date") == date(2024, 1, 8))
+
+    def test_unconstrained_identity_sibling_does_not_block_the_window(self):
+        tracker = PredicateTracker(self.DAYS)
+        specs = {
+            "data_date": FilterSpec(),
+            "date": FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=self._previous_weekday),
+        }
+        _assert_matches_native({"s": (tracker.lazy_frame, specs)}, self._combine, pl.col("date") == date(2024, 1, 8))
+        assert tracker.get_analyzer().find_temporal_filter("data_date") is not None
+
+    def test_mapped_aliases_in_a_self_join_union(self):
+        specs = {
+            "d1": FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=lambda d: d - timedelta(days=1)),
+            "d2": FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=lambda d: d - timedelta(days=1)),
+        }
+
+        def combine(s):
+            side = s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), (pl.col("data_date") + pl.duration(days=1)).alias("d"))
+            return side.select(pl.col("d").alias("d1"), pl.col("r").alias("r1")).join(
+                side.select(pl.col("d").alias("d2"), pl.col("r").alias("r2")), how="cross"
+            )
+
+        pred = (pl.col("d1") == date(2024, 1, 3)) & (pl.col("d2") == date(2024, 1, 12))
+        assert _assert_matches_native({"s": (self.DAYS.lazy(), specs)}, combine, pred).height == 1
+
+    def test_integer_output_key_is_not_used_as_a_date(self):
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping={8: date(2024, 1, 7)})
+
+        def combine(s):
+            return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").dt.day().cast(pl.Int64).add(1).alias("k"))
+
+        _assert_matches_native({"s": (self.DAYS.lazy(), {"k": spec})}, combine, pl.col("k") == 8)
+
+
+class TestUnappliedWindow:
+    """A window that cannot be applied pushes nothing rather than the unwidened value."""
+
+    def test_time_zone_aware_column(self):
+        src = pl.LazyFrame({"t": [datetime(2024, 1, d, tzinfo=ZoneInfo("UTC")) for d in range(1, 11)], "v": list(range(10))})
+
+        def combine(s):
+            return s["s"].with_columns(pl.col("v").shift(1).alias("lag"))
+
+        pred = pl.col("t") == datetime(2024, 1, 5, tzinfo=ZoneInfo("UTC"))
+        result = _assert_matches_native({"s": (src, {"t": FilterSpec(lookback=timedelta(days=3))})}, combine, pred)
+        assert result["lag"].to_list() == [3]
+
+    def test_unbounded_window(self):
+        src = pl.LazyFrame({"d": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(10))})
+
+        def combine(s):
+            return s["s"].with_columns(pl.col("v").cum_sum().alias("c"))
+
+        _assert_matches_native({"s": (src, {"d": FilterSpec(lookback=timedelta.max)})}, combine, pl.col("d") == date(2024, 1, 5))
+
+
+@pytest.mark.parametrize("pred", [pl.lit(False), pl.lit(None, dtype=pl.Boolean)])
+def test_constant_false_predicate_reads_nothing(pred):
+    from polars.io.plugins import register_io_source
+
+    df = pl.DataFrame({"d": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(10))})
+    rows_read = []
+
+    def generator(with_columns, predicate, n_rows, batch_size):
+        out = df if n_rows is None else df.head(n_rows)
+        rows_read.append(out.height)
+        yield out
+
+    source = register_io_source(generator, schema=df.schema)
+
+    def combine(s):
+        return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"))
+
+    result = pushdown_combine({"s": (source, {"d": FilterSpec(lookback=timedelta(days=1))})}, combine).filter(pred).collect()
+    assert result.height == 0
+    assert sum(rows_read) == 0
+
+
+def test_mapped_values_keep_both_readings_of_a_repeated_hour():
+    ny = ZoneInfo("America/New_York")
+    src = pl.LazyFrame(
+        {"t": [datetime(2024, 11, 3, 1, 30, tzinfo=ny, fold=0), datetime(2024, 11, 3, 1, 30, tzinfo=ny, fold=1)]},
+        schema={"t": pl.Datetime("us", "America/New_York")},
+    )
+
+    def combine(s):
+        return s["s"].with_columns(pl.col("t").dt.convert_time_zone("UTC").alias("a"))
+
+    spec = FilterSpec(source_col="t", value_mapping=lambda a: a.astimezone(ny))
+    pred = pl.col("a").is_in([datetime(2024, 11, 3, 5, 30, tzinfo=ZoneInfo("UTC")), datetime(2024, 11, 3, 6, 30, tzinfo=ZoneInfo("UTC"))])
+    assert _assert_matches_native({"s": (src, {"a": spec})}, combine, pred).height == 2
+
+
+@pytest.mark.parametrize("unit", ["ms", "us", "ns"])
+@pytest.mark.parametrize("time_zone", [None, "UTC"])
+def test_is_in_on_any_datetime_unit(unit, time_zone):
+    tz = ZoneInfo(time_zone) if time_zone else None
+    values = [datetime(2024, 1, 1, 0, 0, s, tzinfo=tz) for s in range(5)]
+    src = pl.LazyFrame({"t": values}, schema={"t": pl.Datetime(unit, time_zone)})
+    # The collection has the column's own dtype: Polars rejects a microsecond list against a millisecond column.
+    members = pl.Series([values[1], values[3]], dtype=pl.Datetime(unit, time_zone))
+    pred = pl.col("t").is_in(members.implode())
+    assert _assert_matches_native({"s": (src, {"t": FilterSpec()})}, lambda s: s["s"], pred).height == 2
+
+
+def test_value_set_keys_do_not_overflow_near_the_date_limit():
+    minus5 = timezone(timedelta(hours=-5))
+    values = [datetime(9999, 12, 31, 23, 59, 59, 999998, tzinfo=minus5), datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=minus5)]
+    src = pl.LazyFrame({"t": values, "k": [1, 2]})
+    spec = FilterSpec(source_col="t", value_mapping={1: values[0], 2: values[1]})
+    assert _assert_matches_native({"s": (src, {"k": spec})}, lambda s: s["s"], pl.col("k").is_in([1, 2])).height == 2
+
+
+def test_pushed_equality_keeps_the_predicates_comparison_unit():
+    src = pl.LazyFrame({"t": pl.Series([1704067200000000000, 1704067200000000001]).cast(pl.Datetime("ns", "UTC"))})
+
+    def combine(s):
+        return s["s"].with_columns(pl.col("t").dt.cast_time_unit("us").alias("a"))
+
+    pred = pl.col("a") == datetime(2024, 1, 1, tzinfo=UTC)
+    assert _assert_matches_native({"s": (src, {"a": FilterSpec(source_col="t")})}, combine, pred).height == 2
+
+
+def test_membership_with_another_unit_keeps_native_rows():
+    members = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2)], dtype=pl.Datetime("us", "UTC"))
+    src = pl.LazyFrame({"t": members.to_physical().cast(pl.Datetime("ns", "UTC"))})
+    pred = pl.col("t").is_in(members.implode())
+    _assert_matches_native({"s": (src, {"t": FilterSpec()})}, lambda s: s["s"].collect().lazy(), pred)
+
+
+class TestMappedWindowRanges:
+    DAYS = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 21)], "v": list(range(20))})
+
+    @staticmethod
+    def _combine(s):
+        return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").alias("date"))
+
+    def _run(self, spec, pred):
+        tracker = PredicateTracker(self.DAYS)
+        _assert_matches_native({"s": (tracker.lazy_frame, {"date": spec})}, self._combine, pred)
+        return tracker
+
+    def test_dict_covering_the_range_is_enumerated(self):
+        mapping = {date(2024, 1, 8): date(2024, 1, 8), date(2024, 1, 9): date(2024, 1, 9)}
+        tracker = self._run(
+            FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=mapping),
+            pl.col("date").is_between(date(2024, 1, 8), date(2024, 1, 9)),
+        )
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(2024, 1, 7), date(2024, 1, 9))
+
+    def test_lookahead_around_mapped_values(self):
+        def combine(s):
+            return s["s"].with_columns(pl.col("v").shift(-2).alias("lead"), pl.col("data_date").alias("date"))
+
+        spec = FilterSpec(source_col="data_date", lookahead=timedelta(days=2), value_mapping=lambda d: d)
+        _assert_matches_native({"s": (self.DAYS.lazy(), {"date": spec})}, combine, pl.col("date") == date(2024, 1, 10))
+
+    def test_range_beyond_the_enumeration_cap_gets_the_window_around_the_range(self):
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=lambda d: d)
+        tracker = self._run(spec, pl.col("date").is_between(date(1990, 1, 1), date(2024, 1, 10)))
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(1989, 12, 31), date(2024, 1, 10))
+
+
+def test_unbounded_window_sharer_keeps_the_whole_source_column():
+    src = pl.LazyFrame({"d": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(1, 11))})
+
+    def combine(s):
+        return s["s"].select(pl.col("d").alias("a"), pl.col("v").cum_sum().alias("c")).join(s["s"].select(pl.col("d").alias("b")), how="cross")
+
+    specs = {"a": FilterSpec(source_col="d", lookback=timedelta.max), "b": FilterSpec(source_col="d", value_mapping=lambda x: x)}
+    pred = (pl.col("a") >= date(2024, 1, 5)) & (pl.col("b") == date(2024, 1, 8))
+    assert _assert_matches_native({"s": (src, specs)}, combine, pred)["c"].sort().to_list() == [15, 21, 28, 36, 45, 55]

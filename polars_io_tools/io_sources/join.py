@@ -30,6 +30,18 @@ _POLARS_PUSHDOWN_FILTERS_JOIN_COLUMNS = version.parse(pl.__version__) > version.
 _POLARS_IS_IN_IMPLODE = version.parse(pl.__version__) >= version.parse("1.28.0")
 
 
+def _exact_python_list(series: pl.Series) -> list | None:
+    """The values of ``series`` as a Python list if a list holds them exactly (integers, strings), else None."""
+    if series.dtype.is_temporal() or isinstance(series.dtype, pl.Decimal) or series.dtype.is_float():
+        return None
+    try:
+        values = series.to_list()
+        rebuilt = pl.Series(values)
+    except (Exception, pl.exceptions.PanicException):  # noqa: BLE001 -- keep the typed Series
+        return None
+    return values if rebuilt.dtype == series.dtype and rebuilt.equals(series) else None
+
+
 def _normalize_join_columns(
     on: str | list[str] | None,
     left_on: str | list[str] | None,
@@ -219,8 +231,13 @@ def filtered_join(
             if len(left_col_ser) == 1 and pl.Series([left_col_ser[0]], dtype=left_col_ser.dtype).equals(left_col_ser):
                 new_filters.append(pl.col(right_col) == left_col_ser[0])
             else:
-                # A typed Series: Python values would truncate ns temporals and widen Decimal precision.
-                new_filters.append(pl.col(right_col).is_in(left_col_ser.implode() if _POLARS_IS_IN_IMPLODE else left_col_ser))
+                values = _exact_python_list(left_col_ser)
+                if values is not None:
+                    # A plain list keeps these values exactly (e.g. integers, strings).
+                    new_filters.append(pl.col(right_col).is_in(values))
+                else:
+                    # A typed Series: Python values would truncate ns temporals and widen Decimal precision.
+                    new_filters.append(pl.col(right_col).is_in(left_col_ser.implode() if _POLARS_IS_IN_IMPLODE else left_col_ser))
 
         extra_filter = pl.all_horizontal(*new_filters) if len(left_on) > 1 else new_filters[0]
         # Filter the right lazyframe based on the join column in the materialized left df

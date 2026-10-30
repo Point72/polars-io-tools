@@ -39,7 +39,7 @@ from typing import Any
 import polars as pl
 import portion
 
-from .base import get_parsed_expr
+from .base import LiteralNode, get_parsed_expr
 from .range_visitor import (
     _convert_interval_to_polars_expr,
     _extend_dates_to_full_datetimes,
@@ -51,7 +51,7 @@ from .range_visitor import (
 )
 from .restrict_visitor import restrict_expr_to_columns
 from .set_visitor import convert_expr_to_valid_values
-from .util import _is_in_collection, collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import _is_in_collection, _membership_supported, collect_lf_in_io_source, register_io_source_with_is_pure
 
 __all__ = ("FilterSpec", "IntervalFilterSpec", "pushdown_combine")
 
@@ -83,7 +83,11 @@ class FilterSpec:
         value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform filter values before applying to source.
             Used when the source uses different values than the output column.
             Can be a dict for direct mapping or a callable for custom logic.
-            Only applies to equality (==) and is_in() filters; range filters on a mapped column are not pushed down.
+            Applies to equality (==) and is_in() filters. With a lookback or lookahead, the window is applied around
+            each requested value and around its mapped value, so it may be declared relative to either; a bounded
+            range on a ``Date`` output column is mapped day by day. Other ranges (open, or too long to enumerate) get
+            the window around the requested range only, so the window must also cover the mapping's offset. Mappings
+            that fail or return None push nothing for the source column.
 
     Examples:
         Same column name, no transformation::
@@ -203,20 +207,8 @@ def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> t
             - For dict mapping: only values present in the dict are mapped;
               values not in the dict are returned as unmapped (not pushed down)
     """
-    if mapping is None:
-        return values, set()
-    if callable(mapping):
-        return {mapping(v) for v in values}, set()
-    # Dict mapping - only map values that are explicitly in the mapping
-    # Values not in the mapping are NOT pushed down (safer behavior)
-    mapped = set()
-    unmapped = set()
-    for v in values:
-        if v in mapping:
-            mapped.add(mapping[v])
-        else:
-            unmapped.add(v)
-    return mapped, unmapped
+    mapped, unmapped = _map_values(values, mapping)
+    return set(mapped), unmapped
 
 
 def _union_discrete_filter(
@@ -242,29 +234,61 @@ def _union_discrete_filter(
     Otherwise returns a filter keeping rows whose ``source_col`` is in the union (a ``None`` value keeps null
     rows). Each member's values are mapped through that member's own ``spec.value_mapping`` before unioning.
     """
-    union: set[Any] = set()
+    union: dict[Any, Any] = {}
     for output_col, spec in members:
         discrete_values = extracted_values.get(output_col)
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
             log.debug(f"Column '{output_col}' unconstrained/empty/null-accepting; pushing nothing for source col '{source_col}'")
             return None
-        mapped_values, unmapped_values = _apply_value_mapping(discrete_values, spec.value_mapping)
+        mapped_values, unmapped_values = _map_values(discrete_values, spec.value_mapping)
         if unmapped_values:
             log.debug(
                 f"Values {unmapped_values} for column '{output_col}' not found in value_mapping; "
                 f"pushing nothing for source col '{source_col}' (will be applied after combine)"
             )
             return None
-        union |= mapped_values
+        for value in mapped_values:
+            union.setdefault(_value_key(value), value)
 
     col = pl.col(source_col)
     # A value_mapping may map to None. Do not sort: the values may be unorderable (e.g. mixed types).
-    non_null = [v for v in union if v is not None]
+    non_null = [v for v in union.values() if v is not None]
     if not non_null:
         return col.is_null()
-    expr = col == non_null[0] if len(non_null) == 1 else col.is_in(_is_in_collection(non_null, dtype))
+    if len(non_null) == 1:
+        expr = col == non_null[0]
+    else:
+        if not _membership_supported(non_null, dtype):
+            log.debug(f"Values for source col '{source_col}' cannot form a membership on {dtype}; pushing nothing")
+            return None
+        expr = col.is_in(_is_in_collection(non_null, dtype))
     # ``== None`` and ``is_in`` never match null rows.
     return expr | col.is_null() if len(non_null) < len(union) else expr
+
+
+def _value_key(value: Any) -> Any:
+    """Key under which two values are the same filter value.
+
+    Timezone-aware datetimes are keyed by wall time and UTC offset: the two readings of a repeated local hour
+    (``fold``) are equal as Python objects but have different offsets.
+    """
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        # Converting to UTC instead could overflow near the date limits.
+        return ("instant", value.replace(tzinfo=None), value.utcoffset())
+    return value
+
+
+def _map_values(values: set[Any], mapping: dict | Callable | None) -> tuple[list[Any], set[Any]]:
+    """Map ``values`` as :func:`_apply_value_mapping` does, returning a list so that values equal in Python are kept.
+
+    Returns ``(mapped, unmapped)``; with a dict mapping, ``unmapped`` holds the values that are not keys.
+    """
+    if mapping is None:
+        return list(values), set()
+    if callable(mapping):
+        return [mapping(v) for v in values], set()
+    unmapped = {v for v in values if v not in mapping}
+    return [mapping[v] for v in values if v in mapping], unmapped
 
 
 # Endpoint comparison operators per ``closed`` mode. ``lower`` is the ``end_col >= lo`` side (left
@@ -358,6 +382,168 @@ def _apply_interval_filter(
         filtered_lf = filtered_lf.filter(cond)
 
     return filtered_lf
+
+
+_MAX_ENUMERATED_DAYS = 10_000
+"""Most days a bounded ``Date`` range is enumerated over to map it through a ``value_mapping``."""
+
+
+def _has_window(spec: FilterSpec) -> bool:
+    return bool(spec.lookback) or bool(spec.lookahead)
+
+
+def _is_naive_temporal(dtype: pl.DataType) -> bool:
+    return _is_temporal_dtype(dtype) and getattr(dtype, "time_zone", None) is None
+
+
+def _expand_to_source(interval: portion.Interval, spec: FilterSpec, source_dtype: pl.DataType) -> portion.Interval:
+    """Widen ``interval`` (date or naive datetime bounds) by the spec's window, as bounds comparable with the source column."""
+    if source_dtype == pl.Date:
+        # Promote date bounds to midnight datetimes so sub-day lookback/lookahead nudges them across day boundaries;
+        # ``_extend_to_full_dates`` below floors them back to dates.
+        interval = _promote_dates_to_datetimes(interval)
+    elif isinstance(source_dtype, pl.Datetime):
+        # Widen date bounds to full-day datetime ranges before the window. ``date - timedelta(hours=18)`` truncates to
+        # whole days in Python, and the upper bound would otherwise collapse to midnight and drop intraday rows.
+        interval = _extend_dates_to_full_datetimes(interval)
+    if spec.lookback:
+        interval = _lookback_interval(interval, spec.lookback)
+    if spec.lookahead:
+        interval = _lookahead_interval(interval, spec.lookahead)
+    if source_dtype == pl.Date:
+        # Round sub-day bounds out to whole days (e.g. a 2d 18h lookback includes the start of day 3).
+        interval = _extend_to_full_dates(interval)
+    return interval
+
+
+def _temporal_point(value: Any) -> portion.Interval | None:
+    """A singleton interval for a ``date`` or naive ``datetime`` value, else None."""
+    if isinstance(value, datetime):
+        return portion.singleton(value) if value.tzinfo is None else None
+    if isinstance(value, date):
+        return portion.singleton(value)
+    return None
+
+
+def _enumerate_days(interval: portion.Interval) -> list[date] | None:
+    """Every ``date`` in an interval with finite ``date`` bounds, or None if it is unbounded, not date-typed, or too long."""
+    days: list[date] = []
+    for atomic in interval:
+        lo, hi = atomic.lower, atomic.upper
+        if not all(isinstance(b, date) and not isinstance(b, datetime) for b in (lo, hi)):
+            return None
+        first = lo if atomic.left == portion.CLOSED else lo + timedelta(days=1)
+        last = hi if atomic.right == portion.CLOSED else hi - timedelta(days=1)
+        if (last - first).days + 1 + len(days) > _MAX_ENUMERATED_DAYS:
+            return None
+        days.extend(first + timedelta(days=i) for i in range((last - first).days + 1))
+    return days
+
+
+def _member_enclosure(
+    output_col: str,
+    spec: FilterSpec,
+    source_dtype: pl.DataType,
+    extracted_values: dict[str, set[Any] | None],
+    extracted_ranges: dict[str, portion.Interval],
+) -> portion.Interval | None:
+    """Source values that rows requested through ``output_col`` may need, or None if no sound bound is known.
+
+    Without a ``value_mapping`` this is the requested range (or values) widened by the window. With a mapping, each
+    requested value ``v`` contributes the window around ``v`` itself (when ``v`` is a date or datetime) and around its
+    mapped value, so the result covers a window declared relative to either. Requested ranges are mapped day by day,
+    which needs finite ``date`` bounds; a dict mapping must then contain every day of the range.
+    """
+    mapping = spec.value_mapping
+    if mapping is None:
+        if output_col in extracted_ranges:
+            return _expand_to_source(extracted_ranges[output_col], spec, source_dtype)
+        values = extracted_values.get(output_col)
+        if values is None or None in values:
+            return None
+        points = [_temporal_point(v) for v in values]
+        if any(p is None for p in points):
+            return None
+        return portion.Interval(*[_expand_to_source(p, spec, source_dtype) for p in points])
+
+    values = extracted_values.get(output_col)
+    if values is None and output_col in extracted_ranges:
+        values = _enumerate_days(extracted_ranges[output_col])
+        if values is None:
+            # A range that cannot be mapped value by value (open, too long, or not of dates) gets the window around the
+            # requested range itself: the window must then also cover the mapping's offset.
+            return _expand_to_source(extracted_ranges[output_col], spec, source_dtype) if _has_window(spec) else None
+    if values is None or None in values:
+        return None
+    enclosure = portion.empty()
+    for value in values:
+        try:
+            mapped = mapping(value) if callable(mapping) else mapping.get(value)  # a missing dict key gives None
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
+            return None
+        mapped_point = _temporal_point(mapped)
+        if mapped_point is None:
+            return None
+        enclosure |= _expand_to_source(mapped_point, spec, source_dtype)
+        if _has_window(spec) and (own_point := _temporal_point(value)) is not None:
+            enclosure |= _expand_to_source(own_point, spec, source_dtype)
+    return enclosure
+
+
+def _is_unbounded(interval: portion.Interval) -> bool:
+    """Whether ``interval`` is the whole temporal domain (no filter narrower than all rows)."""
+    return interval == portion.open(-portion.inf, portion.inf)
+
+
+def _window_group_filter(
+    members: list[tuple[str, FilterSpec]],
+    source_col: str,
+    source_dtype: pl.DataType,
+    extracted_values: dict[str, set[Any] | None],
+    extracted_ranges: dict[str, portion.Interval],
+) -> tuple[bool, pl.Expr | bool | None]:
+    """Filter for a source column whose sharers cannot be handled one at a time by the temporal and discrete passes.
+
+    Returns ``(handled, filter)``. ``handled`` is False when the passes can handle the column. Otherwise the column is
+    taken out of both passes and ``filter`` is the expression to push, ``False`` if no row can match, or None to push
+    nothing. A column is handled here when:
+
+    - a sharer has a ``value_mapping`` and a window: the union of the source values each sharer the query constrains may
+      need (see :func:`_member_enclosure`) is pushed, taking the sharers to describe the same source row; nothing is
+      pushed if one of them has no known bound, or if the column is not a timezone-naive date or datetime;
+    - a sharer's window cannot be applied (the column is not a timezone-naive date or datetime) or reaches the end of
+      the temporal domain: nothing is pushed, so no sharer falls back to its unwidened values.
+    """
+    windowed = [(o, sp) for o, sp in members if _has_window(sp)]
+    mapped_window = any(sp.value_mapping is not None for _, sp in windowed)
+    if not windowed:
+        return False, None
+    if not _is_naive_temporal(source_dtype):
+        return True, None
+    if not mapped_window:
+        for output_col, spec in windowed:
+            if output_col not in extracted_ranges and output_col not in extracted_values:
+                continue
+            try:
+                enclosure = _member_enclosure(output_col, spec, source_dtype, extracted_values, extracted_ranges)
+            except (TypeError, ValueError, OverflowError):
+                return True, None
+            if enclosure is not None and _is_unbounded(enclosure):
+                return True, None
+        return False, None
+    constrained = [(o, sp) for o, sp in members if o in extracted_ranges or o in extracted_values]
+    if not constrained:
+        return True, None
+    enclosure = portion.empty()
+    for output_col, spec in constrained:
+        try:
+            member = _member_enclosure(output_col, spec, source_dtype, extracted_values, extracted_ranges)
+        except (TypeError, ValueError, OverflowError):
+            member = None
+        if member is None:
+            return True, None
+        enclosure |= member
+    return True, _convert_interval_to_polars_expr(enclosure, source_col)
 
 
 def _call_combine(
@@ -517,6 +703,13 @@ def pushdown_combine(
         2. combine() runs and creates ``region`` column from ``region_code``
         3. Original filter ``region == "NORTH_AMERICA"`` applied, ensuring correctness
 
+        A ``lookback``/``lookahead`` is a declaration: the combine must only need source rows within the window of
+        each requested (or mapped) value. A window on a timezone-aware source column cannot be applied, so nothing is
+        pushed for that source column; a window reaching the end of the temporal domain pushes nothing for its output
+        column. When a source column has a spec with a mapped window, the union of the windows of the sharers the
+        query constrains is pushed: all sharers are taken to describe the same source row, so a self-join that reads
+        one source as two independent rows must list the source twice.
+
         **Shared source column (union of discrete filters):**
 
         When multiple output columns map to the same ``source_col`` (e.g. a self-join that exposes
@@ -664,8 +857,18 @@ def pushdown_combine(
         # The ORIGINAL filter is applied at the end (after combine) to trim back to exactly
         # what the user requested. We skip discrete filters for temporal columns when there's
         # expansion, as they would undo the lookback/lookahead.
+        #
+        # A constant false (or null) predicate keeps no rows, so no source needs to be read.
+        keeps_nothing = (
+            isinstance(parsed_predicate, LiteralNode)
+            and parsed_predicate.can_extract_literal
+            and (parsed_predicate.value is False or parsed_predicate.value is None)
+        )
         filtered_sources: dict[str, pl.LazyFrame] = {}
         for source_name, (source_lf, specs) in sources.items():
+            if keeps_nothing:
+                filtered_sources[source_name] = source_lf.head(0)
+                continue
             filtered_lf = source_lf
             source_schema = source_schemas[source_name]
             empty_temporal_range = False
@@ -674,7 +877,27 @@ def pushdown_combine(
             # the discrete-union decision knows the per-column suppression before applying any filter.
             suppressed: set[str] = set()
 
-            # Pass 1: interval and temporal filters (logic unchanged from the single-pass version).
+            # Source columns whose sharers include a mapped window, or a window that cannot be applied, are filtered here
+            # as a group and skipped by both passes (see _window_group_filter).
+            groups: dict[str, list[tuple[str, FilterSpec]]] = {}
+            for output_col, spec in specs.items():
+                if not isinstance(spec, IntervalFilterSpec) and (source_col := _get_source_col(output_col, spec)) in source_schema:
+                    groups.setdefault(source_col, []).append((output_col, spec))
+            handled: set[str] = set()
+            for source_col, members in groups.items():
+                is_handled, group_filter = _window_group_filter(members, source_col, source_schema[source_col], extracted_values, extracted_ranges)
+                if not is_handled:
+                    continue
+                handled.add(source_col)
+                if group_filter is False:
+                    empty_temporal_range = True
+                elif group_filter is not None:
+                    filtered_lf = filtered_lf.filter(group_filter)
+                    log.debug(f"Applied window filter to {source_name}.{source_col}: {group_filter}")
+                else:
+                    log.debug(f"No sound window for {source_name}.{source_col}; pushing nothing")
+
+            # Pass 1: interval and temporal filters.
             for output_col, spec in specs.items():
                 # Interval specs reference two source columns and push an overlap predicate; handle them
                 # separately from the single-column FilterSpec path below.
@@ -689,6 +912,8 @@ def pushdown_combine(
                 if source_col not in source_schema:
                     log.debug(f"Source column {source_col} not in source {source_name}, skipping")
                     continue
+                if source_col in handled:
+                    continue
 
                 source_dtype = source_schema[source_col]
 
@@ -698,31 +923,10 @@ def pushdown_combine(
 
                     # Only apply lookback/lookahead to temporal columns. Bounds are naive UTC while date bounds stand for
                     # local days, so neither can be compared with a timezone-aware column and it is left unfiltered.
-                    # value_mapping is applied only to discrete values, so a mapped column is left to the discrete pass.
-                    if _is_temporal_dtype(source_dtype) and getattr(source_dtype, "time_zone", None) is None and spec.value_mapping is None:
-                        expanded_range = date_range
-                        has_expansion = bool(spec.lookback) or bool(spec.lookahead)
-
-                        if source_dtype == pl.Date:
-                            # Date source: promote date bounds to midnight datetimes so sub-day lookback/lookahead nudges
-                            # them across day boundaries; ``_extend_to_full_dates`` below floors them back to dates.
-                            expanded_range = _promote_dates_to_datetimes(expanded_range)
-                        elif isinstance(source_dtype, pl.Datetime):
-                            # Datetime source with date-typed filter literal: widen date bounds to full-day datetime ranges
-                            # before lookback/lookahead. ``date - timedelta(hours=18)`` truncates to whole days in Python,
-                            # so sub-day shifts would otherwise be silently dropped, and the upper bound would collapse to
-                            # midnight and drop intraday rows on the bound day.
-                            expanded_range = _extend_dates_to_full_datetimes(expanded_range)
-
-                        if spec.lookback:
-                            expanded_range = _lookback_interval(expanded_range, spec.lookback)
-                        if spec.lookahead:
-                            expanded_range = _lookahead_interval(expanded_range, spec.lookahead)
-
-                        # Floor interval bounds back to dates for Date sources so sub-day lookback/lookahead values are
-                        # rounded to include the full day boundary (e.g., 2d 18h lookback includes the start of day 3).
-                        if source_dtype == pl.Date:
-                            expanded_range = _extend_to_full_dates(expanded_range)
+                    # A mapped column without a window is left to the discrete pass; with a window it was handled above.
+                    if _is_naive_temporal(source_dtype) and spec.value_mapping is None:
+                        has_expansion = _has_window(spec)
+                        expanded_range = _expand_to_source(date_range, spec, source_dtype)
 
                         temporal_filter = _convert_interval_to_polars_expr(expanded_range, source_col)
                         if temporal_filter is False:
@@ -756,7 +960,7 @@ def pushdown_combine(
                 if isinstance(spec, IntervalFilterSpec) or output_col in suppressed:
                     continue
                 source_col = _get_source_col(output_col, spec)
-                if source_col not in source_schema:
+                if source_col not in source_schema or source_col in handled:
                     continue
                 by_source_col.setdefault(source_col, []).append((output_col, spec))
 
