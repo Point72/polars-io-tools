@@ -28,7 +28,7 @@ from pydantic import GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
 
-from .._compat import POLARS_HAS_PARTITION_BY
+from .._compat import POLARS_HAS_PARTITION_BY, POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
 from .dnf_visitor import ColumnConstraintAnalyzer, DNFClause, convert_expr_to_dnf
 from .range_visitor import _convert_atomic_interval_to_polars_expr, convert_expr_to_datetime_range
 from .restrict_visitor import restrict_expr_to_columns
@@ -62,14 +62,23 @@ def _path_as_file_uri(path: Path | PureWindowsPath) -> str:
 
 
 def _prepare_lf_for_sink_from_io_source(lf: pl.LazyFrame) -> pl.LazyFrame:
+    # On runtimes where nested streaming io_source collection is known-good
+    # (``POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN``, polars >= 1.43.2), stream the source
+    # straight into the partitioned sink. On older runtimes, retain the previous behavior:
+    # materialize whenever the Rayon pool has a single worker or the plan contains a Python
+    # io_source (``PYTHON SCAN``), to dodge a polars scheduler deadlock where a partitioned
+    # sink re-entered the io_source callback.
+    #
+    # The materialization is catastrophic for large nested-io_source sources, which can
+    # materialize tens of GB before writing instead of streaming at a few GB, so it must
+    # not run on fixed runtimes. The single-worker guard for the *other* re-entrancy path
+    # (``collect_batches``) still lives in ``collect_lf_in_io_source`` and is unaffected by this.
+    if POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN:
+        return lf
     plan = lf.explain(optimized=False)
     has_python_scan = "PYTHON SCAN" in plan or "PYTHON[" in plan
     if pl.thread_pool_size() > 1 and not has_python_scan:
         return lf
-    # Avoid re-entering partitioned sink execution from an io_source callback when
-    # Polars has only one Rayon worker, or when the source plan itself contains a
-    # Python io_source. This path is less memory efficient, but it prevents a
-    # scheduler deadlock for chained cache_parquet calls.
     return lf.collect().lazy()
 
 

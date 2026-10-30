@@ -165,29 +165,47 @@ def test_iosource_collect_batches_does_not_deadlock_at_threads_one(otel_setup):
     assert "OK 100000" in result.stdout, result.stdout
 
 
-def test_helper_falls_back_to_iter_slices_at_threads_one():
-    """Direct unit check that ``collect_lf_in_io_source`` does not invoke
-    ``collect_batches`` when the thread pool has a single worker."""
+def test_helper_collect_method_at_threads_one():
+    """``collect_lf_in_io_source`` at a single worker: stream via ``collect_batches`` on fixed
+    runtimes (``POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN``), else fall back to full-collect +
+    ``iter_slices`` to dodge the (old) collect_batches re-entrancy deadlock. Either way the
+    results are correct and the call does not hang."""
     script = textwrap.dedent(
         """
         import polars as pl
         from polars_io_tools.io_sources.util import collect_lf_in_io_source
+        from polars_io_tools._compat import (
+            POLARS_HAS_COLLECT_BATCHES,
+            POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN,
+        )
 
         assert pl.thread_pool_size() == 1, pl.thread_pool_size()
 
-        # If this called collect_batches under threads=1 we'd deadlock when
-        # invoked from inside an io_source callback. Here we just assert the
-        # results are correct and the call itself does not hang.
+        used = {"collect_batches": 0}
+        _orig_cb = getattr(pl.LazyFrame, "collect_batches", None)
+        if _orig_cb is not None:
+            def _spy(self, *a, **k):
+                used["collect_batches"] += 1
+                return _orig_cb(self, *a, **k)
+            pl.LazyFrame.collect_batches = _spy
+
         lf = pl.LazyFrame({"a": list(range(1000))}).filter(pl.col("a") < 500)
 
-        # batch_size=None -> single DataFrame
+        # batch_size=None -> single DataFrame (always a plain collect, never collect_batches)
         chunks = list(collect_lf_in_io_source(lf, None))
         assert len(chunks) == 1, len(chunks)
         assert chunks[0].height == 500, chunks[0].height
+        assert used["collect_batches"] == 0, used
 
         # batch_size set -> multiple DataFrames summing to expected
         chunks = list(collect_lf_in_io_source(lf, 100))
         assert sum(c.height for c in chunks) == 500
+
+        expect_batches = POLARS_HAS_COLLECT_BATCHES and POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
+        if expect_batches:
+            assert used["collect_batches"] == 1, ("expected collect_batches on fixed runtime", used)
+        else:
+            assert used["collect_batches"] == 0, ("expected iter_slices fallback on old runtime", used)
         print("OK")
         """
     )
@@ -196,8 +214,18 @@ def test_helper_falls_back_to_iter_slices_at_threads_one():
     assert "OK" in result.stdout, result.stdout
 
 
-def test_cache_parquet_sink_preparation_materializes_python_scan(monkeypatch):
-    """Nested io_sources are materialized before partitioned sink execution."""
+def test_cache_parquet_sink_preparation_python_scan_behavior(monkeypatch):
+    """Sink preparation streams nested io_sources on fixed runtimes, materializes on old ones.
+
+    On runtimes where nested streaming io_source collection is known-good
+    (``POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN``, polars >= 1.43.2),
+    ``_prepare_lf_for_sink_from_io_source`` must return the frame lazily (no eager collect of
+    the source), so a large nested source streams into the sink instead of materializing. On
+    older runtimes it must retain the previous behavior: materialize the source eagerly to
+    dodge the partitioned-sink re-entrancy deadlock.
+    """
+    from polars_io_tools._compat import POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
+
     calls = 0
 
     def reader(with_columns, predicate, n_rows, batch_size):
@@ -210,9 +238,15 @@ def test_cache_parquet_sink_preparation_materializes_python_scan(monkeypatch):
     lf = register_io_source_with_is_pure(reader, schema={"a": pl.Int64})
     prepared = lazy_cache_parquet._prepare_lf_for_sink_from_io_source(lf)
 
-    assert calls == 1
-    assert prepared.collect().to_dict(as_series=False) == {"a": [1]}
-    assert calls == 1
+    if POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN:
+        # Streamed: the source is not collected during preparation.
+        assert calls == 0
+        assert prepared.collect().to_dict(as_series=False) == {"a": [1]}
+    else:
+        # Materialized: the source is collected eagerly during preparation.
+        assert calls == 1
+        assert prepared.collect().to_dict(as_series=False) == {"a": [1]}
+        assert calls == 1
 
 
 def test_cache_parquet_chained_write_does_not_deadlock_at_threads_one():
