@@ -1,3 +1,10 @@
+"""concat_named: which sources a query reads, and how identifiers become typed key columns.
+
+A pruning row names, per source, whether it may be read and what predicate it must receive: ``None`` none, ``SOME`` a
+predicate, ``ANY`` anything, ``NEVER`` no read at all. An identifier row names the typed value a string or Python
+identifier becomes, or its physical integer for temporal precision.
+"""
+
 import datetime
 import decimal
 
@@ -6,509 +13,246 @@ import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
+from polars_io_tools.tests.helpers.catalogue import Case, params
 
 from .conftest import io_source_assert
 
-
-def test_concat_named_basic():
-    """Test basic functionality of concat_named."""
-    df1 = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-    df2 = pl.DataFrame({"a": [7, 8, 9], "b": [10, 11, 12]})
-
-    # Track whether each dataframe is queried
-    queried = {"df1": False, "df2": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-        assert predicate is None  # No predicate should be applied
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        assert predicate is None  # No predicate should be applied
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).collect()
-
-    expected = pl.DataFrame({"a": [1, 2, 3, 7, 8, 9], "b": [4, 5, 6, 10, 11, 12], "source": ["foo", "foo", "foo", "bar", "bar", "bar"]})
-
-    assert_frame_equal(result, expected)
-    assert queried["df1"]  # Both dataframes should be queried
-    assert queried["df2"]
-
-
-def test_concat_named_filter_pushdown():
-    """Test that concat_named correctly pushes down filters on unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-    df2 = pl.DataFrame({"a": [7, 8, 9], "b": [10, 11, 12]})
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-        # df1 should be queried because its key ("foo") matches the filter
-        assert predicate is None
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        # df2 should not be queried since we filter for source == "foo"
-        assert False, "df2 should not be queried when filtering for 'foo'"
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter(pl.col("source") == "foo").collect()
-
-    expected = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "source": ["foo", "foo", "foo"]})
-
-    assert_frame_equal(result, expected)
-    assert queried["df1"]  # Only df1 should be queried
-    assert not queried["df2"]  # df2 should not be queried
-
-
-def test_concat_named_filter_selects_no_sources():
-    """A missing identifier returns an empty frame without reading any source."""
-
-    def fail_if_queried(_predicate):
-        pytest.fail("No source should be queried for a missing identifier")
-
-    lf1 = io_source_assert(pl.DataFrame({"value": [1]}), fail_if_queried)
-    lf2 = io_source_assert(pl.DataFrame({"value": [2]}), fail_if_queried)
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter(pl.col("source") == "missing").collect()
-
-    assert_frame_equal(result, pl.DataFrame(schema={"value": pl.Int64, "source": pl.String}))
-
-
-def test_concat_named_multiple_unique_columns():
-    """Test concat_named with multiple unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    df2 = pl.DataFrame({"a": [5, 6], "b": [7, 8]})
-    df3 = pl.DataFrame({"a": [9, 10], "b": [11, 12]})
-    df4 = pl.DataFrame({"a": [13, 14], "b": [15, 16]})
-
-    # Track which dataframes are queried
-    queried = {f"df{i}": False for i in range(1, 5)}
-
-    def create_assert_func(df_name, should_query):
-        def assert_func(predicate):
-            queried[df_name] = True
-            if not should_query:
-                assert False, f"{df_name} should not be queried"
-            assert predicate is None
-
-        return assert_func
-
-    lf1 = io_source_assert(df1, create_assert_func("df1", True))  # (east, A) - should query
-    lf2 = io_source_assert(df2, create_assert_func("df2", False))  # (east, B) - should not query
-    lf3 = io_source_assert(df3, create_assert_func("df3", False))  # (west, A) - should not query
-    lf4 = io_source_assert(df4, create_assert_func("df4", False))  # (west, B) - should not query
-
-    result = (
-        cpl.concat_named({("east", "A"): lf1, ("east", "B"): lf2, ("west", "A"): lf3, ("west", "B"): lf4}, ["region", "type"])
-        .filter((pl.col("region") == "east") & (pl.col("type") == "A"))
-        .collect()
-    )
-
-    expected = pl.DataFrame({"a": [1, 2], "b": [3, 4], "region": ["east", "east"], "type": ["A", "A"]})
-
-    assert_frame_equal(result, expected)
-    # Verify only the correct dataframe was queried
-    assert queried["df1"]
-    assert not queried["df2"]
-    assert not queried["df3"]
-    assert not queried["df4"]
-
-
-def test_concat_named_different_data_types():
-    """Test concat_named with different data types for the unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    df2 = pl.DataFrame({"a": [5, 6], "b": [7, 8]})
-
-    date1 = datetime.date(2023, 1, 1)
-    date2 = datetime.date(2023, 2, 1)
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-        # df1 should be queried with date1
-        assert predicate is None
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        # df2 should not be queried when filtering for date1
-        assert False, "df2 should not be queried"
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-
-    result = cpl.concat_named({(date1, 100): lf1, (date2, 200): lf2}, ["date", ("id", pl.Float64)]).filter(pl.col("date") == date1).collect()
-
-    expected = pl.DataFrame({"a": [1, 2], "b": [3, 4], "date": [date1, date1], "id": [100.0, 100.0]})
-    assert_frame_equal(result, expected)
-    assert queried["df1"]
-    assert not queried["df2"]
-
-
-@pytest.mark.parametrize(
-    "identifier,dtype,expected",
-    [
-        ("2023-01-01", pl.Date, datetime.date(2023, 1, 1)),
-        ("2023-01-01T12:30:00", pl.Datetime("ms"), datetime.datetime(2023, 1, 1, 12, 30)),
-        ("12:30:00", pl.Time, datetime.time(12, 30)),
-    ],
-)
-def test_concat_named_temporal_string_identifiers(identifier, dtype, expected):
-    source = pl.DataFrame({"value": [1, 2]}).lazy()
-    result = cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier") == expected).collect()
-    expected_frame = pl.DataFrame({"value": [1, 2], "identifier": pl.Series([expected, expected], dtype=dtype)})
-    assert_frame_equal(result, expected_frame)
-
-
-@pytest.mark.parametrize(
-    "identifier,dtype,expected,polars_dtype",
-    [
-        ("label", str, "label", pl.String),
-        ("42", int, 42, pl.Int64),
-        ("3.5", float, 3.5, pl.Float64),
-        ("2023-01-01", datetime.date, datetime.date(2023, 1, 1), pl.Date),
-        ("2023-01-01T12:30:00", datetime.datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
-        ("12:30:00", datetime.time, datetime.time(12, 30), pl.Time),
-        (42, int, 42, pl.Int64),
-        (True, bool, True, pl.Boolean),
-        (datetime.datetime(2023, 1, 1), pl.Datetime, datetime.datetime(2023, 1, 1), pl.Datetime("us")),
-        ("2023-01-01T12:30:00", pl.Datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
-        (datetime.timedelta(days=1), pl.Duration, datetime.timedelta(days=1), pl.Duration("us")),
-        (datetime.timedelta(days=1), datetime.timedelta, datetime.timedelta(days=1), pl.Duration("us")),
-        ("rates", pl.Categorical, "rates", pl.Categorical()),
-    ],
-)
-def test_concat_named_python_dtype_identifiers(identifier, dtype, expected, polars_dtype):
-    source = pl.DataFrame({"value": [1, 2]}).lazy()
-    result = cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier") == expected).collect()
-    expected_frame = pl.DataFrame({"value": [1, 2], "identifier": pl.Series([expected, expected], dtype=polars_dtype)})
-    assert_frame_equal(result, expected_frame)
-
-
-@pytest.mark.parametrize("dtype", [pl.Decimal, decimal.Decimal])
-def test_concat_named_unspecified_decimal_does_not_round(dtype):
-    source = pl.DataFrame({"value": [1]}).lazy()
-    with pytest.raises(TypeError):
-        cpl.concat_named({(decimal.Decimal("1.5"),): source}, [("identifier", dtype)])
-
-
-def test_concat_named_python_dtypes_prune_multiple_sources():
-    calls = []
-
-    def matching_source(predicate):
-        calls.append("matching")
-
-    def rejected_source(predicate):
-        pytest.fail("A non-matching identifier source was queried")
-
-    matching = io_source_assert(pl.DataFrame({"value": [10, 20]}), matching_source)
-    rejected = io_source_assert(pl.DataFrame({"value": [30]}), rejected_source)
-    frame = cpl.concat_named(
-        {("rates", "1"): rejected, ("rates", "2"): matching, ("credit", "2"): rejected},
-        [("desk", str), ("bucket", int)],
-    )
-    result = frame.filter((pl.col("desk") == "rates") & (pl.col("bucket") == 2)).collect()
-    assert_frame_equal(result, pl.DataFrame({"value": [10, 20], "desk": ["rates", "rates"], "bucket": [2, 2]}))
-    assert calls == ["matching"]
-
-
-@pytest.mark.parametrize(
-    "identifier,dtype,physical_value",
-    [
-        (1672531200000, pl.Datetime("ms"), 1672531200000),
-        ("2023-01-01T12:30:00.123456789", pl.Datetime("ns"), 1672576200123456789),
-        ("2023-01-01T12:30:00", pl.Datetime("ms", "America/New_York"), 1672594200000),
-    ],
-)
-def test_concat_named_temporal_identifier_precision(identifier, dtype, physical_value):
-    source = pl.DataFrame({"value": [1, 2]}).lazy()
-    result = (
-        cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier").cast(pl.Int64) == physical_value).collect()
-    )
-    assert result["value"].to_list() == [1, 2]
-    assert result.schema["identifier"] == dtype
-    assert result["identifier"].cast(pl.Int64).to_list() == [physical_value, physical_value]
-
-
-@pytest.mark.parametrize(
-    "identifier,dtype,physical_value",
-    [
-        ("2023-01-01T12:30:00Z", pl.Datetime("us"), 1672576200000000),
-        ("2023-01-01T12:30:00+05:30", pl.Datetime("us"), 1672576200000000),
-        ("2023-01-01T12:30+05:30", pl.Datetime("us"), 1672576200000000),
-        ("2023-01-01T12:30:00+05", pl.Datetime("us"), 1672576200000000),
-        ("2023-01-01T12:30:00+05:30:15", pl.Datetime("us"), 1672576200000000),
-        ("2023-01-01T12:30:00 +05:30", pl.Datetime("us"), 1672576200000000),
-        ("2023-01-01T12:30:00.123456789-05:30", pl.Datetime("ns"), 1672576200123456789),
-        (" 2023-01-01 ", pl.Date, 19358),
-        (" 12:30:00 ", pl.Time, 45000000000000),
-        (" 2023-01-01T12:30:00 ", pl.Datetime("ms"), 1672576200000),
-        ("2023-01-01T12:30:00+05:30", pl.Datetime("us", "America/New_York"), 1672556400000000),
-    ],
-)
-def test_concat_named_legacy_temporal_strings(identifier, dtype, physical_value):
-    source = pl.DataFrame({"value": [1, 2]}).lazy()
-    result = (
-        cpl.concat_named({(identifier,): source}, [("identifier", dtype)]).filter(pl.col("identifier").cast(pl.Int64) == physical_value).collect()
-    )
-    assert result["value"].to_list() == [1, 2]
-    assert result.schema["identifier"] == dtype
-    assert result["identifier"].cast(pl.Int64).to_list() == [physical_value, physical_value]
-
-
-@pytest.mark.parametrize("identifier", ["1600-01-01T00:00:00", "1600-01-01T00:00:00+05:30", "2500-01-01T00:00:00Z"])
-@pytest.mark.parametrize("dtype", [pl.Datetime("ns"), pl.Datetime("ns", "UTC")])
-def test_concat_named_rejects_out_of_range_nanoseconds(identifier, dtype):
-    source = pl.DataFrame({"value": [1]}).lazy()
-    with pytest.raises(pl.exceptions.InvalidOperationError, match="nanosecond.*range"):
-        cpl.concat_named({(identifier,): source}, [("identifier", dtype)])
-
-
-@pytest.mark.parametrize(
-    "identifier,physical_value",
-    [
-        ("1677-09-21T00:12:43.145224192", -9223372036854775808),
-        ("2262-04-11T23:47:16.854775807", 9223372036854775807),
-        ("1677-09-21T00:12:43.145225192", -9223372036854774808),
-        ("1969-12-31T23:59:59.999999999", -1),
-    ],
-)
-def test_concat_named_accepts_nanosecond_boundaries(identifier, physical_value):
-    source = pl.DataFrame({"value": [1]}).lazy()
-    result = cpl.concat_named({(identifier,): source}, [("identifier", pl.Datetime("ns"))]).collect()
-    assert result["identifier"].cast(pl.Int64).to_list() == [physical_value]
-
-
-def test_concat_named_empty_dict():
-    """Test concat_named with an empty dictionary."""
-    # The function should raise a ValueError for empty dictionaries
-    with pytest.raises(ValueError):
-        cpl.concat_named({}, ["source"]).collect()
-
-
-def test_concat_named_or_condition():
-    """Test concat_named with an OR condition on unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    df2 = pl.DataFrame({"a": [5, 6], "b": [7, 8]})
-    df3 = pl.DataFrame({"a": [9, 10], "b": [11, 12]})
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False, "df3": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-        # df1 should be queried (source = "foo")
-        assert predicate is not None
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        # df2 should be queried (source = "bar")
-        assert predicate is not None
-
-    def assert_func3(predicate):
-        queried["df3"] = True
-        # df3 should not be queried (source = "baz")
-        assert False, "df3 should not be queried"
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-    lf3 = io_source_assert(df3, assert_func3)
-
-    result = (
-        cpl.concat_named({("foo",): lf1, ("bar",): lf2, ("baz",): lf3}, ["source"])
-        .filter((pl.col("source") == "foo") | (pl.col("source") == "bar"), pl.col("a") > 1)
-        .collect()
-    )
-
-    expected = pl.DataFrame({"a": [2, 5, 6], "b": [4, 7, 8], "source": ["foo", "bar", "bar"]})
-
-    assert_frame_equal(result, expected)
-    assert queried["df1"]
-    assert queried["df2"]
-    assert not queried["df3"]
-
-
-def test_concat_named_is_in_filter():
-    """Test concat_named with an is_in filter on unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    df2 = pl.DataFrame({"a": [5, 6], "b": [7, 8]})
-    df3 = pl.DataFrame({"a": [9, 10], "b": [11, 12]})
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False, "df3": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-        assert predicate is None
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        assert predicate is None
-
-    def assert_func3(predicate):
-        queried["df3"] = True
-        assert False, "df3 should not be queried"
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-    lf3 = io_source_assert(df3, assert_func3)
-
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2, ("baz",): lf3}, ["source"]).filter(pl.col("source").is_in(["foo", "bar"])).collect()
-
-    expected = pl.DataFrame({"a": [1, 2, 5, 6], "b": [3, 4, 7, 8], "source": ["foo", "foo", "bar", "bar"]})
-
-    assert_frame_equal(result, expected)
-    assert queried["df1"]
-    assert queried["df2"]
-    assert not queried["df3"]
-
-
-def test_concat_named_filter_non_unique_column():
-    """Test concat_named with filtering on non-unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-    df2 = pl.DataFrame({"a": [7, 8, 9], "b": [10, 11, 12]})
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter(pl.col("a") == 1).collect()
-
-    expected = pl.DataFrame({"a": [1], "b": [4], "source": ["foo"]})
-
-    assert_frame_equal(result, expected)
-    # Both dataframes should be queried since filter is on a non-unique column
-    assert queried["df1"]
-    assert queried["df2"]
-
-
-def test_concat_named_complex_predicate():
-    """Test concat_named with complex predicates combining unique and non-unique columns."""
-    df1 = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-    df2 = pl.DataFrame({"a": [1, 8, 9], "b": [10, 11, 12]})
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        # df2 should not be queried (source = "bar")
-        assert False, "df2 should not be queried"
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-
-    # Filtering on both source and 'a'
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter((pl.col("source") == "foo") & (pl.col("a") >= 2)).collect()
-
-    expected = pl.DataFrame({"a": [2, 3], "b": [5, 6], "source": ["foo", "foo"]})
-
-    assert_frame_equal(result, expected)
-    assert queried["df1"]  # Should query df1 because source = "foo"
-    assert not queried["df2"]  # Should not query df2
-
-
-def test_concat_named_mismatched_columns_keys():
-    """Test concat_named with mismatched numbers of unique columns and keys."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    df2 = pl.DataFrame({"a": [5, 6], "b": [7, 8]})
-
-    # The keys are tuples of length 1, but we provide 2 unique columns
-    with pytest.raises(ValueError, match="Number of unique columns 2 does not match number of keys 1"):
-        cpl.concat_named({("foo",): df1.lazy(), ("bar",): df2.lazy()}, ["source", "type"]).collect()
-
-
-def test_concat_named_with_column_selection():
-    """Test concat_named with column selection."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4], "c": [5, 6]})
-    df2 = pl.DataFrame({"a": [7, 8], "b": [9, 10], "c": [11, 12]})
-
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False}
-
-    def assert_func1(predicate):
-        queried["df1"] = True
-        assert predicate is None
-
-    def assert_func2(predicate):
-        queried["df2"] = True
-        assert False, "df2 should not be queried"
-
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
-
-    result = cpl.concat_named({("foo",): lf1, ("bar",): lf2}, ["source"]).filter(pl.col("source") == "foo").select(["a", "c"]).collect()
-
-    expected = pl.DataFrame(
+c = pl.col
+SOME, ANY, NEVER = "some predicate", "any predicate", "never read"
+D1, D2 = datetime.date(2023, 1, 1), datetime.date(2023, 2, 1)
+AB = [pl.DataFrame({"a": [1 + 2 * i, 2 + 2 * i], "b": [11 + 2 * i, 12 + 2 * i]}) for i in range(4)]
+ABC = [pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}), pl.DataFrame({"a": [7, 8, 9], "b": [10, 11, 12]})]
+
+
+def P(id, sources, names, pred, expect, query=None):
+    """A pruning row: ``sources`` maps an identifier to (frame, what it must receive); ``expect`` is the result."""
+    return Case(id, pred, pl.DataFrame(expect) if isinstance(expect, dict) else expect, {"sources": sources, "names": names, "query": query})
+
+
+PRUNING = [
+    P(
+        "concat_named_basic",
+        {("foo",): (ABC[0], None), ("bar",): (ABC[1], None)},
+        ["source"],
+        None,
+        {"a": [1, 2, 3, 7, 8, 9], "b": [4, 5, 6, 10, 11, 12], "source": ["foo"] * 3 + ["bar"] * 3},
+    ),
+    P(
+        "concat_named_filter_pushdown",
+        {("foo",): (ABC[0], None), ("bar",): (ABC[1], NEVER)},
+        ["source"],
+        c("source") == "foo",
+        {"a": [1, 2, 3], "b": [4, 5, 6], "source": ["foo"] * 3},
+    ),
+    P(
+        "concat_named_filter_selects_no_sources",
+        {("foo",): (pl.DataFrame({"value": [1]}), NEVER), ("bar",): (pl.DataFrame({"value": [2]}), NEVER)},
+        ["source"],
+        c("source") == "missing",
+        pl.DataFrame(schema={"value": pl.Int64, "source": pl.String}),
+    ),
+    P(
+        "concat_named_multiple_unique_columns",
+        {("east", "A"): (AB[0], None), ("east", "B"): (AB[1], NEVER), ("west", "A"): (AB[2], NEVER), ("west", "B"): (AB[3], NEVER)},
+        ["region", "type"],
+        (c("region") == "east") & (c("type") == "A"),
+        {"a": [1, 2], "b": [11, 12], "region": ["east"] * 2, "type": ["A"] * 2},
+    ),
+    P(
+        "concat_named_different_data_types",
+        {(D1, 100): (AB[0], None), (D2, 200): (AB[1], NEVER)},
+        ["date", ("id", pl.Float64)],
+        c("date") == D1,
+        {"a": [1, 2], "b": [11, 12], "date": [D1, D1], "id": [100.0, 100.0]},
+    ),
+    P(
+        "concat_named_or_condition",
+        {("foo",): (AB[0], SOME), ("bar",): (AB[1], SOME), ("baz",): (AB[2], NEVER)},
+        ["source"],
+        ((c("source") == "foo") | (c("source") == "bar")) & (c("a") > 1),
+        {"a": [2, 3, 4], "b": [12, 13, 14], "source": ["foo", "bar", "bar"]},
+    ),
+    P(
+        "concat_named_is_in_filter",
+        {("foo",): (AB[0], None), ("bar",): (AB[1], None), ("baz",): (AB[2], NEVER)},
+        ["source"],
+        c("source").is_in(["foo", "bar"]),
+        {"a": [1, 2, 3, 4], "b": [11, 12, 13, 14], "source": ["foo", "foo", "bar", "bar"]},
+    ),
+    # A filter on a column the sources share reads every source.
+    P(
+        "concat_named_filter_non_unique_column",
+        {("foo",): (ABC[0], ANY), ("bar",): (ABC[1], ANY)},
+        ["source"],
+        c("a") == 1,
+        {"a": [1], "b": [4], "source": ["foo"]},
+    ),
+    P(
+        "concat_named_complex_predicate",
+        {("foo",): (ABC[0], ANY), ("bar",): (ABC[1].with_columns(a=pl.Series([1, 8, 9])), NEVER)},
+        ["source"],
+        (c("source") == "foo") & (c("a") >= 2),
+        {"a": [2, 3], "b": [5, 6], "source": ["foo", "foo"]},
+    ),
+    P(
+        "concat_named_with_column_selection",
+        {("foo",): (AB[0].with_columns(c=pl.Series([5, 6])), None), ("bar",): (AB[1].with_columns(c=pl.Series([11, 12])), NEVER)},
+        ["source"],
+        c("source") == "foo",
+        {"a": [1, 2], "c": [5, 6]},
+        query=lambda lf: lf.select("a", "c"),
+    ),
+    P(
+        "concat_named_filter_with_inequality",
+        {(datetime.date(2025, 5, 1),): (AB[0], ANY), (datetime.date(2025, 5, 2),): (AB[1], NEVER)},
+        ["source"],
+        c("source") < datetime.date(2025, 5, 2),
+        {"a": [1, 2], "b": [11, 12], "source": [datetime.date(2025, 5, 1)] * 2},
+    ),
+    P(
+        "concat_named_python_dtypes_prune_multiple_sources",
         {
-            "a": [1, 2],
-            "c": [5, 6],
-        }
-    )
+            ("rates", "1"): (pl.DataFrame({"value": [30]}), NEVER),
+            ("rates", "2"): (pl.DataFrame({"value": [10, 20]}), ANY),
+            ("credit", "2"): (pl.DataFrame({"value": [30]}), NEVER),
+        },
+        [("desk", str), ("bucket", int)],
+        (c("desk") == "rates") & (c("bucket") == 2),
+        {"value": [10, 20], "desk": ["rates", "rates"], "bucket": [2, 2]},
+    ),
+]
 
-    assert_frame_equal(result, expected)
-    assert queried["df1"]
-    assert not queried["df2"]
+
+@pytest.mark.parametrize(("pred", "expect", "kw"), params(PRUNING, "pred", "expect", "kw"))
+def test_concat_named_pruning(pred, expect, kw):
+    seen = {key: [] for key in kw["sources"]}
+    lf = cpl.concat_named({key: io_source_assert(df, seen[key].append) for key, (df, _) in kw["sources"].items()}, kw["names"])
+    lf = lf if pred is None else lf.filter(pred)
+    assert_frame_equal((kw["query"] or (lambda frame: frame))(lf).collect(), expect)
+    for key, (_, want) in kw["sources"].items():
+        if want is NEVER:
+            assert not seen[key], f"{key} was read"
+            continue
+        assert seen[key], f"{key} was not read"
+        if want is not ANY:
+            assert all((p is not None) == (want is SOME) for p in seen[key]), (key, seen[key])
 
 
-def test_concat_named_filter_with_inequality():
-    """Test concat_named using a date filter with inequality."""
-    df1 = pl.DataFrame({"a": [1, 2], "b": [3, 4]})
-    df2 = pl.DataFrame({"a": [5, 6], "b": [7, 8]})
+class Physical(int):
+    """An identifier's expected value as the physical integer of its temporal dtype."""
 
-    # Track which dataframes are queried
-    queried = {"df1": False, "df2": False}
 
-    def assert_func1(predicate):
-        queried["df1"] = True
+def I(group, identifier, dtype, value, polars_dtype=None):
+    return (group, identifier, dtype, value, polars_dtype or dtype)
 
-    def assert_func2(predicate):
-        queried["df2"] = True
-        assert False, "df2 should not be queried"
 
-    lf1 = io_source_assert(df1, assert_func1)
-    lf2 = io_source_assert(df2, assert_func2)
+_IDENTIFIERS = [
+    I("concat_named_temporal_string_identifiers", "2023-01-01", pl.Date, datetime.date(2023, 1, 1)),
+    I("concat_named_temporal_string_identifiers", "2023-01-01T12:30:00", pl.Datetime("ms"), datetime.datetime(2023, 1, 1, 12, 30)),
+    I("concat_named_temporal_string_identifiers", "12:30:00", pl.Time, datetime.time(12, 30)),
+    I("concat_named_python_dtype_identifiers", "label", str, "label", pl.String),
+    I("concat_named_python_dtype_identifiers", "42", int, 42, pl.Int64),
+    I("concat_named_python_dtype_identifiers", "3.5", float, 3.5, pl.Float64),
+    I("concat_named_python_dtype_identifiers", "2023-01-01", datetime.date, datetime.date(2023, 1, 1), pl.Date),
+    I("concat_named_python_dtype_identifiers", "2023-01-01T12:30:00", datetime.datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
+    I("concat_named_python_dtype_identifiers", "12:30:00", datetime.time, datetime.time(12, 30), pl.Time),
+    I("concat_named_python_dtype_identifiers", 42, int, 42, pl.Int64),
+    I("concat_named_python_dtype_identifiers", True, bool, True, pl.Boolean),
+    I("concat_named_python_dtype_identifiers", datetime.datetime(2023, 1, 1), pl.Datetime, datetime.datetime(2023, 1, 1), pl.Datetime("us")),
+    I("concat_named_python_dtype_identifiers", "2023-01-01T12:30:00", pl.Datetime, datetime.datetime(2023, 1, 1, 12, 30), pl.Datetime("us")),
+    I("concat_named_python_dtype_identifiers", datetime.timedelta(days=1), pl.Duration, datetime.timedelta(days=1), pl.Duration("us")),
+    I("concat_named_python_dtype_identifiers", datetime.timedelta(days=1), datetime.timedelta, datetime.timedelta(days=1), pl.Duration("us")),
+    I("concat_named_python_dtype_identifiers", "rates", pl.Categorical, "rates", pl.Categorical()),
+    I("concat_named_temporal_identifier_precision", 1672531200000, pl.Datetime("ms"), Physical(1672531200000)),
+    I("concat_named_temporal_identifier_precision", "2023-01-01T12:30:00.123456789", pl.Datetime("ns"), Physical(1672576200123456789)),
+    I("concat_named_temporal_identifier_precision", "2023-01-01T12:30:00", pl.Datetime("ms", "America/New_York"), Physical(1672594200000)),
+    # Offsets, padding and sub-microsecond digits in temporal strings.
+    *[
+        I("concat_named_legacy_temporal_strings", s, pl.Datetime("us"), Physical(1672576200000000))
+        for s in [
+            "2023-01-01T12:30:00Z",
+            "2023-01-01T12:30:00+05:30",
+            "2023-01-01T12:30+05:30",
+            "2023-01-01T12:30:00+05",
+            "2023-01-01T12:30:00+05:30:15",
+            "2023-01-01T12:30:00 +05:30",
+        ]
+    ],
+    I("concat_named_legacy_temporal_strings", "2023-01-01T12:30:00.123456789-05:30", pl.Datetime("ns"), Physical(1672576200123456789)),
+    I("concat_named_legacy_temporal_strings", " 2023-01-01 ", pl.Date, Physical(19358)),
+    I("concat_named_legacy_temporal_strings", " 12:30:00 ", pl.Time, Physical(45000000000000)),
+    I("concat_named_legacy_temporal_strings", " 2023-01-01T12:30:00 ", pl.Datetime("ms"), Physical(1672576200000)),
+    I("concat_named_legacy_temporal_strings", "2023-01-01T12:30:00+05:30", pl.Datetime("us", "America/New_York"), Physical(1672556400000000)),
+    *[
+        I("concat_named_accepts_nanosecond_boundaries", s, pl.Datetime("ns"), Physical(n))
+        for s, n in [
+            ("1677-09-21T00:12:43.145224192", -9223372036854775808),
+            ("2262-04-11T23:47:16.854775807", 9223372036854775807),
+            ("1677-09-21T00:12:43.145225192", -9223372036854774808),
+            ("1969-12-31T23:59:59.999999999", -1),
+        ]
+    ],
+]
+IDENTIFIERS = [pytest.param(*row[1:], id=f"{row[0]}-{i}") for i, row in enumerate(_IDENTIFIERS)]
 
-    result = (
-        cpl.concat_named({(datetime.date(2025, 5, 1),): lf1, (datetime.date(2025, 5, 2),): lf2}, ["source"])
-        .filter(pl.col("source") < datetime.date(2025, 5, 2))
-        .collect()
-    )
 
-    expected = pl.DataFrame({"a": [1, 2], "b": [3, 4], "source": [datetime.date(2025, 5, 1), datetime.date(2025, 5, 1)]})
+@pytest.mark.parametrize(("identifier", "dtype", "value", "polars_dtype"), IDENTIFIERS)
+def test_concat_named_identifier(identifier, dtype, value, polars_dtype):
+    lf = cpl.concat_named({(identifier,): pl.LazyFrame({"value": [1, 2]})}, [("identifier", dtype)])
+    if isinstance(value, Physical):
+        result = lf.filter(c("identifier").cast(pl.Int64) == value).collect()
+        assert result["value"].to_list() == [1, 2]
+        assert result.schema["identifier"] == polars_dtype
+        assert result["identifier"].cast(pl.Int64).to_list() == [value, value]
+    else:
+        result = lf.filter(c("identifier") == value).collect()
+        assert_frame_equal(result, pl.DataFrame({"value": [1, 2], "identifier": pl.Series([value, value], dtype=polars_dtype)}))
 
-    assert_frame_equal(result, expected)
-    assert queried["df1"]
-    assert not queried["df2"]
+
+ERRORS = [
+    *[
+        Case(
+            f"concat_named_unspecified_decimal_does_not_round-{dtype}",
+            {(decimal.Decimal("1.5"),): None},
+            TypeError,
+            {"names": [("identifier", dtype)]},
+        )
+        for dtype in (pl.Decimal, decimal.Decimal)
+    ],
+    *[
+        Case(
+            f"concat_named_rejects_out_of_range_nanoseconds-{dtype}-{s}",
+            {(s,): None},
+            pl.exceptions.InvalidOperationError,
+            {"names": [("identifier", dtype)], "match": "nanosecond.*range"},
+        )
+        for dtype in (pl.Datetime("ns"), pl.Datetime("ns", "UTC"))
+        for s in ["1600-01-01T00:00:00", "1600-01-01T00:00:00+05:30", "2500-01-01T00:00:00Z"]
+    ],
+    Case("concat_named_empty_dict", {}, ValueError, {"names": ["source"]}),
+    Case(
+        "concat_named_mismatched_columns_keys",
+        {("foo",): None, ("bar",): None},
+        ValueError,
+        {"names": ["source", "type"], "match": "Number of unique columns 2 does not match number of keys 1"},
+    ),
+]
+
+
+@pytest.mark.parametrize(("keys", "error", "kw"), params(ERRORS, "pred", "expect", "kw"))
+def test_concat_named_error(keys, error, kw):
+    with pytest.raises(error, match=kw.get("match")):
+        cpl.concat_named({key: pl.LazyFrame({"value": [1]}) for key in keys}, kw["names"]).collect()
 
 
 @pytest.mark.parametrize(
     ("lf_dict", "kwargs", "pred"),
     [
         # 2**31 - 1 is an Int32 literal, so ``k + 1`` wraps in the data and must wrap in the pruning index too.
-        ({(2**31 - 1,): pl.LazyFrame({"v": [42]})}, {}, (pl.col("k") + 1) < 0),
-        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"y": [2]})}, {"how": "diagonal"}, pl.col("y") == 2),
-        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"y": [2]})}, {"how": "diagonal"}, pl.col("k") == "b"),
-        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"x": [2.5]})}, {"how": "vertical_relaxed"}, pl.col("k") == "a"),
+        ({(2**31 - 1,): pl.LazyFrame({"v": [42]})}, {}, (c("k") + 1) < 0),
+        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"y": [2]})}, {"how": "diagonal"}, c("y") == 2),
+        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"y": [2]})}, {"how": "diagonal"}, c("k") == "b"),
+        ({("a",): pl.LazyFrame({"x": [1]}), ("b",): pl.LazyFrame({"x": [2.5]})}, {"how": "vertical_relaxed"}, c("k") == "a"),
     ],
 )
 def test_concat_named_pruning_matches_concat(lf_dict, kwargs, pred):
