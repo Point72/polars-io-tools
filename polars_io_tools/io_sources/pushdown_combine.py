@@ -149,10 +149,13 @@ class IntervalFilterSpec:
               - ``"right"`` (``(start, end]``): ``end >= lo`` and ``start <  hi``
               - ``"none"``  (``(start, end)``): ``end >  lo`` and ``start <  hi``
 
-        value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform the request
+        value_mapping (dict[Any, Any] | Callable[[Any], Any] | timedelta | None): Transform the request
             bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
-            values (e.g. a business-day offset applied to the request date). Every day of a bounded
-            ``Date`` request is mapped and the pushed range spans the mapped days. Nothing is pushed
+            values (e.g. a business-day offset applied to the request date). A ``timedelta`` is a
+            constant shift of both bounds, which must be whole days for a ``Date`` request; it is
+            pushed for any request, and a bound shifted out of range is left unbounded. For a dict or
+            callable, every day of a bounded ``Date`` request is mapped and the pushed range spans the
+            mapped days. Nothing is pushed
             for other requests, or when a dict lacks a requested day or a day maps to None. ``None``
             passes bounds through.
 
@@ -172,7 +175,7 @@ class IntervalFilterSpec:
     start_col: str
     end_col: str
     closed: str = "both"
-    value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
+    value_mapping: dict[Any, Any] | Callable[[Any], Any] | timedelta | None = None
 
     def __post_init__(self) -> None:
         if self.closed not in _CLOSED_MODES:
@@ -365,6 +368,18 @@ def _bound_expr(value: Any, source_col: str, source_dtype: pl.DataType, *, is_lo
     return expr if isinstance(expr, pl.Expr) else None
 
 
+def _shift_bound(bound: Any, shift: timedelta, overflow: Any) -> Any:
+    """``bound`` shifted by ``shift``, ``overflow`` if the result is out of range; infinite bounds are kept."""
+    if not isinstance(bound, date):
+        return bound
+    if not isinstance(bound, datetime) and shift % timedelta(days=1):
+        raise ValueError(f"IntervalFilterSpec value_mapping {shift!r} must be a whole number of days for a Date request")
+    try:
+        return bound + shift
+    except OverflowError:
+        return overflow
+
+
 def _apply_interval_filter(
     filtered_lf: pl.LazyFrame,
     spec: IntervalFilterSpec,
@@ -389,7 +404,9 @@ def _apply_interval_filter(
     enclosure = date_range.enclosure
     lo, hi = enclosure.lower, enclosure.upper
     mapping = spec.value_mapping
-    if mapping is not None:
+    if isinstance(mapping, timedelta):
+        lo, hi, mapping = _shift_bound(lo, mapping, -portion.inf), _shift_bound(hi, mapping, portion.inf), None
+    elif mapping is not None:
         # The mapping need not be monotone, so every requested day is mapped, not only the range ends.
         mapped = [_map_bound(day, mapping) for day in _enumerate_days(date_range) or ()]
         # A day the mapping does not know (a missing dict key or a null result) pushes nothing.
