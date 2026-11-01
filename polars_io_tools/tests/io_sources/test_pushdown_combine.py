@@ -1,16 +1,19 @@
 """pushdown_combine: scenario rows run by one test, and tables for FilterSpec, IntervalFilterSpec and the helpers.
 
 A scenario names its sources (a frame and its specs), the combine function and the user's predicate. The result must
-match combine over the unfiltered sources filtered by the predicate, unless the row sets ``native=False``; with the
-identity combine this also means the source kept every row the predicate keeps. A row may pin what a source was asked
-for: ``pushed`` sources received a predicate, ``bounds`` are the temporal bounds on a column, ``discrete`` the values on
-a column, and ``no_discrete`` a column with no discrete filter. ``check`` runs on the result and the trackers. Sources a
-row inspects, and the source of the identity combine, sit behind a ``PredicateTracker``.
+match combine over the unfiltered sources filtered by the predicate, unless the row sets ``compare_native=False``; with
+the identity combine this also means the source kept every row the predicate keeps. A row may pin what a source was
+asked for: ``pushed`` sources received a predicate, ``bounds`` are the temporal bounds on a column, ``discrete`` the
+values on a column, and ``no_discrete`` a column with no discrete filter. ``check`` runs on the result and the trackers.
+Sources a row inspects, and the source of the identity combine, sit behind a ``PredicateTracker``.
 """
 
 import sys
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -86,9 +89,41 @@ def two(left: pl.DataFrame, right: pl.DataFrame, left_specs: dict, right_specs: 
     return {"left": (left, left_specs), "right": (right, left_specs if right_specs is None else right_specs)}
 
 
-def S(id, sources, combine, pred=None, marks=(), **kw):
-    """A scenario row; ``pred`` may be a list of predicates collected in turn from the same frame."""
-    return Case(id, pred, None, {"sources": sources, "combine": combine, **kw}, marks)
+@dataclass(frozen=True)
+class Scenario:
+    """Sources (a frame and its specs per name), the combine function and the user's predicate.
+
+    ``predicate`` may be a list of predicates collected in turn from the same frame. ``bounds``, ``discrete`` and
+    ``discrete_node`` are keyed by source name, then column.
+    """
+
+    id: str
+    sources: dict
+    combine: Callable
+    predicate: Any = None
+    _: KW_ONLY
+    compare_native: bool = True
+    # defaults to True for the identity combine, which keeps the source's row order
+    check_row_order: bool | None = None
+    # sources that must receive a predicate
+    pushed: tuple[str, ...] = ()
+    # (lower, upper) temporal bounds, as in ``assert_pushed_bounds``
+    bounds: dict[str, dict[str, tuple]] = field(default_factory=dict)
+    # the values the first discrete filter admits
+    discrete: dict[str, dict[str, set]] = field(default_factory=dict)
+    # "eq" or "is_in": the node shape of that filter
+    discrete_node: dict[str, dict[str, str]] = field(default_factory=dict)
+    # columns with no discrete filter
+    no_discrete: dict[str, set[str]] = field(default_factory=dict)
+    # runs on the result and the trackers
+    check: Callable | None = None
+    # (exception type, match) that collecting raises
+    raises: tuple | None = None
+    # applied to the filtered frame and to the reference
+    post: Callable | None = None
+    combine_kwargs: dict | None = None
+    sources_as_kwargs: bool = False
+    marks: tuple = ()
 
 
 # Checks on the result and the trackers
@@ -134,7 +169,7 @@ def as_date(s):
 
 
 def intraday(pred, **spec):
-    return {"sources": {"main": (INTRADAY, {"data_date": F(source_col="timestamp", **spec)})}, "combine": as_date, "pred": pred}
+    return {"sources": {"main": (INTRADAY, {"data_date": F(source_col="timestamp", **spec)})}, "combine": as_date, "predicate": pred}
 
 
 def scaled(sources, multiplier):
@@ -249,7 +284,7 @@ INTRADAY_SCHED = schedule(
 )
 
 
-def endpoint_row(closed: str, keep_start_eq_hi: bool, keep_end_eq_lo: bool) -> Case:
+def endpoint_row(closed: str, keep_start_eq_hi: bool, keep_end_eq_lo: bool) -> Scenario:
     """A window starting on the requested day is kept iff its start is closed (val 1); one ending there iff its end is (val 2)."""
     kept = {1} if keep_start_eq_hi else set()
     kept |= {2} if keep_end_eq_lo else set()
@@ -259,12 +294,12 @@ def endpoint_row(closed: str, keep_start_eq_hi: bool, keep_end_eq_lo: bool) -> C
 
     sched = schedule([d(15), d(1)], [d(20), d(15)], roots=["A", "B"])
     spine_df = spine(d(15), d(15), roots=["A", "B"])
-    return S(
+    return Scenario(
         f"date_endpoints-{closed}",
         windows(sched, spine_df, closed=closed),
         interval_join(pl.lit(True)),
         c("date") == d(15),
-        native=False,
+        compare_native=False,
         check=check,
     )
 
@@ -274,7 +309,7 @@ def shift_bounds_row(id, pred, end_lower, start_upper):
     is_datetime = isinstance(end_lower, datetime)
     sched, spine_df = (SCHED_11_20_DT, spine(datetime(2024, 1, 13))) if is_datetime else (SCHED_11_20, spine(d(13)))
     start = (f'(col("start")) <= ({start_upper})',) if start_upper is not None else ()
-    return S(
+    return Scenario(
         f"interval_timedelta_mapping_shifts_bounds-{id}",
         windows(sched, spine_df, value_mapping=days(-1)),
         interval_join(None),
@@ -404,143 +439,160 @@ NEAR_MAX = [
 US_MEMBERS = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2)], dtype=pl.Datetime("us", "UTC"))
 
 
-def is_in_units_row(unit: str, time_zone: str | None) -> Case:
+def is_in_units_row(unit: str, time_zone: str | None) -> Scenario:
     tz = ZoneInfo(time_zone) if time_zone else None
     values = pl.Series([datetime(2024, 1, 1, 0, 0, s, tzinfo=tz) for s in range(5)], dtype=pl.Datetime(unit, time_zone))
     # The collection has the column's own dtype: Polars rejects a microsecond list against a millisecond column.
-    return S(
+    return Scenario(
         f"is_in_on_any_datetime_unit-{time_zone}-{unit}", one(values.to_frame("t"), t=F()), identity, c("t").is_in(values.gather([1, 3]).implode())
     )
 
 
 SCENARIOS = [
     # Propagation through a join
-    S("no_filters", two(pl.DataFrame({"id": [1, 2], "val": [10, 20]}), pl.DataFrame({"id": [1, 2], "other": [100, 200]}), {}), join("id")),
-    S("simple_date_filter", two(DAILY10, OTHER10, {"date": F()}), join("date", maintain_order="left"), c("date") >= d(5), row_order=True),
-    S(
+    Scenario("no_filters", two(pl.DataFrame({"id": [1, 2], "val": [10, 20]}), pl.DataFrame({"id": [1, 2], "other": [100, 200]}), {}), join("id")),
+    Scenario(
+        "simple_date_filter", two(DAILY10, OTHER10, {"date": F()}), join("date", maintain_order="left"), c("date") >= d(5), check_row_order=True
+    ),
+    Scenario(
         "dt_date_filter_prunes_datetime_source",
         one(daily_frame(90, dtype=pl.Datetime("us")), date=F()),
         identity,
         (c("date").dt.date() >= d(1)) & (c("date").dt.date() <= d(31)),
         pushed=("data",),
     ),
-    S("simple_equality_filter", two(*GROUP_PAIR, {"group": F()}), join("group"), c("group") == "B"),
-    S("is_in_filter", two(*GROUP_PAIR, {"group": F()}), join("group"), c("group").is_in(["A", "C"])),
+    Scenario("simple_equality_filter", two(*GROUP_PAIR, {"group": F()}), join("group"), c("group") == "B"),
+    Scenario("is_in_filter", two(*GROUP_PAIR, {"group": F()}), join("group"), c("group").is_in(["A", "C"])),
     # Lookback and lookahead
-    S("lookback_with_date_equality", one(DAILY14, date=F(lookback=days(4))), lag(3), c("date") == d(5)),
-    S("lookahead_with_date_equality", one(DAILY14, date=F(lookahead=days(4))), lead(3), c("date") == d(5)),
-    S(
+    Scenario("lookback_with_date_equality", one(DAILY14, date=F(lookback=days(4))), lag(3), c("date") == d(5)),
+    Scenario("lookahead_with_date_equality", one(DAILY14, date=F(lookahead=days(4))), lead(3), c("date") == d(5)),
+    Scenario(
         "lookback_and_lookahead_with_date_equality",
         one(DAILY14, date=F(lookback=days(3), lookahead=days(3))),
         lambda s: s["data"].with_columns(c("val").shift(2).alias("lag2"), c("val").shift(-2).alias("lead2")),
         c("date") == d(7),
     ),
-    S(
+    Scenario(
         "lookback_expands_date_range",
         two(daily_frame(10, base=100), OTHER10, {"date": F(lookback=days(3))}, {"date": F()}),
         join("date", maintain_order="left"),
         c("date") >= d(5),
-        row_order=True,
+        check_row_order=True,
         pushed=("left",),
     ),
-    S(
+    Scenario(
         "lookback_for_rolling_computation",
         one(DAILY10.with_columns(c("val").cast(pl.Float64)), date=F(lookback=days(3))),
         lambda s: s["data"].sort("date").with_columns(c("val").rolling_sum(window_size=3, min_samples=1).alias("rolling_sum")),
         c("date") >= d(5),
     ),
-    S("lookahead_expands_date_range", one(daily_frame(10, base=100), date=F(lookahead=days(2))), identity, c("date") <= d(5)),
-    S(
+    Scenario("lookahead_expands_date_range", one(daily_frame(10, base=100), date=F(lookahead=days(2))), identity, c("date") <= d(5)),
+    Scenario(
         "combined_lookback_lookahead",
         one(daily_frame(10, base=100), date=F(lookback=days(2), lookahead=days(2))),
         identity,
         c("date").is_between(d(4), d(7)),
     ),
     # Pushed bounds and values
-    S("date_gte_filter_structure", one(DAILY10, date=F()), identity, c("date") >= d(5), bounds=[("data", "date", d(5), ...)]),
-    S("date_between_filter_structure", one(DAILY10, date=F()), identity, c("date").is_between(d(3), d(7)), bounds=[("data", "date", d(3), d(7))]),
-    S(
+    Scenario("date_gte_filter_structure", one(DAILY10, date=F()), identity, c("date") >= d(5), bounds={"data": {"date": (d(5), ...)}}),
+    Scenario(
+        "date_between_filter_structure", one(DAILY10, date=F()), identity, c("date").is_between(d(3), d(7)), bounds={"data": {"date": (d(3), d(7))}}
+    ),
+    Scenario(
         "lookback_expands_date_range_correctly",
         one(DAILY10, date=F(lookback=days(3))),
         identity,
         c("date") >= d(5),
-        bounds=[("data", "date", d(2), ...)],
+        bounds={"data": {"date": (d(2), ...)}},
     ),
-    S(
+    Scenario(
         "lookback_with_is_between_and_complex_combine",
         one(DAILY14, date=F(lookback=days(4))),
         lag(3),
         c("date").is_between(d(5), d(10)),
-        bounds=[("data", "date", d(1), d(10))],
+        bounds={"data": {"date": (d(1), d(10))}},
     ),
     # Polars may fold the widened filter into the user's one when the combine is the identity.
-    S(
+    Scenario(
         "lookback_optimization_with_identity_combine",
         one(DAILY14, date=F(lookback=days(4))),
         identity,
         c("date").is_between(d(5), d(10)),
-        bounds=[("data", "date", (d(1), d(5)), d(10))],
+        bounds={"data": {"date": ((d(1), d(5)), d(10))}},
     ),
-    S("lookahead_expands_upper_bound", one(DAILY14, date=F(lookahead=days(3))), identity, c("date") <= d(7), bounds=[("data", "date", ..., d(10))]),
-    S("discrete_equality_filter_structure", one(GROUP_FRAME, group=F()), identity, c("group") == "B", discrete=[("data", "group", {"B"}, "eq")]),
-    S(
+    Scenario(
+        "lookahead_expands_upper_bound", one(DAILY14, date=F(lookahead=days(3))), identity, c("date") <= d(7), bounds={"data": {"date": (..., d(10))}}
+    ),
+    Scenario(
+        "discrete_equality_filter_structure",
+        one(GROUP_FRAME, group=F()),
+        identity,
+        c("group") == "B",
+        discrete={"data": {"group": {"B"}}},
+        discrete_node={"data": {"group": "eq"}},
+    ),
+    Scenario(
         "discrete_is_in_filter_structure",
         one(GROUP_FRAME, group=F()),
         identity,
         c("group").is_in(["A", "C"]),
-        discrete=[("data", "group", {"A", "C"}, "is_in")],
+        discrete={"data": {"group": {"A", "C"}}},
+        discrete_node={"data": {"group": "is_in"}},
     ),
     # Value mapping and source column renames
-    S(
+    Scenario(
         "dict_value_mapping",
         one(region_frame("NA", "EU"), region=F(source_col="region_code", value_mapping=to_codes("NA", "EU"))),
         regions,
         c("region") == "NORTH_AMERICA",
-        discrete=[("data", "region_code", {"NA"}, "eq")],
+        discrete={"data": {"region_code": {"NA"}}},
+        discrete_node={"data": {"region_code": "eq"}},
     ),
-    S(
+    Scenario(
         "callable_value_mapping",
         one(pl.DataFrame({"name": ["foo", "bar", "baz"], "val": [1, 2, 3]}), name=F(value_mapping=str.lower)),
         lambda s: s["data"].with_columns(c("name").str.to_uppercase()),
         c("name") == "FOO",
     ),
-    S(
+    Scenario(
         "is_in_with_value_mapping",
         one(region_frame("NA", "EU", "APAC"), region=F(source_col="region_code", value_mapping=to_codes("NA", "EU", "APAC"))),
         regions,
         c("region").is_in(["NORTH_AMERICA", "ASIA_PACIFIC"]),
-        discrete=[("data", "region_code", {"NA", "APAC"}, "is_in")],
+        discrete={"data": {"region_code": {"NA", "APAC"}}},
+        discrete_node={"data": {"region_code": "is_in"}},
     ),
     # An unmapped value is not pushed: the source supplies every row and the user's filter decides.
-    S(
+    Scenario(
         "unmapped_value_not_pushed_down",
         one(region_frame("NA", "EU", "APAC", "LATAM"), region=F(source_col="region_code", value_mapping=to_codes("NA", "EU"))),
         regions,
         c("region") == "LATIN_AMERICA",
     ),
-    S(
+    Scenario(
         "mixed_mapped_and_unmapped_values_in_is_in",
         one(region_frame("NA", "EU", "APAC", "LATAM"), region=F(source_col="region_code", value_mapping=to_codes("NA", "EU"))),
         regions,
         c("region").is_in(["NORTH_AMERICA", "LATIN_AMERICA"]),
     ),
-    S(
+    Scenario(
         "different_source_column_name",
         one(DAILY10.rename({"date": "DataDate"}), date=F(source_col="DataDate")),
         lambda s: s["data"].rename({"DataDate": "date"}),
         c("date") == d(2),
-        discrete=[("data", "DataDate", {d(2)}, "eq")],
+        discrete={"data": {"DataDate": {d(2)}}},
+        discrete_node={"data": {"DataDate": "eq"}},
     ),
     # Several sources with their own specs
-    S(
+    Scenario(
         "different_lookback_per_source",
         {"source1": (DAILY10.rename({"val": "val1"}), {"date": F(lookback=days(5))}), "source2": (OTHER10, {"date": F(lookback=days(2))})},
         lambda s: s["source1"].join(s["source2"], on="date", maintain_order="right"),
         c("date") >= d(7),
-        row_order=True,
-        bounds=[("source1", "date", d(2), ...), ("source2", "date", d(5), ...)],
+        check_row_order=True,
+        bounds={"source1": {"date": (d(2), ...)}, "source2": {"date": (d(5), ...)}},
     ),
-    S(
+    Scenario(
         "mixed_filter_types_per_source",
         {
             "left": (GROUPS.head(5), {"date": F(lookback=days(2)), "group": F()}),
@@ -548,92 +600,94 @@ SCENARIOS = [
         },
         join(["date", "group"], maintain_order="left"),
         (c("date") >= d(3)) & (c("group") == "A"),
-        row_order=True,
+        check_row_order=True,
     ),
-    S("pushdown_combine_join_with_mapping_and_lookback", THREE_WAY, three_way, c("date").is_between(d(5), d(7)) & (c("category") == "CAT_A")),
+    Scenario("pushdown_combine_join_with_mapping_and_lookback", THREE_WAY, three_way, c("date").is_between(d(5), d(7)) & (c("category") == "CAT_A")),
     # Edge cases
-    S("empty_result", one(daily_frame(1), date=F()), identity, c("date") == d(31, 12)),
-    S("no_filter_specs", one(pl.DataFrame({"id": [1, 2], "val": [10, 20]})), identity, c("id") == 1),
-    S("source_col_not_in_schema", one(pl.DataFrame({"id": [1, 2], "val": [10, 20]}), nonexistent=F(source_col="also_nonexistent")), identity),
-    S("multiple_filters_combined", one(GROUPS, date=F(), group=F()), identity, (c("date") >= d(5)) & (c("group") == "A")),
-    S(
+    Scenario("empty_result", one(daily_frame(1), date=F()), identity, c("date") == d(31, 12)),
+    Scenario("no_filter_specs", one(pl.DataFrame({"id": [1, 2], "val": [10, 20]})), identity, c("id") == 1),
+    Scenario("source_col_not_in_schema", one(pl.DataFrame({"id": [1, 2], "val": [10, 20]}), nonexistent=F(source_col="also_nonexistent")), identity),
+    Scenario("multiple_filters_combined", one(GROUPS, date=F(), group=F()), identity, (c("date") >= d(5)) & (c("group") == "A")),
+    Scenario(
         "datetime_column",
         one(pl.DataFrame({"ts": [datetime(2024, 1, 1, h) for h in range(24)], "val": range(24)}), ts=F(lookback=timedelta(hours=3))),
         identity,
         c("ts") >= datetime(2024, 1, 1, 12),
     ),
-    S(
+    Scenario(
         "column_selection_with_columns",
         one(pl.DataFrame({"date": [d(1), d(2)], "a": [1, 2], "b": [10, 20], "c": [100, 200]}), date=F()),
         identity,
         post=lambda lf: lf.select("date", "a"),
     ),
-    S("row_limit", one(DAILY10, date=F()), identity, post=lambda lf: lf.head(3)),
-    S(
+    Scenario("row_limit", one(DAILY10, date=F()), identity, post=lambda lf: lf.head(3)),
+    Scenario(
         "filter_on_column_without_spec",
         one(FIVE.with_columns(unspecified_col=pl.Series(list("ABCDE"))), date=F()),
         identity,
         c("unspecified_col") == "C",
     ),
-    S("complex_predicate_with_or", one(DAILY10, date=F()), identity, (c("date") == d(3)) | (c("date") == d(7))),
-    S("nested_filters_with_and", one(GROUPS, date=F(lookback=days(2)), group=F()), identity, (c("date") >= d(5)) & (c("group") == "A")),
-    S("filter_with_null_values", one(pl.DataFrame({"date": [d(1), d(2), None, d(4)], "val": [1, 2, 3, 4]}), date=F()), identity, c("date") >= d(2)),
-    S("multiple_collects", one(DAILY10, date=F()), identity, [c("date") >= d(5), c("date") <= d(3)]),
-    S("empty_source", one(daily_frame(0), date=F()), identity, c("date") >= d(1)),
-    S("very_large_lookback", one(DAILY10, date=F(lookback=days(365))), identity, c("date") >= d(5)),
-    S(
+    Scenario("complex_predicate_with_or", one(DAILY10, date=F()), identity, (c("date") == d(3)) | (c("date") == d(7))),
+    Scenario("nested_filters_with_and", one(GROUPS, date=F(lookback=days(2)), group=F()), identity, (c("date") >= d(5)) & (c("group") == "A")),
+    Scenario(
+        "filter_with_null_values", one(pl.DataFrame({"date": [d(1), d(2), None, d(4)], "val": [1, 2, 3, 4]}), date=F()), identity, c("date") >= d(2)
+    ),
+    Scenario("multiple_collects", one(DAILY10, date=F()), identity, [c("date") >= d(5), c("date") <= d(3)]),
+    Scenario("empty_source", one(daily_frame(0), date=F()), identity, c("date") >= d(1)),
+    Scenario("very_large_lookback", one(DAILY10, date=F(lookback=days(365))), identity, c("date") >= d(5)),
+    Scenario(
         "combine_with_additional_columns",
         one(FIVE, date=F()),
         lambda s: s["data"].with_columns((c("val") * 2).alias("val_doubled"), pl.lit("constant").alias("const_col")),
         c("date") >= d(3),
     ),
-    S(
+    Scenario(
         "combine_drops_columns",
         one(FIVE.with_columns(drop_col=pl.Series(list("abcde"))), date=F()),
         lambda s: s["data"].drop("drop_col"),
         c("date") >= d(3),
     ),
     # combine_kwargs and sources_as_kwargs
-    S("combine_kwargs_basic", one(FIVE, date=F()), scaled, c("date") >= d(3), combine_kwargs={"multiplier": 10}),
-    S(
+    Scenario("combine_kwargs_basic", one(FIVE, date=F()), scaled, c("date") >= d(3), combine_kwargs={"multiplier": 10}),
+    Scenario(
         "combine_kwargs_with_mapping_dict",
         one(pl.DataFrame({"date": [d(1), d(2)], "code": ["US", "CN"], "val": [100, 200]}), date=F()),
         with_mapping,
         combine_kwargs={"code_to_region": {"US": "North America", "CN": "Asia"}},
     ),
-    S(
+    Scenario(
         "combine_kwargs_multiple_args",
         one(FIVE, date=F()),
         multiple_args,
         combine_kwargs={"multiplier": 2, "suffix": "doubled", "constant": "hello"},
-        row_order=True,
+        check_row_order=True,
     ),
-    S("combine_kwargs_with_none", one(FIVE, date=F()), identity, combine_kwargs=None),
-    S("combine_kwargs_empty_dict", one(FIVE, date=F()), identity, combine_kwargs={}),
-    S(
+    Scenario("combine_kwargs_with_none", one(FIVE, date=F()), identity, combine_kwargs=None),
+    Scenario("combine_kwargs_empty_dict", one(FIVE, date=F()), identity, combine_kwargs={}),
+    Scenario(
         "combine_kwargs_complex_join_pattern",
         PRIMARY_REFERENCE,
         primary_with_reference,
         (c("date") >= d(2)) & (c("category") == "CATEGORY_A"),
         combine_kwargs={"category_to_code": CATEGORY_TO_CODE},
     ),
-    S(
+    Scenario(
         "sources_as_kwargs_basic",
         two(FIVE.rename({"val": "left_val"}), FIVE.rename({"val": "right_val"}), {"date": F()}),
         kw_join,
         c("date") >= d(3),
         sources_as_kwargs=True,
     ),
-    S(
+    Scenario(
         "sources_as_kwargs_with_combine_kwargs",
         one(FIVE, date=F()),
         kw_scaled,
         combine_kwargs={"multiplier": 10, "suffix": "x10"},
         sources_as_kwargs=True,
-        row_order=True,
+        check_row_order=True,
     ),
-    S("sources_as_kwargs_with_lookback", one(DAILY14, date=F(lookback=days(4))), kw_lag, c("date") == d(5), sources_as_kwargs=True),
-    S(
+    Scenario("sources_as_kwargs_with_lookback", one(DAILY14, date=F(lookback=days(4))), kw_lag, c("date") == d(5), sources_as_kwargs=True),
+    Scenario(
         "sources_as_kwargs_multiple_sources",
         {
             "prices": (FIVE.rename({"val": "price"}), {"date": F()}),
@@ -644,15 +698,15 @@ SCENARIOS = [
         c("date") >= d(3),
         sources_as_kwargs=True,
     ),
-    S("sources_as_kwargs_false_is_default", one(FIVE, date=F()), identity),
-    S(
+    Scenario("sources_as_kwargs_false_is_default", one(FIVE, date=F()), identity),
+    Scenario(
         "sources_as_kwargs_with_value_mapping",
         one(region_frame("NA", "EU"), region=F(source_col="region_code", value_mapping=to_codes("NA", "EU"))),
         kw_regions,
         c("region") == "NORTH_AMERICA",
         sources_as_kwargs=True,
     ),
-    S(
+    Scenario(
         "sources_as_kwargs_complex_join_pattern",
         {
             "primary": (PRIMARY.with_columns(category=pl.lit("A")), {"date": F(), "category": F()}),
@@ -664,10 +718,10 @@ SCENARIOS = [
         sources_as_kwargs=True,
     ),
     # A Date filter linked to a Datetime source keeps every intraday row of the requested days.
-    S("eq_covers_full_day", **intraday(c("data_date") == d(2))),
-    S("eq_with_lookback_covers_full_day", **intraday(c("data_date") == d(2), lookback=days(1))),
+    Scenario("eq_covers_full_day", **intraday(c("data_date") == d(2))),
+    Scenario("eq_with_lookback_covers_full_day", **intraday(c("data_date") == d(2), lookback=days(1))),
     # A sub-day lookback from a Date literal still crosses the day boundary, and the upper bound covers the whole day.
-    S(
+    Scenario(
         "eq_with_subday_lookback_fetches_prior_evening",
         sources={
             "main": (
@@ -681,37 +735,39 @@ SCENARIOS = [
             )
         },
         combine=as_date,
-        pred=c("data_date") == d(2),
+        predicate=c("data_date") == d(2),
         check=pushed_text("main", has=("2024-01-01 06:00:00", "2024-01-03 00:00:00")),
     ),
-    S("le_covers_full_day", **intraday(c("data_date") <= d(2))),
-    S("ge_starts_at_midnight", **intraday(c("data_date") >= d(2))),
-    S("lt_excludes_full_day", **intraday(c("data_date") < d(2))),
-    S("gt_starts_next_day", **intraday(c("data_date") > d(2))),
-    S("is_in_covers_full_days", **intraday(c("data_date").is_in([d(2), d(3)]))),
-    S(
+    Scenario("le_covers_full_day", **intraday(c("data_date") <= d(2))),
+    Scenario("ge_starts_at_midnight", **intraday(c("data_date") >= d(2))),
+    Scenario("lt_excludes_full_day", **intraday(c("data_date") < d(2))),
+    Scenario("gt_starts_next_day", **intraday(c("data_date") > d(2))),
+    Scenario("is_in_covers_full_days", **intraday(c("data_date").is_in([d(2), d(3)]))),
+    Scenario(
         "datetime_filter_on_datetime_source_unchanged",
         {"main": (INTRADAY, {"timestamp": F()})},
         lambda s: s["main"],
         c("timestamp") >= datetime(2024, 1, 2, 12),
-        row_order=True,
+        check_row_order=True,
     ),
     # IntervalFilterSpec pushes start <= hi and end >= lo onto the schedule; membership is the combine's.
-    S("selects_covering_windows", windows(schedule([d(1), d(11), d(21)], [d(10), d(20), d(30)]), spine(d(15))), interval_join(), c("date") == d(15)),
-    S("long_window_kept", windows(schedule([d(1, 1, 2020)], [d(1, 1, 2030)]), spine(d(15))), interval_join(), c("date") == d(15)),
-    S(
+    Scenario(
+        "selects_covering_windows", windows(schedule([d(1), d(11), d(21)], [d(10), d(20), d(30)]), spine(d(15))), interval_join(), c("date") == d(15)
+    ),
+    Scenario("long_window_kept", windows(schedule([d(1, 1, 2020)], [d(1, 1, 2030)]), spine(d(15))), interval_join(), c("date") == d(15)),
+    Scenario(
         "bounds_pushed_to_source",
         windows(SCHED_11_20, spine(d(12), d(15))),
         interval_join(),
         c("date").is_between(d(12), d(15)),
-        bounds=[("sched", "end", d(12), ...), ("sched", "start", ..., d(15))],
+        bounds={"sched": {"end": (d(12), ...), "start": (..., d(15))}},
     ),
     shift_bounds_row("open", c("date") >= d(12), d(11), None),
     shift_bounds_row("over_cap", c("date").is_between(d(1, 1, 1990), d(15)), d(31, 12, 1989), d(14)),
     shift_bounds_row(
         "datetime", c("date").is_between(datetime(2024, 1, 12, 6), datetime(2024, 1, 15, 6)), datetime(2024, 1, 11, 6), datetime(2024, 1, 14, 6)
     ),
-    S(
+    Scenario(
         "interval_timedelta_mapping_must_be_whole_days_for_dates",
         windows(SCHED_11_20, spine(d(13)), value_mapping=timedelta(hours=12)),
         interval_join(),
@@ -724,7 +780,7 @@ SCENARIOS = [
     endpoint_row("none", False, False),
     # A Date request on the 15th keeps windows that end or start intraday on the 15th, under every closed mode.
     *[
-        S(
+        Scenario(
             f"datetime_intraday_boundary_not_pruned-{closed}",
             windows(INTRADAY_SCHED, spine(d(15), d(15), roots=["A", "B"]), closed=closed),
             interval_join(None),
@@ -733,27 +789,27 @@ SCENARIOS = [
         for closed in CLOSED
     ],
     # Disjoint requested ranges collapse to their hull: a window in the gap survives the pushdown.
-    S(
+    Scenario(
         "disjoint_request_collapses_to_hull",
         windows(schedule([d(20)], [d(25)]), spine(d(22))),
         interval_join(None),
         c("date").is_between(d(1), d(5)) | c("date").is_between(d(30), d(31)),
-        bounds=[("sched", "end", d(1), ...)],
+        bounds={"sched": {"end": (d(1), ...)}},
     ),
     # Monday maps to the previous Friday, other days to the day before: Sun 1 Sep maps after Mon 2 Sep.
-    S(
+    Scenario(
         "non_monotone_value_mapping_keeps_interior_days",
         windows(SEP_SCHED, SEP_SPINE, value_mapping=previous_weekday),
         interval_join(SEP_MEMBERSHIP),
         c("date").is_between(d(1, 9), d(3, 9)),
     ),
-    S(
+    Scenario(
         "value_mapping_to_none_pushes_nothing",
         windows(schedule([d(1), d(3)], [d(1), d(3)], [1, 3]), spine(d(1), d(2), d(3)), value_mapping=lambda day: None if day == d(2) else day),
         interval_join(),
         c("date").is_between(d(1), d(3)),
     ),
-    S(
+    Scenario(
         "interval_filter_with_tz_aware_endpoints",
         {
             "spine": (pl.DataFrame({"d": [datetime(2024, 1, 2, tzinfo=UTC_ZONE)]}), {"d": F()}),
@@ -766,44 +822,44 @@ SCENARIOS = [
         c("d") == datetime(2024, 1, 2, tzinfo=UTC_ZONE),
     ),
     # Shared source columns: a source row may serve any output column mapped to it, so the pushed values are the union.
-    S("lone_side_filter_returns_all_partners", one(THREE_GROUPS, **PAIR_SPECS), group_pairs, c("group1") == "A"),
-    S(
+    Scenario("lone_side_filter_returns_all_partners", one(THREE_GROUPS, **PAIR_SPECS), group_pairs, c("group1") == "A"),
+    Scenario(
         "both_sides_filter_unions_to_is_in",
         one(THREE_GROUPS, **PAIR_SPECS),
         group_pairs,
         (c("group1") == "A") & (c("group2") == "B"),
-        discrete=[("data", "group", {"A", "B"})],
+        discrete={"data": {"group": {"A", "B"}}},
     ),
-    S(
+    Scenario(
         "is_in_both_sides_unions",
         one(THREE_GROUPS, **PAIR_SPECS),
         group_pairs,
         c("group1").is_in(["A", "B"]) & c("group2").is_in(["B", "C"]),
-        discrete=[("data", "group", {"A", "B", "C"})],
+        discrete={"data": {"group": {"A", "B", "C"}}},
     ),
-    S(
+    Scenario(
         "three_shared_columns_union-all_constrained",
         one(THREE_GROUPS.select("group"), **THREE_SPECS),
         cross_aliases("group", "group1", "group2", "group3"),
         (c("group1") == "A") & (c("group2") == "B") & (c("group3") == "C"),
-        discrete=[("data", "group", {"A", "B", "C"})],
+        discrete={"data": {"group": {"A", "B", "C"}}},
     ),
-    S(
+    Scenario(
         "three_shared_columns_union-one_unconstrained",
         one(THREE_GROUPS.select("group"), **THREE_SPECS),
         cross_aliases("group", "group1", "group2", "group3"),
         (c("group1") == "A") & (c("group2") == "B"),
-        no_discrete=[("data", "group")],
+        no_discrete={"data": {"group"}},
     ),
-    S(
+    Scenario(
         "value_mapping_union_of_mapped_values",
         one(CODES, name1=F(source_col="code", value_mapping=NAME_MAPPING), name2=F(source_col="code", value_mapping=NAME_MAPPING)),
         cross_aliases("code", "name1", "name2"),
         (c("name1") == "A") & (c("name2") == "B"),
-        discrete=[("data", "code", {"a", "b"})],
+        discrete={"data": {"code": {"a", "b"}}},
     ),
     # name2 has no mapping for "C", so the union is skipped and the user's filter decides.
-    S(
+    Scenario(
         "value_mapping_unmapped_member_still_correct",
         one(CODES, name1=F(source_col="code", value_mapping=NAME_MAPPING), name2=F(source_col="code", value_mapping={"A": "a", "B": "b"})),
         mapped_cross,
@@ -811,42 +867,44 @@ SCENARIOS = [
     ),
     # Only the pushed filters are checked: the filter on ``other`` reaches the whole source, so the group2 side loses "B"
     # and the result is empty where plain Polars returns one row.
-    S(
+    Scenario(
         "non_shared_column_in_same_source_unaffected",
         one(GROUP_OTHER, **GROUP_OTHER_SPECS),
         cross_aliases("group", "group1", "group2", keep=("other",)),
         GROUP_OTHER_PRED,
-        native=False,
-        discrete=[("data", "group", {"A", "B"}), ("data", "other", {"x"})],
+        compare_native=False,
+        discrete={"data": {"group": {"A", "B"}, "other": {"x"}}},
     ),
     # A lookback on d1 suppresses its discrete membership, so d2 is the lone member of the union on d. The result is not
     # checked: the lookback range and d == Jan 2 intersect on the shared column and starve d1 == Jan 3 (a documented
     # limitation of mixing temporal and discrete specs on one source column).
-    S(
+    Scenario(
         "temporal_suppressed_column_excluded_from_union",
         one(THREE_DATES, d1=F(source_col="d", lookback=days(2)), d2=F(source_col="d")),
         cross_aliases("d", "d1", "d2"),
         (c("d1") == d(3)) & (c("d2") == d(2)),
-        native=False,
-        bounds=[("data", "d", ..., ...)],
-        discrete=[("data", "d", {d(2)})],
+        compare_native=False,
+        bounds={"data": {"d": (..., ...)}},
+        discrete={"data": {"d": {d(2)}}},
     ),
     # Unorderable members (None and strings) must not be sorted into the pushed is_in.
-    S(
+    Scenario(
         "union_with_unorderable_values_does_not_crash",
         one(pl.DataFrame({"group": ["A", "B", None]}), group1=F(source_col="group"), group2=F(source_col="group")),
         cross_aliases("group", "group1", "group2"),
         (c("group1").is_null() | (c("group1") == "A")) & (c("group2") == "B"),
     ),
     # Casts: 257 wraps to 1 under Int8, and 16777217 rounds to 16777216.0 under Float32.
-    S("narrowing_cast_does_not_drop_rows", one(pl.DataFrame({"a": [1, 2, 257]}), a=F()), identity, c("a").cast(pl.Int8, wrap_numerical=True) == 1),
+    Scenario(
+        "narrowing_cast_does_not_drop_rows", one(pl.DataFrame({"a": [1, 2, 257]}), a=F()), identity, c("a").cast(pl.Int8, wrap_numerical=True) == 1
+    ),
     *[
-        S(f"float_cast_in_combine_keeps_rounded_rows-{i}", one(pl.DataFrame({"x": [16777217, 5, None]}), x=F()), cast_to(dtype), pred)
+        Scenario(f"float_cast_in_combine_keeps_rounded_rows-{i}", one(pl.DataFrame({"x": [16777217, 5, None]}), x=F()), cast_to(dtype), pred)
         for i, (pred, dtype) in enumerate(FLOAT_CASTS)
     ],
     # A value set containing None keeps null rows, also when two output columns share a source column.
     *[
-        S(
+        Scenario(
             f"discrete_filter_keeps_null_rows-{name}",
             {"single": (NULLABLE, {"a": F()}), "shared": (NULLABLE, {"a": F(), "b": F(source_col="a")})},
             lambda s: pl.concat([s["single"], s["shared"]]),
@@ -854,20 +912,20 @@ SCENARIOS = [
         )
         for name, pred in NULL_PREDICATES.items()
     ],
-    *[S(f"matches_filter-{i}", one(df, t=spec), identity, pred) for i, (df, pred, spec) in enumerate(MATCHES_FILTER)],
+    *[Scenario(f"matches_filter-{i}", one(df, t=spec), identity, pred) for i, (df, pred, spec) in enumerate(MATCHES_FILTER)],
     *[
-        S(
+        Scenario(
             f"temporal_filter_applies_value_mapping-{name}",
             one(pl.DataFrame({"d": [d(1), d(2)]}), d=F(value_mapping=mapping)),
             lambda s: s["data"].with_columns(c("d") + days(1)),
             c("d") == d(2),
-            row_order=True,
+            check_row_order=True,
         )
         for name, mapping in [("dict", {d(2): d(1)}), ("callable", lambda day: day - days(1))]
     ],
     # Filtering the right side of a left join would null-extend rows that then satisfy the predicate.
     *[
-        S(
+        Scenario(
             f"null_accepting_filter_not_pushed_below_left_join-{name}",
             two(pl.DataFrame({"id": [1, 2]}), pl.DataFrame({"id": [1, 2], "v": [10, None]}), {}, {"v": F()}),
             join("id", how="left"),
@@ -877,24 +935,24 @@ SCENARIOS = [
     ],
     # A value_mapping with a window pushes a window around the mapped values.
     *[
-        S(
+        Scenario(
             f"window_pushed_around_mapped_values-{name}",
             one(DAYS20, date=weekday_window(7)),
             next_day_rolling,
             pred,
-            bounds=[("data", "data_date", ..., ...)],
+            bounds={"data": {"data_date": (..., ...)}},
         )
         for name, pred in [("eq", c("date") == d(8)), ("is_in", c("date").is_in([d(8), d(15)])), ("between", c("date").is_between(d(8), d(10)))]
     ],
-    S(
+    Scenario(
         "open_range_through_callable_pushes_window_around_requested_range",
         one(DAYS20, date=weekday_window(7)),
         next_day_rolling,
         c("date") >= d(8),
-        bounds=[("data", "data_date", d(1), None)],
+        bounds={"data": {"data_date": (d(1), None)}},
     ),
     *[
-        S(
+        Scenario(
             f"incomplete_or_failing_mapping_keeps_rows-{name}",
             one(DAYS20, date=window(lookback=days(2), value_mapping=mapping)),
             next_day_rolling,
@@ -902,56 +960,60 @@ SCENARIOS = [
         )
         for name, mapping in [("dict", {d(9): d(8)}), ("none", lambda day: None), ("raises", lambda day: 1 / 0)]
     ],
-    S(
+    Scenario(
         "unconstrained_identity_sibling_does_not_block_the_window",
         one(DAYS20, data_date=F(), date=weekday_window(2)),
         next_day_rolling,
         c("date") == d(8),
-        bounds=[("data", "data_date", ..., ...)],
+        bounds={"data": {"data_date": (..., ...)}},
     ),
-    S(
+    Scenario(
         "mapped_aliases_in_a_self_join_union",
         one(DAYS20, **{n: window(lookback=days(1), value_mapping=lambda day: day - days(1)) for n in ("d1", "d2")}),
         mapped_self_join,
         (c("d1") == d(3)) & (c("d2") == d(12)),
     ),
-    S("integer_output_key_is_not_used_as_a_date", one(DAYS20, k=window(lookback=days(2), value_mapping={8: d(7)})), day_of_month_key, c("k") == 8),
-    S(
+    Scenario(
+        "integer_output_key_is_not_used_as_a_date", one(DAYS20, k=window(lookback=days(2), value_mapping={8: d(7)})), day_of_month_key, c("k") == 8
+    ),
+    Scenario(
         "dict_covering_the_range_is_enumerated",
         one(DAYS20, date=window(lookback=days(1), value_mapping={d(8): d(8), d(9): d(9)})),
         same_day_rolling,
         c("date").is_between(d(8), d(9)),
-        bounds=[("data", "data_date", d(7), d(9))],
+        bounds={"data": {"data_date": (d(7), d(9))}},
     ),
-    S(
+    Scenario(
         "lookahead_around_mapped_values",
         one(DAYS20, date=window(lookahead=days(2), value_mapping=lambda day: day)),
         lambda s: s["data"].with_columns(c("v").shift(-2).alias("lead"), c("data_date").alias("date")),
         c("date") == d(10),
     ),
-    S(
+    Scenario(
         "range_beyond_the_enumeration_cap_gets_the_window_around_the_range",
         one(DAYS20, date=window(lookback=days(1), value_mapping=lambda day: day)),
         same_day_rolling,
         c("date").is_between(d(1, 1, 1990), d(10)),
-        bounds=[("data", "data_date", d(31, 12, 1989), d(10))],
+        bounds={"data": {"data_date": (d(31, 12, 1989), d(10))}},
     ),
     # A window that cannot be applied pushes nothing rather than the unwidened value.
-    S(
+    Scenario(
         "time_zone_aware_column",
         one(pl.DataFrame({"t": [datetime(2024, 1, day, tzinfo=UTC_ZONE) for day in range(1, 11)], "v": range(10)}), t=F(lookback=days(3))),
         lambda s: s["data"].with_columns(c("v").shift(1).alias("lag")),
         c("t") == datetime(2024, 1, 5, tzinfo=UTC_ZONE),
     ),
-    S("unbounded_window", one(TENDAYS, d=F(lookback=timedelta.max)), lambda s: s["data"].with_columns(c("v").cum_sum().alias("c")), c("d") == d(5)),
-    S(
+    Scenario(
+        "unbounded_window", one(TENDAYS, d=F(lookback=timedelta.max)), lambda s: s["data"].with_columns(c("v").cum_sum().alias("c")), c("d") == d(5)
+    ),
+    Scenario(
         "unbounded_window_sharer_keeps_the_whole_source_column",
         one(TENDAYS.with_columns(c("v") + 1), a=F(source_col="d", lookback=timedelta.max), b=F(source_col="d", value_mapping=lambda x: x)),
         unbounded_sharer,
         (c("a") >= d(5)) & (c("b") == d(8)),
     ),
     # Temporal values and units
-    S(
+    Scenario(
         "mapped_values_keep_both_readings_of_a_repeated_hour",
         one(
             pl.DataFrame({"t": FOLD}, schema={"t": pl.Datetime("us", "America/New_York")}),
@@ -961,19 +1023,19 @@ SCENARIOS = [
         c("a").is_in([datetime(2024, 11, 3, 5, 30, tzinfo=UTC_ZONE), datetime(2024, 11, 3, 6, 30, tzinfo=UTC_ZONE)]),
     ),
     *[is_in_units_row(unit, time_zone) for time_zone in (None, "UTC") for unit in ("ms", "us", "ns")],
-    S(
+    Scenario(
         "value_set_keys_do_not_overflow_near_the_date_limit",
         one(pl.DataFrame({"t": NEAR_MAX, "k": [1, 2]}), k=F(source_col="t", value_mapping={1: NEAR_MAX[0], 2: NEAR_MAX[1]})),
         identity,
         c("k").is_in([1, 2]),
     ),
-    S(
+    Scenario(
         "pushed_equality_keeps_the_predicates_comparison_unit",
         one(pl.Series("t", [1704067200000000000, 1704067200000000001]).cast(pl.Datetime("ns", "UTC")).to_frame(), a=F(source_col="t")),
         lambda s: s["data"].with_columns(c("t").dt.cast_time_unit("us").alias("a")),
         c("a") == datetime(2024, 1, 1, tzinfo=UTC),
     ),
-    S(
+    Scenario(
         "membership_with_another_unit_keeps_native_rows",
         one(US_MEMBERS.to_physical().cast(pl.Datetime("ns", "UTC")).to_frame("t"), t=F()),
         lambda s: s["data"].collect().lazy(),
@@ -982,9 +1044,9 @@ SCENARIOS = [
 ]
 
 
-def _call(combine, frames: dict, kw: dict) -> pl.LazyFrame:
-    extra = kw.get("combine_kwargs") or {}
-    return combine(**frames, **extra) if kw.get("sources_as_kwargs") else combine(frames, **extra)
+def _call(scenario: Scenario, frames: dict) -> pl.LazyFrame:
+    extra = scenario.combine_kwargs or {}
+    return scenario.combine(**frames, **extra) if scenario.sources_as_kwargs else scenario.combine(frames, **extra)
 
 
 def _filter(lf: pl.LazyFrame, pred) -> pl.LazyFrame:
@@ -1001,40 +1063,48 @@ def _matches_native(actual: pl.LazyFrame, reference: pl.LazyFrame, row_order: bo
     return assert_matches_native(actual, reference, None, check_row_order=row_order)
 
 
-@pytest.mark.parametrize(("pred", "kw"), params(SCENARIOS, "pred", "kw"))
-def test_pushdown_combine(pred, kw):
-    sources, is_identity = kw["sources"], kw["combine"] is identity
-    # The identity combine keeps the source's row order.
-    inspected = {*kw.get("pushed", ()), *(entry[0] for key in ("bounds", "discrete", "no_discrete") for entry in kw.get(key, ()))}
-    if is_identity or "check" in kw:
+@pytest.mark.parametrize("scenario", [pytest.param(sc, id=sc.id, marks=sc.marks) for sc in SCENARIOS])
+def test_pushdown_combine(scenario):
+    sources, is_identity = scenario.sources, scenario.combine is identity
+    inspected = {*scenario.pushed, *scenario.bounds, *scenario.discrete, *scenario.no_discrete}
+    if is_identity or scenario.check is not None:
         inspected |= set(sources)
     trackers = {name: PredicateTracker(df) for name, (df, _) in sources.items() if name in inspected}
     frames = {name: trackers[name].lazy_frame if name in trackers else df.lazy() for name, (df, _) in sources.items()}
-    options = {k: kw[k] for k in ("combine_kwargs", "sources_as_kwargs") if k in kw}
-    lf = pushdown_combine({name: (frames[name], specs) for name, (_, specs) in sources.items()}, kw["combine"], **options)
-    reference = _call(kw["combine"], {name: df.lazy() for name, (df, _) in sources.items()}, kw)
-    post = kw.get("post", lambda frame: frame)
-    for p in pred if isinstance(pred, list) else [pred]:
+    lf = pushdown_combine(
+        {name: (frames[name], specs) for name, (_, specs) in sources.items()},
+        scenario.combine,
+        combine_kwargs=scenario.combine_kwargs,
+        sources_as_kwargs=scenario.sources_as_kwargs,
+    )
+    reference = _call(scenario, {name: df.lazy() for name, (df, _) in sources.items()})
+    post = scenario.post or (lambda frame: frame)
+    row_order = is_identity if scenario.check_row_order is None else scenario.check_row_order
+    preds = scenario.predicate if isinstance(scenario.predicate, list) else [scenario.predicate]
+    for p in preds:
         actual = post(_filter(lf, p))
-        if "raises" in kw:
-            with pytest.raises(kw["raises"][0], match=kw["raises"][1]):
+        if scenario.raises is not None:
+            with pytest.raises(scenario.raises[0], match=scenario.raises[1]):
                 actual.collect()
             return
-        if kw.get("native", True):
-            got = _matches_native(actual, post(_filter(reference, p)), kw.get("row_order", is_identity))
+        if scenario.compare_native:
+            got = _matches_native(actual, post(_filter(reference, p)), row_order)
         else:
             got = actual.collect()
-    for name in kw.get("pushed", ()):
+    for name in scenario.pushed:
         assert trackers[name].last_predicate is not None, f"nothing pushed to {name}"
-    for name, col, lower, upper in kw.get("bounds", ()):
-        assert_pushed_bounds(trackers[name], col, lower, upper)
-    for name, col, values, *node in kw.get("discrete", ()):
-        assert_discrete(trackers[name], col, values, *node)
-    for name, col in kw.get("no_discrete", ()):
+    for name, columns in scenario.bounds.items():
+        for col, (lower, upper) in columns.items():
+            assert_pushed_bounds(trackers[name], col, lower, upper)
+    for name, columns in scenario.discrete.items():
+        for col, values in columns.items():
+            assert_discrete(trackers[name], col, values, scenario.discrete_node.get(name, {}).get(col))
+    for name, columns in scenario.no_discrete.items():
         pushed = trackers[name].last_predicate
-        assert pushed is None or PredicateAnalyzer(pushed).find_discrete_filter(col) is None, pushed
-    if "check" in kw:
-        kw["check"](got, trackers)
+        for col in columns:
+            assert pushed is None or PredicateAnalyzer(pushed).find_discrete_filter(col) is None, pushed
+    if scenario.check is not None:
+        scenario.check(got, trackers)
 
 
 def test_combine_kwargs_with_join_parameters():
