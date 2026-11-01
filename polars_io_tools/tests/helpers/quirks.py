@@ -1,0 +1,48 @@
+"""Polars behaviour that depends on the installed version, in one table.
+
+Tests read ``quirk("name")`` instead of comparing version strings, so a behaviour change is recorded once with the
+first Polars version that has it.
+"""
+
+import polars as pl
+import pytest
+from packaging.version import Version
+
+POLARS = Version(pl.__version__)
+
+# name -> (first Polars version with the behaviour, what changes)
+QUIRKS: dict[str, tuple[str, str]] = {
+    "pushes_function_predicates": ("1.25.2", "string and temporal-component predicates such as str.contains and dt.day reach the source"),
+    "pushes_python_datetime_comparison": ("1.26.0", "a comparison with a Python datetime literal reaches the source"),
+    "pushes_implicit_casts": ("1.28.0", "a predicate holding an implicit or explicit numeric/temporal cast reaches the source"),
+    "nested_alias_dropped": ("1.31.0b1", "meta.pop() returns no input for a nested alias, so the parser loses it"),
+    "list_eval_serializes": ("1.31.0b1", "list.eval serializes as an Eval node instead of an opaque function"),
+    "pushes_fill_null_predicates": ("1.31.0b1", "a fill_null predicate reaches the source"),
+    "struct_literal_parsed": ("1.32.0b1", "a dict literal parses as a struct LiteralNode instead of an ErrorNode"),
+    "pushes_join_filters": ("1.32.0b1", "Polars pushes filters through joins itself and may rewrite a left join as inner"),
+    "anonymous_function_not_pushed": ("1.32.0b1", "a predicate on an anonymous function is no longer pushed as expected"),
+    "pure_udf_cse": ("1.33.1", "common-subexpression elimination dedupes a pure map_batches UDF"),
+    "datetime_literal_unwrapped": ("1.36.0b1", "pl.lit(datetime) parses as a LiteralNode instead of a CastNode"),
+    "time_partition_subsecond": ("1.38.0", "a Time partition key keeps sub-second precision in its path"),
+    "join_asof_null_by_unmatched": ("1.44.0", "join_asof no longer matches a null by key, and two filtered IO sources cross join correctly"),
+    "ns_literal_min_overflows": ("2.0.0", "re-reading a nanosecond literal near the Int64 minimum overflows"),
+    "pushes_widening_cast": ("2.1.0", "a filter above a widening cast reaches the source (polars#23369)"),
+    "pushes_asof_filter": ("2.1.0", "the post-join filter of a forward join_asof reaches the right source, and col == True becomes col"),
+}
+
+
+def quirk(name: str) -> bool:
+    """Whether the installed Polars has the behaviour ``name``."""
+    return POLARS >= Version(QUIRKS[name][0])
+
+
+def xfail_unless(name: str, reason: str = "") -> pytest.MarkDecorator:
+    """A strict xfail on Polars versions without the behaviour ``name``."""
+    since, what = QUIRKS[name]
+    return pytest.mark.xfail(not quirk(name), reason=reason or f"needs Polars >= {since}: {what}", strict=True)
+
+
+def xfail_if(name: str, reason: str = "") -> pytest.MarkDecorator:
+    """A strict xfail on Polars versions with the behaviour ``name``."""
+    since, what = QUIRKS[name]
+    return pytest.mark.xfail(quirk(name), reason=reason or f"fails from Polars {since}: {what}", strict=True)

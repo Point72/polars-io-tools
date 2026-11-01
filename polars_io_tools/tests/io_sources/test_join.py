@@ -3,18 +3,13 @@ from decimal import Decimal
 
 import polars as pl
 import pytest
-from packaging import version
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, LiteralNode, get_literal_value, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
+from polars_io_tools.tests.helpers.quirks import quirk
 
 from .conftest import io_source_assert
-
-# Polars 2.1.0 pushes the post-join filter into the right side of a (forward) asof join itself and
-# lowers ``col == True`` on a Boolean column to a bare column reference. Both change the shape of the
-# predicate the right source observes, without changing results.
-_POLARS_PUSHES_ASOF_FILTER = version.parse(pl.__version__) >= version.parse("2.1.0")
 
 
 def _flatten_conjuncts(node):
@@ -62,7 +57,7 @@ def test_filtered_join_basic():
 @pytest.mark.parametrize("how", ["inner", "left"])
 def test_filtered_join_basic_no_results_left_side(how):
     """Test basic functionality of filtered_join with single join column when no results are found on the left side."""
-    if version.parse(pl.__version__) > version.parse("1.31.0"):
+    if quirk("pushes_join_filters"):
         # Here, polars pushes down filters for us, so they will be pushed down.
         pytest.skip("Test not applicable for polars > 1.31.0 due to automatic filter pushdown")
     df = pl.DataFrame(
@@ -511,7 +506,7 @@ def test_filtered_join_complex_workflow(how):
         parsed_expr = get_parsed_expr(predicate)
         # In polars >1.31.0, joins can be rewritten, and here the "left" join
         # becomes an inner join.
-        if how == "left" and version.parse(pl.__version__) <= version.parse("1.31.0"):
+        if how == "left" and not quirk("pushes_join_filters"):
             # We only pass the filter generated from the join
             assert_is_in(parsed_expr)
             pytest.skip("Test behavior differs for left joins in polars <= 1.31.0")
@@ -826,7 +821,7 @@ def test_filtered_join_asof_no_tolerance(strategy):
         # lower bound on the raw filter value (never tolerance-widened).
         if predicate is None:
             return
-        assert _POLARS_PUSHES_ASOF_FILTER and strategy == "forward", f"unexpected right-side predicate for {strategy}: {predicate!r}"
+        assert quirk("pushes_asof_filter") and strategy == "forward", f"unexpected right-side predicate for {strategy}: {predicate!r}"
         for atom in _flatten_conjuncts(get_parsed_expr(predicate)):
             assert isinstance(atom, BinaryExprNode) and isinstance(atom.right, LiteralNode)
             assert atom.left.name == "timestamp"

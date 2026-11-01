@@ -12,40 +12,14 @@ from decimal import Context, Decimal
 import polars as pl
 from hypothesis import strategies as st
 
+from polars_io_tools.tests.helpers.catalogue import COLUMN_DTYPES, DST_US, INT64, TEXT
+
 POLARS_ERRORS = (Exception, pl.exceptions.PanicException)
 """What evaluating an expression with Polars can raise; a Rust panic is not an ``Exception``."""
 
-NY = "America/New_York"
-ENUM = pl.Enum(["c", "a", "b"])
-INT64 = (-(2**63), 2**63 - 1)
-# Microsecond ticks around the 2024 DST transitions in New York: the spring gap and both readings of the fall fold.
-DST_US = [1710054000_000000, 1710054000_000000 - 1, 1730611800_000000, 1730615400_000000, 1730613600_000000]
-TEXT = ["a", "b", "a/b", "", "None", "é"]
 _SCALE = {"ns": 1000, "us": 1, "ms": 0.001}
 _PYTHON_SECONDS = (-62_135_596_800, 253_402_300_799)  # 0001-01-01 and 9999-12-31 23:59:59
 _NS_EXTREMES = (INT64[0] + 2 * 86_400 * 10**9, INT64[1] - 2 * 86_400 * 10**9)
-
-COLUMN_DTYPES = [
-    pl.Int8(),
-    pl.Int64(),
-    pl.UInt64(),
-    pl.Float32(),
-    pl.Float64(),
-    pl.Boolean(),
-    pl.Decimal(38, 2),
-    pl.String(),
-    ENUM,
-    pl.Categorical(),
-    pl.Date(),
-    pl.Datetime("ms"),
-    pl.Datetime("us"),
-    pl.Datetime("ns"),
-    pl.Datetime("ns", NY),
-    pl.Datetime("us", "UTC"),
-    pl.Duration("us"),
-    pl.Duration("ns"),
-    pl.Time(),
-]
 
 OPS = {
     "==": operator.eq,

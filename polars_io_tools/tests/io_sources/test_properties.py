@@ -31,9 +31,10 @@ from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_ra
 from polars_io_tools.io_sources.restrict_visitor import restrict_expr_to_columns
 from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
 from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.catalogue import NY
+from polars_io_tools.tests.helpers.quirks import quirk, xfail_if, xfail_unless
 from polars_io_tools.tests.helpers.strategies import (
     IMPLODE,
-    NY,
     POLARS_ERRORS,
     frames_and_predicates,
     native,
@@ -143,8 +144,6 @@ def dnf_expr(dnf: list, schema: dict | None = None) -> pl.Expr:
     return pl.any_horizontal(clauses) if clauses else pl.lit(False)
 
 
-_POLARS_VERSION = tuple(int(p) for p in pl.__version__.split(".")[:2])
-_POLARS_2 = _POLARS_VERSION >= (2, 0)
 SETTINGS = settings(deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much, HealthCheck.data_too_large])
 
 
@@ -447,7 +446,7 @@ def test_cache_parquet_on_a_nanosecond_date_column_near_its_minimum(tmp_path):
     assert_frame_equal(cache_parquet(frame.lazy(), tmp_path, "t", time_unit="daily").filter(pred).collect(), frame, check_row_order=False)
 
 
-@pytest.mark.xfail(_POLARS_2, strict=True, reason="re-reading a nanosecond literal near the Int64 minimum overflows")
+@xfail_if("ns_literal_min_overflows")
 def test_by_time_on_a_nanosecond_value_near_its_minimum():
     t = pl.Series([-(2**63)]).cast(pl.Datetime("ns"))
     by_time("t", "1d").build(pl.col("t").is_in(t.implode()))
@@ -575,7 +574,7 @@ def _old_polars_null_key_bug(shape, frames):
     """Polars 1.37 matches a null ``by`` key in ``join_asof``, and returns wrong rows for a cross join of two IO
     sources filtered on a null key; such inputs are skipped there."""
     nulls = frames["src"]["key"].null_count() or frames["other"]["key"].null_count()
-    return _POLARS_VERSION < (1, 44) and shape in ("asof_join", "self_join_two_entries") and bool(nulls)
+    return not quirk("join_asof_null_by_unmatched") and shape in ("asof_join", "self_join_two_entries") and bool(nulls)
 
 
 @st.composite
@@ -818,7 +817,7 @@ def _check_cache_keeps_filtered_rows(lf: pl.LazyFrame, frame: pl.DataFrame, pred
 def test_cache_parquet_keeps_the_rows_a_filter_keeps(tmp_path_factory, case, time_unit):
     frame, predicates = case
     # Known bug, see test_cache_parquet_on_sub_second_time_keys.
-    assume(_POLARS_VERSION >= (1, 38) or frame["x"].dtype != pl.Time or frame["x"].dt.nanosecond().fill_null(0).eq(0).all())
+    assume(quirk("time_partition_subsecond") or frame["x"].dtype != pl.Time or frame["x"].dt.nanosecond().fill_null(0).eq(0).all())
     # Known crash, see test_cache_parquet_after_caching_only_null_partition_keys: a query that caches only null keys
     # breaks later queries, so the partition column holds no null here.
     assume(frame["x"].null_count() == 0)
@@ -870,7 +869,7 @@ def test_cache_parquet_after_caching_only_null_partition_keys(tmp_path):
         assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
 
 
-@pytest.mark.xfail(_POLARS_VERSION < (1, 38), strict=True, reason="Polars 1.37 names Time partitions to the second")
+@xfail_unless("time_partition_subsecond", reason="Polars 1.37 names Time partitions to the second")
 def test_cache_parquet_on_sub_second_time_keys(tmp_path):
     frame = pl.DataFrame({"date": [date(2024, 1, 31)] * 2, "x": pl.Series([0, 1000]).cast(pl.Time), "i": [0, 1]})
     lf = cache_parquet(frame.lazy(), tmp_path, "date", time_unit="daily", extra_partition_cols="x")

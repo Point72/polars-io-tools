@@ -5,7 +5,6 @@ from graphlib import CycleError
 
 import polars as pl
 import pytest
-from packaging import version
 from polars.exceptions import ColumnNotFoundError, SchemaError
 from polars.testing import assert_frame_equal
 
@@ -18,6 +17,7 @@ from polars_io_tools.io_sources.util import (
     with_columns_topo,
     wrap_io_source_with_error_catching,
 )
+from polars_io_tools.tests.helpers.quirks import quirk
 
 from .conftest import io_source_assert
 
@@ -242,7 +242,7 @@ class TestRegisterIoSourceWithIsPure:
         assert_frame_equal(result, expected, check_row_order=False)
 
         # Check if CSE is working based on Polars version
-        if version.parse(pl.__version__) >= version.parse("1.33.1"):
+        if quirk("pure_udf_cse"):
             # With is_pure=True, CSE should work and counter should be 1
             assert counter == 1, f"Expected counter=1 (CSE working), but got counter={counter}"
 

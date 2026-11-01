@@ -4,7 +4,6 @@ from datetime import UTC, date, datetime, time, timedelta
 
 import polars as pl
 import pytest
-from packaging import version
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import (
@@ -38,6 +37,7 @@ from polars_io_tools.io_sources.enum import (
     StringFunctionType,
     TemporalFunctionType,
 )
+from polars_io_tools.tests.helpers.quirks import quirk
 
 from .conftest import PredicateTracker
 
@@ -194,7 +194,7 @@ def test_date_time_literals_parsed():
     expr = pl.lit(dt)
     node = get_parsed_expr(expr)
 
-    if version.parse(pl.__version__) >= version.parse("1.36.0-beta.1"):
+    if quirk("datetime_literal_unwrapped"):
         # In polars 1.36+, datetime literals are parsed directly as LiteralNode
         assert_node_type(node, LiteralNode)
         assert node.value == dt
@@ -227,7 +227,7 @@ def test_complex_literals():
     node = get_parsed_expr(expr)
 
     # We cant use dictionaries as literal values
-    if version.parse(pl.__version__) > version.parse("1.31.0"):
+    if quirk("struct_literal_parsed"):
         assert_node_type(node, LiteralNode)
         assert node.value == {"a": 1, "b": 2}
     else:
@@ -437,7 +437,7 @@ def test_binary_expr_node_contents():
 
 def test_nested_alias():
     """Test parsing nested aliases."""
-    if version.parse(pl.__version__) > version.parse("1.30.0"):
+    if quirk("nested_alias_dropped"):
         # Nested aliases parsing is not correct in 1.31.0-beta.1
         # Since `.meta.pop()` returns an empty list improperly.
         return
@@ -910,7 +910,7 @@ def test_list_eval():
     # Filter a list column by a condition
     expr = pl.col("list_column").list.eval(pl.element() > 0)
     # In `1.31.0` we added a new "Eval" node type
-    if version.parse(pl.__version__) <= version.parse("1.30.0"):
+    if not quirk("list_eval_serializes"):
         node = get_parsed_expr(expr)
         assert isinstance(node, ErrorNode)
         assert "serialization not supported for this 'opaque' function" in node.error
@@ -996,7 +996,7 @@ def test_string_predicates(tester):
 
     # String contains - version dependent
     expr2 = pl.col("long_string").str.contains("text_")
-    if version.parse(pl.__version__) >= version.parse("1.25.2"):
+    if quirk("pushes_function_predicates"):
         # Should be pushed down in newer versions
         tester.assert_predicate_pushed_down(expr2)
     tester.assert_results_match(expr2)
@@ -1075,7 +1075,7 @@ def test_temporal_predicates(tester):
     # Case 1: Standard Python datetime
     expr2 = pl.col("datetime_val") < datetime_val
     tester.assert_results_match(expr2)
-    if version.parse(pl.__version__) >= version.parse("1.26.0"):
+    if quirk("pushes_python_datetime_comparison"):
         # Fixed in polars 1.26
         tester.assert_predicate_pushed_down(expr2)
 
@@ -1088,13 +1088,13 @@ def test_temporal_predicates(tester):
     tester.assert_predicate_pushed_down(expr3)
 
     expr4 = pl.col("datetime_val").is_between(datetime_val, datetime_val_end)
-    if version.parse(pl.__version__) >= version.parse("1.26.0"):
+    if quirk("pushes_python_datetime_comparison"):
         # Fixed in polars 1.26
         tester.assert_predicate_pushed_down(expr4)
 
     # Extract components
     expr5 = pl.col("date_val").dt.day() == 3
-    if version.parse(pl.__version__) >= version.parse("1.25.2"):
+    if quirk("pushes_function_predicates"):
         # Should be pushed down in newer versions
         tester.assert_predicate_pushed_down(expr5)
 
@@ -1118,12 +1118,12 @@ def test_temporal_schema_edge_case():
     datetime_val_end = datetime(2023, 1, 1, 23, 59, 59)
     expr = pl.col("timestamp").is_between(datetime_val, datetime_val_end)
     expected_pushed_down = False
-    if version.parse(pl.__version__) >= version.parse("1.28.0"):
+    if quirk("pushes_implicit_casts"):
         expected_pushed_down = True
     tracker.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushed_down)
 
     expr_converted = pl.col("timestamp").is_between(convert_datetime_to_polars(datetime_val), convert_datetime_to_polars(datetime_val_end))
-    if version.parse(pl.__version__) >= version.parse("1.26.0"):
+    if quirk("pushes_python_datetime_comparison"):
         tracker.assert_predicate_pushed_down(expr_converted)
 
 
@@ -1170,7 +1170,7 @@ def test_complex_predicates(tester):
 
 
 def test_predicates_with_implicit_casts(tester):
-    if version.parse(pl.__version__) < version.parse("1.28.0"):
+    if not quirk("pushes_implicit_casts"):
         # Implicit casts prevent any predicate pushdown in
         # previouse versions of polars
         return
@@ -1201,7 +1201,7 @@ def test_predicate_with_explicit_cast_on_column(tester, strict):
 def test_compare_float_gt_int_with_int_to_float_cast_pushed_down(tester, strict):
     """Ensure pushdown when casting int_val to Float64 in a float vs int comparison."""
     expr = pl.col("float_val") > pl.col("int_val").cast(pl.Float64, strict=strict)
-    expected_pushed_down = version.parse(pl.__version__) >= version.parse("1.28.0")
+    expected_pushed_down = quirk("pushes_implicit_casts")
     tester.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushed_down)
 
 
@@ -1209,7 +1209,7 @@ def test_compare_float_gt_int_with_int_to_float_cast_pushed_down(tester, strict)
 def test_compare_float_gt_int_with_float_to_int_cast_pushed_down(tester, strict):
     """Ensure pushdown when casting float_val to Int64 in a float vs int comparison."""
     expr = pl.col("float_val").cast(pl.Int64, strict=strict) > pl.col("int_val")
-    expected_pushed_down = version.parse(pl.__version__) >= version.parse("1.28.0")
+    expected_pushed_down = quirk("pushes_implicit_casts")
     tester.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushed_down)
 
 
@@ -1248,7 +1248,7 @@ def test_map_batches(tester):
         assert isinstance(pushed_expr_node, AnonymousFunctionNode)
 
     # TODO: Check the actual shit
-    if version.parse(pl.__version__) > version.parse("1.31.0"):
+    if quirk("anonymous_function_not_pushed"):
         pytest.xfail("This is not pushed down properly in polars 1.32.0 pre-release")
     tester.assert_predicate_pushed_down(expr, assert_func)
 
@@ -1261,7 +1261,7 @@ def test_fill_null_constant(tester):
         # TODO: The function is FillNull, add support for this in parsing
         assert node.left.function_type == GenericFunctionType.FILL_NULL
 
-    if version.parse(pl.__version__) > version.parse("1.30.0"):
+    if quirk("pushes_fill_null_predicates"):
         tester.assert_predicate_pushed_down(expr, assert_func)
     else:
         # In versions 1.30.0 and before, this is not pushed down
@@ -1312,7 +1312,7 @@ def test_all_results_match_regardless_of_pushdown(tester):
 
     # For each expression, ensure results match regardless of pushdown
     for expr, expected_pushdown in expressions:
-        expected_pushdown = expected_pushdown or version.parse(pl.__version__) >= version.parse("1.25.2")
+        expected_pushdown = expected_pushdown or quirk("pushes_function_predicates")
         tester.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushdown)
         if expected_pushdown:
             tester.assert_results_match(expr)

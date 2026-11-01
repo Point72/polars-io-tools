@@ -16,13 +16,9 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
-from packaging import version
 
 from polars_io_tools.testing import PredicateTracker
-
-# Polars 2.1.0 closed the filter-before-widening-cast pushdown gap (polars#23369);
-# earlier versions leave the filter above the cast and do not push it to the source.
-_POLARS_PUSHES_WIDENING_CAST = version.parse(pl.__version__) >= version.parse("2.1.0")
+from polars_io_tools.tests.helpers.quirks import quirk
 
 
 @pytest.fixture
@@ -45,7 +41,7 @@ def test_widening_cast_then_filter_pushdown(tracker: PredicateTracker):
     """
     result = tracker.lazy_frame.with_columns(pl.col("x").cast(pl.Int64)).filter(pl.col("x") > 2).collect()
     assert result["x"].to_list() == [3, 4, 5]
-    if _POLARS_PUSHES_WIDENING_CAST:
+    if quirk("pushes_widening_cast"):
         assert tracker.last_predicate is not None, "expected widening-cast filter to be pushed to the source"
     else:
         assert tracker.last_predicate is None, f"unexpectedly pushed: {tracker.last_predicate!r}"
