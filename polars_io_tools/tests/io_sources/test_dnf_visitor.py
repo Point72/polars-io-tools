@@ -1,3 +1,10 @@
+"""DNF conversion: tables of predicate -> DNF, DNF negation, contradiction detection, and checks that a DNF keeps every
+row its predicate keeps.
+
+A DNF row's ``expect`` is compared ignoring the order of terms inside a clause, or exactly when the row sets ``exact``;
+``...`` skips the comparison for rows that only check kept rows.
+"""
+
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -6,8 +13,6 @@ import pytest
 
 from polars_io_tools.io_sources.base import get_parsed_expr
 from polars_io_tools.io_sources.dnf_visitor import (
-    DNFClause,
-    DNFTuple,
     DNFVisitor,
     _is_contradiction,
     combine_and_dnf,
@@ -15,1071 +20,348 @@ from polars_io_tools.io_sources.dnf_visitor import (
     is_contradiction,
     negate_dnf,
 )
+from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.oracles import assert_keeps_rows
 from polars_io_tools.tests.io_sources.conftest import assert_dnf_equal
 
-
-# Fixtures for common expressions
-@pytest.fixture
-def basic_comparison_exprs():
-    """Basic comparison expressions for testing."""
-    return {
-        "eq": (pl.col("x") == 10, [[("x", "=", 10)]]),
-        "neq": (pl.col("y") != "test", [[("y", "!=", "test")]]),
-        "gt": (pl.col("z") > 5, [[("z", ">", 5)]]),
-        "lt": (pl.col("a") < 100, [[("a", "<", 100)]]),
-        "gte": (pl.col("b") >= 20, [[("b", ">=", 20)]]),
-        "lte": (pl.col("c") <= 50, [[("c", "<=", 50)]]),
-        "reversed": (5 == pl.col("x"), [[("x", "=", 5)]]),  # Test reversed operands
-    }
+c = pl.col
+x, y, z, a, s = c("x"), c("y"), c("z"), c("a"), c("s")
+B = pl.Boolean
 
 
-@pytest.fixture
-def logical_operation_exprs():
-    """Logical operation expressions for testing."""
-    return {
-        "simple_and": ((pl.col("x") == 10) & (pl.col("y") == "test"), [[("x", "=", 10), ("y", "=", "test")]]),
-        "nested_and": ((pl.col("x") == 10) & (pl.col("y") == "test") & (pl.col("z") > 5), [[("x", "=", 10), ("y", "=", "test"), ("z", ">", 5)]]),
-        "simple_or": ((pl.col("x") == 10) | (pl.col("y") == "test"), [[("x", "=", 10)], [("y", "=", "test")]]),
-        "nested_or": ((pl.col("x") == 10) | (pl.col("y") == "test") | (pl.col("z") > 5), [[("x", "=", 10)], [("y", "=", "test")], [("z", ">", 5)]]),
-        "and_or_mixed": (
-            (pl.col("x") == 10) & ((pl.col("y") == "test") | (pl.col("z") > 5)),
-            [[("x", "=", 10), ("y", "=", "test")], [("x", "=", 10), ("z", ">", 5)]],
-        ),
-        "or_and_mixed": (
-            (pl.col("x") == 10) | ((pl.col("y") == "test") & (pl.col("z") > 5)),
-            [[("x", "=", 10)], [("y", "=", "test"), ("z", ">", 5)]],
-        ),
-    }
+def D(id, pred, expect=..., schema=None, df=None, exact=False):
+    return Case(id, pred, expect, {"schema": schema, "df": df, "exact": exact})
 
 
-@pytest.fixture
-def function_exprs():
-    """Function expressions for testing."""
-    return {
-        "is_in": (pl.col("x").is_in((1, 2, 3)), [[("x", "in", [1, 2, 3])]]),
-        "is_null": (pl.col("y").is_null(), [[("y", "is", None)]]),
-        "is_not_null": (pl.col("z").is_not_null(), [[("z", "is not", None)]]),
-        "starts_with": (pl.col("s").str.starts_with("prefix"), [[("s", "~", "^prefix")]]),
-        "ends_with": (pl.col("s").str.ends_with("suffix"), [[("s", "~", "suffix$")]]),
-        "contains": (pl.col("s").str.contains("substr"), [[("s", "~", "substr")]]),
-    }
+_NULL_MIX = pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]})
+_FLAG = pl.Schema({"flag": pl.Boolean})
+_Y2 = date(2023, 1, 1), date(2023, 12, 31)
+_NY = ZoneInfo("America/New_York")
+_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=_NY)
+_NAN = float("nan")
 
 
-@pytest.fixture
-def complex_exprs():
-    """Complex expressions for testing."""
-    return {
-        "complex_1": (
-            ((pl.col("a") > 5) & (pl.col("b") <= 10)) | ((pl.col("c") == "test") & (pl.col("d").is_not_null())),
-            [[("a", ">", 5), ("b", "<=", 10)], [("c", "=", "test"), ("d", "is not", None)]],
-        ),
-        "complex_2": (
-            ((pl.col("a") > 5) & (pl.col("b") <= 10)) | (((pl.col("c") == "test") | (pl.col("d").ne(True))) & pl.col("e").is_null()),
-            [[("a", ">", 5), ("b", "<=", 10)], [("c", "=", "test"), ("e", "is", None)], [("d", "!=", True), ("e", "is", None)]],
-        ),
-        "complex_3": ((pl.col("e").is_in([1, 2, 3]) & pl.col("f").str.contains("xyz")), [[("e", "in", [1, 2, 3]), ("f", "~", "xyz")]]),
-    }
-
-
-def test_single_predicate():
-    """Test negation of a DNF with a single predicate."""
-    assert negate_dnf([[("x", "=", 0)]]) == [[("x", "!=", 0)]]
-
-
-def test_single_conjunction():
-    """Test negation of a DNF with a single conjunction of multiple predicates."""
-    dnf = [[("x", "=", 0), ("y", ">=", 5)]]
-    expected = [[("x", "!=", 0)], [("y", "<", 5)]]
-    assert negate_dnf(dnf) == expected
-
-
-def test_two_clauses():
-    """Test negation of a DNF with two clauses."""
-    dnf = [[("x", "=", 0), ("y", ">=", 5)], [("z", "<", 10)]]
-    expected = [[("x", "!=", 0), ("z", ">=", 10)], [("y", "<", 5), ("z", ">=", 10)]]
-    assert negate_dnf(dnf) == expected
-
-
-def test_complex_dnf():
-    """Test negation of a complex DNF with multiple clauses."""
-    dnf = [[("a", "=", 1), ("b", ">", 2)], [("c", "<=", 3)], [("d", "in", [4, 5])]]
-    expected = [[("a", "!=", 1), ("c", ">", 3), ("d", "!in", [4, 5])], [("b", "<=", 2), ("c", ">", 3), ("d", "!in", [4, 5])]]
-    assert negate_dnf(dnf) == expected
-
-
-def test_boolean_column_predicate():
-    """A bare Boolean column and its negation are read as ``== True`` / ``== False``.
-
-    Polars >= 2.1 lowers ``col == True`` on a Boolean column to a bare column reference and
-    ``col == False`` to ``col.not()``; both forms must still enumerate a single partition value.
-    """
-    schema = pl.Schema({"flag": pl.Boolean})
-    assert convert_expr_to_dnf(pl.col("flag"), schema=schema) == [[("flag", "=", True)]]
-    assert convert_expr_to_dnf(pl.col("flag").not_(), schema=schema) == [[("flag", "=", False)]]
-    assert convert_expr_to_dnf(~pl.col("flag"), schema=schema) == [[("flag", "=", False)]]
-    assert convert_expr_to_dnf(pl.col("flag") == True, schema=schema) == [[("flag", "=", True)]]
-    assert convert_expr_to_dnf(pl.col("flag") == False, schema=schema) == [[("flag", "=", False)]]
-    # Without a schema a bare column predicate is still Boolean by definition.
-    assert convert_expr_to_dnf(pl.col("flag")) == [[("flag", "=", True)]]
-
-
-def test_non_boolean_cast_to_boolean_not_misread():
-    """``col.cast(Boolean)`` on a non-Boolean column is ``int != 0``, not ``col == True``.
-
-    The cast must not be read as ``col == True`` whether or not a schema is supplied, otherwise valid
-    non-1 integer rows would be excluded and a false contradiction could be reported.
-    """
-    schema = pl.Schema({"x": pl.Int64})
-    assert convert_expr_to_dnf(pl.col("x").cast(pl.Boolean), schema=schema) is None
-    # Without a schema the integer column must still not be assumed Boolean.
-    assert convert_expr_to_dnf(pl.col("x").cast(pl.Boolean)) is None
-    # A row with x == 2 satisfies ``x.cast(Boolean) & (x == 2)``; it must not be flagged a contradiction.
-    dnf = convert_expr_to_dnf(pl.col("x").cast(pl.Boolean) & (pl.col("x") == 2))
-    assert dnf == [[("x", "=", 2)]]
-    assert not is_contradiction(dnf[0])
-
-
-def test_equal_date():
-    """Test equality with date objects."""
-    # Create a date object
-    date_obj = date(2023, 1, 1)
-
-    expr = pl.col("date") == date_obj
-    dnf = convert_expr_to_dnf(expr)
-
-    # Verify correct operator and value are preserved
-    assert dnf == [[("date", "=", date_obj)]]
-
-
-def test_is_between_date():
-    """Test date range filtering with is_between"""
-    # Create date objects for range
-    start_date = date(2023, 1, 1)
-    end_date = date(2023, 12, 31)
-
-    expr = pl.col("date").is_between(start_date, end_date)
-    dnf = convert_expr_to_dnf(expr)
-
-    # Verify correct operators and values are preserved
-    assert_dnf_equal(dnf, [[("date", ">=", start_date), ("date", "<=", end_date)]])
-
-
-def test_is_between_datetime():
-    """Test datetime range filtering with is_between"""
-    # Create datetime objects with time components
-    start_dt = datetime(2023, 1, 1, 8, 30, 0)
-    end_dt = datetime(2023, 12, 31, 17, 45, 30)
-
-    expr = pl.col("timestamp").is_between(start_dt, end_dt)
-    dnf = convert_expr_to_dnf(expr)
-
-    # Verify correct operators and datetime objects are preserved
-    assert dnf == [[("timestamp", ">=", start_dt), ("timestamp", "<=", end_dt)]]
-
-
-def test_is_between_date_closed_parameters():
-    """Test all closed parameter options with dates"""
-    start_date = date(2023, 1, 1)
-    end_date = date(2023, 12, 31)
-
-    test_cases = [("both", ">=", "<="), ("left", ">=", "<"), ("right", ">", "<="), ("none", ">", "<")]
-
-    for closed, lower_op, upper_op in test_cases:
-        expr = pl.col("date").is_between(start_date, end_date, closed=closed)
-        dnf = convert_expr_to_dnf(expr)
-        expected = [[("date", lower_op, start_date), ("date", upper_op, end_date)]]
-        assert dnf == expected, f"Failed with closed={closed}"
-
-
-def test_is_between_same_day():
-    """Test edge case with same date for both bounds"""
-    same_date = date(2023, 6, 15)
-
-    # Both inclusive should be equivalent to equals
-    expr = pl.col("date").is_between(same_date, same_date)
-    dnf = convert_expr_to_dnf(expr)
-    assert dnf == [[("date", ">=", same_date), ("date", "<=", same_date)]]
-
-    # With "none" closed parameter, this creates an impossible condition
-    expr = pl.col("date").is_between(same_date, same_date, closed="none")
-    dnf = convert_expr_to_dnf(expr)
-    assert dnf == [[("date", ">", same_date), ("date", "<", same_date)]]
-
-
-def test_is_between_mixed_date_types():
-    """Test mixing datetime and date objects"""
-    # Mix datetime and date objects (this is valid in Polars)
-    start = date(2023, 1, 1)
-    end = datetime(2023, 12, 31, 23, 59, 59)
-
-    expr = pl.col("dt").is_between(start, end)
-    dnf = convert_expr_to_dnf(expr)
-
-    # Should preserve the original types
-    assert dnf == [[("dt", ">=", start), ("dt", "<=", end)]]
-    assert isinstance(dnf[0][0][2], date)
-    assert isinstance(dnf[0][1][2], datetime)
-
-
-def test_is_between_with_polars_date_literals():
-    """Test with Polars date literals"""
-    # Using Polars literals instead of Python date objects
-    expr = pl.col("date").is_between(pl.lit(date(2023, 1, 1)), pl.lit(date(2023, 12, 31)))
-    dnf = convert_expr_to_dnf(expr)
-
-    # The get_literal_value function should extract Python date objects
-    assert dnf[0][0][0] == "date"
-    assert dnf[0][0][1] == ">="
-    assert isinstance(dnf[0][0][2], date)
-    assert dnf[0][0][2] == date(2023, 1, 1)
-
-    assert dnf[0][1][0] == "date"
-    assert dnf[0][1][1] == "<="
-    assert isinstance(dnf[0][1][2], date)
-    assert dnf[0][1][2] == date(2023, 12, 31)
-
-
-@pytest.mark.parametrize(
-    "dnf,expected",
-    [
-        ([[("x", "=", 0)], [("y", "<>", 5)], [("z", "in", [1, 2, 3])]], [[("x", "!=", 0), ("y", "=", 5), ("z", "!in", [1, 2, 3])]]),
-        ([[("x", "!=", 0)], [("y", "not in", [1, 2])], [("z", "is not", None)]], [[("x", "=", 0), ("y", "in", [1, 2]), ("z", "is", None)]]),
-        ([[("x", "=", 0), ("y", "=", 0)], [("z", "=", 0)]], [[("x", "!=", 0), ("z", "!=", 0)], [("y", "!=", 0), ("z", "!=", 0)]]),
+DNF_CASES = [
+    # comparisons
+    D("basic_comparisons-eq", x == 10, [[("x", "=", 10)]]),
+    D("basic_comparisons-neq", y != "test", [[("y", "!=", "test")]]),
+    D("basic_comparisons-gt", z > 5, [[("z", ">", 5)]]),
+    D("basic_comparisons-lt", a < 100, [[("a", "<", 100)]]),
+    D("basic_comparisons-gte", c("b") >= 20, [[("b", ">=", 20)]]),
+    D("basic_comparisons-lte", c("c") <= 50, [[("c", "<=", 50)]]),
+    D("basic_comparisons-reversed", 5 == x, [[("x", "=", 5)]]),
+    D("literal_on_left_is_flipped-lt", pl.lit(1) < a, [[("a", ">", 1)]]),
+    D("literal_on_left_is_flipped-ge", pl.lit(5) >= a, [[("a", "<=", 5)]]),
+    D("equal_date", c("date") == date(2023, 1, 1), [[("date", "=", date(2023, 1, 1))]], exact=True),
+    D("expr_with_col_comparisons-and", (a > c("b")) & (c("c") == 12), [[("c", "=", 12)]]),
+    D("expr_with_col_comparisons-or", (a > c("b")) | (c("c") == 12), None),
+    D("unsupported_expressions", x.cast(pl.Int64) + 5, None),
+    D("literal_comparisons", pl.lit(5) > pl.lit(3), None),
+    # Boolean columns: a bare column is ``== True`` and its negation ``== False``; Polars >= 2.1 lowers
+    # ``col == True`` to the bare column and ``col == False`` to ``col.not()``.
+    D("boolean_column_predicate-bare", c("flag"), [[("flag", "=", True)]], schema=_FLAG, exact=True),
+    D("boolean_column_predicate-not", c("flag").not_(), [[("flag", "=", False)]], schema=_FLAG, exact=True),
+    D("boolean_column_predicate-invert", ~c("flag"), [[("flag", "=", False)]], schema=_FLAG, exact=True),
+    D("boolean_column_predicate-eq_true", c("flag") == True, [[("flag", "=", True)]], schema=_FLAG, exact=True),
+    D("boolean_column_predicate-eq_false", c("flag") == False, [[("flag", "=", False)]], schema=_FLAG, exact=True),
+    D("boolean_column_predicate-no_schema", c("flag"), [[("flag", "=", True)]], exact=True),
+    # ``cast(Boolean)`` on an integer column is ``x != 0``, not ``x == True``.
+    D("non_boolean_cast_to_boolean_not_misread-schema", x.cast(B), None, schema=pl.Schema({"x": pl.Int64})),
+    D("non_boolean_cast_to_boolean_not_misread-no_schema", x.cast(B), None),
+    D("non_boolean_cast_to_boolean_not_misread-and_eq", x.cast(B) & (x == 2), [[("x", "=", 2)]], exact=True),
+    # is_between
+    D("is_between_date", c("date").is_between(*_Y2), [[("date", ">=", _Y2[0]), ("date", "<=", _Y2[1])]]),
+    D(
+        "is_between_datetime",
+        c("timestamp").is_between(datetime(2023, 1, 1, 8, 30), datetime(2023, 12, 31, 17, 45, 30)),
+        [[("timestamp", ">=", datetime(2023, 1, 1, 8, 30)), ("timestamp", "<=", datetime(2023, 12, 31, 17, 45, 30))]],
+        exact=True,
+    ),
+    *[
+        D(
+            f"is_between_date_closed_parameters-{closed}",
+            c("date").is_between(*_Y2, closed=closed),
+            [[("date", lo, _Y2[0]), ("date", hi, _Y2[1])]],
+            exact=True,
+        )
+        for closed, lo, hi in [("both", ">=", "<="), ("left", ">=", "<"), ("right", ">", "<="), ("none", ">", "<")]
     ],
-)
-def test_various_dnf_forms(dnf, expected):
-    """Test negation of various DNF forms with different operators and structures."""
-    assert negate_dnf(dnf) == expected
-
-
-@pytest.mark.parametrize("key", ["eq", "neq", "gt", "lt", "gte", "lte", "reversed"])
-def test_basic_comparisons(basic_comparison_exprs, key):
-    """Test conversion of basic comparison expressions."""
-    expr, expected = basic_comparison_exprs[key]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-@pytest.mark.parametrize("key", ["simple_and", "nested_and", "simple_or", "nested_or", "and_or_mixed", "or_and_mixed"])
-def test_logical_operations(logical_operation_exprs, key):
-    """Test conversion of logical operations."""
-    expr, expected = logical_operation_exprs[key]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-@pytest.mark.parametrize("key", ["is_in", "is_null", "is_not_null", "starts_with", "ends_with", "contains"])
-def test_function_expressions(function_exprs, key):
-    """Test conversion of function expressions."""
-    expr, expected = function_exprs[key]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-@pytest.mark.parametrize("key", ["complex_1", "complex_2", "complex_3"])
-def test_complex_expressions(complex_exprs, key):
-    """Test conversion of complex nested expressions."""
-    expr, expected = complex_exprs[key]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected, f"Failed for {key}")
-
-
-def test_collections_in_is_in():
-    """Test is_in with different collection types."""
-    # List
-    expr = pl.col("x").is_in([1, 2, 3])
-    expected = [[("x", "in", [1, 2, 3])]]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-    # Tuple
-    expr = pl.col("x").is_in((4, 5, 6))
-    # The result might be a list or tuple depending on Polars implementation
-    result = convert_expr_to_dnf(expr)
-    if result[0][0][2] == (4, 5, 6):
-        assert_dnf_equal(result, [[("x", "in", (4, 5, 6))]])
-    else:
-        assert_dnf_equal(result, [[("x", "in", [4, 5, 6])]])
-
-    # Empty collection
-    expr = pl.col("x").is_in([])
-    expected = [[("x", "in", [])]]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_combine_and_dnf():
-    """Test the combine_and_dnf function."""
-    # Basic AND combination
-    left = [[("x", "=", 10)]]
-    right = [[("y", "=", "test")]]
-    expected = [[("x", "=", 10), ("y", "=", "test")]]
-    result = combine_and_dnf(left, right)
-    assert_dnf_equal(result, expected)
-
-    # AND with multiple clauses
-    left = [[("x", "=", 10)], [("y", "=", "test")]]
-    right = [[("z", ">", 5)]]
-    expected = [[("x", "=", 10), ("z", ">", 5)], [("y", "=", "test"), ("z", ">", 5)]]
-    result = combine_and_dnf(left, right)
-    assert_dnf_equal(result, expected)
-
-    # Handling None values
-    assert combine_and_dnf(None, right) == right
-    assert combine_and_dnf(left, None) == left
-    assert combine_and_dnf(None, None) is None
-
-
-def test_unsupported_expressions():
-    """Test behavior with unsupported expression types."""
-    # A complex expression that isn't fully supported
-    expr = pl.col("x").cast(pl.Int64) + 5
-    try:
-        convert_expr_to_dnf(expr)
-    except Exception as e:
-        pytest.fail(f"convert_expr_to_dnf raised {e} on unsupported expression")
-
-
-def test_literal_comparisons():
-    """Test comparisons between literals."""
-    expr = pl.lit(5) > pl.lit(3)
-    try:
-        convert_expr_to_dnf(expr)
-    except Exception as e:
-        pytest.fail(f"convert_expr_to_dnf raised {e} on literal comparison")
-
-
-def test_is_in_single_item():
-    """Test negated operators (prefixed with !)."""
-    # This tests a feature that might not be implemented yet
-    expr = pl.col("x").is_in(["US"])
-    expected = [[("x", "in", ["US"])]]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_negated_operators():
-    """Test negated operators (prefixed with !)."""
-    # This tests a feature that might not be implemented yet
-    expr = ~(pl.col("x").is_in([1, 2, 3]))
-    expected = [[("x", "!in", [1, 2, 3])]]
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_dnf_visitor_direct():
-    """Test using DNFVisitor directly."""
-    expr = (pl.col("x") == 10) & (pl.col("y") > 5)
-
-    # Parse the expression
-    node = get_parsed_expr(expr)
-
-    # Apply the visitor
-    visitor = DNFVisitor()
-    visitor.visit(node)
-    result = visitor.process_results()
-    # Verify the result
-    assert result == [[("x", "=", 10), ("y", ">", 5)]]
-
-
-def test_any_horizontal_nested_with_and():
-    expr = pl.any_horizontal(
-        pl.col("x") > 5,
-        (pl.col("y") == 10) & (pl.col("z") < 3),
-    )
-    expected = [
-        [("x", ">", 5)],
-        [("y", "=", 10), ("z", "<", 3)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_basic():
-    """Test basic ternary expression conversion to DNF."""
-    expr = pl.when(pl.col("x") > 5).then(pl.col("y") == 10).otherwise(pl.col("z") < 3)
-
-    # Expected:
-    # ((x > 5) AND (y == 10)) OR ((NOT(x > 5)) AND (z < 3))
-    expected = [
-        [("x", ">", 5), ("y", "=", 10)],  # predicate and truthy
-        [("x", "<=", 5), ("z", "<", 3)],  # negated predicate and falsy
-        # A null when-condition takes the otherwise branch.
-        [("x", "is", None), ("z", "<", 3)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_with_complex_predicate():
-    """Test ternary expression with a complex predicate."""
-    expr = pl.when((pl.col("x") > 5) & (pl.col("y") < 10)).then(pl.col("z") == 15).otherwise(pl.col("a") != 0)
-
-    # Expected:
-    # ((x > 5) AND (y < 10) AND (z == 15)) OR
-    # ((NOT(x > 5) OR NOT(y < 10)) AND (a != 0))
-    # which simplifies to:
-    # ((x > 5) AND (y < 10) AND (z == 15)) OR
-    # ((x <= 5) AND (a != 0)) OR ((y >= 10) AND (a != 0))
-    expected = [
-        [("x", ">", 5), ("y", "<", 10), ("z", "=", 15)],  # predicate and truthy
-        [("x", "<=", 5), ("a", "!=", 0)],  # first negated predicate clause and falsy
-        [("y", ">=", 10), ("a", "!=", 0)],  # second negated predicate clause and falsy
-        [("a", "!=", 0), ("x", "is", None)],
-        [("a", "!=", 0), ("y", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_with_function_expressions():
-    """Test ternary with function expressions."""
-    expr = pl.when(pl.col("x").is_in([1, 2, 3])).then((pl.col("y") > 5) & (pl.col("z") == 0)).otherwise(pl.col("w").is_null())
-
-    # Expected:
-    # ((x in [1,2,3]) AND (y > 5) AND (z == 0)) OR
-    # ((x NOT in [1,2,3]) AND (w IS NULL))
-    expected = [
-        [("x", "in", [1, 2, 3]), ("y", ">", 5), ("z", "=", 0)],  # predicate and truthy
-        [("x", "!in", [1, 2, 3]), ("w", "is", None)],  # negated predicate and falsy
-        [("w", "is", None), ("x", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_nested():
-    """Test nested ternary expressions."""
-    # Create a nested ternary expression
-    inner_ternary = pl.when(pl.col("y") > 10).then(pl.col("z") == 5).otherwise(pl.col("z") == 0)
-    outer_ternary = pl.when(pl.col("x") < 0).then(inner_ternary).otherwise(pl.col("w").is_not_null())
-
-    # Expected structure:
-    # ((x < 0) AND ((y > 10) AND (z == 5) OR (y <= 10) AND (z == 0))) OR
-    # ((x >= 0) AND (w IS NOT NULL))
-    #
-    # Which expands to:
-    # ((x < 0) AND (y > 10) AND (z == 5)) OR
-    # ((x < 0) AND (y <= 10) AND (z == 0)) OR
-    # ((x >= 0) AND (w IS NOT NULL))
-    expected = [
-        [("x", "<", 0), ("y", ">", 10), ("z", "=", 5)],  # outer predicate, inner predicate, inner truthy
-        [("x", "<", 0), ("y", "<=", 10), ("z", "=", 0)],  # outer predicate, negated inner predicate, inner falsy
-        [("x", ">=", 0), ("w", "is not", None)],  # negated outer predicate, outer falsy
-        [("x", "<", 0), ("y", "is", None), ("z", "=", 0)],
-        [("w", "is not", None), ("x", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(outer_ternary)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_with_empty_clauses():
-    """Test ternary expressions with empty clauses."""
-    # When no conditions in truthy or falsy branch
-    # Using pl.lit(True) and pl.lit(False) for simplicity
-    expr = pl.when(pl.col("x") > 5).then(pl.lit(True)).otherwise(pl.lit(False))
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", ">", 5)]]
-    # Just verify we got a result without asserting exact structure
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_chained_when():
-    """Test chained when-then-when expressions in Polars."""
-    # Create a chained when expression like:
-    # WHEN x > 10 THEN
-    #    WHEN y < 5 THEN z = 1
-    #    ELSE z = 2
-    # ELSE z = 3
-    expr = pl.when(pl.col("x") > 10).then(pl.when(pl.col("y") < 5).then(pl.col("z") == 1).otherwise(pl.col("z") == 2)).otherwise(pl.col("z") == 3)
-
-    # Expected DNF:
-    # ((x > 10) AND (y < 5) AND (z == 1)) OR
-    # ((x > 10) AND (y >= 5) AND (z == 2)) OR
-    # ((x <= 10) AND (z == 3))
-    expected = [
-        [("x", ">", 10), ("y", "<", 5), ("z", "=", 1)],  # outer condition true, inner condition true
-        [("x", ">", 10), ("y", ">=", 5), ("z", "=", 2)],  # outer condition true, inner condition false
-        [("x", "<=", 10), ("z", "=", 3)],  # outer condition false
-        [("x", ">", 10), ("y", "is", None), ("z", "=", 2)],
-        [("x", "is", None), ("z", "=", 3)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_multiple_chained_when():
-    """Test multiple chained when expressions (if-elseif-else pattern)."""
-    # Create a chain of when expressions like:
-    # IF x > 100 THEN "high"
-    # ELSE IF x > 50 THEN "medium"
-    # ELSE IF x > 10 THEN "low"
-    # ELSE "very low"
-    expr = (
-        pl.when(pl.col("x") > 100)
-        .then(pl.col("result") == "high")
-        .when(pl.col("x") > 50)
-        .then(pl.col("result") == "medium")
-        .when(pl.col("x") > 10)
-        .then(pl.col("result") == "low")
-        .otherwise(pl.col("result") == "very low")
-    )
-
-    # Expected DNF:
-    # ((x > 100) AND (result == "high")) OR
-    # ((x <= 100) AND (x > 50) AND (result == "medium")) OR
-    # ((x <= 100) AND (x <= 50) AND (x > 10) AND (result == "low")) OR
-    # ((x <= 100) AND (x <= 50) AND (x <= 10) AND (result == "very low"))
-    expected = [
-        [("x", ">", 100), ("result", "=", "high")],
-        [("x", "<=", 100), ("x", ">", 50), ("result", "=", "medium")],
-        [("x", "<=", 100), ("x", "<=", 50), ("x", ">", 10), ("result", "=", "low")],
-        [("x", "<=", 100), ("x", "<=", 50), ("x", "<=", 10), ("result", "=", "very low")],
-        [("result", "=", "very low"), ("x", "is", None), ("x", "is", None), ("x", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_multiple_conditions_in_when():
-    """Test when expressions with multiple comma-separated conditions."""
-    # When with multiple conditions (implicitly AND-ed together)
-    expr = (
-        pl.when(
-            pl.col("x") > 10,  # First condition
-            pl.col("y") < 5,  # Second condition (implicitly AND with first)
-        )
-        .then(pl.col("z") == 1)
-        .otherwise(pl.col("z") == 2)
-    )
-
-    # Expected DNF:
-    # ((x > 10) AND (y < 5) AND (z == 1)) OR
-    # ((NOT(x > 10) OR NOT(y < 5)) AND (z == 2))
-    # Which simplifies to:
-    # ((x > 10) AND (y < 5) AND (z == 1)) OR
-    # ((x <= 10) AND (z == 2)) OR
-    # ((y >= 5) AND (z == 2))
-    expected = [
-        [("x", ">", 10), ("y", "<", 5), ("z", "=", 1)],  # All conditions true
-        [("x", "<=", 10), ("z", "=", 2)],  # First condition false
-        [("y", ">=", 5), ("z", "=", 2)],  # Second condition false
-        [("x", "is", None), ("z", "=", 2)],
-        [("y", "is", None), ("z", "=", 2)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_multiple_when_with_multiple_conditions():
-    """Test multiple when clauses each with multiple conditions."""
-    # Chain of when expressions with multiple conditions in each
-    expr = (
-        pl.when(pl.col("x") > 100, pl.col("y") == "A")
-        .then(pl.col("result") == "category_1")
-        .when(pl.col("x") > 50, pl.col("y") == "B")
-        .then(pl.col("result") == "category_2")
-        .otherwise(pl.col("result") == "category_3")
-    )
-
-    # Expected DNF:
-    # ((x > 100) AND (y == "A") AND (result == "category_1")) OR
-    # ((NOT(x > 100) OR NOT(y == "A")) AND (x > 50) AND (y == "B") AND (result == "category_2")) OR
-    # ((NOT(x > 100) OR NOT(y == "A")) AND (NOT(x > 50) OR NOT(y == "B")) AND (result == "category_3"))
-    #
-    # Which simplifies to multiple clauses:
-    expected = [
-        [("x", ">", 100), ("y", "=", "A"), ("result", "=", "category_1")],
-        [("x", "<=", 100), ("x", ">", 50), ("y", "=", "B"), ("result", "=", "category_2")],
-        [("y", "!=", "A"), ("x", ">", 50), ("y", "=", "B"), ("result", "=", "category_2")],
-        [("x", "<=", 100), ("x", "<=", 50), ("result", "=", "category_3")],
-        [("x", "<=", 100), ("y", "!=", "B"), ("result", "=", "category_3")],
-        [("y", "!=", "A"), ("x", "<=", 50), ("result", "=", "category_3")],
-        [("y", "!=", "A"), ("y", "!=", "B"), ("result", "=", "category_3")],
-        [("result", "=", "category_3"), ("x", "<=", 100), ("y", "is", None)],
-        [("result", "=", "category_3"), ("x", "is", None), ("y", "!=", "A")],
-        [("result", "=", "category_3"), ("y", "!=", "A"), ("y", "is", None)],
-        [("result", "=", "category_3"), ("x", "is", None), ("y", "!=", "B")],
-        [("result", "=", "category_3"), ("x", "is", None), ("x", "is", None)],
-        [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
-        [("result", "=", "category_3"), ("x", "<=", 50), ("y", "is", None)],
-        [("result", "=", "category_3"), ("y", "!=", "B"), ("y", "is", None)],
-        [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
-        [("result", "=", "category_3"), ("y", "is", None), ("y", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_ternary_nested_with_multiple_conditions():
-    """Test nested ternary expressions with multiple conditions."""
-    # Nested ternary with multiple conditions at each level
-    expr = (
-        pl.when(pl.col("category") == "A", pl.col("value") > 100)
-        .then(
-            pl.when(pl.col("subcategory") == "X", pl.col("priority") > 3)
-            .then(pl.col("result") == "high_priority_A")
-            .otherwise(pl.col("result") == "normal_A")
-        )
-        .otherwise(pl.when(pl.col("category") == "B").then(pl.col("result") == "any_B").otherwise(pl.col("result") == "other"))
-    )
-
-    # This creates a complex decision tree with many branches
-    # The expected DNF would have multiple clauses for each possible path
-    expected = [
-        # Path: category=A, value>100, subcategory=X, priority>3 -> high_priority_A
-        [("category", "=", "A"), ("value", ">", 100), ("subcategory", "=", "X"), ("priority", ">", 3), ("result", "=", "high_priority_A")],
-        # Path: category=A, value>100, (subcategory!=X OR priority<=3) -> normal_A
-        [("category", "=", "A"), ("value", ">", 100), ("subcategory", "!=", "X"), ("result", "=", "normal_A")],
-        [("category", "=", "A"), ("value", ">", 100), ("priority", "<=", 3), ("result", "=", "normal_A")],
-        # Path: (category!=A OR value<=100), category=B -> any_B
-        [("category", "!=", "A"), ("category", "=", "B"), ("result", "=", "any_B")],
-        [("value", "<=", 100), ("category", "=", "B"), ("result", "=", "any_B")],
-        # Path: (category!=A OR value<=100), category!=B -> other
-        [("category", "!=", "A"), ("category", "!=", "B"), ("result", "=", "other")],
-        [("value", "<=", 100), ("category", "!=", "B"), ("result", "=", "other")],
-        [("category", "=", "A"), ("result", "=", "normal_A"), ("subcategory", "is", None), ("value", ">", 100)],
-        [("category", "=", "A"), ("priority", "is", None), ("result", "=", "normal_A"), ("value", ">", 100)],
-        [("category", "!=", "A"), ("category", "is", None), ("result", "=", "other")],
-        [("category", "is", None), ("result", "=", "other"), ("value", "<=", 100)],
-        [("category", "!=", "B"), ("category", "is", None), ("result", "=", "other")],
-        [("category", "is", None), ("category", "is", None), ("result", "=", "other")],
-        [("category", "=", "B"), ("result", "=", "any_B"), ("value", "is", None)],
-        [("category", "!=", "B"), ("result", "=", "other"), ("value", "is", None)],
-        [("category", "is", None), ("result", "=", "other"), ("value", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-def test_expr_with_col_comparisons():
-    expr = (pl.col("a") > pl.col("b")) & (pl.col("c") == 12)
-    result = convert_expr_to_dnf(expr)
-    expected = [[("c", "=", 12)]]
-    assert_dnf_equal(result, expected)
-
-    # we cant get a restriction here
-    expr = (pl.col("a") > pl.col("b")) | (pl.col("c") == 12)
-    assert convert_expr_to_dnf(expr) is None
-
-
-def test_supported_cast():
-    expr = (pl.col.x == 0).cast(pl.Boolean)
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", "=", 0)]]
-    assert_dnf_equal(result, expected)
-
-
-# Helper to create DNFTuples easily for testing, and we get type hints
-def T(column: str, op: str, value) -> DNFTuple:
-    return (column, op, value)
-
-
-# Test cases: List of (description, dnf_clause, expected_is_contradiction)
-contradiction_test_cases = [
-    # Empty Clause
-    ("Empty clause (always true)", [], False),  # this is a degenerate case
-    # Exact Value Contradictions
-    ("Exact: col = 5 AND col = 6", [T("colA", "=", 5), T("colA", "=", 6)], True),
-    ("Exact: col = 5 AND col != 5", [T("colA", "=", 5), T("colA", "!=", 5)], True),
-    ("Exact: col = 5 AND col = 5", [T("colA", "=", 5), T("colA", "=", 5)], False),  # Redundant but not a contradiction
-    ("Exact: col == 5 AND col <> 5", [T("colA", "==", 5), T("colA", "<>", 5)], True),
-    # Range Contradictions
-    ("Range: col > 10 AND col < 5", [T("colA", ">", 10), T("colA", "<", 5)], True),
-    ("Range: col > 5 AND col < 5", [T("colA", ">", 5), T("colA", "<", 5)], True),
-    ("Range: col >= 5 AND col <= 5", [T("colA", ">=", 5), T("colA", "<=", 5)], False),
-    ("Range: col > 5 AND col <= 5", [T("colA", ">", 5), T("colA", "<=", 5)], True),
-    ("Range: col >= 5 AND col < 5", [T("colA", ">=", 5), T("colA", "<", 5)], True),
-    ("Range: col > 5 AND col > 10", [T("colA", ">", 5), T("colA", ">", 10)], False),  # min_bound becomes 10
-    ("Range: col < 10 AND col < 5", [T("colA", "<", 10), T("colA", "<", 5)], False),  # max_bound becomes 5
-    (
-        "Range: col < datetime(2024, 1, 1) AND col >= datetime(2024, 1, 2)",
-        [T("colA", "<", datetime(2024, 1, 1)), T("colA", ">=", datetime(2024, 1, 2))],
-        True,
-    ),  # datetime bounds contradict
-    (
-        "Range: col < datetime(2024, 1, 1) AND col >= datetime(2022, 1, 2)",
-        [T("colA", "<", datetime(2024, 1, 1)), T("colA", ">=", datetime(2022, 1, 2))],
-        False,
-    ),  # datetime bounds don't contradict
-    # Exact Value vs. Range
-    ("Exact vs Range: col = 3 AND col > 5", [T("colA", "=", 3), T("colA", ">", 5)], True),
-    ("Exact vs Range: col = 7 AND col > 5 AND col < 10", [T("colA", "=", 7), T("colA", ">", 5), T("colA", "<", 10)], False),
-    ("Exact vs Range: col = 5 AND col >= 5", [T("colA", "=", 5), T("colA", ">=", 5)], False),
-    ("Exact vs Range: col = 5 AND col > 5", [T("colA", "=", 5), T("colA", ">", 5)], True),
-    ("Exact vs Range: col = 5 AND col <= 5", [T("colA", "=", 5), T("colA", "<=", 5)], False),
-    ("Exact vs Range: col = 5 AND col < 5", [T("colA", "=", 5), T("colA", "<", 5)], True),
-    # Inclusion/Exclusion Contradictions
-    ("In/Ex: col IN (1,2) AND col = 3", [T("colA", "in", [1, 2]), T("colA", "=", 3)], True),
-    ("In/Ex: col IN (1,2) AND col = 1", [T("colA", "in", [1, 2]), T("colA", "=", 1)], False),
-    ("In/Ex: col IN (1,2) AND col NOT IN (1,2,3)", [T("colA", "in", [1, 2]), T("colA", "!in", [1, 2, 3])], True),
-    ("In/Ex: col IN (1,2) AND col NOT IN (3,4)", [T("colA", "in", [1, 2]), T("colA", "!in", [3, 4])], False),
-    ("In/Ex: col IN (1,2) AND col IN (3,4)", [T("colA", "in", [1, 2]), T("colA", "in", [3, 4])], True),
-    ("In/Ex: col IN (1,2,3) AND col IN (3,4,5)", [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5])], False),  # Valid values: {3}
-    ("In/Ex: col IN (1,2,3) AND col IN (3,4,5) AND col = 3", [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5]), T("colA", "=", 3)], False),
-    ("In/Ex: col IN (1,2,3) AND col IN (3,4,5) AND col = 1", [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5]), T("colA", "=", 1)], True),
-    (
-        "In/Ex: col IN (1,2,3) AND col IN (3,4,5) AND col NOT IN (3)",
-        [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5]), T("colA", "!in", [3])],
-        True,
+    D(
+        "is_between_same_day-both",
+        c("date").is_between(date(2023, 6, 15), date(2023, 6, 15)),
+        [[("date", ">=", date(2023, 6, 15)), ("date", "<=", date(2023, 6, 15))]],
+        exact=True,
     ),
-    # NULL Contradictions
-    ("NULL: col IS NULL AND col = 5", [T("colA", "is", None), T("colA", "=", 5)], True),
-    ("NULL: col IS NULL AND col > 0", [T("colA", "is", None), T("colA", ">", 0)], True),
-    ("NULL: col IS NULL AND col IN (1,2)", [T("colA", "is", None), T("colA", "in", [1, 2])], True),
-    ("NULL: col IS NULL AND col IS NOT NULL", [T("colA", "is", None), T("colA", "is not", None)], True),
-    ("NULL: col IS NOT NULL AND col = None (exact value is None)", [T("colA", "is not", None), T("colA", "=", None)], True),
-    ("NULL: col IS NOT NULL AND col IN (None,)", [T("colA", "is not", None), T("colA", "in", [None])], True),
-    ("NULL: col IS NOT NULL AND col IN (None, 1)", [T("colA", "is not", None), T("colA", "in", [None, 1])], False),
-    ("NULL: col IS NULL (no contradiction)", [T("colA", "is", None)], False),
-    ("NULL: col IS NOT NULL (no contradiction)", [T("colA", "is not", None)], False),
-    ("NULL: col IS NULL AND col IN (None,)", [T("colA", "is", None), T("colA", "in", [None])], False),  # Exact value None is compatible with IS NULL
-    # Complex (Single Column)
-    ("Complex: col > 0 AND col < 10 AND col IN (20,30)", [T("colA", ">", 0), T("colA", "<", 10), T("colA", "in", [20, 30])], True),
-    ("Complex: col > 0 AND col < 10 AND col IN (5, 20)", [T("colA", ">", 0), T("colA", "<", 10), T("colA", "in", [5, 20])], False),  # 5 is valid
-    ("Complex: col = 5 AND col != 5 AND col > 0", [T("colA", "=", 5), T("colA", "!=", 5), T("colA", ">", 0)], True),
-    # Multiple Columns
-    ("Multi-col: colA = 1 AND colA = 2 AND colB = 10", [T("colA", "=", 1), T("colA", "=", 2), T("colB", "=", 10)], True),
-    ("Multi-col: colA = 1 AND colB > 5", [T("colA", "=", 1), T("colB", ">", 5)], False),
-    (
-        "Multi-col: colA > 0 AND colA < 1, colB = 1 (colA contradiction only for int)",
-        [T("colA", ">", 0), T("colA", "<", 1), T("colB", "=", 1)],
-        False,
+    D(
+        "is_between_same_day-none",
+        c("date").is_between(date(2023, 6, 15), date(2023, 6, 15), closed="none"),
+        [[("date", ">", date(2023, 6, 15)), ("date", "<", date(2023, 6, 15))]],
+        exact=True,
     ),
-    (
-        "Multi-col: colA > 0 AND colA < 12, colB = 1, colA < -1 (colA contradiction)",
-        [T("colA", ">", 0), T("colA", "<", 1), T("colA", "<", -1), T("colB", "=", 1)],
-        True,
+    # literal types are kept: a date never equals a datetime
+    D(
+        "is_between_mixed_date_types",
+        c("dt").is_between(date(2023, 1, 1), datetime(2023, 12, 31, 23, 59, 59)),
+        [[("dt", ">=", date(2023, 1, 1)), ("dt", "<=", datetime(2023, 12, 31, 23, 59, 59))]],
+        exact=True,
     ),
-    # Non-Contradictions
-    ("Non-C: col = 5 AND col > 0", [T("colA", "=", 5), T("colA", ">", 0)], False),
-    ("Non-C: col > 0 AND col < 10", [T("colA", ">", 0), T("colA", "<", 10)], False),
-    ("Non-C: col IN (1,2,3) AND col = 1", [T("colA", "in", [1, 2, 3]), T("colA", "=", 1)], False),
-    ("Non-C: col IS NOT NULL AND col > 5", [T("colA", "is not", None), T("colA", ">", 5)], False),
-    ("Non-C: colA = 1, colB = 'test', colC > 3.0", [T("colA", "=", 1), T("colB", "=", "test"), T("colC", ">", 3.0)], False),
-    # Type Issues (False due to conservative TypeError handling)
-    # Edge cases for IN operator value types
-    ("Edge IN: col IN 'abc' (scalar string)", [T("colA", "in", "abc")], False),  # Analyzer wraps scalar in a list
-    ("Edge IN: col IN 1 (scalar int)", [T("colA", "in", 1)], False),
-    # IS with non-None values (current behavior test)
-    ("IS non-None: colA IS TRUE", [T("colA", "is", True)], False),  # Sets is_null = False, no contradiction alone
-    ("IS non-None: colA IS TRUE AND colA IS NULL", [T("colA", "is", True), T("colA", "is", None)], True),  # is_null=False vs is_null=True
-    ("IS NOT non-None: colA IS NOT TRUE", [T("colA", "is not", True)], False),  # Does not set is_null, no contradiction
+    D(
+        "is_between_with_polars_date_literals",
+        c("date").is_between(pl.lit(_Y2[0]), pl.lit(_Y2[1])),
+        [[("date", ">=", _Y2[0]), ("date", "<=", _Y2[1])]],
+        exact=True,
+    ),
+    # logical operations
+    D("logical_operations-simple_and", (x == 10) & (y == "test"), [[("x", "=", 10), ("y", "=", "test")]]),
+    D("logical_operations-nested_and", (x == 10) & (y == "test") & (z > 5), [[("x", "=", 10), ("y", "=", "test"), ("z", ">", 5)]]),
+    D("logical_operations-simple_or", (x == 10) | (y == "test"), [[("x", "=", 10)], [("y", "=", "test")]]),
+    D("logical_operations-nested_or", (x == 10) | (y == "test") | (z > 5), [[("x", "=", 10)], [("y", "=", "test")], [("z", ">", 5)]]),
+    D(
+        "logical_operations-and_or_mixed",
+        (x == 10) & ((y == "test") | (z > 5)),
+        [[("x", "=", 10), ("y", "=", "test")], [("x", "=", 10), ("z", ">", 5)]],
+    ),
+    D("logical_operations-or_and_mixed", (x == 10) | ((y == "test") & (z > 5)), [[("x", "=", 10)], [("y", "=", "test"), ("z", ">", 5)]]),
+    D("any_horizontal_nested_with_and", pl.any_horizontal(x > 5, (y == 10) & (z < 3)), [[("x", ">", 5)], [("y", "=", 10), ("z", "<", 3)]]),
+    # functions
+    D("function_expressions-is_in", x.is_in((1, 2, 3)), [[("x", "in", [1, 2, 3])]]),
+    D("function_expressions-is_null", y.is_null(), [[("y", "is", None)]]),
+    D("function_expressions-is_not_null", z.is_not_null(), [[("z", "is not", None)]]),
+    D("function_expressions-starts_with", s.str.starts_with("prefix"), [[("s", "~", "^prefix")]]),
+    D("function_expressions-ends_with", s.str.ends_with("suffix"), [[("s", "~", "suffix$")]]),
+    D("function_expressions-contains", s.str.contains("substr"), [[("s", "~", "substr")]]),
+    D("collections_in_is_in-list", x.is_in([1, 2, 3]), [[("x", "in", [1, 2, 3])]]),
+    D("collections_in_is_in-tuple", x.is_in((4, 5, 6)), [[("x", "in", [4, 5, 6])]]),
+    D("collections_in_is_in-empty", x.is_in([]), [[("x", "in", [])]]),
+    D("is_in_single_item", x.is_in(["US"]), [[("x", "in", ["US"])]]),
+    D("negated_operators", ~x.is_in([1, 2, 3]), [[("x", "!in", [1, 2, 3])]]),
+    D("eq_missing_and_ne_missing_with_null_literal-eq", a.eq_missing(None), [[("a", "is", None)]]),
+    D("eq_missing_and_ne_missing_with_null_literal-ne", a.ne_missing(None), [[("a", "is not", None)]]),
+    D(
+        "complex_expressions-complex_1",
+        ((a > 5) & (c("b") <= 10)) | ((c("c") == "test") & c("d").is_not_null()),
+        [[("a", ">", 5), ("b", "<=", 10)], [("c", "=", "test"), ("d", "is not", None)]],
+    ),
+    D(
+        "complex_expressions-complex_2",
+        ((a > 5) & (c("b") <= 10)) | (((c("c") == "test") | c("d").ne(True)) & c("e").is_null()),
+        [[("a", ">", 5), ("b", "<=", 10)], [("c", "=", "test"), ("e", "is", None)], [("d", "!=", True), ("e", "is", None)]],
+    ),
+    D("complex_expressions-complex_3", c("e").is_in([1, 2, 3]) & c("f").str.contains("xyz"), [[("e", "in", [1, 2, 3]), ("f", "~", "xyz")]]),
+    # Boolean casts are transparent, other casts are not
+    D("supported_cast", (x == 0).cast(B), [[("x", "=", 0)]]),
+    D("complex_expression_with_boolean_cast", ((x > 5) & (y == "test")).cast(B), [[("x", ">", 5), ("y", "=", "test")]]),
+    D("nested_boolean_casts", (x == 0).cast(B).cast(B), [[("x", "=", 0)]]),
+    D("cast_other_than_boolean", (x == 0).cast(pl.Int32), None),
+    D("boolean_cast_in_logical_operation", (x > 5).cast(B) & (y == "test"), [[("x", ">", 5), ("y", "=", "test")]]),
+    D("value_preserving_widening_cast_still_pushes_down-no_schema", a.cast(pl.Int64) == 1, None),
+    D("value_preserving_widening_cast_still_pushes_down-schema", a.cast(pl.Int64) == 1, [[("a", "=", 1)]], schema={"a": pl.Int8}),
+    D(
+        "sub_microsecond_is_in_literal_is_not_pushed",
+        c("t").is_in(pl.concat_list(pl.lit(1704198600000000500).cast(pl.Datetime("ns")))),
+        None,
+        schema={"t": pl.Datetime("ns")},
+    ),
+    # aliases are transparent
+    D("alias_simple_equality", x.alias("x_alias") == 10, [[("x", "=", 10)]]),
+    D("alias_logical_operations", (x.alias("x_alias") == 10) & (y.alias("y_alias") > 5), [[("x", "=", 10), ("y", ">", 5)]]),
+    # ternaries: a null condition takes the otherwise branch
+    D(
+        "ternary_basic",
+        pl.when(x > 5).then(y == 10).otherwise(z < 3),
+        [[("x", ">", 5), ("y", "=", 10)], [("x", "<=", 5), ("z", "<", 3)], [("x", "is", None), ("z", "<", 3)]],
+    ),
+    D(
+        "boolean_cast_in_ternary_expression",
+        pl.when((x > 5).cast(B)).then(y == 10).otherwise(z < 3),
+        [[("x", ">", 5), ("y", "=", 10)], [("x", "<=", 5), ("z", "<", 3)], [("x", "is", None), ("z", "<", 3)]],
+    ),
+    D(
+        "ternary_with_complex_predicate",
+        pl.when((x > 5) & (y < 10)).then(z == 15).otherwise(a != 0),
+        [
+            [("x", ">", 5), ("y", "<", 10), ("z", "=", 15)],
+            [("x", "<=", 5), ("a", "!=", 0)],
+            [("y", ">=", 10), ("a", "!=", 0)],
+            [("a", "!=", 0), ("x", "is", None)],
+            [("a", "!=", 0), ("y", "is", None)],
+        ],
+    ),
+    D(
+        "ternary_with_function_expressions",
+        pl.when(x.is_in([1, 2, 3])).then((y > 5) & (z == 0)).otherwise(c("w").is_null()),
+        [
+            [("x", "in", [1, 2, 3]), ("y", ">", 5), ("z", "=", 0)],
+            [("x", "!in", [1, 2, 3]), ("w", "is", None)],
+            [("w", "is", None), ("x", "is", None)],
+        ],
+    ),
+    D(
+        "ternary_nested",
+        pl.when(x < 0).then(pl.when(y > 10).then(z == 5).otherwise(z == 0)).otherwise(c("w").is_not_null()),
+        [
+            [("x", "<", 0), ("y", ">", 10), ("z", "=", 5)],
+            [("x", "<", 0), ("y", "<=", 10), ("z", "=", 0)],
+            [("x", ">=", 0), ("w", "is not", None)],
+            [("x", "<", 0), ("y", "is", None), ("z", "=", 0)],
+            [("w", "is not", None), ("x", "is", None)],
+        ],
+    ),
+    D("ternary_with_empty_clauses", pl.when(x > 5).then(pl.lit(True)).otherwise(pl.lit(False)), [[("x", ">", 5)]]),
+    D(
+        "ternary_chained_when",
+        pl.when(x > 10).then(pl.when(y < 5).then(z == 1).otherwise(z == 2)).otherwise(z == 3),
+        [
+            [("x", ">", 10), ("y", "<", 5), ("z", "=", 1)],
+            [("x", ">", 10), ("y", ">=", 5), ("z", "=", 2)],
+            [("x", "<=", 10), ("z", "=", 3)],
+            [("x", ">", 10), ("y", "is", None), ("z", "=", 2)],
+            [("x", "is", None), ("z", "=", 3)],
+        ],
+    ),
+    D(
+        "ternary_multiple_chained_when",
+        pl.when(x > 100)
+        .then(c("result") == "high")
+        .when(x > 50)
+        .then(c("result") == "medium")
+        .when(x > 10)
+        .then(c("result") == "low")
+        .otherwise(c("result") == "very low"),
+        [
+            [("x", ">", 100), ("result", "=", "high")],
+            [("x", "<=", 100), ("x", ">", 50), ("result", "=", "medium")],
+            [("x", "<=", 100), ("x", "<=", 50), ("x", ">", 10), ("result", "=", "low")],
+            [("x", "<=", 100), ("x", "<=", 50), ("x", "<=", 10), ("result", "=", "very low")],
+            [("result", "=", "very low"), ("x", "is", None), ("x", "is", None), ("x", "is", None)],
+        ],
+    ),
+    D(
+        "ternary_multiple_conditions_in_when",
+        pl.when(x > 10, y < 5).then(z == 1).otherwise(z == 2),
+        [
+            [("x", ">", 10), ("y", "<", 5), ("z", "=", 1)],
+            [("x", "<=", 10), ("z", "=", 2)],
+            [("y", ">=", 5), ("z", "=", 2)],
+            [("x", "is", None), ("z", "=", 2)],
+            [("y", "is", None), ("z", "=", 2)],
+        ],
+    ),
+    D(
+        "ternary_multiple_when_with_multiple_conditions",
+        pl.when(x > 100, y == "A")
+        .then(c("result") == "category_1")
+        .when(x > 50, y == "B")
+        .then(c("result") == "category_2")
+        .otherwise(c("result") == "category_3"),
+        [
+            [("x", ">", 100), ("y", "=", "A"), ("result", "=", "category_1")],
+            [("x", "<=", 100), ("x", ">", 50), ("y", "=", "B"), ("result", "=", "category_2")],
+            [("y", "!=", "A"), ("x", ">", 50), ("y", "=", "B"), ("result", "=", "category_2")],
+            [("x", "<=", 100), ("x", "<=", 50), ("result", "=", "category_3")],
+            [("x", "<=", 100), ("y", "!=", "B"), ("result", "=", "category_3")],
+            [("y", "!=", "A"), ("x", "<=", 50), ("result", "=", "category_3")],
+            [("y", "!=", "A"), ("y", "!=", "B"), ("result", "=", "category_3")],
+            [("result", "=", "category_3"), ("x", "<=", 100), ("y", "is", None)],
+            [("result", "=", "category_3"), ("x", "is", None), ("y", "!=", "A")],
+            [("result", "=", "category_3"), ("y", "!=", "A"), ("y", "is", None)],
+            [("result", "=", "category_3"), ("x", "is", None), ("y", "!=", "B")],
+            [("result", "=", "category_3"), ("x", "is", None), ("x", "is", None)],
+            [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
+            [("result", "=", "category_3"), ("x", "<=", 50), ("y", "is", None)],
+            [("result", "=", "category_3"), ("y", "!=", "B"), ("y", "is", None)],
+            [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
+            [("result", "=", "category_3"), ("y", "is", None), ("y", "is", None)],
+        ],
+    ),
+    D(
+        "ternary_nested_with_multiple_conditions",
+        pl.when(c("category") == "A", c("value") > 100)
+        .then(pl.when(c("subcategory") == "X", c("priority") > 3).then(c("result") == "high_priority_A").otherwise(c("result") == "normal_A"))
+        .otherwise(pl.when(c("category") == "B").then(c("result") == "any_B").otherwise(c("result") == "other")),
+        [
+            [("category", "=", "A"), ("value", ">", 100), ("subcategory", "=", "X"), ("priority", ">", 3), ("result", "=", "high_priority_A")],
+            [("category", "=", "A"), ("value", ">", 100), ("subcategory", "!=", "X"), ("result", "=", "normal_A")],
+            [("category", "=", "A"), ("value", ">", 100), ("priority", "<=", 3), ("result", "=", "normal_A")],
+            [("category", "!=", "A"), ("category", "=", "B"), ("result", "=", "any_B")],
+            [("value", "<=", 100), ("category", "=", "B"), ("result", "=", "any_B")],
+            [("category", "!=", "A"), ("category", "!=", "B"), ("result", "=", "other")],
+            [("value", "<=", 100), ("category", "!=", "B"), ("result", "=", "other")],
+            [("category", "=", "A"), ("result", "=", "normal_A"), ("subcategory", "is", None), ("value", ">", 100)],
+            [("category", "=", "A"), ("priority", "is", None), ("result", "=", "normal_A"), ("value", ">", 100)],
+            [("category", "!=", "A"), ("category", "is", None), ("result", "=", "other")],
+            [("category", "is", None), ("result", "=", "other"), ("value", "<=", 100)],
+            [("category", "!=", "B"), ("category", "is", None), ("result", "=", "other")],
+            [("category", "is", None), ("category", "is", None), ("result", "=", "other")],
+            [("category", "=", "B"), ("result", "=", "any_B"), ("value", "is", None)],
+            [("category", "!=", "B"), ("result", "=", "other"), ("value", "is", None)],
+            [("category", "is", None), ("result", "=", "other"), ("value", "is", None)],
+        ],
+    ),
+    # Nulls and partial conversions: the DNF must keep every row of ``df`` that the predicate keeps.
+    D("not_over_partially_converted_and_does_not_drop_rows", ~((a == 1) & (c("b").str.len_chars() == 2)), None, df=_NULL_MIX),
+    D("ne_missing_keeps_null_rows", a.ne_missing(1), [[("a", "!=", 1)], [("a", "is", None)]], df=_NULL_MIX),
+    D("negated_is_in_nulls_equal_keeps_nulls", ~a.is_in([1], nulls_equal=True), None, df=_NULL_MIX),
+    D(
+        "is_in_nulls_equal_with_null_value_keeps_nulls",
+        a.is_in([1, None], nulls_equal=True),
+        [[("a", "in", [1])], [("a", "is", None)]],
+        df=pl.DataFrame({"a": [1, 2, None]}, schema={"a": pl.Int64}),
+    ),
+    # A narrowing cast is refused even with a schema: 257 wraps to 1 under Int8.
+    D("narrowing_cast_on_column_is_not_stripped-no_schema", a.cast(pl.Int8, wrap_numerical=True) == 1, None, df=_NULL_MIX),
+    D("narrowing_cast_on_column_is_not_stripped-schema", a.cast(pl.Int8, wrap_numerical=True) == 1, None, schema={"a": pl.Int64}, df=_NULL_MIX),
+    D("ternary_otherwise_keeps_rows_where_condition_is_null", pl.when(a >= 5).then(False).otherwise(True), df=pl.DataFrame({"a": [None, 1, 5]})),
+    D("regex_contains_is_not_escaped-regex", s.str.contains("A|B"), df=pl.DataFrame({"s": ["A", "B", "A|B", "C"]})),
+    D("regex_contains_is_not_escaped-literal", s.str.contains("A|B", literal=True), df=pl.DataFrame({"s": ["A", "B", "A|B", "C"]})),
 ]
-
-
-@pytest.mark.parametrize("description, dnf_clause, expected", contradiction_test_cases)
-def test_is_contradiction(description: str, dnf_clause: DNFClause, expected: bool):
-    assert is_contradiction(dnf_clause) == expected, f"Test failed for: {description}"
-
-
-_is_contradiction_test_cases = [
-    (
-        "Multi option is in check",
-        (pl.col("y").is_in(["a", "b"]) & pl.col("a").eq(5) & (pl.col("a").ne(5) | pl.col("y").is_in(["b", "a"]).not_())),
-        pl.Schema({"a": pl.Boolean, "y": pl.String}),
-        True,
-    ),
-    (
-        "Compare with True (python boolean)",
-        (pl.col("y").is_in(["a", "b"]) & pl.col("p").eq(True) & (pl.col("p").ne(True) | pl.col("y").is_in(["b", "a"]).not_())),
-        pl.Schema({"x": pl.Int64, "y": pl.String, "p": pl.Boolean, "x2": pl.Int64, "y2": pl.String, "p2": pl.Boolean}),
-        True,
-    ),
-    (
-        "Compare with pl.lit(True)",
-        (pl.col("y").is_in(["a", "b"]) & pl.col("p").eq(pl.lit(True)) & pl.Expr.or_(pl.col("p").ne(pl.lit(True)), ~pl.col("y").is_in(["b", "a"]))),
-        pl.Schema({"x": pl.Int64, "y": pl.String, "p": pl.Boolean, "x2": pl.Int64, "y2": pl.String, "p2": pl.Boolean}),
-        True,
-    ),
-]
-
-
-@pytest.mark.parametrize("description, pl_expr, schema, expected", _is_contradiction_test_cases)
-def test_is_contradiction_pl(description: str, pl_expr: pl.Expr, schema: pl.Schema, expected: bool):
-    """Test is_contradiction with Polars expressions."""
-    _is_contradiction(pl_expr, schema)
-    assert _is_contradiction(pl_expr, schema) == expected, f"Test failed for: {description}"
-
-
-def test_complex_expression_with_boolean_cast():
-    """Test a more complex expression with a cast to Boolean."""
-    expr = ((pl.col("x") > 5) & (pl.col("y") == "test")).cast(pl.Boolean)
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", ">", 5), ("y", "=", "test")]]
-    assert_dnf_equal(result, expected)
-
-
-def test_nested_boolean_casts():
-    """Test expression with nested casts to Boolean."""
-    expr = (pl.col("x") == 0).cast(pl.Boolean).cast(pl.Boolean)
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", "=", 0)]]
-    assert_dnf_equal(result, expected)
-
-
-def test_cast_other_than_boolean():
-    """Test that casts to types other than Boolean are not processed."""
-    expr = (pl.col("x") == 0).cast(pl.Int32)
-    # This should fail to convert to DNF since the casting to non-Boolean
-    # is not handled by visit_cast
-    result = convert_expr_to_dnf(expr)
-    assert result is None
-
-
-def test_boolean_cast_in_logical_operation():
-    """Test a cast to Boolean as part of a larger logical operation."""
-    expr = ((pl.col("x") > 5).cast(pl.Boolean)) & (pl.col("y") == "test")
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", ">", 5), ("y", "=", "test")]]
-    assert_dnf_equal(result, expected)
-
-
-def test_boolean_cast_in_ternary_expression():
-    """Test a cast to Boolean in a ternary expression."""
-    expr = pl.when((pl.col("x") > 5).cast(pl.Boolean)).then(pl.col("y") == 10).otherwise(pl.col("z") < 3)
-    result = convert_expr_to_dnf(expr)
-    expected = [
-        [("x", ">", 5), ("y", "=", 10)],  # predicate and truthy
-        [("x", "<=", 5), ("z", "<", 3)],  # negated predicate and falsy
-        [("x", "is", None), ("z", "<", 3)],
-    ]
-    assert_dnf_equal(result, expected)
-
-
-# Test cases for alias expressions that should fail before the fix
-def test_alias_simple_equality():
-    """Test that aliases in simple equality expressions are handled properly."""
-    expr = pl.col("x").alias("x_alias") == 10
-    result = convert_expr_to_dnf(expr)
-    # This should extract the DNF from the aliased column expression
-    expected = [[("x", "=", 10)]]
-    assert_dnf_equal(result, expected)
-
-
-def test_alias_logical_operations():
-    """Test aliases in logical operations."""
-    expr = (pl.col("x").alias("x_alias") == 10) & (pl.col("y").alias("y_alias") > 5)
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", "=", 10), ("y", ">", 5)]]
-    assert_dnf_equal(result, expected)
-
-
-def test_is_contradiction_with_column_not_in_schema():
-    """Test that is_contradiction returns False when column is not in schema.
-
-    This tests the fix for the case where schema.get(column_name) returns None.
-    Before the fix, trying to access col_typ.is_integer() would fail.
-    The fix returns False (conservative - not proven to be a contradiction).
-    """
-    # Create a clause with valid bounds that might need enumeration to check.
-    # The bounds are valid (3 < x < 10), so we need schema info to check further.
-    clause = [("unknown_col", ">", 3), ("unknown_col", "<", 10), ("unknown_col", "!=", 5)]
-
-    # Schema doesn't contain 'unknown_col'
-    schema = pl.Schema({"other_col": pl.Int64})
-
-    # Should return False (not proven to be a contradiction) because we don't know the column type
-    # Without the fix, this would crash when trying to call methods on None
-    result = is_contradiction(clause, schema)
-    assert result is False
-
-
-def test_is_contradiction_with_column_in_schema():
-    """Test that is_contradiction properly detects contradiction when column IS in schema."""
-    # Create a clause that is a contradiction for integer columns:
-    # 3 < x < 10 AND x != all valid values in that range
-    # This is equivalent to: x in {4, 5, 6, 7, 8, 9} but none of those are valid
-    clause = [
-        ("x", ">", 3),
-        ("x", "<", 10),
-        ("x", "!=", 4),
-        ("x", "!=", 5),
-        ("x", "!=", 6),
-        ("x", "!=", 7),
-        ("x", "!=", 8),
-        ("x", "!=", 9),
-    ]
-
-    # Schema contains 'x' as Int64
-    schema = pl.Schema({"x": pl.Int64})
-
-    # Should return True (is a contradiction) because all valid integers are excluded
-    result = is_contradiction(clause, schema)
-    assert result is True
-
-
-def test_is_contradiction_obvious_bound_conflict():
-    """Test that obvious bound conflicts (min > max) are detected without schema."""
-    # x > 5 AND x < 3 is an obvious contradiction regardless of type
-    clause = [("x", ">", 5), ("x", "<", 3)]
-
-    # Even with no schema, this should be detected as a contradiction
-    result = is_contradiction(clause, schema=None)
-    assert result is True
-
-
-_DNF_OPS = {
-    "=": lambda c, v: c == v,
-    "==": lambda c, v: c == v,
-    "!=": lambda c, v: c != v,
-    "<": lambda c, v: c < v,
-    "<=": lambda c, v: c <= v,
-    ">": lambda c, v: c > v,
-    ">=": lambda c, v: c >= v,
-    "~": lambda c, v: c.str.contains(v),
-}
 
 
 def _dnf_to_expr(dnf: list[list[tuple]]) -> pl.Expr:
-    """Materialise a DNF back into a Polars predicate (null -> drop, like a scan filter)."""
+    """A DNF materialised back into a Polars predicate (null -> drop, like a scan filter)."""
 
     def term(col, op, value):
-        c = pl.col(col)
+        col = pl.col(col)
         if op == "in":
-            return c.is_in(list(value))
+            return col.is_in(list(value))
         if op in ("not in", "!in"):
-            return ~c.is_in(list(value))
+            return ~col.is_in(list(value))
         if op == "is":
-            return c.is_null()
+            return col.is_null()
         if op in ("is not", "!is"):
-            return c.is_not_null()
-        return _DNF_OPS[op](c, value)
+            return col.is_not_null()
+        return _DNF_OPS[op](col, value)
 
     return pl.any_horizontal([pl.all_horizontal([term(*t) for t in clause]) for clause in dnf]).fill_null(False)
 
 
-def _assert_dnf_keeps_all_rows(df: pl.DataFrame, pred: pl.Expr, dnf, schema=None):
-    """The DNF (if any) must be a superset of the predicate: it may keep extra rows but never drop one."""
-    rows = df.with_row_index()
-    kept_by_pred = set(rows.filter(pred)["index"].to_list())
-    if dnf is None:
-        return  # "no filter" is always safe
-    kept_by_dnf = set(rows.filter(_dnf_to_expr(dnf))["index"].to_list())
-    dropped = kept_by_pred - kept_by_dnf
-    assert not dropped, f"DNF {dnf} dropped rows {sorted(dropped)} that predicate keeps"
+_DNF_OPS = {
+    "=": lambda col, v: col == v,
+    "==": lambda col, v: col == v,
+    "!=": lambda col, v: col != v,
+    "<": lambda col, v: col < v,
+    "<=": lambda col, v: col <= v,
+    ">": lambda col, v: col > v,
+    ">=": lambda col, v: col >= v,
+    "~": lambda col, v: col.str.contains(v),
+}
 
 
-@pytest.fixture
-def _null_mix_df() -> pl.DataFrame:
-    return pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]})
+def _assert_dnf_keeps_rows(df: pl.DataFrame, pred: pl.Expr, dnf) -> None:
+    assert_keeps_rows(df, pred, None if dnf is None else _dnf_to_expr(dnf))
 
 
-def test_not_over_partially_converted_and_does_not_drop_rows(_null_mix_df):
-    """``~((a == 1) & <unconvertible>)`` must not negate the relaxed AND into a row-dropping DNF."""
-    pred = ~((pl.col("a") == 1) & (pl.col("b").str.len_chars() == 2))
-    dnf = convert_expr_to_dnf(pred)
-    # The inner AND dropped the unconvertible side, so negating is unsafe -> no filter.
-    assert dnf is None
-    _assert_dnf_keeps_all_rows(_null_mix_df, pred, dnf)
+@pytest.mark.parametrize(("pred", "schema", "df", "exact", "expect"), params(DNF_CASES, "pred", "schema", "df", "exact", "expect"))
+def test_dnf(pred, schema, df, exact, expect):
+    dnf = convert_expr_to_dnf(pred, schema)
+    if exact:
+        assert dnf == expect
+    elif expect is not ...:
+        assert_dnf_equal(dnf, expect)
+    if df is not None:
+        _assert_dnf_keeps_rows(df, pred, dnf)
 
 
-def test_ne_missing_keeps_null_rows(_null_mix_df):
-    """``ne_missing(v)`` keeps nulls, so a bare ``!=`` would drop them."""
-    pred = pl.col("a").ne_missing(1)
-    dnf = convert_expr_to_dnf(pred)
-    assert_dnf_equal(dnf, [[("a", "!=", 1)], [("a", "is", None)]])
-    _assert_dnf_keeps_all_rows(_null_mix_df, pred, dnf)
-
-
-def test_eq_missing_and_ne_missing_with_null_literal():
-    """``eq_missing(None)`` is "is null"; ``ne_missing(None)`` is "is not null"."""
-    assert_dnf_equal(convert_expr_to_dnf(pl.col("a").eq_missing(None)), [[("a", "is", None)]])
-    assert_dnf_equal(convert_expr_to_dnf(pl.col("a").ne_missing(None)), [[("a", "is not", None)]])
-
-
-def test_negated_is_in_nulls_equal_keeps_nulls(_null_mix_df):
-    """``~is_in([1], nulls_equal=True)`` keeps nulls, so ``!in`` would drop them."""
-    pred = ~pl.col("a").is_in([1], nulls_equal=True)
-    dnf = convert_expr_to_dnf(pred)
-    assert dnf is None
-    _assert_dnf_keeps_all_rows(_null_mix_df, pred, dnf)
-
-
-def test_is_in_nulls_equal_with_null_value_keeps_nulls():
-    """``is_in([1, None], nulls_equal=True)`` matches nulls -> emit "in OR is null"."""
-    df = pl.DataFrame({"a": [1, 2, None]}, schema={"a": pl.Int64})
-    pred = pl.col("a").is_in([1, None], nulls_equal=True)
-    dnf = convert_expr_to_dnf(pred)
-    assert_dnf_equal(dnf, [[("a", "in", [1])], [("a", "is", None)]])
-    _assert_dnf_keeps_all_rows(df, pred, dnf)
-
-
-def test_narrowing_cast_on_column_is_not_stripped(_null_mix_df):
-    """A narrowing/wrapping cast must not resolve to the raw column (257 wraps to 1 under Int8)."""
-    pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
-    # Without a schema the source dtype is unknown -> refuse the cast.
-    assert convert_expr_to_dnf(pred) is None
-    # Even with a schema, Int64 -> Int8 is narrowing -> still refused.
-    assert convert_expr_to_dnf(pred, {"a": pl.Int64}) is None
-    _assert_dnf_keeps_all_rows(_null_mix_df, pred, convert_expr_to_dnf(pred, {"a": pl.Int64}))
-
-
-def test_value_preserving_widening_cast_still_pushes_down():
-    """A provably value- and order-preserving widening cast is unwrapped when a schema is supplied."""
-    pred = pl.col("a").cast(pl.Int64) == 1
-    assert convert_expr_to_dnf(pred) is None  # unknown source dtype -> safe refusal
-    assert_dnf_equal(convert_expr_to_dnf(pred, {"a": pl.Int8}), [[("a", "=", 1)]])
-
-
-def test_literal_on_left_is_flipped():
-    """``lit(1) < col`` should become ``col > 1`` rather than failing to convert."""
-    assert_dnf_equal(convert_expr_to_dnf(pl.lit(1) < pl.col("a")), [[("a", ">", 1)]])
-    assert_dnf_equal(convert_expr_to_dnf(pl.lit(5) >= pl.col("a")), [[("a", "<=", 5)]])
-
-
-def test_ternary_otherwise_keeps_rows_where_condition_is_null():
-    """Polars takes the ``otherwise`` branch when the condition is null, so those rows must be kept."""
-    df = pl.DataFrame({"a": [None, 1, 5]})
-    pred = pl.when(pl.col("a") >= 5).then(False).otherwise(True)
-    _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred))
-
-
-def test_regex_contains_is_not_escaped():
-    """``str.contains`` defaults to a regex, so ``"A|B"`` must match ``"A"`` and ``"B"``."""
-    df = pl.DataFrame({"s": ["A", "B", "A|B", "C"]})
-    for pred in (pl.col("s").str.contains("A|B"), pl.col("s").str.contains("A|B", literal=True)):
-        _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred))
-
-
-@pytest.mark.parametrize("dtype", [pl.Time, pl.Datetime("ns"), pl.Duration("ns")])
-@pytest.mark.parametrize("literal_left", [False, True])
-@pytest.mark.parametrize("operation", ["=", "!=", "<", "<=", ">", ">="])
-@pytest.mark.parametrize("tick", [1, 1000], ids=["submicrosecond", "microsecond"])
-def test_temporal_comparison_dnf_preserves_nanoseconds(dtype, literal_left, operation, tick):
-    frame = pl.DataFrame({"value": pl.Series([0, 1, 2, 1000, 1001], dtype=pl.Int64).cast(dtype)})
-    literal = pl.lit(tick).cast(dtype)
-    column = pl.col("value")
-    left, right = (literal, column) if literal_left else (column, literal)
-    predicate = _DNF_OPS[operation](left, right)
-    dnf = convert_expr_to_dnf(predicate)
-    if tick == 1000:
-        assert dnf is not None
-    if dnf is not None:
-        dnf = [[(name, comparison, pl.lit(value, dtype=frame.schema[name])) for name, comparison, value in clause] for clause in dnf]
-    _assert_dnf_keeps_all_rows(frame, predicate, dnf)
-
-
-def test_sub_microsecond_is_in_literal_is_not_pushed():
-    """A Python ``datetime`` cannot hold the literal's nanoseconds, so a truncated value would drop matching rows."""
-    ns_literal = pl.lit(1704198600000000500).cast(pl.Datetime("ns"))
-    assert convert_expr_to_dnf(pl.col("t").is_in(pl.concat_list(ns_literal)), {"t": pl.Datetime("ns")}) is None
-
-
-_NY = ZoneInfo("America/New_York")
-_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=_NY)
-_LATE = _EARLY.replace(fold=1)
-_NAN = float("nan")
 _X = pl.col("x")
 
 
@@ -1088,7 +370,7 @@ _X = pl.col("x")
     [
         (pl.DataFrame({"x": [_NAN, 1.0, 2.0]}), (_X == _NAN) & (_X == _NAN)),
         (pl.DataFrame({"x": [_NAN, 1.0, 2.0]}), _X.is_in([_NAN, 1.0]) & _X.is_in([_NAN, 2.0])),
-        (pl.DataFrame({"x": [_EARLY, _LATE]}), (_X == _EARLY) & (_X != _LATE)),
+        (pl.DataFrame({"x": [_EARLY, _EARLY.replace(fold=1)]}), (_X == _EARLY) & (_X != _EARLY.replace(fold=1))),
         (pl.DataFrame({"x": pl.Series(["z", "a", "m"], dtype=pl.Enum(["z", "a", "m"]))}), _X.is_in(["z", "m"]) & (_X < "a")),
         (pl.DataFrame({"x": [-1, 0, 1, None]}), pl.when(_X.is_between(None, 0)).then(False).otherwise(True)),
         (pl.DataFrame({"x": [date(2024, 1, 1)]}), pl.when(_X == date(2024, 1, 1)).then(_X >= datetime(2024, 1, 1)).otherwise(False)),
@@ -1126,4 +408,225 @@ _X = pl.col("x")
 def test_dnf_and_contradiction_keep_matching_rows(df, pred):
     """Python value comparisons must not prove a contradiction or drop rows that Polars keeps."""
     assert df.filter(pred).is_empty() or _is_contradiction(pred, df.schema) is False
-    _assert_dnf_keeps_all_rows(df, pred, convert_expr_to_dnf(pred, df.schema))
+    _assert_dnf_keeps_rows(df, pred, convert_expr_to_dnf(pred, df.schema))
+
+
+@pytest.mark.parametrize("dtype", [pl.Time, pl.Datetime("ns"), pl.Duration("ns")])
+@pytest.mark.parametrize("literal_left", [False, True])
+@pytest.mark.parametrize("operation", ["=", "!=", "<", "<=", ">", ">="])
+@pytest.mark.parametrize("tick", [1, 1000], ids=["submicrosecond", "microsecond"])
+def test_temporal_comparison_dnf_preserves_nanoseconds(dtype, literal_left, operation, tick):
+    frame = pl.DataFrame({"value": pl.Series([0, 1, 2, 1000, 1001], dtype=pl.Int64).cast(dtype)})
+    literal = pl.lit(tick).cast(dtype)
+    left, right = (literal, pl.col("value")) if literal_left else (pl.col("value"), literal)
+    predicate = _DNF_OPS[operation](left, right)
+    dnf = convert_expr_to_dnf(predicate)
+    if tick == 1000:
+        assert dnf is not None
+    if dnf is not None:
+        dnf = [[(name, comparison, pl.lit(value, dtype=frame.schema[name])) for name, comparison, value in clause] for clause in dnf]
+    _assert_dnf_keeps_rows(frame, predicate, dnf)
+
+
+def test_dnf_visitor_direct():
+    visitor = DNFVisitor()
+    visitor.visit(get_parsed_expr((x == 10) & (y > 5)))
+    assert visitor.process_results() == [[("x", "=", 10), ("y", ">", 5)]]
+
+
+def test_combine_and_dnf():
+    one, two = [[("x", "=", 10)]], [[("y", "=", "test")]]
+    assert_dnf_equal(combine_and_dnf(one, two), [[("x", "=", 10), ("y", "=", "test")]])
+    either, right = [[("x", "=", 10)], [("y", "=", "test")]], [[("z", ">", 5)]]
+    assert_dnf_equal(combine_and_dnf(either, right), [[("x", "=", 10), ("z", ">", 5)], [("y", "=", "test"), ("z", ">", 5)]])
+    assert combine_and_dnf(None, right) == right
+    assert combine_and_dnf(either, None) == either
+    assert combine_and_dnf(None, None) is None
+
+
+@pytest.mark.parametrize(
+    ("dnf", "expect"),
+    [
+        pytest.param([[("x", "=", 0)]], [[("x", "!=", 0)]], id="single_predicate"),
+        pytest.param([[("x", "=", 0), ("y", ">=", 5)]], [[("x", "!=", 0)], [("y", "<", 5)]], id="single_conjunction"),
+        pytest.param(
+            [[("x", "=", 0), ("y", ">=", 5)], [("z", "<", 10)]],
+            [[("x", "!=", 0), ("z", ">=", 10)], [("y", "<", 5), ("z", ">=", 10)]],
+            id="two_clauses",
+        ),
+        pytest.param(
+            [[("a", "=", 1), ("b", ">", 2)], [("c", "<=", 3)], [("d", "in", [4, 5])]],
+            [[("a", "!=", 1), ("c", ">", 3), ("d", "!in", [4, 5])], [("b", "<=", 2), ("c", ">", 3), ("d", "!in", [4, 5])]],
+            id="complex_dnf",
+        ),
+        pytest.param(
+            [[("x", "=", 0)], [("y", "<>", 5)], [("z", "in", [1, 2, 3])]],
+            [[("x", "!=", 0), ("y", "=", 5), ("z", "!in", [1, 2, 3])]],
+            id="various_dnf_forms-eq_ne_in",
+        ),
+        pytest.param(
+            [[("x", "!=", 0)], [("y", "not in", [1, 2])], [("z", "is not", None)]],
+            [[("x", "=", 0), ("y", "in", [1, 2]), ("z", "is", None)]],
+            id="various_dnf_forms-ne_not_in_is_not",
+        ),
+        pytest.param(
+            [[("x", "=", 0), ("y", "=", 0)], [("z", "=", 0)]],
+            [[("x", "!=", 0), ("z", "!=", 0)], [("y", "!=", 0), ("z", "!=", 0)]],
+            id="various_dnf_forms-and_or",
+        ),
+    ],
+)
+def test_negate_dnf(dnf, expect):
+    assert negate_dnf(dnf) == expect
+
+
+def T(column: str, op: str, value) -> tuple:
+    return (column, op, value)
+
+
+_INT_X = pl.Schema({"x": pl.Int64})
+
+# (description, clause, schema, is a contradiction)
+CONTRADICTIONS = [
+    ("Empty clause (always true)", [], None, False),
+    # Exact values
+    ("Exact: col = 5 AND col = 6", [T("colA", "=", 5), T("colA", "=", 6)], None, True),
+    ("Exact: col = 5 AND col != 5", [T("colA", "=", 5), T("colA", "!=", 5)], None, True),
+    ("Exact: col = 5 AND col = 5", [T("colA", "=", 5), T("colA", "=", 5)], None, False),
+    ("Exact: col == 5 AND col <> 5", [T("colA", "==", 5), T("colA", "<>", 5)], None, True),
+    ("Exact: x = 2", [T("x", "=", 2)], None, False),
+    # Ranges
+    ("Range: col > 10 AND col < 5", [T("colA", ">", 10), T("colA", "<", 5)], None, True),
+    ("Range: col > 5 AND col < 5", [T("colA", ">", 5), T("colA", "<", 5)], None, True),
+    ("Range: col >= 5 AND col <= 5", [T("colA", ">=", 5), T("colA", "<=", 5)], None, False),
+    ("Range: col > 5 AND col <= 5", [T("colA", ">", 5), T("colA", "<=", 5)], None, True),
+    ("Range: col >= 5 AND col < 5", [T("colA", ">=", 5), T("colA", "<", 5)], None, True),
+    ("Range: col > 5 AND col > 10", [T("colA", ">", 5), T("colA", ">", 10)], None, False),
+    ("Range: col < 10 AND col < 5", [T("colA", "<", 10), T("colA", "<", 5)], None, False),
+    (
+        "Range: col < datetime(2024, 1, 1) AND col >= datetime(2024, 1, 2)",
+        [T("colA", "<", datetime(2024, 1, 1)), T("colA", ">=", datetime(2024, 1, 2))],
+        None,
+        True,
+    ),
+    (
+        "Range: col < datetime(2024, 1, 1) AND col >= datetime(2022, 1, 2)",
+        [T("colA", "<", datetime(2024, 1, 1)), T("colA", ">=", datetime(2022, 1, 2))],
+        None,
+        False,
+    ),
+    ("is_contradiction_obvious_bound_conflict: x > 5 AND x < 3", [T("x", ">", 5), T("x", "<", 3)], None, True),
+    # Exact value vs range
+    ("Exact vs Range: col = 3 AND col > 5", [T("colA", "=", 3), T("colA", ">", 5)], None, True),
+    ("Exact vs Range: col = 7 AND col > 5 AND col < 10", [T("colA", "=", 7), T("colA", ">", 5), T("colA", "<", 10)], None, False),
+    ("Exact vs Range: col = 5 AND col >= 5", [T("colA", "=", 5), T("colA", ">=", 5)], None, False),
+    ("Exact vs Range: col = 5 AND col > 5", [T("colA", "=", 5), T("colA", ">", 5)], None, True),
+    ("Exact vs Range: col = 5 AND col <= 5", [T("colA", "=", 5), T("colA", "<=", 5)], None, False),
+    ("Exact vs Range: col = 5 AND col < 5", [T("colA", "=", 5), T("colA", "<", 5)], None, True),
+    # Inclusion and exclusion
+    ("In/Ex: col IN (1,2) AND col = 3", [T("colA", "in", [1, 2]), T("colA", "=", 3)], None, True),
+    ("In/Ex: col IN (1,2) AND col = 1", [T("colA", "in", [1, 2]), T("colA", "=", 1)], None, False),
+    ("In/Ex: col IN (1,2) AND col NOT IN (1,2,3)", [T("colA", "in", [1, 2]), T("colA", "!in", [1, 2, 3])], None, True),
+    ("In/Ex: col IN (1,2) AND col NOT IN (3,4)", [T("colA", "in", [1, 2]), T("colA", "!in", [3, 4])], None, False),
+    ("In/Ex: col IN (1,2) AND col IN (3,4)", [T("colA", "in", [1, 2]), T("colA", "in", [3, 4])], None, True),
+    ("In/Ex: col IN (1,2,3) AND col IN (3,4,5)", [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5])], None, False),
+    (
+        "In/Ex: col IN (1,2,3) AND col IN (3,4,5) AND col = 3",
+        [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5]), T("colA", "=", 3)],
+        None,
+        False,
+    ),
+    ("In/Ex: col IN (1,2,3) AND col IN (3,4,5) AND col = 1", [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5]), T("colA", "=", 1)], None, True),
+    (
+        "In/Ex: col IN (1,2,3) AND col IN (3,4,5) AND col NOT IN (3)",
+        [T("colA", "in", [1, 2, 3]), T("colA", "in", [3, 4, 5]), T("colA", "!in", [3])],
+        None,
+        True,
+    ),
+    # NULL
+    ("NULL: col IS NULL AND col = 5", [T("colA", "is", None), T("colA", "=", 5)], None, True),
+    ("NULL: col IS NULL AND col > 0", [T("colA", "is", None), T("colA", ">", 0)], None, True),
+    ("NULL: col IS NULL AND col IN (1,2)", [T("colA", "is", None), T("colA", "in", [1, 2])], None, True),
+    ("NULL: col IS NULL AND col IS NOT NULL", [T("colA", "is", None), T("colA", "is not", None)], None, True),
+    ("NULL: col IS NOT NULL AND col = None (exact value is None)", [T("colA", "is not", None), T("colA", "=", None)], None, True),
+    ("NULL: col IS NOT NULL AND col IN (None,)", [T("colA", "is not", None), T("colA", "in", [None])], None, True),
+    ("NULL: col IS NOT NULL AND col IN (None, 1)", [T("colA", "is not", None), T("colA", "in", [None, 1])], None, False),
+    ("NULL: col IS NULL (no contradiction)", [T("colA", "is", None)], None, False),
+    ("NULL: col IS NOT NULL (no contradiction)", [T("colA", "is not", None)], None, False),
+    ("NULL: col IS NULL AND col IN (None,)", [T("colA", "is", None), T("colA", "in", [None])], None, False),
+    # Complex, single column
+    ("Complex: col > 0 AND col < 10 AND col IN (20,30)", [T("colA", ">", 0), T("colA", "<", 10), T("colA", "in", [20, 30])], None, True),
+    ("Complex: col > 0 AND col < 10 AND col IN (5, 20)", [T("colA", ">", 0), T("colA", "<", 10), T("colA", "in", [5, 20])], None, False),
+    ("Complex: col = 5 AND col != 5 AND col > 0", [T("colA", "=", 5), T("colA", "!=", 5), T("colA", ">", 0)], None, True),
+    # Multiple columns
+    ("Multi-col: colA = 1 AND colA = 2 AND colB = 10", [T("colA", "=", 1), T("colA", "=", 2), T("colB", "=", 10)], None, True),
+    ("Multi-col: colA = 1 AND colB > 5", [T("colA", "=", 1), T("colB", ">", 5)], None, False),
+    (
+        "Multi-col: colA > 0 AND colA < 1, colB = 1 (colA contradiction only for int)",
+        [T("colA", ">", 0), T("colA", "<", 1), T("colB", "=", 1)],
+        None,
+        False,
+    ),
+    (
+        "Multi-col: colA > 0 AND colA < 12, colB = 1, colA < -1 (colA contradiction)",
+        [T("colA", ">", 0), T("colA", "<", 1), T("colA", "<", -1), T("colB", "=", 1)],
+        None,
+        True,
+    ),
+    # Non-contradictions
+    ("Non-C: col = 5 AND col > 0", [T("colA", "=", 5), T("colA", ">", 0)], None, False),
+    ("Non-C: col > 0 AND col < 10", [T("colA", ">", 0), T("colA", "<", 10)], None, False),
+    ("Non-C: col IN (1,2,3) AND col = 1", [T("colA", "in", [1, 2, 3]), T("colA", "=", 1)], None, False),
+    ("Non-C: col IS NOT NULL AND col > 5", [T("colA", "is not", None), T("colA", ">", 5)], None, False),
+    ("Non-C: colA = 1, colB = 'test', colC > 3.0", [T("colA", "=", 1), T("colB", "=", "test"), T("colC", ">", 3.0)], None, False),
+    # A scalar IN value is wrapped in a list
+    ("Edge IN: col IN 'abc' (scalar string)", [T("colA", "in", "abc")], None, False),
+    ("Edge IN: col IN 1 (scalar int)", [T("colA", "in", 1)], None, False),
+    # IS with a value other than None
+    ("IS non-None: colA IS TRUE", [T("colA", "is", True)], None, False),
+    ("IS non-None: colA IS TRUE AND colA IS NULL", [T("colA", "is", True), T("colA", "is", None)], None, True),
+    ("IS NOT non-None: colA IS NOT TRUE", [T("colA", "is not", True)], None, False),
+    # Enumerating an integer range needs the column's dtype: unknown -> not proven a contradiction.
+    (
+        "is_contradiction_with_column_not_in_schema",
+        [T("unknown_col", ">", 3), T("unknown_col", "<", 10), T("unknown_col", "!=", 5)],
+        pl.Schema({"other_col": pl.Int64}),
+        False,
+    ),
+    ("is_contradiction_with_column_in_schema", [T("x", ">", 3), T("x", "<", 10), *(T("x", "!=", v) for v in range(4, 10))], _INT_X, True),
+]
+
+
+@pytest.mark.parametrize(("clause", "schema", "expect"), [pytest.param(*row[1:], id=row[0]) for row in CONTRADICTIONS])
+def test_is_contradiction(clause, schema, expect):
+    assert is_contradiction(clause, schema) is expect
+
+
+_YP = pl.Schema({"x": pl.Int64, "y": pl.String, "p": pl.Boolean, "x2": pl.Int64, "y2": pl.String, "p2": pl.Boolean})
+
+
+@pytest.mark.parametrize(
+    ("pred", "schema", "expect"),
+    [
+        pytest.param(
+            c("y").is_in(["a", "b"]) & c("a").eq(5) & (c("a").ne(5) | c("y").is_in(["b", "a"]).not_()),
+            pl.Schema({"a": pl.Boolean, "y": pl.String}),
+            True,
+            id="Multi option is in check",
+        ),
+        pytest.param(
+            c("y").is_in(["a", "b"]) & c("p").eq(True) & (c("p").ne(True) | c("y").is_in(["b", "a"]).not_()),
+            _YP,
+            True,
+            id="Compare with True (python boolean)",
+        ),
+        pytest.param(
+            c("y").is_in(["a", "b"]) & c("p").eq(pl.lit(True)) & pl.Expr.or_(c("p").ne(pl.lit(True)), ~c("y").is_in(["b", "a"])),
+            _YP,
+            True,
+            id="Compare with pl.lit(True)",
+        ),
+    ],
+)
+def test_is_contradiction_pl(pred, schema, expect):
+    assert _is_contradiction(pred, schema) == expect
