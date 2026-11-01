@@ -170,8 +170,10 @@ RANGE_CASES = [
     # a NaN literal cannot bound a column
     R("unusable_nan-eq", c("x") == _NAN, ALL, col="x"),
     R("unusable_nan-is_in", c("x").is_in([1.0, _NAN]), ALL, col="x"),
-    R("unusable_nan-is_between", c("x").is_between(0, _NAN), ALL, col="x"),
+    R("unusable_nan-is_between", c("x").is_between(0, _NAN), P.closed(0, P.inf), col="x"),
     R("unusable_nan-or", c("x").is_between(0, 10) | (c("x") == _NAN), ALL, col="x"),
+    # an integer column is compared with a float as Float64, so a float of magnitude 2**53 or more cannot bound it
+    R("float_rounds_int-is_between", c("x").is_between(1.0, float(2**53)) & (c("x") <= 5), P.closed(1.0, 5), col="x"),
 ]
 
 

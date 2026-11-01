@@ -345,7 +345,6 @@ _EARLY, _LATE = (pl.Series([t], dtype=pl.Int64).cast(pl.Datetime("ns", NY)) for 
             pl.DataFrame({"x": [2**53 + 1]}),
             (pl.col("x") == float(2**53)) & (pl.col("x") > 2**53),
             id="float_rounds_int",
-            marks=pytest.mark.xfail(strict=True, reason="the range of an integer column compared with a float is intersected in Python"),
         ),
         pytest.param(pl.DataFrame({"x": pl.Series([20240100.0], dtype=pl.Float32)}), pl.col("x") == 20240101, id="float32_int"),
         pytest.param(pl.DataFrame({"x": _EARLY.dt.offset_by("29m59s999999us")}), pl.col("x") <= _LATE[0], id="zoned_fold_bound"),
