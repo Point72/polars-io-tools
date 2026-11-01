@@ -5,6 +5,7 @@ The contracts:
 - matches native: an entry point filtered by a predicate returns what plain Polars returns.
 - superset: what a source is asked for keeps every row the user's predicate keeps; pushdown is never lossy.
 - pushed bounds / pushed discrete: the predicate a source receives has the expected temporal bounds or values.
+- translated text: the SQL or filter string a predicate becomes holds, or leaves out, given fragments.
 """
 
 from collections.abc import Callable
@@ -41,6 +42,28 @@ def assert_matches_native(actual: pl.LazyFrame, reference: pl.LazyFrame, pred: p
     else:
         assert_frame_equal(_sorted(got), _sorted(want.select(got.columns)))
     return got
+
+
+def assert_text(
+    text: str | None, contains=(), omits=(), *, equals: str | None = None, startswith: str | None = None, ignore_case: bool = False
+) -> None:
+    """``text`` (translated SQL, a filter string) exists, equals ``equals``, starts with ``startswith``, holds every
+    item of ``contains`` and none of ``omits``.
+
+    A string is one item; an item of ``contains`` that is a tuple is satisfied by any of its alternatives.
+    """
+    assert text is not None, "nothing was translated"
+    norm = str.upper if ignore_case else str
+    got = norm(text)
+    if equals is not None:
+        assert text == equals, f"{text!r} != {equals!r}"
+    if startswith is not None:
+        assert got.lstrip().startswith(norm(startswith)), f"{text!r} does not start with {startswith!r}"
+    for item in [contains] if isinstance(contains, str) else contains:
+        alternatives = item if isinstance(item, tuple) else (item,)
+        assert any(norm(a) in got for a in alternatives), f"{item!r} not in {text!r}"
+    for item in [omits] if isinstance(omits, str) else omits:
+        assert norm(item) not in got, f"{item!r} in {text!r}"
 
 
 def assert_keeps_rows(df: pl.DataFrame, pred: pl.Expr, pushed: pl.Expr | None) -> None:

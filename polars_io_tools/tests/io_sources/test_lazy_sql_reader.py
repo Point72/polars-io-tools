@@ -1,9 +1,14 @@
+"""scan_db and its SQL translation, against an in-memory DuckDB behind a fake ``arrow_odbc`` (see ``helpers.sql_backends``).
+
+Most tests are tables: a predicate or node and the SQL text it becomes per dialect, a predicate and the rows its WHERE
+clause keeps, and a reader query whose result must equal what the database returns for the same query, filtered and
+selected by Polars. The query table also runs ``scan_clickhouse`` where the two readers share a test.
+"""
+
 import concurrent.futures
-import io
 import logging
 import sqlite3
 import sys
-import threading
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -15,43 +20,25 @@ import pyarrow as pa
 import pytest
 from polars.testing import assert_frame_equal
 from sqlglot import exp, parse_one
+from sqlglot.dialects import ClickHouse
 
 import polars_io_tools as cpl
-from polars_io_tools import io_sources as polars_utils
-from polars_io_tools.io_sources import lazy_sql_reader  # noqa: F401  (ensures polars_utils.lazy_sql_reader is importable for monkeypatching)
+from polars_io_tools.io_sources import lazy_sql_reader
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, FunctionNode, LiteralNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType, TemporalFunctionType
 from polars_io_tools.io_sources.sql_dialects import MSSQL
 from polars_io_tools.io_sources.sql_utils import (
+    DEFAULT_MAX_IN_PREDICATE_SIZE,
     SQLExpressionVisitor,
+    _prepare_inner_for_subquery,
     _stabilize_mssql_projection_aliases,
     apply_polars_io_source_exprs,
     convert_predicate_to_sql,
     create_sqlglot_literal,
 )
-
-"""
-This module contains tests for the lazy Polars SQL reader. We
-mock the data and connections here; for usage examples (and
-proof that this works on real data), please refer to the file
-`lazy_polars_sql.py` in examples/.
-"""
-
-# This sample data is from the [Calendar].[dbo].[CC_Bond]
-# and [Calendar].[dbo].[ElectionCalendar] databases.
-CC_BOND_CSV = (
-    "CenterID,CentreCode,ISOCountryCode,Centre,EventYear,EventDate,EventDayOfWeek,EventName,FileType\n"
-    "103,GTQ,GT,Guatemala Quetzal,2021,2021-01-01T00:00:00.000,Fri,New Year's Day,G\n"
-    "146,PHP,PH,Philippine Peso,2045,2045-04-06T00:00:00.000,Thu,Holy Thursday,G\n"
-    "158,KPW,KP,Pyongyang,2053,2053-02-19T00:00:00.000,Wed,Lunar New Year 1,G\n"
-    "67,BND,BN,Bandar Seri Begawan,2046,2046-06-30T00:00:00.000,Sat,Mid-year Bank Holiday,G\n"
-    "148,BDT,BD,Dhaka,2015,2015-03-17T00:00:00.000,Tue,Birthday of Father of the Nation,G\n"
-    "56,ZMW,ZM,Lusaka,2013,2013-10-24T00:00:00.000,Thu,Independence Day,G\n"
-    "77,ERN,ER,Asmara,2016,2016-01-07T00:00:00.000,Thu,Christmas (Ge'ez),G\n"
-    "47,RON,RO,Bucharest,2021,2021-12-25T00:00:00.000,Sat,Christmas Day,G\n"
-    "126,ETB,ET,Addis Ababa,2054,2054-10-14T00:00:00.000,Wed,Birth of Prophet Mohammed*,G\n"
-    "148,BDT,BD,Dhaka,2053,2053-05-20T00:00:00.000,Tue,Eid-ul Fitr 2*,G\n"
-)
+from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.sql_backends import ENTRY_POINTS, Backend, cc_bond_df, connect, employee_df, install
 
 ELECTION_CSV = (
     "Country,ElectFor,EventDate,Status,KnowledgeDate,SourceFile,Isbackfill,DBTimestamp\n"
@@ -68,147 +55,28 @@ ELECTION_CSV = (
 )
 
 
-def get_cc_bond_df() -> pl.DataFrame:
-    return pl.read_csv(io.StringIO(CC_BOND_CSV), try_parse_dates=True)
-
-
-def get_election_df() -> pl.DataFrame:
-    return pl.read_csv(io.StringIO(ELECTION_CSV), try_parse_dates=True)
-
-
-def get_employee_df() -> pl.DataFrame:
-    df = pl.DataFrame(
-        {
-            "id": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
-            "name": [
-                "Alice",
-                "Bob",
-                "Alice",
-                "Bob",
-                "Charlie",
-                "Alice",
-                "David",
-                "Eve",
-                "Bob",
-                "Charlie",
-                "Alice",
-                "Bartholomew",
-                "David",
-                "Eve",
-                "Bob",
-                "Charlie",
-                "Frank",
-            ],
-            "score": [85.4, 92.1, 34.1, 51.6, 78.3, 88.2, 90.5, 87.9, 89.7, 82.1, 91.3, 67.1, 85.8, 90.2, 94.5, 75.6, 88.9],
-            "passed": [True, True, False, False, False, True, True, True, True, True, True, False, True, True, True, False, True],
-            "test_date": [
-                # Multiple people joining on same dates, and same people on different dates
-                date(2022, 1, 1),  # Alice joins
-                date(2022, 1, 1),  # Bob joins same day as Alice
-                date(2022, 1, 2),  # Alice rejoins
-                date(2022, 1, 2),  # Bob rejoins same day as Alice
-                date(2022, 1, 2),  # Charlie joins
-                date(2022, 1, 3),  # Alice rejoins
-                date(2022, 1, 2),  # David joins same day as Charlie
-                date(2022, 1, 4),  # Eve joins
-                date(2022, 1, 5),  # Bob has another entry
-                date(2022, 1, 5),  # Charlie also on same day as Bob's second entry
-                date(2022, 1, 6),  # Alice's third entry
-                date(2022, 1, 7),  # Bartholomew joins
-                date(2022, 1, 6),  # David's second entry, same day as Alice's third
-                date(2022, 1, 8),  # Eve's second entry
-                date(2022, 1, 9),  # Bob's third entry
-                date(2022, 1, 9),  # Charlie's third entry, same day as Bob's third
-                date(2022, 1, 10),  # Frank joins
-            ],
-        }
-    )
-    return df
-
-
-# Module-level variable to store the connection
-_duckdb_conn: duckdb.DuckDBPyConnection | None = None
-
-
 @pytest.fixture(scope="module")
 def duckdb_connection():
-    """
-    Create a DuckDB connection once per test module.
-    This connection will be reused by all tests in this file.
-    """
-    global _duckdb_conn
+    import io
 
-    # Create a fresh in-memory database
-    conn = duckdb.connect(database=":memory:")
-
-    # Load test data frames into DuckDB
-    _cc_bond_df = get_cc_bond_df()
-    _election_df = get_election_df()
-    _employee_df = get_employee_df()
-
-    # DuckDB can natively query Polars DataFrames by referring to the name of Polars DataFrames
-    # as they exist in the current scope.
-    conn.execute("CREATE TABLE CC_Bond AS SELECT * FROM _cc_bond_df")
-    conn.execute("CREATE TABLE ElectionCalendar AS SELECT * FROM _election_df")
-    conn.execute("CREATE TABLE EmployeeTbl AS SELECT * FROM _employee_df")
-
-    # Store in module variable for the batch reader to access
-    _duckdb_conn = conn
-
+    conn = connect(CC_Bond=cc_bond_df(), ElectionCalendar=pl.read_csv(io.StringIO(ELECTION_CSV), try_parse_dates=True), EmployeeTbl=employee_df())
     yield conn
-
-    # Clean up
     conn.close()
-    _duckdb_conn = None
-
-
-# Fake BatchReader to simulate read_arrow_batches_from_odbc behavior.
-# This needs to be mocked because read_arrow_batches_from_odbc REQUIRES
-# an ODBC connection string (and cannot recieve a connection object).
-# This is not a problem in an integrated environment (i.e., a firm-issued
-# server), but is a problem when running automated tests on GitHub Actions.
-
-
-class FakeBatchReader:
-    def __init__(self, table: pa.Table, batch_size: int):
-        self.table = table
-        self.batch_size = batch_size
-        self.schema = table.schema
-
-    def __iter__(self):
-        return iter(self.table.to_batches())
-
-
-def fake_read_arrow_batches_from_odbc(query: str, batch_size: int, connection_string: str, **kwargs):
-    # Execute query and get arrow table
-    global _duckdb_conn
-    table = _duckdb_conn.sql(query).to_arrow_table()
-    return FakeBatchReader(table, batch_size)
 
 
 @pytest.fixture(autouse=True)
-def patch_odbc(monkeypatch, duckdb_connection):
-    # Patch arrow_odbc directly since it's imported lazily inside functions
-    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=fake_read_arrow_batches_from_odbc))
-    monkeypatch.setattr(polars_utils.lazy_sql_reader, "get_sqlglot_dialect_odbc", lambda conn_string: "duckdb")
-
-
-@pytest.fixture(autouse=True)
-def transaction_isolation(duckdb_connection):
-    """Isolate test changes using transactions"""
+def db(monkeypatch, duckdb_connection):
+    """The backend both readers query, inside a transaction rolled back after the test."""
+    backend = Backend(duckdb_connection)
+    install(monkeypatch, backend)
     duckdb_connection.execute("BEGIN TRANSACTION")
-    yield
+    yield backend
     duckdb_connection.execute("ROLLBACK")
 
 
 @pytest.fixture(autouse=True)
 def clear_piot_cache():
-    """Clear the global cachebetween tests to prevent test pollution.
-
-    The cacheuses a global dict keyed by a hash of the serialized LazyFrame.
-    In newer versions of polars, LazyFrame serialization is more stable, meaning
-    different tests can end up with the same cache key and unexpectedly share cached data.
-    """
+    """Clear the global cache: equal serialized LazyFrames in different tests would share cached data."""
     from polars_io_tools.io_sources import lazy_cache
 
     lazy_cache._CACHE.clear()
@@ -216,616 +84,313 @@ def clear_piot_cache():
     lazy_cache._CACHE.clear()
 
 
-# Tests begin
+def scan_db(query: str, **kw) -> pl.LazyFrame:
+    return ENTRY_POINTS["scan_db"](query, **kw)
 
 
-def test_wrap_binary_expr():
-    expr = (pl.col("A") > 5) | pl.col("B").eq(10)
-    res = convert_predicate_to_sql(expr, "tsql").sql("tsql")
-    expected = "((A > 5) OR (B = 10))"
-    assert res == expected
+def _union(*rows: str) -> str:
+    return " UNION ALL ".join(f"SELECT {r}" for r in rows)
 
 
-def test_logical_or_operator():
-    """Test that LOGICAL_OR is correctly converted to SQL OR.
+# Tables a query row needs, created inside the test's transaction.
+TABLES = {
+    "A": "CREATE TABLE A AS "
+    + _union("1 AS id, 10 AS shared, 100 AS aval", "2 AS id, 20 AS shared, 200 AS aval", "3 AS id, 30 AS shared, 300 AS aval"),
+    "B": "CREATE TABLE B AS " + _union("10 AS shared, 1000 AS bval", "30 AS shared, 3000 AS bval", "40 AS shared, 4000 AS bval"),
+    "CreditRef": "CREATE TABLE CreditRef AS "
+    + _union(
+        "1 AS ID, 100 AS ID_BB_COMPANY, 'US' AS CNTRY, DATE '2024-01-15' AS SOME_DATE",
+        "2 AS ID, 200 AS ID_BB_COMPANY, 'GB' AS CNTRY, DATE '2024-02-20' AS SOME_DATE",
+        "3 AS ID, 100 AS ID_BB_COMPANY, 'JP' AS CNTRY, DATE '2024-03-10' AS SOME_DATE",
+    ),
+    "BBCredit": "CREATE TABLE BBCredit AS " + _union("100 AS ID_BB_COMPANY, 'USA' AS CNTRY_OF_RISK", "200 AS ID_BB_COMPANY, 'GBR' AS CNTRY_OF_RISK"),
+    "PointID": "ALTER TABLE CreditRef ADD COLUMN PointID BIGINT; UPDATE CreditRef SET PointID = ID * 100000",
+    "StarA": "CREATE TABLE StarA AS " + _union("1 AS aid, 10 AS joinkey", "2 AS aid, 20 AS joinkey"),
+    "StarB": "CREATE TABLE StarB AS " + _union("10 AS bkey, 'x' AS bval", "20 AS bkey, 'y' AS bval"),
+    "JoinA": "CREATE TABLE JoinA AS " + _union("1 AS id, 10 AS shared, 100 AS aval", "2 AS id, 20 AS shared, 200 AS aval"),
+    "JoinB": "CREATE TABLE JoinB AS " + _union("10 AS shared, 1000 AS bval", "20 AS shared, 2000 AS bval"),
+    "Orders": "CREATE TABLE Orders AS "
+    + _union(
+        "1 AS order_id, 10 AS customer_id, DATE '2024-01-15' AS order_date",
+        "2 AS order_id, 20 AS customer_id, DATE '2024-02-20' AS order_date",
+        "3 AS order_id, 10 AS customer_id, DATE '2024-03-10' AS order_date",
+    ),
+    "Products": "CREATE TABLE Products AS "
+    + _union(
+        "1 AS product_id, 'Widget' AS product_name", "2 AS product_id, 'Gadget' AS product_name", "3 AS product_id, 'Doohickey' AS product_name"
+    ),
+    "Customers": "CREATE TABLE Customers AS " + _union("10 AS customer_id, 'Alice' AS cust_name", "20 AS customer_id, 'Bob' AS cust_name"),
+    "CommaA": "CREATE TABLE CommaA AS " + _union("1 AS aid, 10 AS shared_key", "2 AS aid, 20 AS shared_key"),
+    "CommaB": "CREATE TABLE CommaB AS " + _union("10 AS shared_key, 'x' AS bval", "20 AS shared_key, 'y' AS bval"),
+    "Sales": "CREATE TABLE Sales AS "
+    + _union(
+        "'East' AS region, 100 AS amount, DATE '2024-01-15' AS sale_date",
+        "'East' AS region, 200 AS amount, DATE '2024-02-20' AS sale_date",
+        "'West' AS region, 150 AS amount, DATE '2024-01-10' AS sale_date",
+        "'West' AS region, 300 AS amount, DATE '2024-03-05' AS sale_date",
+    ),
+    "SalesQ1": "CREATE TABLE SalesQ1 AS " + _union("'East' AS region, 100 AS amount", "'West' AS region, 200 AS amount"),
+    "SalesQ2": "CREATE TABLE SalesQ2 AS " + _union("'East' AS region, 300 AS amount", "'North' AS region, 400 AS amount"),
+    "UnionA": "CREATE TABLE UnionA AS " + _union("1 AS id, 'a' AS name, 10 AS val", "2 AS id, 'b' AS name, 20 AS val"),
+    "UnionB": "CREATE TABLE UnionB AS " + _union("3 AS id, 'c' AS name, 30 AS val"),
+    "OrderQualA": "CREATE TABLE OrderQualA AS " + _union("1 AS id, DATE '2024-01-01' AS event_date", "2 AS id, DATE '2024-03-01' AS event_date"),
+    # RecordDate is a TIMESTAMP holding dates: the mis-declared type cast_map narrows.
+    "RecordTbl": "CREATE TABLE RecordTbl AS "
+    + _union(
+        "CAST('2025-05-30 09:15:00' AS TIMESTAMP) AS RecordDate, 1 AS PointID, 1.5 AS Rate",
+        "CAST('2025-05-30 17:45:00' AS TIMESTAMP) AS RecordDate, 2 AS PointID, 2.5 AS Rate",
+        "CAST('2025-05-31 00:00:00' AS TIMESTAMP) AS RecordDate, 3 AS PointID, 3.5 AS Rate",
+    ),
+    "QuotedMetadataColumns": 'CREATE TABLE QuotedMetadataColumns AS SELECT 1 AS "group", 2 AS "value with space", 3 AS ordinary',
+    "ns_tbl": "CREATE TABLE ns_tbl AS SELECT * FROM (VALUES (1, TIMESTAMP_NS '2024-01-01 00:00:00'), (2, TIMESTAMP_NS '2024-01-01 00:00:00.000000500')) t(id, ts)",
+}
 
-    This tests a bug where OperatorType.LOGICAL_OR was not mapped in the SQL visitor,
-    causing a warning and falling back to Python-side filtering instead of SQL pushdown.
-    LOGICAL_OR can be produced by Polars' optimizer when rewriting expressions.
-    """
-    # Construct a BinaryExprNode directly with LOGICAL_OR
-    left_col = ColumnNode(expr=pl.col("A"), name="A")
-    left_lit = LiteralNode(expr=pl.lit(5), value=5)
-    left_cmp = BinaryExprNode(expr=pl.col("A") > 5, left=left_col, op=OperatorType.GT, right=left_lit)
 
-    right_col = ColumnNode(expr=pl.col("B"), name="B")
-    right_lit = LiteralNode(expr=pl.lit(10), value=10)
-    right_cmp = BinaryExprNode(expr=pl.col("B") > 10, left=right_col, op=OperatorType.GT, right=right_lit)
+# Predicate -> SQL text. ``expect`` is None when nothing may be pushed, else assert_text arguments.
+def _visit(predicate: pl.Expr, dialect) -> exp.Expression | None:
+    """Translate without the exception guard of ``convert_predicate_to_sql`` so failures surface."""
+    visitor = SQLExpressionVisitor(dialect)
+    visitor.visit(get_parsed_expr(predicate))
+    return visitor.process_results()
 
-    # Create the LOGICAL_OR node
-    logical_or_node = BinaryExprNode(
-        expr=(pl.col("A") > 5) | (pl.col("B") > 10),
-        left=left_cmp,
-        op=OperatorType.LOGICAL_OR,
-        right=right_cmp,
+
+def T(id, pred, dialect, expect, render="same", strict=False, **opts):
+    return Case(id, pred, expect, {"dialect": dialect, "render": dialect if render == "same" else render, "strict": strict, "opts": opts})
+
+
+def X(*contains, omits=(), equals=None):
+    return {"contains": contains, "omits": omits, "equals": equals}
+
+
+ts, a, s, f, x = pl.col("ts"), pl.col("a"), pl.col("s"), pl.col("f"), pl.col("x")
+_EST = timezone(timedelta(hours=-5))
+_CH_UTC = "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')"
+_BIG_IN = [f"ID{i}" for i in range(DEFAULT_MAX_IN_PREDICATE_SIZE + 1)]
+_DT_DATE = (ts.dt.date() == date(2026, 1, 15)) & pl.col("symbol").is_in(["A", "B"])
+_REGEXES = ["^(CL|GC|SI|HO)", ".*abc", "foo|bar", "[A-Z]+", r"CL\d+"]
+
+TRANSLATIONS = [
+    T("wrap_binary_expr", (pl.col("A") > 5) | pl.col("B").eq(10), "tsql", X(equals="((A > 5) OR (B = 10))")),
+    # tz-aware datetimes on ClickHouse are explicit-UTC instants; elsewhere offset strings (issue #52)
+    T(
+        "tz_aware_datetime_clickhouse_uses_explicit_utc",
+        (ts >= datetime(2026, 1, 15, tzinfo=UTC)) & (ts < datetime(2026, 1, 15, 9, 0, 0, 123456, tzinfo=_EST)),
+        "clickhouse",
+        X(_CH_UTC, "toDateTime64('2026-01-15 14:00:00.123456', 6, 'UTC')", omits="+00:00"),
+    ),
+    T("tz_aware_datetime_clickhouse_dialect_class-str", ts >= datetime(2026, 1, 15, tzinfo=UTC), "clickhouse", X(_CH_UTC, omits="+00:00")),
+    T(
+        "tz_aware_datetime_clickhouse_dialect_class-class",
+        ts >= datetime(2026, 1, 15, tzinfo=UTC),
+        ClickHouse,
+        X(_CH_UTC, omits="+00:00"),
+        render="clickhouse",
+    ),
+    T(
+        "tz_aware_datetime_is_in_clickhouse_uses_explicit_utc",
+        ts.is_in([datetime(2026, 1, 15, tzinfo=UTC), datetime(2026, 1, 16, tzinfo=UTC)]),
+        "clickhouse",
+        X(_CH_UTC, "toDateTime64('2026-01-16 00:00:00', 6, 'UTC')", omits="+00:00"),
+    ),
+    *[
+        T(f"tz_aware_datetime_non_clickhouse_unchanged-{d}", ts >= datetime(2026, 1, 15, tzinfo=UTC), d, X("2026-01-15 00:00:00+00:00"))
+        for d in ["tsql", "postgres", "duckdb"]
+    ],
+    T(
+        "naive_datetime_clickhouse_uses_todatetime64_without_tz",
+        ts >= datetime(2024, 1, 15, 12, 30),
+        "clickhouse",
+        X("toDateTime64('2024-01-15 12:30:00', 6)", omits="'UTC'"),
+    ),
+    # the MSSQL class and no dialect behave like "tsql"
+    *[
+        T(f"convert_predicate_to_sql_with_mssql_class-{n}", x > 5, d, X(equals="(x > 5)"), render=None)
+        for n, d in [("tsql", "tsql"), ("MSSQL", MSSQL), ("None", None)]
+    ],
+    # dt.date() becomes a calendar-date expression per dialect (issue #51)
+    *[
+        T(f"dt_date_predicate_is_pushed_down-{d}", _DT_DATE, d, X(want, "symbol IN ('A', 'B')"))
+        for d, want in [
+            ("clickhouse", "CAST(ts AS Nullable(Date32)) = '2026-01-15'"),
+            ("tsql", "CAST(ts AS DATE) = '2026-01-15'"),
+            ("postgres", "CAST(ts AS DATE) = '2026-01-15'"),
+            ("duckdb", "CAST(ts AS DATE) = '2026-01-15'"),
+            # SQLite has no DATE type and Oracle DATE keeps the time, so both need calendar-date functions.
+            ("sqlite", "DATE(ts) = '2026-01-15'"),
+            ("oracle", "TRUNC(ts) = TO_DATE('2026-01-15', 'YYYY-MM-DD')"),
+        ]
+    ],
+    T(
+        "dt_date_pushdown_oracle_uses_trunc",
+        ts.dt.date() == date(2024, 5, 6),
+        "oracle",
+        X("TRUNC(ts) = TO_DATE('2024-05-06', 'YYYY-MM-DD')", omits="CAST(ts AS DATE)"),
+    ),
+    T(
+        "date_is_in_pushdown_oracle_uses_typed_literals",
+        pl.col("day").is_in([date(2024, 5, 6), date(2024, 5, 7)]),
+        "oracle",
+        X("day IN (TO_DATE('2024-05-06', 'YYYY-MM-DD'), TO_DATE('2024-05-07', 'YYYY-MM-DD'))"),
+    ),
+    # an is_in list over the size limit is not pushed; an AND keeps its other side
+    T("oversized_in_predicate_is_not_pushed_down-small", pl.col("id").is_in([f"ID{i}" for i in range(5)]), "tsql", X("IN")),
+    T("oversized_in_predicate_is_not_pushed_down-big", pl.col("id").is_in(_BIG_IN), "tsql", None),
+    T("oversized_in_predicate_is_not_pushed_down-and", pl.col("id").is_in(_BIG_IN) & (pl.col("year") == 2025), "tsql", X("year", omits="IN")),
+    T("oversized_in_predicate_is_not_pushed_down-raised_limit", pl.col("id").is_in(_BIG_IN), "tsql", X("IN"), max_in_predicate_size=len(_BIG_IN)),
+    # regex semantics differ between databases and Polars
+    *[
+        T(f"str_contains_regex_skips_pushdown-{d}-{r}", pl.col("Centre").str.contains(r), d, None)
+        for d in ["tsql", "postgres", "clickhouse", "duckdb"]
+        for r in _REGEXES
+    ],
+    T(
+        "str_contains_regex_with_and_partial_pushdown",
+        pl.col("Centre").str.contains("^test") & (pl.col("EventYear") > 2020),
+        "tsql",
+        X("EventYear", omits="LIKE"),
+        render=None,
+    ),
+    *[
+        T(f"predicate_without_exact_sql_translation_is_not_pushed_down-{p}", p, d, None, strict=True)
+        for p, d in [
+            (ts.dt.second() == 0, "postgres"),
+            (a.cast(pl.UInt8) > 3, "postgres"),
+            (a.cast(pl.Int128) > 3, "duckdb"),
+            (f.cast(pl.String) == "1.0", "duckdb"),
+            (s.str.starts_with("a\\"), "postgres"),
+            (s.str.contains("a_b", literal=True), "tsql"),
+            (a // 2 == 1, "duckdb"),
+        ]
+    ],
+    # Polars panics while exposing this literal; the panic must not escape conversion
+    T("nanosecond_numpy_literal_in_is_in_is_not_pushed_down", ts.is_in([np.datetime64("2024-01-01T00:00:00.000000001", "ns")]), "duckdb", None),
+    *[T(f"dt_year_renders_in_dialect-{d}", ts.dt.year() == 2024, d, X("2024"), strict=True) for d in ["tsql", "snowflake", "duckdb"]],
+    T("head_with_non_sql_filter_returns_correct_count-udf", pl.col("score").map_elements(lambda v: v > 80, return_dtype=pl.Boolean), "tsql", None),
+]
+
+
+@pytest.mark.parametrize(
+    ("pred", "dialect", "render", "strict", "opts", "expect"), params(TRANSLATIONS, "pred", "dialect", "render", "strict", "opts", "expect")
+)
+def test_translation(pred, dialect, render, strict, opts, expect):
+    result = _visit(pred, dialect) if strict else convert_predicate_to_sql(pred, dialect, **opts)
+    if expect is None:
+        assert result is None, result.sql(render)
+    else:
+        assert_text(None if result is None else result.sql(render), **expect)
+
+
+# A hand-built node -> the sqlglot type and SQL text the visitor produces.
+def _cmp(name, op, value):
+    return BinaryExprNode(
+        expr=pl.col(name) > value, left=ColumnNode(expr=pl.col(name), name=name), op=op, right=LiteralNode(expr=pl.lit(value), value=value)
     )
 
-    visitor = SQLExpressionVisitor(dialect="tsql")
-    visitor.visit(logical_or_node)
+
+def _logical(op):
+    return BinaryExprNode(expr=pl.lit(True), left=_cmp("A", OperatorType.GT, 5), op=op, right=_cmp("B", OperatorType.GT, 10))
+
+
+def _span(function_type):
+    nodes = [get_parsed_expr(pl.col("StartDate")), get_parsed_expr(pl.col("EndDate"))]
+    return FunctionNode(expr=pl.col("StartDate"), inputs=nodes, function_type=function_type)
+
+
+_my_col = ColumnNode(expr=pl.col("my_column"), name="my_column")
+_DAYS = "DATEDIFF(DAY, StartDate, EndDate)"
+
+NODES = [
+    # LOGICAL_OR / LOGICAL_AND come from Polars' optimizer; unmapped they fell back to client-side filtering
+    Case("logical_or_operator", _logical(OperatorType.LOGICAL_OR), (None, X("OR", "A > 5", "B > 10")), {"dialect": "tsql"}),
+    Case("logical_and_operator", _logical(OperatorType.LOGICAL_AND), (None, X("AND", "A > 5", "B > 10")), {"dialect": "tsql"}),
+    Case("visit_column", _my_col, (exp.Column, X(equals="my_column")), {"dialect": "tsql"}),
+    Case("visit_literal-number", LiteralNode(expr=pl.lit(42), value=42), (exp.Literal, X(equals="42")), {"dialect": "tsql"}),
+    Case("visit_literal-null", LiteralNode(expr=pl.lit(None), value=None), (exp.Null, X(equals="NULL")), {"dialect": "tsql"}),
+    Case(
+        "visit_function_is_null",
+        FunctionNode(expr=pl.col("my_column").is_null(), inputs=[_my_col], function_type=BooleanFunctionType.IS_NULL),
+        (exp.Is, X(equals="my_column IS NULL")),
+        {"dialect": "tsql"},
+    ),
+    Case("total_days_to_datediff-days", _span(TemporalFunctionType.TOTAL_DAYS), (exp.DateDiff, X(equals=_DAYS)), {"dialect": "tsql"}),
+    Case(
+        "total_days_to_datediff-hours",
+        _span(TemporalFunctionType.TOTAL_HOURS),
+        (exp.DateDiff, X(equals="DATEDIFF(HOUR, StartDate, EndDate)")),
+        {"dialect": "tsql"},
+    ),
+    # the MSSQL class and None normalize to "tsql", so the TSQL-only DATEDIFF still applies
+    *[
+        Case(f"visitor_dialect_normalization-{n}", _span(TemporalFunctionType.TOTAL_DAYS), (exp.DateDiff, X(equals=_DAYS)), {"dialect": d})
+        for n, d in [("tsql", "tsql"), ("MSSQL", MSSQL), ("None", None)]
+    ],
+]
+
+
+@pytest.mark.parametrize(("node", "dialect", "expect"), params(NODES, "pred", "dialect", "expect"))
+def test_visit_node(node, dialect, expect):
+    visitor = SQLExpressionVisitor(dialect=dialect)
+    visitor.visit(node)
     result = visitor.process_results()
-
-    assert result is not None, "LOGICAL_OR should be converted to SQL, not return None"
-    sql = result.sql("tsql")
-    assert "OR" in sql, f"Expected OR in SQL output, got: {sql}"
-    assert "A > 5" in sql and "B > 10" in sql, f"Expected both conditions in SQL, got: {sql}"
-
-
-def test_logical_and_operator():
-    """Test that LOGICAL_AND is correctly converted to SQL AND.
-
-    This tests that OperatorType.LOGICAL_AND is properly mapped in the SQL visitor.
-    LOGICAL_AND can be produced by Polars' optimizer when rewriting expressions.
-    """
-    # Construct a BinaryExprNode directly with LOGICAL_AND
-    left_col = ColumnNode(expr=pl.col("A"), name="A")
-    left_lit = LiteralNode(expr=pl.lit(5), value=5)
-    left_cmp = BinaryExprNode(expr=pl.col("A") > 5, left=left_col, op=OperatorType.GT, right=left_lit)
-
-    right_col = ColumnNode(expr=pl.col("B"), name="B")
-    right_lit = LiteralNode(expr=pl.lit(10), value=10)
-    right_cmp = BinaryExprNode(expr=pl.col("B") > 10, left=right_col, op=OperatorType.GT, right=right_lit)
-
-    # Create the LOGICAL_AND node
-    logical_and_node = BinaryExprNode(
-        expr=(pl.col("A") > 5) & (pl.col("B") > 10),
-        left=left_cmp,
-        op=OperatorType.LOGICAL_AND,
-        right=right_cmp,
-    )
-
-    visitor = SQLExpressionVisitor(dialect="tsql")
-    visitor.visit(logical_and_node)
-    result = visitor.process_results()
-
-    assert result is not None, "LOGICAL_AND should be converted to SQL, not return None"
-    sql = result.sql("tsql")
-    assert "AND" in sql, f"Expected AND in SQL output, got: {sql}"
-    assert "A > 5" in sql and "B > 10" in sql, f"Expected both conditions in SQL, got: {sql}"
-
-
-def test_basic_query():
-    """Test simple query"""
-    base_query = """
-    SELECT CenterID, Centre, EventYear
-    FROM CC_Bond
-    """
-    sql_query = base_query + " WHERE EventYear > 2015"
-
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") > 2015]
-    expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventYear"])
-    actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_dt_date_filter_pushdown():
-    """`.dt.date()` pushes down as a DATE cast and returns correct rows (issue #51).
-
-    The row check alone would pass even with the clause dropped (Polars re-filters
-    client-side), so the emitted SQL is captured to confirm the cast is pushed down.
-    """
-    import arrow_odbc
-
-    base_query = "SELECT CenterID, Centre, EventDate FROM CC_Bond"
-    df = get_cc_bond_df()
-    target = df["EventDate"].dt.date().min()
-
-    captured: list[str] = []
-    original_fake_func = arrow_odbc.read_arrow_batches_from_odbc
-
-    def capturing_fake_func(*args, **kwargs):
-        captured.append(args[0] if args else kwargs["query"])
-        return original_fake_func(*args, **kwargs)
-
-    arrow_odbc.read_arrow_batches_from_odbc = capturing_fake_func
-    try:
-        for equivalent_filters in (
-            [pl.col("EventDate").dt.date() == target],
-            [pl.col("EventDate").dt.date() >= target],
-        ):
-            expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventDate"])
-            actual = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-            assert expected.height > 0
-            assert_frame_equal(actual, expected)
-    finally:
-        arrow_odbc.read_arrow_batches_from_odbc = original_fake_func
-
-    assert captured, "No SQL captured from read_arrow_batches_from_odbc"
-    data_queries = [sql for sql in captured if "WHERE" in sql]
-    assert data_queries and all('CAST("EventDate" AS DATE)' in sql for sql in data_queries), data_queries
-
-
-def test_implicit_cast_query():
-    """Test implicit cast query"""
-    base_query = """
-    SELECT CenterID, Centre, EventYear
-    FROM CC_Bond
-    """
-    sql_query = base_query + " WHERE EventYear > 2015"
-
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") > 2015.1]
-    expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventYear"])
-    actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_column_selection():
-    """Test column selection and LIKE"""
-    base_query = """
-    SELECT *
-    FROM CC_Bond
-    """
-    sql_query = base_query + " WHERE Centre LIKE '%Da%'"
-
-    cols = ["CenterID", "Centre", "EventDate"]
-
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("Centre").str.contains("Da")]
-    expected = df.filter(*equivalent_filters).select(cols)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").select(cols).collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").select(cols).filter(*equivalent_filters).collect()
-
-    actual = actual.sort(cols)
-    expected = expected.sort(cols)
-    actual_from_query = actual_from_query.sort(cols)
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_complex_query():
-    """Test more complex query with AND and OR"""
-    base_query = """
-    SELECT CenterID, CentreCode, ISOCountryCode, Centre, EventYear, EventDate, EventDayOfWeek, EventName, FileType
-    FROM CC_Bond
-    """
-    sql_query = (
-        base_query
-        + """
-    WHERE EventYear BETWEEN 2015 AND 2050
-      AND (EventDayOfWeek = 'Fri' OR EventDayOfWeek = 'Sat')
-      AND EventName LIKE '%Day%'
-    """
-    )
-
-    cols = ["CenterID", "CentreCode", "ISOCountryCode", "Centre", "EventYear", "EventDate", "EventDayOfWeek", "EventName", "FileType"]
-
-    df = get_cc_bond_df()
-    equivalent_filters = [
-        (pl.col("EventYear").is_between(2015, 2050))
-        & ((pl.col("EventDayOfWeek") == "Fri") | (pl.col("EventDayOfWeek") == "Sat"))
-        & (pl.col("EventName").str.contains("Day"))
-    ]
-    expected = df.filter(*equivalent_filters).select(cols)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").select(cols).collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").select(cols).filter(*equivalent_filters).collect()
-
-    actual = actual.sort(cols)
-    expected = expected.sort(cols)
-    actual_from_query = actual_from_query.sort(cols)
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_join():
-    """Test on a joined table with filters"""
-    base_query = """
-    SELECT cb.CenterID, cb.Centre, ec.Country, ec.ElectFor
-    FROM CC_Bond AS cb, ElectionCalendar AS ec
-    """
-    sql_query = base_query + " WHERE ec.Country LIKE '%a%'"
-    cols = ["CenterID", "Centre", "Country", "ElectFor"]
-
-    df_cb = get_cc_bond_df().select(["CenterID", "Centre"])
-    df_ec = get_election_df().select(["Country", "ElectFor"])
-
-    # Create a cross join and then apply filter
-    cross_join = df_cb.join(df_ec, how="cross")
-    equivalent_filters = [pl.col("Country").str.contains("a")]
-    expected = cross_join.filter(*equivalent_filters)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-
-    expected = expected.sort(cols)
-    actual = actual.sort(cols)
-    actual_from_query = actual_from_query.sort(cols)
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_not_null():
-    """Test NOT NULL"""
-    base_query = """
-    SELECT CenterID, Centre, EventDate
-    FROM CC_Bond
-    """
-    sql_query = base_query + " WHERE EventDate IS NOT NULL"
-
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventDate").is_not_null()]
-    expected = df.select(["CenterID", "Centre", "EventDate"]).filter(*equivalent_filters)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_empty_df():
-    """Test functionality on a query that returns no records"""
-    base_query = """
-    SELECT CenterID, Centre, EventDate, EventYear
-    FROM CC_Bond
-    """
-    sql_query = base_query + " WHERE EventYear < 1900"
-
-    cols = [
-        "CenterID",
-        "Centre",
-        "EventDate",
-    ]
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") < 1900]
-    expected = df.filter(*equivalent_filters).select(cols)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").select(cols).collect()
-    # Here, we need to filter first and then select, because we filter on a column that is not selected
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).select(cols).collect()
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_in_operator():
-    """Test IN operator"""
-    base_query = """
-    SELECT CenterID, Centre, EventYear, EventDate, EventDayOfWeek
-    FROM CC_Bond
-    """
-
-    cols = ["CenterID", "Centre", "EventYear", "EventDate", "EventDayOfWeek"]
-    sql_query = base_query + " WHERE EventDayOfWeek IN ('Fri', 'Sat', 'Sun')"
-
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventDayOfWeek").is_in(["Fri", "Sat", "Sun"])]
-    expected = df.filter(*equivalent_filters).select(cols)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-
-    actual = actual.sort(cols)
-    expected = expected.sort(cols)
-    actual_from_query = actual_from_query.sort(cols)
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_not_like():
-    """Test NOT LIKE operator"""
-    base_query = """
-    SELECT CenterID, Centre, EventYear, EventName
-    FROM CC_Bond
-    """
-    sql_query = base_query + " WHERE EventName NOT LIKE '%Day%'"
-
-    cols = ["CenterID", "Centre", "EventYear", "EventName"]
-    df = get_cc_bond_df()
-    equivalent_filters = [~pl.col("EventName").str.contains("Day")]
-    expected = df.filter(*equivalent_filters).select(cols)
-
-    # Test both ways: direct SQL and base query + filters
-    actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
-    actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
-
-    actual = actual.sort(cols)
-    expected = expected.sort(cols)
-    actual_from_query = actual_from_query.sort(cols)
-
-    assert_frame_equal(actual, expected)
-    assert_frame_equal(actual_from_query, expected)
-
-
-def test_with_columns_preserves_qualification_on_join(duckdb_connection):
-    """Ensure with_columns uses original qualified columns to avoid ambiguity.
-
-    When the base query selects a qualified column from a joined table where both
-    sides share the same column name, rebuilding projections must keep the table
-    qualifier. Otherwise databases can raise an "ambiguous column" error.
-    """
-
-    # Create two small tables with a shared column name directly in DuckDB
-    duckdb_connection.execute(
-        """
-        CREATE TABLE A AS SELECT * FROM (
-            SELECT 1 AS id, 10 AS shared, 100 AS aval
-            UNION ALL
-            SELECT 2 AS id, 20 AS shared, 200 AS aval
-            UNION ALL
-            SELECT 3 AS id, 30 AS shared, 300 AS aval
-        )
-        """
-    )
-    duckdb_connection.execute(
-        """
-        CREATE TABLE B AS SELECT * FROM (
-            SELECT 10 AS shared, 1000 AS bval
-            UNION ALL
-            SELECT 30 AS shared, 3000 AS bval
-            UNION ALL
-            SELECT 40 AS shared, 4000 AS bval
-        )
-        """
-    )
-
-    # Base query selects a qualified shared column from the left side only
-    base_query = "SELECT a.shared, a.aval, b.bval FROM A AS a LEFT JOIN B AS b ON a.shared = b.shared"
-
-    # Expected result computed via Polars for correctness
-    expected = (
-        pl.DataFrame(
-            {
-                "shared": [10, 20, 30],
-                "aval": [100, 200, 300],
-            }
-        )
-        .sort(["shared", "aval"])
-        .rechunk()
-    )
-
-    # Using scan_db, selecting unqualified names should preserve original qualification
-    lf = cpl.scan_db(base_query, "fake_connection_string")
-
-    # Wrap the fake batch reader to capture the executed SQL
-    import arrow_odbc
-
-    captured: list[str] = []
-    original_fake_func = arrow_odbc.read_arrow_batches_from_odbc
-
-    def capturing_fake_func(*args, **kwargs):
-        # args: (query, batch_size, connection_string)
-        if args:
-            captured.append(args[0])
-        elif "query" in kwargs:
-            captured.append(kwargs["query"])
-        return original_fake_func(*args, **kwargs)
-
-    # Temporarily patch within this test
-    arrow_odbc.read_arrow_batches_from_odbc = capturing_fake_func
-    try:
-        actual = lf.select(["shared", "aval"]).collect().sort(["shared", "aval"]).rechunk()
-    finally:
-        arrow_odbc.read_arrow_batches_from_odbc = original_fake_func
-
-    # Validate result values, dtypes can differ by backend
-    assert_frame_equal(actual, expected, check_dtypes=False)
-
-    # Validate that the generated SQL preserved qualification for shared/aval
-    assert captured, "No SQL captured from read_arrow_batches_from_odbc"
-    sql = captured[0]
-    patterns = [
-        "SELECT a.shared, a.aval",
-        'SELECT "a"."shared", "a"."aval"',
-        "SELECT [a].[shared], [a].[aval]",
-    ]
-    assert any(p in sql for p in patterns), f"Expected qualified columns in SQL, got: {sql}"
-
-
-def test_visit_column():
-    """Test if we can correctly visit a column"""
-    column_expr = pl.col("my_column")
-    column_node = ColumnNode(expr=column_expr, name="my_column")
-
-    visitor = SQLExpressionVisitor(dialect="tsql")
-
-    visitor.visit(column_node)
-    result = visitor.process_results()
-
-    assert isinstance(result, exp.Column)
-    assert result.sql() == "my_column"
-
-
-def test_visit_literal():
-    """Test visiting numeric and NULL literals."""
-    visitor = SQLExpressionVisitor(dialect="tsql")
-
-    # Numeric literal
-    literal_node_num = LiteralNode(expr=pl.lit(42), value=42)
-    visitor.visit(literal_node_num)
-    result_num = visitor.process_results()
-    assert isinstance(result_num, exp.Literal)
-    assert result_num.sql() == "42"
-
-    # NULL literal
-    literal_node_null = LiteralNode(expr=pl.lit(None), value=None)
-    visitor.visit(literal_node_null)
-    result_null = visitor.process_results()
-    assert isinstance(result_null, exp.Null)
-    assert result_null.sql() == "NULL"
-
-
-def test_create_sqlglot_literal_various_types():
-    """Unit tests for create_sqlglot_literal to ensure consistent literal handling."""
-    # None -> NULL
-    assert isinstance(create_sqlglot_literal(None), exp.Null)
-    assert create_sqlglot_literal(None).sql() == "NULL"
-
-    # Numeric -> unquoted
-    lit_int = create_sqlglot_literal(123)
-    assert isinstance(lit_int, exp.Literal)
-    assert lit_int.sql() == "123"
-
-    lit_float = create_sqlglot_literal(12.34)
-    assert isinstance(lit_float, exp.Literal)
-    assert lit_float.sql() == "12.34"
-
-    # String -> quoted
-    lit_str = create_sqlglot_literal("abc")
-    assert isinstance(lit_str, exp.Literal)
-    assert lit_str.sql() == "'abc'"
-
-    # Date -> quoted string (handled by str() formatting)
-    d = date(2025, 1, 2)
-    lit_date = create_sqlglot_literal(d)
-    assert isinstance(lit_date, exp.Literal)
-    # sqlglot will quote since we mark is_string=True
-    assert lit_date.sql() == "'2025-01-02'"
-
-    # bool -> SQL boolean (TRUE / FALSE), not quoted string
-    lit_true = create_sqlglot_literal(True)
-    assert isinstance(lit_true, exp.Boolean)
-    assert lit_true.sql() == "TRUE"
-
-    lit_false = create_sqlglot_literal(False)
-    assert isinstance(lit_false, exp.Boolean)
-    assert lit_false.sql() == "FALSE"
+    typ, text = expect
+    assert typ is None or isinstance(result, typ), type(result)
+    assert_text(result.sql(dialect="tsql"), **text)
+
+
+def test_total_days_parses_to_function_node():
+    node = get_parsed_expr((pl.col("end_dt") - pl.col("start_dt")).dt.total_days())
+    assert isinstance(node, FunctionNode) and node.function_type == TemporalFunctionType.TOTAL_DAYS
+
+
+LITERALS = [
+    Case("create_sqlglot_literal_various_types-none", None, (exp.Null, "NULL")),
+    Case("create_sqlglot_literal_various_types-int", 123, (exp.Literal, "123")),
+    Case("create_sqlglot_literal_various_types-float", 12.34, (exp.Literal, "12.34")),
+    Case("create_sqlglot_literal_various_types-str", "abc", (exp.Literal, "'abc'")),
+    Case("create_sqlglot_literal_various_types-date", date(2025, 1, 2), (exp.Literal, "'2025-01-02'")),
+    # booleans are SQL booleans, not the strings 'True'/'False'
+    Case("create_sqlglot_literal_various_types-true", True, (exp.Boolean, "TRUE")),
+    Case("create_sqlglot_literal_various_types-false", False, (exp.Boolean, "FALSE")),
+    Case("naive_datetime_literal_unchanged", datetime(2026, 1, 15, 12, 30), (exp.Literal, "'2026-01-15 12:30:00'")),
+]
+
+
+@pytest.mark.parametrize(("value", "expect"), params(LITERALS, "pred", "expect"))
+def test_create_sqlglot_literal(value, expect):
+    result = create_sqlglot_literal(value)
+    assert isinstance(result, expect[0])
+    assert result.sql() == expect[1]
 
 
 def test_create_sqlglot_literal_bool_via_duckdb(duckdb_connection):
-    """Verify bool literals round-trip through SQL correctly using DuckDB.
-
-    This guards against the regression where True/False were emitted as quoted
-    string literals ('True'/'False') causing DATATYPE_MISMATCH errors when a
-    bool value was used as a filter predicate.
-    """
-    # create_sqlglot_literal(True) must produce TRUE (unquoted), not 'True' (quoted string).
-    # A quoted 'True' would fail in DuckDB with a type mismatch when compared to a boolean column.
+    """A quoted 'True' would fail in DuckDB with a type mismatch against a boolean column."""
     duckdb_connection.execute("CREATE TEMPORARY TABLE IF NOT EXISTS bool_test (flag BOOLEAN, val INTEGER)")
     duckdb_connection.execute("INSERT INTO bool_test VALUES (TRUE, 1), (FALSE, 2), (TRUE, 3)")
-
-    true_literal = create_sqlglot_literal(True).sql(dialect="duckdb")
-    false_literal = create_sqlglot_literal(False).sql(dialect="duckdb")
-
-    # Verify the literals are unquoted SQL booleans
-    assert true_literal == "TRUE"
-    assert false_literal == "FALSE"
-
-    # Verify the literals execute in DuckDB without type errors
-    rows_true = duckdb_connection.execute(f"SELECT val FROM bool_test WHERE flag = {true_literal}").fetchall()
-    rows_false = duckdb_connection.execute(f"SELECT val FROM bool_test WHERE flag = {false_literal}").fetchall()
-
-    assert sorted(r[0] for r in rows_true) == [1, 3]
-    assert [r[0] for r in rows_false] == [2]
-
-
-def test_tz_aware_datetime_clickhouse_uses_explicit_utc():
-    """ClickHouse renders tz-aware datetimes as an explicit-UTC instant (issue #52).
-
-    An offset-bearing string is rejected by DateTime64, and a bare naive string would be
-    interpreted in the column's timezone; toDateTime64(..., 'UTC') is unambiguous.
-    """
-    est = timezone(timedelta(hours=-5))
-    pred = (pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)) & (pl.col("ts") < datetime(2026, 1, 15, 9, 0, 0, 123456, tzinfo=est))
-    sql = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
-    assert "+00:00" not in sql
-    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in sql
-    # non-UTC bound normalized to the equivalent UTC instant, microseconds preserved
-    assert "toDateTime64('2026-01-15 14:00:00.123456', 6, 'UTC')" in sql
-
-
-def test_tz_aware_datetime_clickhouse_dialect_class():
-    """The ClickHouse dialect class normalizes like the 'clickhouse' string (issue #52).
-
-    Passing SQLGlot's ``ClickHouse`` class must not fall back to TSQL, which would emit the
-    offset-bearing string this fix removes.
-    """
-    from sqlglot.dialects import ClickHouse
-
-    pred = pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)
-    from_str = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
-    from_cls = convert_predicate_to_sql(pred, ClickHouse).sql(dialect="clickhouse")
-    assert from_str == from_cls
-    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in from_cls
-    assert "+00:00" not in from_cls
-
-
-def test_tz_aware_datetime_is_in_clickhouse_uses_explicit_utc():
-    """is_in with tz-aware datetimes routes through the same ClickHouse rendering (issue #52)."""
-    pred = pl.col("ts").is_in([datetime(2026, 1, 15, tzinfo=UTC), datetime(2026, 1, 16, tzinfo=UTC)])
-    sql = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
-    assert "+00:00" not in sql
-    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in sql
-    assert "toDateTime64('2026-01-16 00:00:00', 6, 'UTC')" in sql
-
-
-@pytest.mark.parametrize("dialect", ["tsql", "postgres", "duckdb"])
-def test_tz_aware_datetime_non_clickhouse_unchanged(dialect):
-    """Non-ClickHouse dialects keep the existing offset-string rendering (#52 is ClickHouse-scoped)."""
-    pred = pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)
-    sql = convert_predicate_to_sql(pred, dialect).sql(dialect=dialect)
-    assert "2026-01-15 00:00:00+00:00" in sql
-
-
-def test_naive_datetime_literal_unchanged():
-    """Naive datetimes are unaffected by the tz-aware handling."""
-    assert create_sqlglot_literal(datetime(2026, 1, 15, 12, 30)).sql() == "'2026-01-15 12:30:00'"
+    for value, want in [(True, [1, 3]), (False, [2])]:
+        literal = create_sqlglot_literal(value).sql(dialect="duckdb")
+        assert literal == str(value).upper()
+        assert sorted(r[0] for r in duckdb_connection.execute(f"SELECT val FROM bool_test WHERE flag = {literal}").fetchall()) == want
 
 
 def test_clickhouse_datetime_literal_returns_none_on_overflow():
-    """Rendering bails out (returns None) when a datetime can't be represented.
-
-    A datetime beyond Python's year range has no representable form, so the helper returns None
-    and the caller skips pushdown rather than emit a truncated bound.
-    """
+    """A datetime beyond Python's year range has no representable form, so pushdown is skipped, not truncated."""
     from polars_io_tools.io_sources.sql_utils import _clickhouse_datetime_literal
 
-    far_future = pl.lit(pl.Series([300_000_000_000_000], dtype=pl.Datetime("ms")))
-    assert _clickhouse_datetime_literal(far_future) is None
+    assert _clickhouse_datetime_literal(pl.lit(pl.Series([300_000_000_000_000], dtype=pl.Datetime("ms")))) is None
 
 
 def test_visit_literal_skips_pushdown_when_precision_unrecoverable(monkeypatch):
-    """When a ClickHouse datetime can't be rendered, the clause is dropped, not truncated.
-
-    Real out-of-range datetimes raise earlier, so patch the renderer to exercise the guard
-    directly and confirm pushdown is abandoned (the exact client-side filter still applies).
-    """
+    """Real out-of-range datetimes raise earlier, so patch the renderer to reach the guard."""
     import polars_io_tools.io_sources.sql_utils as su
 
     monkeypatch.setattr(su, "_clickhouse_datetime_literal", lambda expr: None)
-    assert convert_predicate_to_sql(pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC), "clickhouse") is None
-
-
-def test_naive_datetime_clickhouse_uses_todatetime64_without_tz():
-    """Naive datetimes on ClickHouse render as toDateTime64 without a timezone argument."""
-    sql = convert_predicate_to_sql(pl.col("ts") >= datetime(2024, 1, 15, 12, 30), "clickhouse").sql(dialect="clickhouse")
-    assert "toDateTime64('2024-01-15 12:30:00', 6)" in sql
-    assert "'UTC'" not in sql
+    assert convert_predicate_to_sql(ts >= datetime(2026, 1, 15, tzinfo=UTC), "clickhouse") is None
 
 
 def test_nanosecond_datetime_pushdown_clickhouse_preserves_precision():
-    """A nanosecond-column filter pushes down with full precision on ClickHouse (PR #54 review).
+    """Equality on a ``Datetime(ns)`` column reaches the source as an ``is_between`` whose bounds share a microsecond.
 
-    Equality on a ``Datetime(ns)`` column becomes a nanosecond ``is_between`` whose bounds
-    collapse to the same microsecond through Python ``datetime``. If the pushdown kept only the
-    microsecond value, ClickHouse would drop matching ``DateTime64(9)`` rows before the
-    client-side filter. The two bounds must survive as distinct 9-digit ``toDateTime64`` values.
+    Both bounds must survive as distinct 9-digit ``toDateTime64`` values, or ClickHouse drops matching rows.
     """
     from polars.io.plugins import register_io_source
 
@@ -833,328 +398,89 @@ def test_nanosecond_datetime_pushdown_clickhouse_preserves_precision():
 
     def source(with_columns, predicate, n_rows, batch_size):
         captured["predicate"] = predicate
-        ts = pl.Series("ts", [1705276800123456789], dtype=pl.Int64).cast(pl.Datetime("ns", "UTC"))
-        yield pl.DataFrame({"ts": ts})
+        yield pl.DataFrame({"ts": pl.Series("ts", [1705276800123456789], dtype=pl.Int64).cast(pl.Datetime("ns", "UTC"))})
 
-    lf = register_io_source(source, schema={"ts": pl.Datetime("ns", "UTC")})
-    lf.filter(pl.col("ts") == datetime(2024, 1, 15, 0, 0, 0, 123456, tzinfo=UTC)).collect()
-
-    sql = convert_predicate_to_sql(captured["predicate"], "clickhouse").sql(dialect="clickhouse")
-    assert "toDateTime64('2024-01-15 00:00:00.123456000', 9, 'UTC')" in sql
-    assert "toDateTime64('2024-01-15 00:00:00.123456999', 9, 'UTC')" in sql
-
-
-def test_visit_function_is_null():
-    """Test if we can correctly visit NULL"""
-
-    input_expr = pl.col("my_column")
-    input_node = ColumnNode(expr=input_expr, name="my_column")
-    function_node = FunctionNode(expr=input_expr.is_null(), inputs=[input_node], function_type=BooleanFunctionType.IS_NULL)
-
-    visitor = SQLExpressionVisitor(dialect="tsql")
-
-    visitor.visit(function_node)
-    result = visitor.process_results()
-
-    assert isinstance(result, exp.Is)
-    assert isinstance(result.expression, exp.Null)
-    assert result.sql() == "my_column IS NULL"
-
-
-@pytest.mark.parametrize("range_dates", [True, False])
-def test_piot_cache_integration(monkeypatch, range_dates):
-    """Test if we can correctly cache a query"""
-    import arrow_odbc
-
-    # Create a call counter
-    call_counter = {"count": 0}
-
-    # Store the original fake implementation (which is already patched by the fixture)
-    original_fake_func = arrow_odbc.read_arrow_batches_from_odbc
-
-    # Create a wrapper that counts calls but still calls the original fake function
-    def counting_fake_func(*args, **kwargs):
-        call_counter["count"] += 1
-        return original_fake_func(*args, **kwargs)
-
-    # Replace the fake function with our counting wrapper
-    monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", counting_fake_func)
-
-    base_query = """
-    SELECT *
-    FROM EmployeeTbl
-    """
-    partition_cols = ["test_date", "name"]
-    emp_lf = cpl.scan_db(base_query, "fake_connection_string").piot.cache(order_by="id", partition_cols=partition_cols)
-
-    def apply_filters(lf: pl.LazyFrame, start: date = date(2022, 1, 1), end: date = date(2022, 1, 2)) -> pl.LazyFrame:
-        if range_dates:
-            lf = lf.filter(pl.col.test_date.is_between(start, end))
-        else:
-            lf = lf.filter(pl.col.test_date.is_in(pl.date_range(start, end, closed="both", eager=True).to_list()))
-        lf = lf.filter(pl.col.name.is_in(["Alice", "Bob"]))
-        return lf
-
-    # Reset counter before first call
-    call_counter["count"] = 0
-
-    # First call - should hit the database
-    res = emp_lf.pipe(apply_filters).collect()
-    assert call_counter["count"] == 1, "Expected read_arrow_batches_from_odbc to be called"
-    assert_frame_equal(res, get_employee_df().pipe(apply_filters))
-
-    # Reset counter before second call
-    call_counter["count"] = 0
-
-    # Same call again - should use cache, not hit database
-    res = emp_lf.pipe(apply_filters).collect()
-    assert call_counter["count"] == 0, "Expected read_arrow_batches_from_odbc to NOT be called (cache should be used)"
-    assert_frame_equal(res, get_employee_df().pipe(apply_filters))
-
-    # Reset counter before third call
-    call_counter["count"] = 0
-
-    # We query for a subset of data, we should hit the cache fully.
-    res = emp_lf.pipe(apply_filters, start=date(2022, 1, 1), end=date(2022, 1, 2)).collect()
-    assert call_counter["count"] == 0, "Expected read_arrow_batches_from_odbc to NOT be called (cache should be used)"
-    assert_frame_equal(res, get_employee_df().pipe(apply_filters, start=date(2022, 1, 1), end=date(2022, 1, 2)))
-
-    # We query for an even smaller subset of the data, thus, we should theoretically be able to (only Alice and Bartholomew)
-    # hit the cache fully. However, because with our current filters, we don't have any data
-    # for Bartholomew, we don't add a partition column filter to the query to exclude Alice. Thus,
-    # we mistakenly assume that we have to query the data instead of only hitting the cache.
-    # Now, if we either:
-    #   - know the full set of our partition column options upfront
-    #   - keep track of the queries we made, and use that to determine if we can
-    #     hit the cache fully. So, we should've known that we queried for Bartholomew before with
-    #     the appropriate dates. This then adds the next challenge of queries that WOULD'VE
-    #     detected Bartholomew (maybe like, pl.col.name.ne("Bill")) we should feasibly be able to
-    #     infer that we can hit the cache fully.
-    # We should be able to know that we can exclusively hit the cache here. The second approach seems difficult,
-    # and the first one is simpler and allows for further validation. This presents a challenge for
-    # efficient caching when we have entries in partition columns that are emtpy.
-
-    def apply_restricted_filters(lf: pl.LazyFrame) -> pl.LazyFrame:
-        start = date(2022, 1, 1)
-        end = date(2022, 1, 2)
-        if range_dates:
-            lf = lf.filter(pl.col.test_date.is_between(start, end))
-        else:
-            dates = pl.date_range(start, end, closed="both", eager=True).to_list()
-            lf = lf.filter(pl.col.test_date.is_in(dates))
-        return lf.filter(pl.col.name.is_in(["Bartholomew", "Alice"]))
-
-    res = emp_lf.pipe(apply_restricted_filters).collect()
-    assert call_counter["count"] == 1, "Expected read_arrow_batches_from_odbc to be called (cache should be used but we do not detect that)"
-    assert_frame_equal(res, get_employee_df().pipe(apply_restricted_filters))
-
-
-def test_mssql_bracket_quoting():
-    """
-    Test that our custom MSSQL dialect wraps identifiers in brackets,
-    even when the name is a reserved keyword or contains spaces/brackets.
-    """
-    assert exp.Column(this="CenterID").sql(dialect=MSSQL) == "[CenterID]"
-    assert exp.Column(this="GROUP").sql(dialect=MSSQL) == "[GROUP]"
-    assert exp.Column(this="Some ] Column").sql(dialect=MSSQL) == "[Some ]] Column]"
-
-    col = exp.Column(this="Amount", table="Sales")
-    assert col.sql(dialect=MSSQL) == "[Sales].[Amount]"
-
-
-def test_total_days_to_datediff():
-    """Test that TOTAL_DAYS fast-path works correctly"""
-    start_expr = pl.col("StartDate")
-    end_expr = pl.col("EndDate")
-
-    start_node = get_parsed_expr(start_expr)
-    end_node = get_parsed_expr(end_expr)
-
-    function_types_and_expected = [
-        (TemporalFunctionType.TOTAL_DAYS, "DATEDIFF(DAY, StartDate, EndDate)"),
-        (TemporalFunctionType.TOTAL_HOURS, "DATEDIFF(HOUR, StartDate, EndDate)"),
-    ]
-
-    for func_type, expected_sql in function_types_and_expected:
-        # Build a FunctionNode for TOTAL_DAYS with the two inputs
-        fn_node = FunctionNode(
-            expr=start_expr,
-            inputs=[start_node, end_node],
-            function_type=func_type,
-        )
-
-        visitor = SQLExpressionVisitor(dialect="tsql")
-        visitor.visit(fn_node)
-        sqlglot_expr = visitor.process_results()
-
-        # The generated SQL should be DATEDIFF(DAY, StartDate, EndDate)
-        assert isinstance(sqlglot_expr, exp.DateDiff)
-        assert sqlglot_expr.sql(dialect="tsql") == expected_sql
-
-    expr = (pl.col("end_dt") - pl.col("start_dt")).dt.total_days()
-
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == TemporalFunctionType.TOTAL_DAYS
-
-
-def test_visitor_dialect_normalization():
-    """SQLExpressionVisitor normalizes dialect so MSSQL class, 'tsql' string, and None all behave identically.
-
-    This prevents a subtle bug where ``self.dialect == "tsql"`` silently failed
-    when the caller passed the ``MSSQL`` class (returned by ``_get_sqlglot_dialect``
-    for SQL Server connections), causing DATEDIFF and other TSQL-specific
-    conversions to be skipped.
-    """
-    start_node = get_parsed_expr(pl.col("StartDate"))
-    end_node = get_parsed_expr(pl.col("EndDate"))
-    fn_node = FunctionNode(
-        expr=pl.col("StartDate"),
-        inputs=[start_node, end_node],
-        function_type=TemporalFunctionType.TOTAL_DAYS,
+    register_io_source(source, schema={"ts": pl.Datetime("ns", "UTC")}).filter(ts == datetime(2024, 1, 15, 0, 0, 0, 123456, tzinfo=UTC)).collect()
+    assert_text(
+        convert_predicate_to_sql(captured["predicate"], "clickhouse").sql(dialect="clickhouse"),
+        ["toDateTime64('2024-01-15 00:00:00.123456000', 9, 'UTC')", "toDateTime64('2024-01-15 00:00:00.123456999', 9, 'UTC')"],
     )
 
-    for dialect in ("tsql", MSSQL, None):
-        visitor = SQLExpressionVisitor(dialect=dialect)
-        visitor.visit(fn_node)
-        result = visitor.process_results()
-        assert isinstance(result, exp.DateDiff), f"DATEDIFF conversion should work with dialect={dialect!r}, got {type(result)}"
-        assert result.sql(dialect="tsql") == "DATEDIFF(DAY, StartDate, EndDate)"
+
+# MSSQL rendering: bracket quoting, qualified stars, and case kept for anonymous nodes (table-valued functions).
+MSSQL_RENDER = [
+    Case("mssql_bracket_quoting-plain", exp.Column(this="CenterID"), X(equals="[CenterID]")),
+    Case("mssql_bracket_quoting-reserved", exp.Column(this="GROUP"), X(equals="[GROUP]")),
+    Case("mssql_bracket_quoting-bracket", exp.Column(this="Some ] Column"), X(equals="[Some ]] Column]")),
+    Case("mssql_bracket_quoting-qualified", exp.Column(this="Amount", table="Sales"), X(equals="[Sales].[Amount]")),
+    Case(
+        "qualified_star_in_join",
+        "SELECT a.*, b.SomeCol FROM ServerA.dbo.vTableOne a LEFT JOIN ServerB.dbo.vTableTwo b"
+        " ON a.JoinKey = b.JoinKey AND a.AsOfDate BETWEEN b.StartDate AND b.EndDate",
+        X("[a].*", omits="[*]"),
+    ),
+    Case("qualified_star_without_join", "SELECT t.* FROM SomeDB.dbo.SomeTable t", X("[t].*", omits="[*]")),
+    Case("unqualified_star", "SELECT * FROM SomeTable", X("SELECT *", omits="[*]")),
+    Case(
+        "tvf_with_literal_args_preserves_case",
+        "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')",
+        X("f_GetFuturesMaxVolAsOfDate", omits="F_GETFUTURESMAXVOLASOFDATE"),
+    ),
+    Case("table_with_nolock_hint_preserves_case", "SELECT * FROM MyTable (nolock)", X("MyTable", omits="MYTABLE")),
+    Case("tvf_with_multiple_args_preserves_case", "SELECT * FROM [db].[dbo].fn_GetData('2026-01-01', 42)", X("fn_GetData", omits="FN_GETDATA")),
+    Case(
+        "tvf_roundtrip_preserves_full_query",
+        "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')",
+        X("[FuturesData]", "[dbo]", "f_GetFuturesMaxVolAsOfDate('2026-02-06')"),
+    ),
+]
 
 
-def test_convert_predicate_to_sql_with_mssql_class():
-    """convert_predicate_to_sql works when passed the MSSQL class (not just 'tsql' string)."""
-    pred = pl.col("x") > 5
-    # Should not raise and should produce valid SQL for both forms
-    result_str = convert_predicate_to_sql(pred, dialect="tsql")
-    result_cls = convert_predicate_to_sql(pred, dialect=MSSQL)
-    result_none = convert_predicate_to_sql(pred, dialect=None)
-    assert result_str is not None
-    assert result_cls is not None
-    assert result_none is not None
-    # All three should produce identical SQL
-    assert result_str.sql() == result_cls.sql() == result_none.sql()
+@pytest.mark.parametrize(("source", "expect"), params(MSSQL_RENDER, "pred", "expect"))
+def test_mssql_render(source, expect):
+    node = parse_one(source, dialect=MSSQL) if isinstance(source, str) else source
+    assert_text(node.sql(dialect=MSSQL), **expect)
+
+
+# _prepare_inner_for_subquery: MSSQL rejects ORDER BY in a derived table without TOP/OFFSET (error 1033), so it and
+# OPTION hints move to the outer query. Expect: (inner keeps ORDER BY, hoisted ORDER BY text or None, hoisted OPTIONs).
+HOISTING = [
+    Case("mssql_order_by_without_top_is_moved_to_outer", "SELECT region, amount FROM Sales ORDER BY amount DESC", (False, X("amount"), [])),
+    Case("mssql_order_by_with_limit_stays_in_inner", "SELECT TOP 2 region, amount FROM Sales ORDER BY amount DESC", (True, None, [])),
+    # the table alias only exists inside the subquery
+    Case(
+        "mssql_order_by_hoisted_with_table_qualifiers_stripped",
+        "SELECT cb.region, cb.amount FROM Sales cb ORDER BY cb.amount DESC",
+        (False, X("amount", omits="cb."), []),
+    ),
+    Case(
+        "mssql_order_by_with_offset_stays_in_inner",
+        "SELECT region, amount FROM Sales ORDER BY amount OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
+        (True, None, []),
+    ),
+    Case("mssql_option_hints_hoisted", "SELECT region FROM Sales OPTION (HASH JOIN)", (False, None, ["HASH JOIN"])),
+    Case("non_mssql_no_hoisting", "SELECT region, amount FROM Sales ORDER BY amount DESC", (True, None, []), {"dialect": "duckdb"}),
+]
 
 
 @pytest.mark.parametrize(
-    "dialect, expected",
-    [
-        ("clickhouse", "CAST(ts AS Nullable(Date32)) = '2026-01-15'"),
-        ("tsql", "CAST(ts AS DATE) = '2026-01-15'"),
-        ("postgres", "CAST(ts AS DATE) = '2026-01-15'"),
-        ("duckdb", "CAST(ts AS DATE) = '2026-01-15'"),
-        # SQLite has no DATE type (a cast coerces to a numeric); Oracle DATE keeps the time
-        # component. Both need dedicated calendar-date functions, not a plain cast.
-        ("sqlite", "DATE(ts) = '2026-01-15'"),
-        ("oracle", "TRUNC(ts) = TO_DATE('2026-01-15', 'YYYY-MM-DD')"),
-    ],
+    ("query", "dialect", "expect"), params([Case(c.id, c.pred, c.expect, {"dialect": MSSQL, **c.kw}) for c in HOISTING], "pred", "dialect", "expect")
 )
-def test_dt_date_predicate_is_pushed_down(dialect, expected):
-    """``.dt.date()`` pushes down as a calendar-date expression instead of being dropped (issue #51).
-
-    The expression is dialect-specific: ``Date32`` for ClickHouse, ``DATE()`` for SQLite,
-    ``TRUNC`` for Oracle, and a ``DATE`` cast elsewhere.
-    """
-    from datetime import date
-
-    pred = (pl.col("ts").dt.date() == date(2026, 1, 15)) & pl.col("symbol").is_in(["A", "B"])
-    result = convert_predicate_to_sql(pred, dialect)
-    assert result is not None
-    sql = result.sql(dialect=dialect)
-    assert expected in sql
-    assert "symbol IN ('A', 'B')" in sql
+def test_prepare_inner_for_subquery(query, dialect, expect):
+    inner_order, hoisted, options = expect
+    inner, order, hoisted_options = _prepare_inner_for_subquery(parse_one(query, dialect=MSSQL), dialect=dialect)
+    assert (inner.args.get("order") is not None) == inner_order
+    if hoisted is None:
+        assert order is None
+    else:
+        assert_text(order.sql(), ignore_case=True, **hoisted)
+    assert len(hoisted_options) == len(options)
+    for got, want in zip(hoisted_options, options):
+        assert_text(got.sql(dialect=MSSQL), want, ignore_case=True)
+    assert not (options and list(inner.find_all(exp.QueryOption)))
 
 
-def test_dt_date_pushdown_sqlite_selects_non_midnight_row():
-    """SQLite pushdown floors to the calendar date, keeping non-midnight rows (PR #53 review).
-
-    ``CAST(... AS DATE)`` coerces to an integer in SQLite and would drop the row, so the
-    pushdown must use ``DATE()``.
-    """
-    import sqlite3
-    from datetime import date
-
-    con = sqlite3.connect(":memory:")
-    con.execute("CREATE TABLE t (ts TEXT)")
-    con.execute("INSERT INTO t VALUES ('2024-05-06 12:34:56'), ('2024-05-07 00:00:00')")
-
-    where = convert_predicate_to_sql(pl.col("ts").dt.date() == date(2024, 5, 6), "sqlite").sql(dialect="sqlite")
-    rows = con.execute(f"SELECT ts FROM t WHERE {where}").fetchall()
-    assert rows == [("2024-05-06 12:34:56",)]
-
-
-def test_dt_year_pushdown_sqlite_runs():
-    import sqlite3
-
-    con = sqlite3.connect(":memory:")
-    con.execute("CREATE TABLE t (ts TEXT, x INTEGER)")
-    con.execute("INSERT INTO t VALUES ('2024-05-06 12:34:56', 1), ('2023-05-07 00:00:00', 2)")
-
-    where = convert_predicate_to_sql((pl.col("ts").dt.year() == 2024) & (pl.col("x") > 0), "sqlite").sql(dialect="sqlite")
-    rows = con.execute(f"SELECT x FROM t WHERE {where}").fetchall()
-    assert (1,) in rows
-
-
-def test_dt_date_pushdown_oracle_uses_trunc():
-    """Oracle pushdown uses TRUNC, not CAST(... AS DATE) (PR #53 review).
-
-    Oracle ``DATE`` retains the time component, so casting a non-midnight timestamp and
-    comparing it to a midnight date literal would drop the row; ``TRUNC`` floors to the day.
-    """
-    from datetime import date
-
-    sql = convert_predicate_to_sql(pl.col("ts").dt.date() == date(2024, 5, 6), "oracle").sql(dialect="oracle")
-    assert "TRUNC(ts) = TO_DATE('2024-05-06', 'YYYY-MM-DD')" in sql
-    assert "CAST(ts AS DATE)" not in sql
-
-
-def test_date_is_in_pushdown_oracle_uses_typed_literals():
-    """Oracle date lists use explicit conversions instead of NLS-dependent strings."""
-    from datetime import date
-
-    sql = convert_predicate_to_sql(pl.col("day").is_in([date(2024, 5, 6), date(2024, 5, 7)]), "oracle").sql(dialect="oracle")
-    assert "day IN (TO_DATE('2024-05-06', 'YYYY-MM-DD'), TO_DATE('2024-05-07', 'YYYY-MM-DD'))" in sql
-
-
-def test_oversized_in_predicate_is_not_pushed_down():
-    """A large ``is_in`` list skips pushdown (would exceed backend expression limits).
-
-    Small ``IN`` lists are still translated; oversized ones drop out of the SQL and are
-    left to the IO source's post-fetch predicate re-application. When an oversized ``IN``
-    is ANDed with a selective predicate, the selective predicate is still pushed.
-    """
-    from polars_io_tools.io_sources.sql_utils import DEFAULT_MAX_IN_PREDICATE_SIZE
-
-    small_values = [f"ID{i}" for i in range(5)]
-    big_values = [f"ID{i}" for i in range(DEFAULT_MAX_IN_PREDICATE_SIZE + 1)]
-
-    # Small IN pushes down as usual.
-    small = convert_predicate_to_sql(pl.col("id").is_in(small_values), "tsql")
-    assert small is not None and "IN" in small.sql("tsql")
-
-    # Oversized IN is dropped entirely (nothing safe to push).
-    assert convert_predicate_to_sql(pl.col("id").is_in(big_values), "tsql") is None
-
-    # Oversized IN ANDed with a selective equality keeps the equality pushdown.
-    combo = convert_predicate_to_sql(pl.col("id").is_in(big_values) & (pl.col("year") == 2025), "tsql")
-    assert combo is not None
-    combo_sql = combo.sql("tsql")
-    assert "year" in combo_sql
-    assert "IN" not in combo_sql
-
-    # An explicit override raises the ceiling so the same list is pushed.
-    raised = convert_predicate_to_sql(pl.col("id").is_in(big_values), "tsql", max_in_predicate_size=len(big_values))
-    assert raised is not None and "IN" in raised.sql("tsql")
-
-
-def _visit_predicate(predicate: pl.Expr, dialect: str) -> exp.Expression | None:
-    """Translate without the exception guard of ``convert_predicate_to_sql`` so failures surface."""
-    visitor = SQLExpressionVisitor(dialect)
-    visitor.visit(get_parsed_expr(predicate))
-    return visitor.process_results()
-
-
+# Predicate -> the WHERE clause runs and returns every row ``df.filter`` keeps (Polars re-filters, so extra rows are fine).
 _PUSHDOWN_DF = pl.DataFrame(
     {
         "id": range(7),
@@ -1173,1717 +499,954 @@ _PUSHDOWN_DF = pl.DataFrame(
         ],
     }
 )
-_UNTRANSLATABLE = pl.col("s").str.len_chars() == 3
+_UNTRANSLATABLE = s.str.len_chars() == 3
+b = pl.col("b")
+
+KEEPS = [
+    Case(f"pushed_predicate_keeps_all_matching_rows-{p}", p, kw={"data": _PUSHDOWN_DF, "dialect": "duckdb"})
+    for p in [
+        ~pl.when(a > 2).then(b > 100).otherwise(b > 0),
+        a.is_between(2, 4).is_null(),
+        a.is_between(2, 4) == False,
+        ((a > 1) & _UNTRANSLATABLE) == False,
+        ((a > 1) & _UNTRANSLATABLE).is_null(),
+        ~((a > 1) & _UNTRANSLATABLE),
+        pl.when(a > 2).then(b > 100).otherwise(_UNTRANSLATABLE),
+        pl.when(a > 2).then(1).otherwise(0) == 0,
+        a.ne_missing(2),
+        ~a.eq_missing(2),
+        a.is_in([1, None], nulls_equal=True),
+        ~a.is_in([1, None]),
+        a % 2 == 1,
+        f.cast(pl.Int64) == 2,
+        (a & 3) == 0,
+        s.str.strip_chars() == "abc",
+        s.str.strip_chars("x") == "ab",
+        pl.concat_str([s, s], separator="-") == "abc-abc",
+        ~s.str.ends_with("_b"),
+        ts.dt.year() == 2024,
+        ts.cast(pl.Datetime("ms")) == datetime(2024, 1, 1),
+        f < float("inf"),
+        f.is_in([float("nan")]),
+        ts < ts + timedelta(days=1),
+    ]
+] + [
+    # where Polars and SQL semantics differ
+    Case(f"pushed_predicate_keeps_polars_semantics-{p}", p, kw={"data": pl.DataFrame(data), "dialect": d})
+    for data, p, d in [
+        ({"x": [2]}, x.cast(pl.Boolean) == True, "duckdb"),
+        ({"x": [1]}, (~x).cast(pl.Boolean), "duckdb"),
+        ({"x": [1]}, (~x) == -2, "duckdb"),
+        ({"x": [2**63 - 1]}, (x + 1) < 0, "duckdb"),
+        ({"x": [b"ab"]}, x == b"ab", "duckdb"),
+        ({"x": [b"ab"]}, x.is_in([b"ab"]), "duckdb"),
+        ({"x": ["straße"]}, x.str.to_uppercase() == "STRASSE", "duckdb"),
+        ({"x": ["A"]}, ~x.str.starts_with("a"), "sqlite"),
+        ({"x": ["A"]}, ~x.str.contains("a", literal=True), "sqlite"),
+        ({"x": ["\u0663"]}, x.str.contains(r"^\d$"), "duckdb"),
+        ({"x": ["a"]}, x.str.contains(r"\u{61}"), "duckdb"),
+        ({"x": ["bad"]}, x.cast(pl.Float64, strict=False).is_null(), "duckdb"),
+        ({"x": [0]}, x.cast(pl.Datetime("us")).dt.year() == 1970, "duckdb"),
+        ({"x": pl.Series([datetime(2024, 1, 1, 23)]).dt.replace_time_zone("UTC")}, x.cast(pl.Datetime("us")).dt.hour() == 23, "duckdb"),
+        ({"x": [1], "ys": [[1]]}, x.is_in(pl.col("ys")), "duckdb"),
+        ({"x": ["a\x00b"]}, x == "a\x00b", "duckdb"),
+        ({"x": ["a", "b"]}, x == pl.lit(pl.Series(["a", "b"])), "duckdb"),
+        ({"x": [1.25]}, x.cast(pl.Decimal(4, 1)) == Decimal("1.2"), "duckdb"),
+        ({"x": pl.Series([0.1], dtype=pl.Float32)}, ~x.is_in([0.1, 0.2]), "duckdb"),
+    ]
+]
 
 
-@pytest.mark.parametrize(
-    "predicate",
-    [
-        ~pl.when(pl.col("a") > 2).then(pl.col("b") > 100).otherwise(pl.col("b") > 0),
-        pl.col("a").is_between(2, 4).is_null(),
-        pl.col("a").is_between(2, 4) == False,
-        ((pl.col("a") > 1) & _UNTRANSLATABLE) == False,
-        ((pl.col("a") > 1) & _UNTRANSLATABLE).is_null(),
-        ~((pl.col("a") > 1) & _UNTRANSLATABLE),
-        pl.when(pl.col("a") > 2).then(pl.col("b") > 100).otherwise(_UNTRANSLATABLE),
-        pl.when(pl.col("a") > 2).then(1).otherwise(0) == 0,
-        pl.col("a").ne_missing(2),
-        ~pl.col("a").eq_missing(2),
-        pl.col("a").is_in([1, None], nulls_equal=True),
-        ~pl.col("a").is_in([1, None]),
-        pl.col("a") % 2 == 1,
-        pl.col("f").cast(pl.Int64) == 2,
-        (pl.col("a") & 3) == 0,
-        pl.col("s").str.strip_chars() == "abc",
-        pl.col("s").str.strip_chars("x") == "ab",
-        pl.concat_str([pl.col("s"), pl.col("s")], separator="-") == "abc-abc",
-        ~pl.col("s").str.ends_with("_b"),
-        pl.col("ts").dt.year() == 2024,
-        pl.col("ts").cast(pl.Datetime("ms")) == datetime(2024, 1, 1),
-        pl.col("f") < float("inf"),
-        pl.col("f").is_in([float("nan")]),
-        pl.col("ts") < pl.col("ts") + timedelta(days=1),
-    ],
-    ids=str,
-)
-def test_pushed_predicate_keeps_all_matching_rows(duckdb_connection, predicate):
-    """The SQL WHERE may return extra rows (Polars re-filters) but must run and must not drop a matching row."""
-    expected = _PUSHDOWN_DF.filter(predicate)
-    where = _visit_predicate(predicate, "duckdb")
-    if where is None:
-        return
-    duckdb_connection.register("pushdown_tbl", _PUSHDOWN_DF.to_arrow())
-    fetched = pl.from_arrow(duckdb_connection.sql(f"SELECT * FROM pushdown_tbl WHERE {where.sql('duckdb')}").to_arrow_table())
-    assert_frame_equal(fetched.filter(predicate).sort("id"), expected)
-
-
-@pytest.mark.parametrize(
-    ("predicate", "dialect"),
-    [
-        (pl.col("ts").dt.second() == 0, "postgres"),
-        (pl.col("a").cast(pl.UInt8) > 3, "postgres"),
-        (pl.col("a").cast(pl.Int128) > 3, "duckdb"),
-        (pl.col("f").cast(pl.String) == "1.0", "duckdb"),
-        (pl.col("s").str.starts_with("a\\"), "postgres"),
-        (pl.col("s").str.contains("a_b", literal=True), "tsql"),
-        (pl.col("a") // 2 == 1, "duckdb"),
-    ],
-    ids=str,
-)
-def test_predicate_without_exact_sql_translation_is_not_pushed_down(predicate, dialect):
-    assert _visit_predicate(predicate, dialect) is None
-
-
-@pytest.mark.parametrize(
-    ("data", "predicate", "dialect"),
-    [
-        ({"x": [2]}, pl.col("x").cast(pl.Boolean) == True, "duckdb"),
-        ({"x": [1]}, (~pl.col("x")).cast(pl.Boolean), "duckdb"),
-        ({"x": [1]}, (~pl.col("x")) == -2, "duckdb"),
-        ({"x": [2**63 - 1]}, (pl.col("x") + 1) < 0, "duckdb"),
-        ({"x": [b"ab"]}, pl.col("x") == b"ab", "duckdb"),
-        ({"x": [b"ab"]}, pl.col("x").is_in([b"ab"]), "duckdb"),
-        ({"x": ["straße"]}, pl.col("x").str.to_uppercase() == "STRASSE", "duckdb"),
-        ({"x": ["A"]}, ~pl.col("x").str.starts_with("a"), "sqlite"),
-        ({"x": ["A"]}, ~pl.col("x").str.contains("a", literal=True), "sqlite"),
-        ({"x": ["\u0663"]}, pl.col("x").str.contains(r"^\d$"), "duckdb"),
-        ({"x": ["a"]}, pl.col("x").str.contains(r"\u{61}"), "duckdb"),
-        ({"x": ["bad"]}, pl.col("x").cast(pl.Float64, strict=False).is_null(), "duckdb"),
-        ({"x": [0]}, pl.col("x").cast(pl.Datetime("us")).dt.year() == 1970, "duckdb"),
-        ({"x": pl.Series([datetime(2024, 1, 1, 23)]).dt.replace_time_zone("UTC")}, pl.col("x").cast(pl.Datetime("us")).dt.hour() == 23, "duckdb"),
-        ({"x": [1], "ys": [[1]]}, pl.col("x").is_in(pl.col("ys")), "duckdb"),
-        ({"x": ["a\x00b"]}, pl.col("x") == "a\x00b", "duckdb"),
-        ({"x": ["a", "b"]}, pl.col("x") == pl.lit(pl.Series(["a", "b"])), "duckdb"),
-        ({"x": [1.25]}, pl.col("x").cast(pl.Decimal(4, 1)) == Decimal("1.2"), "duckdb"),
-        ({"x": pl.Series([0.1], dtype=pl.Float32)}, ~pl.col("x").is_in([0.1, 0.2]), "duckdb"),
-    ],
-    ids=str,
-)
-def test_pushed_predicate_keeps_polars_semantics(data, predicate, dialect):
-    """The WHERE clause must run and return every row ``df.filter`` keeps, where Polars and SQL semantics differ."""
-    df = pl.DataFrame(data)
-    where = _visit_predicate(predicate, dialect)
-    if where is None:
-        return
-    sql = f"SELECT * FROM t WHERE {where.sql(dialect)}"
+def _where_rows(df: pl.DataFrame, where: str, dialect: str) -> set[int]:
+    """Row numbers of ``df`` that ``SELECT ... WHERE where`` returns."""
+    sql = f"SELECT __row FROM t WHERE {where}"
     if dialect == "sqlite":
         con = sqlite3.connect(":memory:")
-        con.execute("CREATE TABLE t (x)")
-        con.executemany("INSERT INTO t VALUES (?)", df.rows())
-        fetched = len(con.execute(sql).fetchall())
-    else:
-        con = duckdb.connect()
-        con.execute("SET TimeZone = 'America/New_York'")
-        con.register("t", df.to_arrow())
-        fetched = len(con.sql(sql).fetchall())
-    assert fetched >= df.filter(predicate).height
-
-
-def test_nanosecond_numpy_literal_in_is_in_is_not_pushed_down():
-    """Polars panics while exposing this literal; the panic must not escape predicate conversion."""
-    assert convert_predicate_to_sql(pl.col("ts").is_in([np.datetime64("2024-01-01T00:00:00.000000001", "ns")]), "duckdb") is None
-
-
-@pytest.mark.parametrize("dialect", ["tsql", "snowflake", "duckdb"])
-def test_dt_year_renders_in_dialect(dialect):
-    assert "2024" in _visit_predicate(pl.col("ts").dt.year() == 2024, dialect).sql(dialect)
-
-
-def test_nanosecond_equality_is_not_truncated(duckdb_connection):
-    """Equality on a nanosecond column becomes an ``is_between`` whose upper bound has sub-microsecond digits."""
-    duckdb_connection.execute(
-        "CREATE TABLE ns_tbl AS SELECT * FROM (VALUES (1, TIMESTAMP_NS '2024-01-01 00:00:00'), (2, TIMESTAMP_NS '2024-01-01 00:00:00.000000500')) t(id, ts)"
-    )
-    predicate = pl.col("ts") == datetime(2024, 1, 1)
-    expected = cpl.scan_db("SELECT id, ts FROM ns_tbl", "fake_connection_string").collect().filter(predicate)
-    actual = cpl.scan_db("SELECT id, ts FROM ns_tbl", "fake_connection_string").filter(predicate).collect()
-    assert expected.height == 2
-    assert_frame_equal(actual.sort("id"), expected.sort("id"))
-
-
-def test_rename_with_filter_integration():
-    """Test that aliases created via select work correctly with filters - integration-like test using mock data."""
-
-    base_query = """
-    SELECT
-        CenterID,
-        EventYear
-    FROM CC_Bond
-    """
-
-    # Test filtering on aliased columns created via select
-    lf = cpl.scan_db(base_query, "fake_connection_string")
-    lf = lf.select(pl.col("CenterID").alias("center_id"), pl.col("EventYear").alias("event_year"))
-    lf = lf.filter(pl.col("event_year").is_not_null())
-    result = lf.collect()
-
-    # Should not throw an error and should return results
-    assert result.shape[0] >= 0  # At least no error
-    assert result.columns == ["center_id", "event_year"]
-
-    # Verify the filtering actually worked by comparing with expected data
-    df = get_cc_bond_df()
-    expected = df.select([pl.col("CenterID").alias("center_id"), pl.col("EventYear").alias("event_year")]).filter(pl.col("event_year").is_not_null())
-
-    assert_frame_equal(result.sort("center_id"), expected.sort("center_id"))
-
-
-def test_select_alias_predicate_pushdown_simple():
-    """Predicates referencing simple SELECT aliases are rewritten to original columns in WHERE."""
-    base_query = """
-    SELECT
-        EventYear AS event_year,
-        CenterID AS center_id
-    FROM CC_Bond
-    """
-
-    # Filter uses alias; pushdown should rewrite to original columns
-    lf = cpl.scan_db(base_query, "fake_connection_string")
-    res = lf.filter(pl.col("event_year") > 2016).select(["event_year", "center_id"]).collect()
-
-    df = get_cc_bond_df()
-    expected = df.select([pl.col("EventYear").alias("event_year"), pl.col("CenterID").alias("center_id")]).filter(pl.col("event_year") > 2016)
-    assert_frame_equal(res.sort(["event_year", "center_id"]), expected.sort(["event_year", "center_id"]))
-
-
-def test_select_alias_cast_datetime_to_date_types():
-    """Casting Datetime to Date via SELECT alias yields Date in schema and result."""
-    base_query = """
-    SELECT
-        CAST(EventDate AS DATE) AS BusDate,
-        CenterID
-    FROM CC_Bond
-    """
-
-    lf = cpl.scan_db(base_query, "fake_connection_string")
-
-    # Validate collect_schema types
-    schema = lf.collect_schema()
-    assert schema.get("BusDate") == pl.Date
-    assert schema.get("CenterID") in (pl.Int64, pl.Int32)
-
-    # Validate actual collected types
-    res = lf.collect()
-    assert res.schema.get("BusDate") == pl.Date
-    assert res.schema.get("CenterID") in (pl.Int64, pl.Int32)
-
-    # Validate values match expected cast
-    df = get_cc_bond_df()
-    expected = df.select([pl.col("EventDate").cast(pl.Date).alias("BusDate"), pl.col("CenterID")])
-    assert_frame_equal(res.sort(["BusDate", "CenterID"]), expected.sort(["BusDate", "CenterID"]))
-
-
-def test_select_original_and_cast_same_column():
-    """Select the same column twice: original Datetime and CAST to Date with alias."""
-    base_query = """
-    SELECT
-        EventDate,
-        CAST(EventDate AS DATE) AS BusDate,
-        CenterID
-    FROM CC_Bond
-    """
-
-    lf = cpl.scan_db(base_query, "fake_connection_string")
-
-    # Validate collect_schema types
-    schema = lf.collect_schema()
-    assert schema.get("EventDate") == pl.Datetime
-    assert schema.get("BusDate") == pl.Date
-    assert schema.get("CenterID") in (pl.Int64, pl.Int32)
-
-    # Validate actual collected types
-    res = lf.collect()
-    assert res.schema.get("EventDate") == pl.Datetime
-    assert res.schema.get("BusDate") == pl.Date
-    assert res.schema.get("CenterID") in (pl.Int64, pl.Int32)
-
-    # Validate values match expected selection
-    df = get_cc_bond_df()
-    expected = df.select(
-        [
-            pl.col("EventDate"),
-            pl.col("EventDate").cast(pl.Date).alias("BusDate"),
-            pl.col("CenterID"),
-        ]
-    )
-    assert_frame_equal(res.sort(["CenterID", "EventDate"]), expected.sort(["CenterID", "EventDate"]))
-
-
-def test_nested_select_star_with_cast_alias(caplog):
-    """Support subquery with CAST alias and star expansion."""
-    query = """
-    SELECT * FROM (
-        SELECT CAST(EventDate AS DATE) AS EventDateAsDate, * FROM CC_Bond
-    ) AS t
-    """
-
-    caplog.set_level(logging.DEBUG)
-    lf = cpl.scan_db(query, "fake_connection_string")
-
-    # Schema checks
-    schema = lf.collect_schema()
-    assert schema.get("EventDateAsDate") == pl.Date
-    assert schema.get("EventDate") == pl.Datetime
-
-    # Data checks
-    res = lf.collect()
-    df = get_cc_bond_df()
-    # Expected columns: alias first, then original table columns in their order
-    orig_cols = [
-        "CenterID",
-        "CentreCode",
-        "ISOCountryCode",
-        "Centre",
-        "EventYear",
-        "EventDate",
-        "EventDayOfWeek",
-        "EventName",
-        "FileType",
-    ]
-    expected = df.select([pl.col("EventDate").cast(pl.Date).alias("EventDateAsDate"), *orig_cols])
-    assert_frame_equal(res, expected)
-
-    # Verify logged SQL matches normalized expected SQL via sqlglot
-    expected_sql = parse_one(query, dialect="duckdb").sql(dialect="duckdb")
-    assert any(("Executing SQL with pushdown: " + expected_sql) in record.message for record in caplog.records)
-
-
-# These tests verify that scan_db LazyFrames can be serialized with cloudpickle,
-# which is required for distributed computing (e.g., Ray). Tests are located here
-# rather than in test_pickle.py because they require the database mocking
-# infrastructure defined in this file.
-
-
-class TestScanDbPickle:
-    """Tests for scan_db cloudpickle serialization support."""
-
-    def test_scan_db_pickle_basic(self):
-        """scan_db LazyFrames can be pickled and unpickled."""
-        import cloudpickle
-
-        query = "SELECT * FROM CC_Bond"
-        lf = cpl.scan_db(query, "fake_connection_string")
-
-        # Pickle roundtrip
-        pickled = cloudpickle.dumps(lf)
-        lf_unpickled = cloudpickle.loads(pickled)
-
-        # Verify schema is preserved
-        assert lf.collect_schema() == lf_unpickled.collect_schema()
-
-        # Verify data is correct after unpickling
-        result = lf_unpickled.collect()
-        expected = get_cc_bond_df()
-        assert_frame_equal(result, expected)
-
-    def test_scan_db_pickle_with_filter(self):
-        """scan_db with filters can be pickled."""
-        import cloudpickle
-
-        query = "SELECT * FROM CC_Bond"
-        lf = cpl.scan_db(query, "fake_connection_string").filter(pl.col("EventYear") > 2020)
-
-        pickled = cloudpickle.dumps(lf)
-        lf_unpickled = cloudpickle.loads(pickled)
-
-        result = lf_unpickled.collect()
-        expected = get_cc_bond_df().filter(pl.col("EventYear") > 2020)
-        assert_frame_equal(result, expected)
-
-    def test_scan_db_pickle_with_select(self):
-        """scan_db with column selection can be pickled."""
-        import cloudpickle
-
-        query = "SELECT CenterID, Centre, EventYear FROM CC_Bond"
-        lf = cpl.scan_db(query, "fake_connection_string")
-
-        pickled = cloudpickle.dumps(lf)
-        lf_unpickled = cloudpickle.loads(pickled)
-
-        result = lf_unpickled.collect()
-        expected = get_cc_bond_df().select(["CenterID", "Centre", "EventYear"])
-        assert_frame_equal(result, expected)
-
-
-class TestHeadPushdownBehavior:
-    """
-    Tests verifying head() behavior with filters in scan_db.
-
-    For ``filter(p).head(n)`` Polars passes the predicate without ``n_rows`` and applies head() itself. For
-    ``head(n).filter(p)`` it passes both, and the first ``n`` rows must be read before filtering.
-    """
-
-    def test_polars_does_not_push_n_rows_with_predicate(self, duckdb_connection):
-        """
-        Verify that Polars does NOT push n_rows when a predicate is present.
-
-        This is the key safety behavior that prevents the head pushdown bug.
-        If this test fails, it means Polars changed behavior and the bug could manifest.
-        """
-        import arrow_odbc
-
-        # Capture executed SQL queries
-        executed_queries = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(query, *args, **kwargs):
-            executed_queries.append(query)
-            return original_func(query, *args, **kwargs)
-
-        arrow_odbc.read_arrow_batches_from_odbc = capturing_func
-
-        try:
-            query = "SELECT * FROM EmployeeTbl"
-            lf = cpl.scan_db(query, "fake_connection_string")
-
-            # Apply a SQL-convertible filter AND head()
-            result = lf.filter(pl.col("score") > 80).head(5).collect()
-
-            # Find the actual data query (not schema query)
-            data_queries = [q for q in executed_queries if "LIMIT 0" not in q]
-            assert len(data_queries) == 1, f"Expected 1 data query, got {len(data_queries)}"
-
-            sql = data_queries[0]
-            print(f"\nExecuted SQL: {sql}")
-
-            # The SQL should have WHERE but NOT have LIMIT
-            # Because Polars doesn't push n_rows when there's a predicate
-            assert "WHERE" in sql.upper(), "SQL should have WHERE clause"
-
-            # Verify LIMIT is NOT in the query (Polars applies head() locally)
-            has_limit = "LIMIT" in sql.upper() and "LIMIT 0" not in sql.upper()
-            assert not has_limit, f"SAFETY CHECK: Polars should NOT push LIMIT when predicate is present. SQL was: {sql}"
-
-            # Verify we got correct results
-            assert result.height == 5, f"Expected 5 rows, got {result.height}"
-            assert all(result["score"] > 80), "All rows should match filter"
-
-        finally:
-            arrow_odbc.read_arrow_batches_from_odbc = original_func
-
-    def test_polars_pushes_n_rows_without_predicate(self, duckdb_connection):
-        """
-        Verify that Polars DOES push n_rows when there's no predicate.
-        """
-        import arrow_odbc
-
-        executed_queries = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(query, *args, **kwargs):
-            executed_queries.append(query)
-            return original_func(query, *args, **kwargs)
-
-        arrow_odbc.read_arrow_batches_from_odbc = capturing_func
-
-        try:
-            query = "SELECT * FROM EmployeeTbl"
-            lf = cpl.scan_db(query, "fake_connection_string")
-
-            # Just head(), no filter
-            result = lf.head(5).collect()
-
-            # Find the actual data query
-            data_queries = [q for q in executed_queries if "LIMIT 0" not in q]
-            assert len(data_queries) == 1
-
-            sql = data_queries[0]
-            print(f"\nExecuted SQL: {sql}")
-
-            # Without predicate, Polars SHOULD push LIMIT
-            assert "LIMIT" in sql.upper(), f"Expected LIMIT in SQL, got: {sql}"
-            assert result.height == 5
-
-        finally:
-            arrow_odbc.read_arrow_batches_from_odbc = original_func
-
-    def test_head_with_non_sql_filter_returns_correct_count(self, duckdb_connection):
-        """
-        Verify that head() with a non-SQL-convertible filter returns correct results.
-
-        Since Polars doesn't push n_rows when there's a predicate, head() is applied
-        locally after filtering, giving correct results.
-        """
-        emp_df = get_employee_df()
-        total_matching = emp_df.filter(pl.col("score") > 80).height
-
-        # Non-SQL-convertible filter (Python UDF)
-        non_sql_filter = pl.col("score").map_elements(lambda x: x > 80, return_dtype=pl.Boolean)
-
-        # Verify filter can't be converted to SQL
-        from polars_io_tools.io_sources.sql_utils import convert_predicate_to_sql
-
-        assert convert_predicate_to_sql(non_sql_filter) is None
-
-        query = "SELECT * FROM EmployeeTbl"
-        lf = cpl.scan_db(query, "fake_connection_string")
-        result = lf.filter(non_sql_filter).head(10).collect()
-
-        # We should get min(10, total_matching) rows
-        expected = min(10, total_matching)
-        assert result.height == expected, f"Expected {expected} rows, got {result.height}"
-        assert all(result["score"] > 80)
-
-    @pytest.mark.parametrize("sql_convertible", [True, False])
-    def test_head_then_filter(self, duckdb_connection, sql_convertible):
-        predicate = pl.col("score") > 80
-        if not sql_convertible:
-            predicate = pl.col("score").map_elements(lambda x: x > 80, return_dtype=pl.Boolean)
-
-        lf = cpl.scan_db("SELECT * FROM EmployeeTbl", "fake_connection_string")
-        result = lf.head(10).filter(predicate).collect()
-
-        assert_frame_equal(result, get_employee_df().head(10).filter(pl.col("score") > 80), check_dtypes=False)
-
-    def test_workaround_collect_then_head(self):
-        """
-        WORKAROUND: Use .collect().head(N) instead of .head(N).collect()
-
-        This pattern guarantees correct results regardless of Polars version
-        or optimizer behavior.
-        """
-        emp_df = get_employee_df()
-
-        non_sql_filter = pl.col("score").map_elements(lambda x: x > 80, return_dtype=pl.Boolean)
-
-        matching_count = emp_df.filter(pl.col("score") > 80).height
-
-        query = "SELECT * FROM EmployeeTbl"
-        lf = cpl.scan_db(query, "fake_connection_string")
-        result = lf.filter(non_sql_filter).collect().head(10)
-
-        expected_count = min(10, matching_count)
-        assert result.height == expected_count
-        assert all(result["score"] > 80)
-
-
-# These tests verify that kwargs like query_timeout_sec are passed correctly
-# to both the schema query and data query in scan_db.
-
-
-class TestArrowOdbcKwargsPassthrough:
-    """Tests for arrow_odbc kwargs being passed to both schema and data queries."""
-
-    def test_query_timeout_sec_passed_to_schema_query(self, monkeypatch, duckdb_connection):
-        """Verify that query_timeout_sec is passed to the schema query."""
-        import arrow_odbc
-
-        # Track kwargs passed to each call
-        captured_calls: list[dict] = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(*args, **kwargs):
-            # Capture the kwargs for each call
-            captured_calls.append({"query": kwargs.get("query") or args[0], "kwargs": dict(kwargs)})
-            return original_func(*args, **kwargs)
-
-        monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
-
-        query = "SELECT * FROM CC_Bond"
-        timeout_value = 30
-
-        # Create the LazyFrame with query_timeout_sec - this triggers schema query
-        _lf = cpl.scan_db(query, "fake_connection_string", query_timeout_sec=timeout_value)
-
-        # The schema query should have been made during scan_db
-        schema_calls = [c for c in captured_calls if "LIMIT 0" in c["query"]]
-        assert len(schema_calls) == 1, f"Expected 1 schema query, got {len(schema_calls)}"
-
-        schema_call = schema_calls[0]
-        assert "query_timeout_sec" in schema_call["kwargs"], "query_timeout_sec should be passed to schema query"
-        assert schema_call["kwargs"]["query_timeout_sec"] == timeout_value
-
-    def test_query_timeout_sec_passed_to_data_query(self, monkeypatch, duckdb_connection):
-        """Verify that query_timeout_sec is passed to the data query during collect."""
-        import arrow_odbc
-
-        captured_calls: list[dict] = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(*args, **kwargs):
-            captured_calls.append({"query": kwargs.get("query") or args[0], "kwargs": dict(kwargs)})
-            return original_func(*args, **kwargs)
-
-        monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
-
-        query = "SELECT * FROM CC_Bond"
-        timeout_value = 45
-
-        lf = cpl.scan_db(query, "fake_connection_string", query_timeout_sec=timeout_value)
-
-        # Clear captured calls to focus on collect
-        captured_calls.clear()
-
-        # Now collect - this triggers the data query
-        lf.collect()
-
-        data_calls = [c for c in captured_calls if "LIMIT 0" not in c["query"]]
-        assert len(data_calls) == 1, f"Expected 1 data query, got {len(data_calls)}"
-
-        data_call = data_calls[0]
-        assert "query_timeout_sec" in data_call["kwargs"], "query_timeout_sec should be passed to data query"
-        assert data_call["kwargs"]["query_timeout_sec"] == timeout_value
-
-    def test_multiple_kwargs_passed_to_both_queries(self, monkeypatch, duckdb_connection):
-        """Verify that multiple arrow_odbc kwargs are passed to both schema and data queries."""
-        import arrow_odbc
-
-        captured_calls: list[dict] = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(*args, **kwargs):
-            captured_calls.append({"query": kwargs.get("query") or args[0], "kwargs": dict(kwargs)})
-            return original_func(*args, **kwargs)
-
-        monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
-
-        query = "SELECT * FROM CC_Bond"
-
-        # Pass multiple kwargs
-        lf = cpl.scan_db(
-            query,
-            "fake_connection_string",
-            krb5=False,
-            query_timeout_sec=30,
-            login_timeout_sec=10,
-            max_text_size=4096,
-        )
-
-        # Check schema query
-        schema_calls = [c for c in captured_calls if "LIMIT 0" in c["query"]]
-        assert len(schema_calls) == 1
-        schema_kwargs = schema_calls[0]["kwargs"]
-        assert schema_kwargs.get("query_timeout_sec") == 30
-        assert schema_kwargs.get("login_timeout_sec") == 10
-        assert schema_kwargs.get("max_text_size") == 4096
-
-        captured_calls.clear()
-
-        # Check data query
-        lf.collect()
-        data_calls = [c for c in captured_calls if "LIMIT 0" not in c["query"]]
-        assert len(data_calls) == 1
-        data_kwargs = data_calls[0]["kwargs"]
-        assert data_kwargs.get("query_timeout_sec") == 30
-        assert data_kwargs.get("login_timeout_sec") == 10
-        assert data_kwargs.get("max_text_size") == 4096
-
-    def test_schema_kwarg_passed_to_both_queries(self, monkeypatch, duckdb_connection):
-        """Verify that 'schema' kwarg is passed to both schema and data queries for consistency."""
-        import arrow_odbc
-        import pyarrow as pa
-
-        captured_calls: list[dict] = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(*args, **kwargs):
-            captured_calls.append({"query": kwargs.get("query") or args[0], "kwargs": dict(kwargs)})
-            return original_func(*args, **kwargs)
-
-        monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
-
-        query = "SELECT CenterID, Centre FROM CC_Bond"
-
-        # Create a custom schema to pass
-        custom_schema = pa.schema([("CenterID", pa.int64()), ("Centre", pa.string())])
-
-        lf = cpl.scan_db(
-            query,
-            "fake_connection_string",
-            krb5=False,
-            query_timeout_sec=30,
-            schema=custom_schema,
-        )
-
-        # Check schema query - 'schema' SHOULD be present for consistency
-        schema_calls = [c for c in captured_calls if "LIMIT 0" in c["query"]]
-        assert len(schema_calls) == 1
-        schema_kwargs = schema_calls[0]["kwargs"]
-        assert "schema" in schema_kwargs, "'schema' should be passed to schema query for consistency"
-        assert schema_kwargs.get("query_timeout_sec") == 30
-
-        captured_calls.clear()
-
-        # Check data query - 'schema' SHOULD be present
-        lf.collect()
-        data_calls = [c for c in captured_calls if "LIMIT 0" not in c["query"]]
-        assert len(data_calls) == 1
-        data_kwargs = data_calls[0]["kwargs"]
-        assert "schema" in data_kwargs, "'schema' should be passed to data query"
-        assert data_kwargs.get("query_timeout_sec") == 30
-
-    def test_map_schema_kwarg_passed_to_both_queries(self, monkeypatch, duckdb_connection):
-        """Verify that 'map_schema' kwarg is passed to both schema and data queries for consistency."""
-        import arrow_odbc
-
-        captured_calls: list[dict] = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(*args, **kwargs):
-            captured_calls.append({"query": kwargs.get("query") or args[0], "kwargs": dict(kwargs)})
-            return original_func(*args, **kwargs)
-
-        monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
-
-        query = "SELECT CenterID, Centre FROM CC_Bond"
-
-        # Create a custom map_schema function
-        def custom_map_schema(schema):
-            return schema
-
-        lf = cpl.scan_db(
-            query,
-            "fake_connection_string",
-            krb5=False,
-            query_timeout_sec=30,
-            map_schema=custom_map_schema,
-        )
-
-        # Check schema query - 'map_schema' SHOULD be present for consistency
-        schema_calls = [c for c in captured_calls if "LIMIT 0" in c["query"]]
-        assert len(schema_calls) == 1
-        schema_kwargs = schema_calls[0]["kwargs"]
-        assert "map_schema" in schema_kwargs, "'map_schema' should be passed to schema query for consistency"
-        assert schema_kwargs.get("query_timeout_sec") == 30
-
-        captured_calls.clear()
-
-        # Check data query - 'map_schema' SHOULD be present
-        lf.collect()
-        data_calls = [c for c in captured_calls if "LIMIT 0" not in c["query"]]
-        assert len(data_calls) == 1
-        data_kwargs = data_calls[0]["kwargs"]
-        assert "map_schema" in data_kwargs, "'map_schema' should be passed to data query"
-        assert data_kwargs.get("query_timeout_sec") == 30
-
-    def test_all_kwargs_passed_to_both_queries(self, monkeypatch, duckdb_connection):
-        """Verify all kwargs including schema overrides are passed to both queries."""
-        import arrow_odbc
-        import pyarrow as pa
-
-        captured_calls: list[dict] = []
-        original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-        def capturing_func(*args, **kwargs):
-            captured_calls.append({"query": kwargs.get("query") or args[0], "kwargs": dict(kwargs)})
-            return original_func(*args, **kwargs)
-
-        monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
-
-        query = "SELECT CenterID, Centre FROM CC_Bond"
-        custom_schema = pa.schema([("CenterID", pa.int64()), ("Centre", pa.string())])
-
-        def custom_map_schema(schema):
-            return schema
-
-        lf = cpl.scan_db(
-            query,
-            "fake_connection_string",
-            krb5=False,
-            query_timeout_sec=30,
-            login_timeout_sec=10,
-            schema=custom_schema,
-            map_schema=custom_map_schema,
-        )
-
-        # Check schema query - all kwargs should be present
-        schema_calls = [c for c in captured_calls if "LIMIT 0" in c["query"]]
-        assert len(schema_calls) == 1
-        schema_kwargs = schema_calls[0]["kwargs"]
-
-        assert "schema" in schema_kwargs
-        assert "map_schema" in schema_kwargs
-        assert schema_kwargs.get("query_timeout_sec") == 30
-        assert schema_kwargs.get("login_timeout_sec") == 10
-
-        captured_calls.clear()
-
-        # Check data query - all kwargs should be present
-        lf.collect()
-        data_calls = [c for c in captured_calls if "LIMIT 0" not in c["query"]]
-        assert len(data_calls) == 1
-        data_kwargs = data_calls[0]["kwargs"]
-
-        assert "schema" in data_kwargs
-        assert "map_schema" in data_kwargs
-        assert data_kwargs.get("query_timeout_sec") == 30
-        assert data_kwargs.get("login_timeout_sec") == 10
-
-
-class TestMSSQLQualifiedStar:
-    """Tests that the MSSQL dialect correctly renders table-qualified star expressions."""
-
-    def test_qualified_star_in_join(self):
-        """Table-qualified star (alias.*) should render as [alias].* not [alias].[*]."""
-        query = """
-        SELECT a.*, b.SomeCol
-        FROM ServerA.dbo.vTableOne a
-        LEFT JOIN ServerB.dbo.vTableTwo b
-          ON a.JoinKey = b.JoinKey
-          AND a.AsOfDate BETWEEN b.StartDate AND b.EndDate
-        """
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "[a].*" in result
-        assert "[*]" not in result
-
-    def test_qualified_star_without_join(self):
-        """Table-qualified star works for a simple aliased table."""
-        query = "SELECT t.* FROM SomeDB.dbo.SomeTable t"
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "[t].*" in result
-        assert "[*]" not in result
-
-    def test_unqualified_star(self):
-        """Plain SELECT * should still work."""
-        query = "SELECT * FROM SomeTable"
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "SELECT *" in result
-        assert "[*]" not in result
-
-
-class TestMSSQLAnonymousCasePreservation:
-    """Tests that the MSSQL dialect preserves original casing for Anonymous nodes."""
-
-    def test_tvf_with_literal_args_preserves_case(self):
-        """Table-valued functions with literal arguments should not be uppercased."""
-        query = "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')"
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "f_GetFuturesMaxVolAsOfDate" in result
-        assert "F_GETFUTURESMAXVOLASOFDATE" not in result
-
-    def test_table_with_nolock_hint_preserves_case(self):
-        """Table names with (nolock) hints should preserve original casing."""
-        query = "SELECT * FROM MyTable (nolock)"
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "MyTable" in result
-        assert "MYTABLE" not in result
-
-    def test_tvf_with_multiple_args_preserves_case(self):
-        """TVFs with multiple arguments should preserve casing."""
-        query = "SELECT * FROM [db].[dbo].fn_GetData('2026-01-01', 42)"
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "fn_GetData" in result
-        assert "FN_GETDATA" not in result
-
-    def test_tvf_roundtrip_preserves_full_query(self):
-        """Full query with TVF should roundtrip correctly through parse/generate."""
-        query = "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')"
-        parsed = parse_one(query, dialect=MSSQL)
-        result = parsed.sql(dialect=MSSQL)
-        assert "[FuturesData]" in result
-        assert "[dbo]" in result
-        assert "f_GetFuturesMaxVolAsOfDate('2026-02-06')" in result
-
-
-def _make_capture_sql():
-    """Return a context manager that captures SQL sent to the fake ODBC reader.
-
-    Shared helper used by multiple test classes.
-    """
-    import contextlib
-
-    import arrow_odbc
-
-    captured: list[str] = []
-    original_func = arrow_odbc.read_arrow_batches_from_odbc
-
-    @contextlib.contextmanager
-    def ctx():
-        def capturing_func(*args, **kwargs):
-            q = kwargs.get("query") or (args[0] if args else "")
-            captured.append(q)
-            return original_func(*args, **kwargs)
-
-        arrow_odbc.read_arrow_batches_from_odbc = capturing_func
-        try:
-            yield captured
-        finally:
-            arrow_odbc.read_arrow_batches_from_odbc = original_func
-
-    return ctx()
-
-
-def _extract_data_sql(captured: list[str]) -> str:
-    """Extract the single data query (skip the LIMIT 0 schema probe).
-
-    Shared helper used by multiple test classes.
-    """
-    data_queries = [q for q in captured if "LIMIT 0" not in q]
-    assert len(data_queries) == 1, f"Expected exactly 1 data query, got {len(data_queries)}: {data_queries}"
-    return data_queries[0]
-
-
-class TestJoinStarAmbiguousColumns:
-    """Tests for the subquery-wrapping fix that avoids ambiguous column names
-    when a query uses ``table.*`` expressions with JOINs.
-
-    When column selection pushdown is active and the query has qualified stars
-    (``cr.*``) with JOINs, the original query is wrapped as a subquery.  The
-    outer SELECT picks columns from the flat result set — no ambiguity possible.
-    """
-
-    BASE_QUERY = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
-
-    @pytest.fixture(autouse=True)
-    def _create_join_tables(self, duckdb_connection):
-        """Create test tables that share a column name (ID_BB_COMPANY)."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE CreditRef AS SELECT * FROM (
-                SELECT 1 AS ID, 100 AS ID_BB_COMPANY, 'US' AS CNTRY, DATE '2024-01-15' AS SOME_DATE
-                UNION ALL
-                SELECT 2 AS ID, 200 AS ID_BB_COMPANY, 'GB' AS CNTRY, DATE '2024-02-20' AS SOME_DATE
-                UNION ALL
-                SELECT 3 AS ID, 100 AS ID_BB_COMPANY, 'JP' AS CNTRY, DATE '2024-03-10' AS SOME_DATE
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE BBCredit AS SELECT * FROM (
-                SELECT 100 AS ID_BB_COMPANY, 'USA' AS CNTRY_OF_RISK
-                UNION ALL
-                SELECT 200 AS ID_BB_COMPANY, 'GBR' AS CNTRY_OF_RISK
-            )
-            """
-        )
-        yield
-        # Tables are rolled back by the transaction_isolation fixture
-
-    def _capture_sql(self):
-        return _make_capture_sql()
-
-    @staticmethod
-    def _data_sql(captured: list[str]) -> str:
-        return _extract_data_sql(captured)
-
-    @staticmethod
-    def _assert_qualified(sql: str, table: str, column: str) -> None:
-        """Assert that *column* appears qualified by *table* in *sql*."""
-        patterns = [
-            f"{table}.{column}",
-            f'"{table}"."{column}"',
-            f"[{table}].[{column}]",
-        ]
-        assert any(p in sql for p in patterns), f"Expected {table}-qualified {column} in SQL, got: {sql}"
-
-    # Column selection on star+JOIN queries wraps the original query as
-    # a subquery (__cpl_subq) so that the outer SELECT uses flat, unambiguous
-    # column names.
-
-    def test_select_shared_column_is_qualified(self):
-        """Selecting a column shared by both tables uses subquery wrapping."""
-        lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]).collect()
-
-        assert result.shape[0] == 3
-        assert set(result.columns) == {"ID_BB_COMPANY", "CNTRY_OF_RISK"}
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
-
-    def test_select_non_shared_column_is_qualified(self):
-        """Selecting a column unique to cr also uses subquery wrapping."""
-        lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["ID", "CNTRY"]).collect()
-
-        assert result.shape[0] == 3
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
-
-    def test_select_all_star_expanded_columns(self):
-        """Selecting every column that came from cr.* uses subquery wrapping."""
-        lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["ID", "ID_BB_COMPANY", "CNTRY", "SOME_DATE"]).collect()
-
-        assert result.shape[0] == 3
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
-
-    # When only a predicate is pushed (no column selection), the standard
-    # path is used — no subquery wrapping.  Predicates stay unqualified.
-
-    def test_predicate_pushdown_works_with_star_join(self):
-        """Filter pushdown on unambiguous columns works without qualification."""
-        lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("CNTRY") == "US").collect()
-
-        assert result.shape[0] == 1
-        assert result["CNTRY"][0] == "US"
-
-        sql = self._data_sql(captured)
-        assert "WHERE" in sql.upper()
-
-    def test_predicate_with_multiple_filters(self, duckdb_connection):
-        """Compound AND filter on columns unique to the star-expanded table.
-
-        Mirrors the real-world query:
-          SELECT cr.*, br.CNTRY_OF_RISK FROM ... LEFT JOIN ...
-          WHERE (DATE = '...' AND PointID = ...)
-        where DATE and PointID only exist on the cr side, so the database
-        resolves them without qualification.
-        """
-        # Add a PointID column to CreditRef so we can filter on it
-        duckdb_connection.execute("ALTER TABLE CreditRef ADD COLUMN PointID BIGINT")
-        duckdb_connection.execute("UPDATE CreditRef SET PointID = ID * 100000")
-
-        base_query = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
-
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter((pl.col("SOME_DATE") == date(2024, 1, 15)) & (pl.col("PointID") == 100000)).collect()
-
-        assert result.shape[0] == 1
-        assert result["ID"][0] == 1
-
-        sql = self._data_sql(captured)
-        assert "WHERE" in sql.upper()
-
-    def test_combined_select_qualified_and_predicate_unqualified(self):
-        """Column selection uses subquery; predicate is applied on the outer query.
-
-        The filter uses CNTRY (unique to cr) so it's unambiguous in WHERE even
-        without table qualification — matching real-world SQL Server behaviour
-        where unqualified WHERE columns resolve fine for non-shared names.
-        """
-        lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("CNTRY") == "US").select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]).collect()
-
-        assert result.shape[0] == 1
-        assert set(result.columns) == {"ID_BB_COMPANY", "CNTRY_OF_RISK"}
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
-        assert "WHERE" in sql.upper()
-
-    def test_alias_predicate_rewrites_to_underlying_expression(self):
-        """A predicate on a CAST alias expands to the underlying CAST, not a bare column."""
-        base_query = (
-            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK "
-            "FROM CreditRef cr "
-            "LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
-        )
-
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("bus_date") >= date(2024, 2, 1)).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        assert "WHERE" in sql.upper()
-        # The alias should be rewritten to the underlying CAST expression
-        assert "CAST" in sql.upper(), f"Expected CAST in WHERE from alias rewrite, got: {sql}"
-
-    def test_select_alias_column_alongside_star_expanded(self):
-        """Selecting an alias + a star-expanded column uses subquery wrapping."""
-        base_query = (
-            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK "
-            "FROM CreditRef cr "
-            "LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
-        )
-
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["bus_date", "ID_BB_COMPANY"]).collect()
-
-        assert result.shape[0] == 3
-        assert set(result.columns) == {"bus_date", "ID_BB_COMPANY"}
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
-        # The inner subquery preserves the original CAST alias
-        assert "CAST" in sql.upper()
-        assert "bus_date" in sql
-
-    def test_bare_star_join_does_not_qualify(self, duckdb_connection):
-        """Bare ``*`` (no table qualifier) does not trigger star expansion."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE StarA AS SELECT * FROM (
-                SELECT 1 AS aid, 10 AS joinkey
-                UNION ALL SELECT 2 AS aid, 20 AS joinkey
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE StarB AS SELECT * FROM (
-                SELECT 10 AS bkey, 'x' AS bval
-                UNION ALL SELECT 20 AS bkey, 'y' AS bval
-            )
-            """
-        )
-
-        base_query = "SELECT * FROM StarA a LEFT JOIN StarB b ON a.joinkey = b.bkey"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["aid", "bval"]).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        # With bare *, columns should be unqualified (no expansion possible)
-        assert "a.aid" not in sql and '"a"."aid"' not in sql
-
-    def test_explicit_columns_with_join_uses_subquery(self, duckdb_connection):
-        """A redundant full-schema select on a JOIN leaves the original SQL unchanged."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE JoinA AS SELECT * FROM (
-                SELECT 1 AS id, 10 AS shared, 100 AS aval
-                UNION ALL SELECT 2 AS id, 20 AS shared, 200 AS aval
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE JoinB AS SELECT * FROM (
-                SELECT 10 AS shared, 1000 AS bval
-                UNION ALL SELECT 20 AS shared, 2000 AS bval
-            )
-            """
-        )
-
-        base_query = "SELECT a.shared, b.bval FROM JoinA a LEFT JOIN JoinB b ON a.shared = b.shared"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["shared", "bval"]).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" not in sql, f"Did not expect subquery wrapping, got: {sql}"
-        self._assert_qualified(sql, "a", "shared")
-        self._assert_qualified(sql, "b", "bval")
-
-    def test_no_expansion_when_no_joins(self):
-        """Single-table SELECT * does not trigger star expansion."""
-        base_query = "SELECT * FROM CreditRef"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["ID", "CNTRY"]).collect()
-
-        assert result.shape[0] == 3
-        sql = self._data_sql(captured)
-        # No qualification needed — single table
-        assert "cr.ID" not in sql and '"cr"."ID"' not in sql
-
-    def test_no_modification_without_pushdown(self):
-        """Collecting without select/filter/head runs the original query unmodified."""
-        lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.collect()
-
-        assert result.shape[0] == 3
-        sql = self._data_sql(captured)
-        # Original query should pass through with the star intact
-        assert "cr.*" in sql or "cr.*" in sql.replace('"', "")
-
-    # When multiple qualified stars are present (e.g., a.*, b.*, c.col),
-    # we can't determine which star produced which column.  The fix wraps
-    # the original query as a subquery and selects from it.
-
-    @pytest.fixture()
-    def _create_multi_star_tables(self, duckdb_connection):
-        """Create three tables for multi-star subquery wrapping tests.
-
-        Orders and Customers share ``customer_id``; Products has no overlap.
-        """
-        duckdb_connection.execute(
-            """
-            CREATE TABLE Orders AS SELECT * FROM (
-                SELECT 1 AS order_id, 10 AS customer_id, DATE '2024-01-15' AS order_date
-                UNION ALL
-                SELECT 2 AS order_id, 20 AS customer_id, DATE '2024-02-20' AS order_date
-                UNION ALL
-                SELECT 3 AS order_id, 10 AS customer_id, DATE '2024-03-10' AS order_date
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE Products AS SELECT * FROM (
-                SELECT 1 AS product_id, 'Widget' AS product_name
-                UNION ALL
-                SELECT 2 AS product_id, 'Gadget' AS product_name
-                UNION ALL
-                SELECT 3 AS product_id, 'Doohickey' AS product_name
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE Customers AS SELECT * FROM (
-                SELECT 10 AS customer_id, 'Alice' AS cust_name
-                UNION ALL
-                SELECT 20 AS customer_id, 'Bob' AS cust_name
-            )
-            """
-        )
-        yield
-
-    @pytest.mark.usefixtures("_create_multi_star_tables")
-    def test_multi_star_select_shared_uses_subquery(self):
-        """Selecting a shared column from a multi-star JOIN uses subquery wrapping."""
-        query = "SELECT o.*, p.*, c.cust_name FROM Orders o CROSS JOIN Products p LEFT JOIN Customers c ON o.customer_id = c.customer_id"
-        lf = cpl.scan_db(query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["customer_id", "cust_name"]).collect()
-
-        assert result.shape[0] == 9  # 3 orders × 3 products (cross join)
-        assert set(result.columns) == {"customer_id", "cust_name"}
-
-        sql = self._data_sql(captured)
-        # Multi-star path wraps in a subquery
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping (__cpl_subq) in SQL, got: {sql}"
-
-    @pytest.mark.usefixtures("_create_multi_star_tables")
-    def test_multi_star_select_non_shared_uses_subquery(self):
-        """Non-shared columns also go through subquery wrapping when multiple stars are present."""
-        query = "SELECT o.*, p.*, c.cust_name FROM Orders o CROSS JOIN Products p LEFT JOIN Customers c ON o.customer_id = c.customer_id"
-        lf = cpl.scan_db(query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["order_id", "product_name"]).collect()
-
-        assert result.shape[0] == 9  # 3 orders × 3 products
-        assert set(result.columns) == {"order_id", "product_name"}
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping (__cpl_subq) in SQL, got: {sql}"
-
-    @pytest.mark.usefixtures("_create_multi_star_tables")
-    def test_multi_star_filter_with_subquery(self):
-        """Predicate pushdown works correctly through the subquery wrapper."""
-        query = "SELECT o.*, p.*, c.cust_name FROM Orders o CROSS JOIN Products p LEFT JOIN Customers c ON o.customer_id = c.customer_id"
-        lf = cpl.scan_db(query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("cust_name") == "Alice").select(["order_id", "cust_name", "product_name"]).collect()
-
-        # Alice has customer_id=10 → orders 1 and 3, cross joined with 3 products = 6 rows
-        assert result.shape[0] == 6
-        assert result["cust_name"].to_list() == ["Alice"] * 6
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-        assert "WHERE" in sql.upper()
-
-    @pytest.mark.usefixtures("_create_multi_star_tables")
-    def test_multi_star_no_subquery_without_pushdown(self):
-        """Collecting without select/filter runs the original multi-star query unmodified."""
-        query = "SELECT o.*, p.*, c.cust_name FROM Orders o CROSS JOIN Products p LEFT JOIN Customers c ON o.customer_id = c.customer_id"
-        lf = cpl.scan_db(query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.collect()
-
-        assert result.shape[0] == 9  # 3 orders × 3 products
-        sql = self._data_sql(captured)
-        # No subquery wrapping when there's no pushdown
-        assert "__cpl_subq" not in sql
-
-    def test_comma_join_with_qualified_star_uses_subquery(self, duckdb_connection):
-        """``SELECT a.*, b.col FROM A a, B b WHERE ...`` triggers subquery wrapping.
-
-        Comma-separated tables in FROM are implicit cross joins.  The detector
-        must find multiple tables in the FROM clause (not just explicit JOINs).
-        """
-        duckdb_connection.execute(
-            """
-            CREATE TABLE CommaA AS SELECT * FROM (
-                SELECT 1 AS aid, 10 AS shared_key
-                UNION ALL SELECT 2 AS aid, 20 AS shared_key
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE CommaB AS SELECT * FROM (
-                SELECT 10 AS shared_key, 'x' AS bval
-                UNION ALL SELECT 20 AS shared_key, 'y' AS bval
-            )
-            """
-        )
-
-        base_query = "SELECT a.*, b.bval FROM CommaA a, CommaB b WHERE a.shared_key = b.shared_key"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["shared_key", "bval"]).collect()
-
-        assert result.shape[0] == 2
-        assert set(result.columns) == {"shared_key", "bval"}
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql, f"Expected subquery wrapping for comma-join, got: {sql}"
-
-
-class TestSubqueryWrappingHoisting:
-    """Tests for the always-wrap subquery approach and clause hoisting.
-
-    When any pushdown (column selection, predicate, or row limit) is requested,
-    the original query is wrapped as ``SELECT ... FROM (original) AS __cpl_subq``.
-    ORDER BY (without TOP/OFFSET) and OPTION hints are hoisted to the outer query.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _create_tables(self, duckdb_connection):
-        """Create test tables for hoisting tests."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE Sales AS SELECT * FROM (
-                SELECT 'East' AS region, 100 AS amount, DATE '2024-01-15' AS sale_date
-                UNION ALL SELECT 'East' AS region, 200 AS amount, DATE '2024-02-20' AS sale_date
-                UNION ALL SELECT 'West' AS region, 150 AS amount, DATE '2024-01-10' AS sale_date
-                UNION ALL SELECT 'West' AS region, 300 AS amount, DATE '2024-03-05' AS sale_date
-            )
-            """
-        )
-        yield
-
-    def _capture_sql(self):
-        return _make_capture_sql()
-
-    @staticmethod
-    def _data_sql(captured: list[str]) -> str:
-        return _extract_data_sql(captured)
-
-    def test_order_by_stays_in_inner_for_non_mssql(self):
-        """A redundant full-schema select does not trigger wrapping for non-MSSQL ORDER BY queries."""
-        base_query = "SELECT region, amount FROM Sales ORDER BY amount DESC"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["region", "amount"]).collect()
-
-        assert result.shape[0] == 4
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" not in sql
-        assert "ORDER BY" in sql.upper(), f"Expected ORDER BY in original query, got: {sql}"
-
-    def test_order_by_with_limit_stays_in_inner(self):
-        """ORDER BY with LIMIT is meaningful — left in inner query even for MSSQL."""
-        base_query = "SELECT region, amount FROM Sales ORDER BY amount DESC LIMIT 2"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["region"]).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-        # ORDER BY should be INSIDE the subquery (paired with LIMIT)
-        inner_match = sql.split("__cpl_subq")[0]
-        assert "ORDER BY" in inner_match.upper(), f"ORDER BY should be in inner query, got: {sql}"
-
-    # ORDER BY hoisting: MSSQL-specific (tested via _prepare_inner_for_subquery)
-    #
-    # These test the hoisting function directly with MSSQL dialect because
-    # the DuckDB test environment uses a non-MSSQL dialect (no hoisting).
-    # Integration tests against real SQL Server cover end-to-end.
-
-    def test_mssql_order_by_without_top_is_moved_to_outer(self):
-        """MSSQL: ORDER BY without TOP is hoisted (SQL Server error 1033)."""
-        from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
-
-        parsed = parse_one("SELECT region, amount FROM Sales ORDER BY amount DESC")
-        inner, order_to_hoist, _ = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
-
-        # ORDER BY removed from inner
-        assert inner.args.get("order") is None
-        # ORDER BY returned for outer
-        assert order_to_hoist is not None
-        assert "amount" in order_to_hoist.sql().lower()
-
-    def test_mssql_order_by_with_limit_stays_in_inner(self):
-        """MSSQL: ORDER BY + TOP stays in inner — determines which rows are selected."""
-        from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
-
-        parsed = parse_one("SELECT TOP 2 region, amount FROM Sales ORDER BY amount DESC", dialect=MSSQL)
-        inner, order_to_hoist, _ = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
-
-        # ORDER BY stays in inner
-        assert inner.args.get("order") is not None
-        # Nothing to hoist
-        assert order_to_hoist is None
-
-    def test_mssql_order_by_hoisted_with_table_qualifiers_stripped(self):
-        """MSSQL: table qualifiers are stripped from hoisted ORDER BY columns.
-
-        ``ORDER BY cb.EventDate`` becomes ``ORDER BY EventDate`` because the
-        table alias ``cb`` only exists inside the subquery.
-        """
-        from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
-
-        parsed = parse_one("SELECT cb.region, cb.amount FROM Sales cb ORDER BY cb.amount DESC")
-        _inner, order_to_hoist, _ = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
-
-        assert order_to_hoist is not None
-        order_sql = order_to_hoist.sql()
-        # Should have "amount" but NOT "cb.amount"
-        assert "amount" in order_sql.lower()
-        assert "cb." not in order_sql.lower(), f"Table qualifier should be stripped, got: {order_sql}"
-
-    def test_mssql_order_by_with_offset_stays_in_inner(self):
-        """MSSQL: ORDER BY + OFFSET stays in inner (pagination)."""
-        from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
-
-        parsed = parse_one(
-            "SELECT region, amount FROM Sales ORDER BY amount OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
-            dialect=MSSQL,
-        )
-        inner, order_to_hoist, _ = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
-
-        assert inner.args.get("order") is not None
-        assert order_to_hoist is None
-
-    def test_mssql_option_hints_hoisted(self):
-        """MSSQL: OPTION hints are moved from inner to outer."""
-        from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
-
-        parsed = parse_one("SELECT region FROM Sales OPTION (HASH JOIN)", dialect=MSSQL)
-        inner, _, options_to_hoist = _prepare_inner_for_subquery(parsed, dialect=MSSQL)
-
-        assert len(options_to_hoist) == 1
-        assert "HASH JOIN" in options_to_hoist[0].sql(dialect=MSSQL).upper()
-        # Inner should have no options left
-        assert not list(inner.find_all(exp.QueryOption))
-
-    def test_non_mssql_no_hoisting(self):
-        """Non-MSSQL: nothing is hoisted — ORDER BY and options stay in inner."""
-        from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
-
-        parsed = parse_one("SELECT region, amount FROM Sales ORDER BY amount DESC")
-        inner, order_to_hoist, options_to_hoist = _prepare_inner_for_subquery(parsed, dialect="duckdb")
-
-        # ORDER BY stays in inner
-        assert inner.args.get("order") is not None
-        # Nothing hoisted
-        assert order_to_hoist is None
-        assert options_to_hoist == []
-
-    def test_no_wrapping_without_pushdown(self):
-        """No pushdown → original query passes through unmodified."""
-        base_query = "SELECT region, amount FROM Sales ORDER BY amount"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.collect()
-
-        assert result.shape[0] == 4
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" not in sql
-        assert "ORDER BY" in sql.upper()
-
-    def test_alias_predicate_works_without_rewriting(self):
-        """Predicate on a CAST alias works via subquery output — no alias rewriting needed."""
-        base_query = "SELECT region, CAST(sale_date AS DATE) AS sale_date FROM Sales"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("sale_date") >= date(2024, 2, 1)).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-        # The outer WHERE references sale_date (subquery output name), not the CAST expression
-        outer_part = sql.split("__cpl_subq")[-1]
-        assert "WHERE" in outer_part.upper()
-        # CAST should only be in the INNER query, not in the outer WHERE
-        assert "CAST" not in outer_part.upper()
-
-    def test_union_predicate_filters_all_branches(self, duckdb_connection):
-        """Predicate on UNION wraps the entire UNION — filters all branches, not just one."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE SalesQ1 AS SELECT * FROM (
-                SELECT 'East' AS region, 100 AS amount
-                UNION ALL SELECT 'West' AS region, 200 AS amount
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE SalesQ2 AS SELECT * FROM (
-                SELECT 'East' AS region, 300 AS amount
-                UNION ALL SELECT 'North' AS region, 400 AS amount
-            )
-            """
-        )
-
-        base_query = "SELECT region, amount FROM SalesQ1 UNION ALL SELECT region, amount FROM SalesQ2"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("region") == "East").collect()
-
-        # Should get East from BOTH branches (Q1 and Q2)
-        assert result.shape[0] == 2
-        assert all(r == "East" for r in result["region"].to_list())
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-
-    def test_union_column_selection(self, duckdb_connection):
-        """Column selection on UNION wraps the entire UNION in a subquery."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE UnionA AS SELECT * FROM (
-                SELECT 1 AS id, 'a' AS name, 10 AS val
-                UNION ALL SELECT 2 AS id, 'b' AS name, 20 AS val
-            )
-            """
-        )
-        duckdb_connection.execute(
-            """
-            CREATE TABLE UnionB AS SELECT * FROM (
-                SELECT 3 AS id, 'c' AS name, 30 AS val
-            )
-            """
-        )
-
-        base_query = "SELECT id, name, val FROM UnionA UNION ALL SELECT id, name, val FROM UnionB"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["id", "name"]).collect()
-
-        assert result.shape[0] == 3
-        assert set(result.columns) == {"id", "name"}
-
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-
-    def test_group_by_with_predicate_pushdown(self):
-        """Predicate on a GROUP BY query works via subquery wrapping."""
-        base_query = "SELECT region, SUM(amount) AS total FROM Sales GROUP BY region"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("total") >= 250).collect()
-
-        assert result.shape[0] == 2  # East=300, West=450
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-        # GROUP BY stays in the inner query — the outer query just filters
-        inner_part = sql.split("__cpl_subq")[0]
-        assert "GROUP BY" in inner_part.upper()
-
-    def test_cte_query_with_column_selection(self):
-        """CTE query wrapped in subquery — sqlglot auto-hoists WITH for TSQL."""
-        base_query = "WITH cte AS (SELECT region, amount FROM Sales) SELECT region, amount FROM cte"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["region"]).collect()
-
-        assert result.shape[0] == 4
-        assert set(result.columns) == {"region"}
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-
-    def test_order_by_with_offset_stays_in_inner(self):
-        """ORDER BY + OFFSET is meaningful — both stay in the inner query."""
-        base_query = "SELECT region, amount FROM Sales ORDER BY amount LIMIT 2 OFFSET 1"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["region"]).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-        # ORDER BY should be INSIDE the subquery (paired with OFFSET)
-        inner_part = sql.split("__cpl_subq")[0]
-        assert "ORDER BY" in inner_part.upper(), f"ORDER BY should be in inner query, got: {sql}"
-
-    def test_order_by_qualified_stays_in_inner_for_non_mssql(self, duckdb_connection):
-        """A redundant full-schema select preserves the original qualified ORDER BY query."""
-        duckdb_connection.execute(
-            """
-            CREATE TABLE OrderQualA AS SELECT * FROM (
-                SELECT 1 AS id, DATE '2024-01-01' AS event_date
-                UNION ALL SELECT 2 AS id, DATE '2024-03-01' AS event_date
-            )
-            """
-        )
-        base_query = "SELECT a.id, a.event_date FROM OrderQualA a ORDER BY a.event_date"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["id", "event_date"]).collect()
-
-        assert result.shape[0] == 2
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" not in sql
-        assert "ORDER BY" in sql.upper()
-
-    def test_predicate_only_pushdown(self):
-        """Predicate-only pushdown still wraps in subquery."""
-        base_query = "SELECT region, amount, sale_date FROM Sales"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.filter(pl.col("region") == "East").collect()
-
-        assert result.shape[0] == 2
-        assert set(result.columns) == {"region", "amount", "sale_date"}
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-        outer_part = sql.split("__cpl_subq")[-1]
-        assert "WHERE" in outer_part.upper()
-
-    def test_nested_subquery_wrapping(self):
-        """Query that already contains a subquery gets wrapped again safely."""
-        base_query = "SELECT region, amount FROM (SELECT region, amount FROM Sales) AS inner_q"
-        lf = cpl.scan_db(base_query, "fake_connection_string")
-
-        with self._capture_sql() as captured:
-            result = lf.select(["region"]).collect()
-
-        assert result.shape[0] == 4
-        assert set(result.columns) == {"region"}
-        sql = self._data_sql(captured)
-        assert "__cpl_subq" in sql
-
-
-def test_head_zero_skips_query(monkeypatch):
-    """head(0) should return an empty DataFrame without sending a query to the database."""
-    query = "SELECT CenterID, Centre, EventYear FROM CC_Bond"
-    lf = cpl.scan_db(query, "fake_connection_string")
-
-    # Track whether the ODBC reader is invoked
-    calls = {"n": 0}
-    original_reader = fake_read_arrow_batches_from_odbc
-
-    def tracking_reader(*args, **kwargs):
-        calls["n"] += 1
-        return original_reader(*args, **kwargs)
-
-    monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", tracking_reader)
-
-    result = lf.head(0).collect()
-
-    assert result.height == 0
-    assert set(result.columns) == {"CenterID", "Centre", "EventYear"}
-    assert calls["n"] == 0, f"Expected no ODBC queries, but {calls['n']} were made"
-
-
-def test_head_zero_with_column_selection(monkeypatch):
-    """head(0) with column selection should return the correct empty schema."""
-    query = "SELECT CenterID, Centre, EventYear FROM CC_Bond"
-    lf = cpl.scan_db(query, "fake_connection_string")
-
-    calls = {"n": 0}
-    original_reader = fake_read_arrow_batches_from_odbc
-
-    def tracking_reader(*args, **kwargs):
-        calls["n"] += 1
-        return original_reader(*args, **kwargs)
-
-    monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", tracking_reader)
-
-    result = lf.select(["CenterID", "Centre"]).head(0).collect()
-
-    assert result.height == 0
-    assert set(result.columns) == {"CenterID", "Centre"}
-    assert calls["n"] == 0
-
-
-@pytest.mark.parametrize("dialect", ["tsql", "postgres", "clickhouse", "duckdb"])
-def test_str_contains_regex_skips_pushdown(dialect):
-    """str.contains with regex metacharacters skips pushdown: database regex dialects differ from Polars."""
-    regex_patterns = [
-        "^(CL|GC|SI|HO)",  # anchored alternation
-        ".*abc",  # wildcard
-        "foo|bar",  # alternation
-        "[A-Z]+",  # character class + quantifier
-        r"CL\d+",  # digit class
-    ]
-    for pattern in regex_patterns:
-        expr = pl.col("Centre").str.contains(pattern)
-        result = convert_predicate_to_sql(expr, dialect=dialect)
-        assert result is None, f"Expected None for regex pattern {pattern!r}, got {result}"
-
-
-def test_str_contains_regex_with_and_partial_pushdown():
-    """When AND-ed with a pushable predicate, the regex term is dropped but the other term pushes (TSQL)."""
-    expr = pl.col("Centre").str.contains("^test") & (pl.col("EventYear") > 2020)
-    result = convert_predicate_to_sql(expr, dialect="tsql")
-    assert result is not None
-    sql = result.sql()
-    assert "LIKE" not in sql  # regex term was dropped
-    assert "EventYear" in sql  # numeric comparison still pushed
+        con.execute(f"CREATE TABLE t ({', '.join(df.columns)})")
+        con.executemany(f"INSERT INTO t VALUES ({', '.join('?' * df.width)})", df.rows())
+        return {r[0] for r in con.execute(sql).fetchall()}
+    con = duckdb.connect()
+    con.execute("SET TimeZone = 'America/New_York'")
+    con.register("t", df.to_arrow())
+    return {r[0] for r in con.sql(sql).fetchall()}
+
+
+@pytest.mark.parametrize(("pred", "data", "dialect"), params(KEEPS, "pred", "data", "dialect"))
+def test_where_keeps_matching_rows(pred, data, dialect):
+    where = _visit(pred, dialect)
+    if where is None:
+        return
+    df = data.with_row_index("__row")
+    kept = set(df.filter(pred)["__row"])
+    assert kept <= _where_rows(df, where.sql(dialect), dialect), where.sql(dialect)
 
 
 @pytest.mark.parametrize(
-    "filter_expr",
+    ("pred", "want", "exact"),
     [
-        pl.col("Centre").str.contains("^(Dh|Ph)"),
-        pl.col("Centre").str.contains(".*mala"),
-        pl.col("Centre").str.contains("Da"),
-        pl.col("Centre").str.contains("Da", literal=True),
-        pl.col("Centre").str.contains("^(Dh|Ph)") & (pl.col("EventYear") > 2020),
-        ~pl.col("Centre").str.contains("Da"),
+        # CAST(... AS DATE) coerces to an integer in SQLite and would drop the non-midnight row
+        pytest.param(ts.dt.date() == date(2024, 5, 6), [("2024-05-06 12:34:56", 1)], True, id="dt_date_pushdown_sqlite_selects_non_midnight_row"),
+        pytest.param((ts.dt.year() == 2024) & (x > 0), [("2024-05-06 12:34:56", 1)], False, id="dt_year_pushdown_sqlite_runs"),
     ],
 )
-def test_str_contains(filter_expr):
-    """scan_db with str.contains filter matches Polars in-memory result."""
-    base_query = "SELECT * FROM CC_Bond"
-
-    # Lazy path: goes through the full scan_db pushdown pipeline
-    actual = cpl.scan_db(base_query, "fake_connection_string").filter(filter_expr).collect()
-    # Eager path: Polars filters in-memory (ground truth)
-    expected = get_cc_bond_df().filter(filter_expr)
-
-    actual = actual.sort("CenterID", "EventDate")
-    expected = expected.sort("CenterID", "EventDate")
-    assert_frame_equal(actual, expected)
+def test_sqlite_where_on_text_timestamps(pred, want, exact):
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE t (ts TEXT, x INTEGER)")
+    con.execute("INSERT INTO t VALUES ('2024-05-06 12:34:56', 1), ('2024-05-07 00:00:00', 2), ('2023-05-07 00:00:00', 3)")
+    rows = con.execute(f"SELECT ts, x FROM t WHERE {convert_predicate_to_sql(pred, 'sqlite').sql(dialect='sqlite')}").fetchall()
+    assert rows == want if exact else set(want) <= set(rows)
 
 
-# ---------------------------------------------------------------------------
-# Identifier quoting / MSSQL projection-alias stabilization
-# ---------------------------------------------------------------------------
+# Reader query -> the result equals what the database returns for the query, put through the same Polars steps.
+def Q(
+    id,
+    query,
+    op=lambda lf: lf,
+    *,
+    both=False,
+    tables=(),
+    where=None,
+    text=None,
+    ordered=False,
+    ref=None,
+    scan=None,
+    calls=None,
+    log=None,
+    height=None,
+):
+    """A query row; ``both`` also runs it through scan_clickhouse.
+
+    ``op`` is applied to the reader and to the database's result (``ref`` first transforms the latter). ``where``
+    is ``(sql, op)``: the query with that WHERE clause, put through ``op``, gives the same frame. ``text`` maps a part
+    of the one data query (``sql``, or ``inner``/``outer`` around the subquery wrapper) to ``assert_text``
+    arguments. ``calls`` is the number of queries collecting may send; ``log`` is ``(level, message)``.
+    """
+    kw = {
+        "op": op,
+        "tables": tables,
+        "where": where,
+        "text": text,
+        "ordered": ordered,
+        "ref": ref,
+        "scan": scan or {},
+        "calls": calls,
+        "log": log,
+        "height": height,
+    }
+    return [pytest.param(e, query, kw, id=f"{id}-{e}" if both else id) for e in (["scan_db", "scan_clickhouse"] if both else ["scan_db"])]
 
 
-def test_column_selection_quotes_metadata_names(duckdb_connection):
-    """Metadata-derived reserved and special-character names remain selectable."""
-    duckdb_connection.execute(
-        """
-        CREATE TABLE QuotedMetadataColumns AS
-        SELECT 1 AS "group", 2 AS "value with space", 3 AS ordinary
-        """
-    )
+def _filter(*preds, select=None, after=None):
+    def op(lf):
+        lf = lf.select(select) if select else lf
+        lf = lf.filter(*preds)
+        return lf.select(after) if after else lf
 
-    result = cpl.scan_db("SELECT * FROM QuotedMetadataColumns", "fake_connection_string", krb5=False).select(["group", "value with space"]).collect()
-
-    expected = pl.DataFrame({"group": [1], "value with space": [2]})
-    assert_frame_equal(result, expected, check_dtypes=False)
+    return op
 
 
+def _select(cols):
+    return lambda lf: lf.select(cols)
+
+
+def _pickled(op=lambda lf: lf):
+    import cloudpickle
+
+    return lambda lf: cloudpickle.loads(cloudpickle.dumps(op(lf)))
+
+
+_CB_ALL = ["CenterID", "CentreCode", "ISOCountryCode", "Centre", "EventYear", "EventDate", "EventDayOfWeek", "EventName", "FileType"]
+_DAY = pl.col("EventName").str.contains("Day")
+_COMPLEX = pl.col("EventYear").is_between(2015, 2050) & ((pl.col("EventDayOfWeek") == "Fri") | (pl.col("EventDayOfWeek") == "Sat")) & _DAY
+_UDF = pl.col("score").map_elements(lambda v: v > 80, return_dtype=pl.Boolean)
+_SUBQ, _WHERE, _CAST = X("__cpl_subq"), X("WHERE"), X("CAST")
+_JOIN_STAR = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+_JOIN_CAST = "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+_MULTI_STAR = "SELECT o.*, p.*, c.cust_name FROM Orders o CROSS JOIN Products p LEFT JOIN Customers c ON o.customer_id = c.customer_id"
+_STAR_TABLES = ("CreditRef", "BBCredit")
+_MULTI_TABLES = ("Orders", "Products", "Customers")
+_DATE_FILTER = (pl.col("EventDate") >= datetime(2013, 1, 1)) & (pl.col("EventDate") < datetime(2017, 1, 1))
+_COUNTRIES = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+_RECORD = {"cast_map": {"RecordDate": pl.Date}}
+
+
+def _record_dates(df):
+    return df.with_columns(pl.col("RecordDate").cast(pl.Date))
+
+
+def _parts(*cs):
+    return lambda: (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in cs)
+
+
+_NESTED_STAR = "SELECT * FROM (SELECT CAST(EventDate AS DATE) AS EventDateAsDate, * FROM CC_Bond) AS t"
+
+QUERIES = [
+    # filters with an equivalent SQL WHERE, shared by scan_db and scan_clickhouse
+    *Q(
+        "basic_query",
+        "SELECT CenterID, Centre, EventYear FROM CC_Bond",
+        _filter(pl.col("EventYear") > 2015),
+        both=True,
+        where=("EventYear > 2015", None),
+        ordered=True,
+    ),
+    *Q(
+        "column_selection",
+        "SELECT * FROM CC_Bond",
+        _filter(pl.col("Centre").str.contains("Da"), select=["CenterID", "Centre", "EventDate"]),
+        both=True,
+        where=("Centre LIKE '%Da%'", _select(["CenterID", "Centre", "EventDate"])),
+    ),
+    *Q(
+        "complex_query",
+        f"SELECT {', '.join(_CB_ALL)} FROM CC_Bond",
+        _filter(_COMPLEX, select=_CB_ALL),
+        both=True,
+        where=("EventYear BETWEEN 2015 AND 2050 AND (EventDayOfWeek = 'Fri' OR EventDayOfWeek = 'Sat') AND EventName LIKE '%Day%'", _select(_CB_ALL)),
+    ),
+    *Q(
+        "not_null",
+        "SELECT CenterID, Centre, EventDate FROM CC_Bond",
+        _filter(pl.col("EventDate").is_not_null()),
+        both=True,
+        where=("EventDate IS NOT NULL", None),
+        ordered=True,
+    ),
+    # filter on a column the selection drops
+    *Q(
+        "empty_df",
+        "SELECT CenterID, Centre, EventDate, EventYear FROM CC_Bond",
+        _filter(pl.col("EventYear") < 1900, after=["CenterID", "Centre", "EventDate"]),
+        both=True,
+        where=("EventYear < 1900", _select(["CenterID", "Centre", "EventDate"])),
+        ordered=True,
+        height=0,
+    ),
+    *Q(
+        "in_operator",
+        "SELECT CenterID, Centre, EventYear, EventDate, EventDayOfWeek FROM CC_Bond",
+        _filter(pl.col("EventDayOfWeek").is_in(["Fri", "Sat", "Sun"])),
+        both=True,
+        where=("EventDayOfWeek IN ('Fri', 'Sat', 'Sun')", None),
+    ),
+    *Q(
+        "not_like",
+        "SELECT CenterID, Centre, EventYear, EventName FROM CC_Bond",
+        _filter(~_DAY),
+        both=True,
+        where=("EventName NOT LIKE '%Day%'", None),
+    ),
+    *Q(
+        "implicit_cast_query",
+        "SELECT CenterID, Centre, EventYear FROM CC_Bond",
+        _filter(pl.col("EventYear") > 2015.1),
+        where=("EventYear > 2015", None),
+        ordered=True,
+    ),
+    *Q(
+        "join",
+        "SELECT cb.CenterID, cb.Centre, ec.Country, ec.ElectFor FROM CC_Bond AS cb, ElectionCalendar AS ec",
+        _filter(pl.col("Country").str.contains("a")),
+        where=("ec.Country LIKE '%a%'", None),
+    ),
+    *[
+        row
+        for i, p in enumerate(
+            [
+                pl.col("Centre").str.contains("^(Dh|Ph)"),
+                pl.col("Centre").str.contains(".*mala"),
+                pl.col("Centre").str.contains("Da"),
+                pl.col("Centre").str.contains("Da", literal=True),
+                pl.col("Centre").str.contains("^(Dh|Ph)") & (pl.col("EventYear") > 2020),
+                ~pl.col("Centre").str.contains("Da"),
+            ]
+        )
+        for row in Q(f"str_contains-{i}", "SELECT * FROM CC_Bond", _filter(p))
+    ],
+    # dt.date() pushes down as a DATE cast (issue #51); Polars re-filters, so only the SQL shows it
+    *Q(
+        "dt_date_filter_pushdown-eq",
+        "SELECT CenterID, Centre, EventDate FROM CC_Bond",
+        _filter(pl.col("EventDate").dt.date() == date(2013, 10, 24)),
+        text={"sql": X('CAST("EventDate" AS DATE)')},
+    ),
+    *Q(
+        "dt_date_filter_pushdown-ge",
+        "SELECT CenterID, Centre, EventDate FROM CC_Bond",
+        _filter(pl.col("EventDate").dt.date() >= date(2013, 10, 24)),
+        text={"sql": X('CAST("EventDate" AS DATE)')},
+    ),
+    # equality on a nanosecond column is an is_between whose upper bound keeps sub-microsecond digits
+    *Q("nanosecond_equality_is_not_truncated", "SELECT id, ts FROM ns_tbl", _filter(ts == datetime(2024, 1, 1)), tables=("ns_tbl",), height=2),
+    # aliases and casts in the query
+    *Q(
+        "rename_with_filter_integration",
+        "SELECT CenterID, EventYear FROM CC_Bond",
+        lambda lf: lf.select(pl.col("CenterID").alias("center_id"), pl.col("EventYear").alias("event_year")).filter(
+            pl.col("event_year").is_not_null()
+        ),
+    ),
+    *Q(
+        "select_alias_predicate_pushdown_simple",
+        "SELECT EventYear AS event_year, CenterID AS center_id FROM CC_Bond",
+        _filter(pl.col("event_year") > 2016, after=["event_year", "center_id"]),
+    ),
+    *Q("select_alias_cast_datetime_to_date_types", "SELECT CAST(EventDate AS DATE) AS BusDate, CenterID FROM CC_Bond"),
+    *Q("select_original_and_cast_same_column", "SELECT EventDate, CAST(EventDate AS DATE) AS BusDate, CenterID FROM CC_Bond"),
+    *Q(
+        "nested_select_star_with_cast_alias",
+        _NESTED_STAR,
+        ordered=True,
+        log=(logging.DEBUG, "Executing SQL with pushdown: " + parse_one(_NESTED_STAR, dialect="duckdb").sql(dialect="duckdb")),
+    ),
+    # cloudpickle round trip (needed by Ray)
+    *Q("scan_db_pickle_basic", "SELECT * FROM CC_Bond", _pickled(), ordered=True),
+    *Q("scan_db_pickle_with_filter", "SELECT * FROM CC_Bond", _pickled(_filter(pl.col("EventYear") > 2020)), ordered=True),
+    *Q("scan_db_pickle_with_select", "SELECT CenterID, Centre, EventYear FROM CC_Bond", _pickled(), ordered=True),
+    # head: Polars pushes n_rows only without a predicate; head(n).filter(p) reads n rows before filtering
+    *Q(
+        "polars_does_not_push_n_rows_with_predicate",
+        "SELECT * FROM EmployeeTbl",
+        lambda lf: lf.filter(pl.col("score") > 80).head(5),
+        text={"sql": X("WHERE", omits="LIMIT")},
+        ordered=True,
+    ),
+    *Q(
+        "polars_pushes_n_rows_without_predicate",
+        "SELECT * FROM EmployeeTbl",
+        lambda lf: lf.head(5),
+        both=True,
+        text={"sql": X("LIMIT")},
+        ordered=True,
+    ),
+    *Q("head_with_non_sql_filter_returns_correct_count", "SELECT * FROM EmployeeTbl", lambda lf: lf.filter(_UDF).head(10), ordered=True),
+    *Q("head_then_filter-sql", "SELECT * FROM EmployeeTbl", lambda lf: lf.head(10).filter(pl.col("score") > 80), ordered=True),
+    *Q("head_then_filter-udf", "SELECT * FROM EmployeeTbl", lambda lf: lf.head(10).filter(_UDF), ordered=True),
+    *Q("workaround_collect_then_head", "SELECT * FROM EmployeeTbl", lambda lf: lf.filter(_UDF).collect().head(10).lazy(), ordered=True),
+    *Q("head_zero_skips_query", "SELECT CenterID, Centre, EventYear FROM CC_Bond", lambda lf: lf.head(0), both=True, calls=0),
+    *Q(
+        "head_zero_with_column_selection",
+        "SELECT CenterID, Centre, EventYear FROM CC_Bond",
+        lambda lf: lf.select(["CenterID", "Centre"]).head(0),
+        both=True,
+        calls=0,
+    ),
+    # joins: rebuilt projections keep the table qualifier, or the query is wrapped as a subquery
+    *Q(
+        "with_columns_preserves_qualification_on_join",
+        "SELECT a.shared, a.aval, b.bval FROM A AS a LEFT JOIN B AS b ON a.shared = b.shared",
+        _select(["shared", "aval"]),
+        tables=("A", "B"),
+        text={"sql": X(("SELECT a.shared, a.aval", 'SELECT "a"."shared", "a"."aval"', "SELECT [a].[shared], [a].[aval]"))},
+    ),
+    *Q("select_shared_column_is_qualified", _JOIN_STAR, _select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]), tables=_STAR_TABLES, text={"sql": _SUBQ}),
+    *Q("select_non_shared_column_is_qualified", _JOIN_STAR, _select(["ID", "CNTRY"]), tables=_STAR_TABLES, text={"sql": _SUBQ}),
+    *Q(
+        "select_all_star_expanded_columns",
+        _JOIN_STAR,
+        _select(["ID", "ID_BB_COMPANY", "CNTRY", "SOME_DATE"]),
+        tables=_STAR_TABLES,
+        text={"sql": _SUBQ},
+    ),
+    *Q("predicate_pushdown_works_with_star_join", _JOIN_STAR, _filter(pl.col("CNTRY") == "US"), tables=_STAR_TABLES, text={"sql": _WHERE}),
+    # columns only on the cr side resolve without a qualifier
+    *Q(
+        "predicate_with_multiple_filters",
+        _JOIN_STAR,
+        _filter((pl.col("SOME_DATE") == date(2024, 1, 15)) & (pl.col("PointID") == 100000)),
+        tables=(*_STAR_TABLES, "PointID"),
+        text={"sql": _WHERE},
+        height=1,
+    ),
+    *Q(
+        "combined_select_qualified_and_predicate_unqualified",
+        _JOIN_STAR,
+        _filter(pl.col("CNTRY") == "US", after=["ID_BB_COMPANY", "CNTRY_OF_RISK"]),
+        tables=_STAR_TABLES,
+        text={"sql": X("__cpl_subq", "WHERE")},
+    ),
+    *Q(
+        "alias_predicate_rewrites_to_underlying_expression",
+        _JOIN_CAST,
+        _filter(pl.col("bus_date") >= date(2024, 2, 1)),
+        tables=_STAR_TABLES,
+        text={"sql": X("WHERE", "CAST")},
+    ),
+    *Q(
+        "select_alias_column_alongside_star_expanded",
+        _JOIN_CAST,
+        _select(["bus_date", "ID_BB_COMPANY"]),
+        tables=_STAR_TABLES,
+        text={"sql": X("__cpl_subq", "CAST", "bus_date")},
+    ),
+    *Q(
+        "bare_star_join_does_not_qualify",
+        "SELECT * FROM StarA a LEFT JOIN StarB b ON a.joinkey = b.bkey",
+        _select(["aid", "bval"]),
+        tables=("StarA", "StarB"),
+        text={"sql": X(omits=["a.aid", '"a"."aid"'])},
+    ),
+    # a redundant full-schema select leaves the SQL unchanged
+    *Q(
+        "explicit_columns_with_join_uses_subquery",
+        "SELECT a.shared, b.bval FROM JoinA a LEFT JOIN JoinB b ON a.shared = b.shared",
+        _select(["shared", "bval"]),
+        tables=("JoinA", "JoinB"),
+        text={"sql": X(("a.shared", '"a"."shared"', "[a].[shared]"), ("b.bval", '"b"."bval"', "[b].[bval]"), omits="__cpl_subq")},
+    ),
+    *Q(
+        "no_expansion_when_no_joins",
+        "SELECT * FROM CreditRef",
+        _select(["ID", "CNTRY"]),
+        tables=_STAR_TABLES,
+        text={"sql": X(omits=["cr.ID", '"cr"."ID"'])},
+    ),
+    *Q("no_modification_without_pushdown", _JOIN_STAR, tables=_STAR_TABLES, text={"sql": X(("cr.*", '"cr".*'))}),
+    *Q("multi_star_select_shared_uses_subquery", _MULTI_STAR, _select(["customer_id", "cust_name"]), tables=_MULTI_TABLES, text={"sql": _SUBQ}),
+    *Q("multi_star_select_non_shared_uses_subquery", _MULTI_STAR, _select(["order_id", "product_name"]), tables=_MULTI_TABLES, text={"sql": _SUBQ}),
+    *Q(
+        "multi_star_filter_with_subquery",
+        _MULTI_STAR,
+        _filter(pl.col("cust_name") == "Alice", after=["order_id", "cust_name", "product_name"]),
+        tables=_MULTI_TABLES,
+        text={"sql": X("__cpl_subq", "WHERE")},
+        height=6,
+    ),
+    *Q("multi_star_no_subquery_without_pushdown", _MULTI_STAR, tables=_MULTI_TABLES, text={"sql": X(omits="__cpl_subq")}),
+    # comma-separated tables are implicit cross joins
+    *Q(
+        "comma_join_with_qualified_star_uses_subquery",
+        "SELECT a.*, b.bval FROM CommaA a, CommaB b WHERE a.shared_key = b.shared_key",
+        _select(["shared_key", "bval"]),
+        tables=("CommaA", "CommaB"),
+        text={"sql": _SUBQ},
+    ),
+    # subquery wrapping: ORDER BY without TOP/OFFSET would move out (MSSQL only); others stay inside
+    *Q(
+        "order_by_stays_in_inner_for_non_mssql",
+        "SELECT region, amount FROM Sales ORDER BY amount DESC",
+        _select(["region", "amount"]),
+        tables=("Sales",),
+        text={"sql": X("ORDER BY", omits="__cpl_subq")},
+        ordered=True,
+    ),
+    *Q(
+        "order_by_with_limit_stays_in_inner",
+        "SELECT region, amount FROM Sales ORDER BY amount DESC LIMIT 2",
+        _select(["region"]),
+        tables=("Sales",),
+        text={"sql": _SUBQ, "inner": X("ORDER BY")},
+        ordered=True,
+    ),
+    *Q(
+        "no_wrapping_without_pushdown",
+        "SELECT region, amount FROM Sales ORDER BY amount",
+        tables=("Sales",),
+        text={"sql": X("ORDER BY", omits="__cpl_subq")},
+        ordered=True,
+    ),
+    *Q(
+        "alias_predicate_works_without_rewriting",
+        "SELECT region, CAST(sale_date AS DATE) AS sale_date FROM Sales",
+        _filter(pl.col("sale_date") >= date(2024, 2, 1)),
+        tables=("Sales",),
+        text={"sql": _SUBQ, "outer": X("WHERE", omits="CAST")},
+    ),
+    # a predicate on a UNION filters every branch
+    *Q(
+        "union_predicate_filters_all_branches",
+        "SELECT region, amount FROM SalesQ1 UNION ALL SELECT region, amount FROM SalesQ2",
+        _filter(pl.col("region") == "East"),
+        tables=("SalesQ1", "SalesQ2"),
+        text={"sql": _SUBQ},
+        height=2,
+    ),
+    *Q(
+        "union_column_selection",
+        "SELECT id, name, val FROM UnionA UNION ALL SELECT id, name, val FROM UnionB",
+        _select(["id", "name"]),
+        tables=("UnionA", "UnionB"),
+        text={"sql": _SUBQ},
+    ),
+    *Q(
+        "group_by_with_predicate_pushdown",
+        "SELECT region, SUM(amount) AS total FROM Sales GROUP BY region",
+        _filter(pl.col("total") >= 250),
+        tables=("Sales",),
+        text={"sql": _SUBQ, "inner": X("GROUP BY")},
+    ),
+    *Q(
+        "cte_query_with_column_selection",
+        "WITH cte AS (SELECT region, amount FROM Sales) SELECT region, amount FROM cte",
+        _select(["region"]),
+        tables=("Sales",),
+        text={"sql": _SUBQ},
+    ),
+    *Q(
+        "order_by_with_offset_stays_in_inner",
+        "SELECT region, amount FROM Sales ORDER BY amount LIMIT 2 OFFSET 1",
+        _select(["region"]),
+        tables=("Sales",),
+        text={"sql": _SUBQ, "inner": X("ORDER BY")},
+        ordered=True,
+    ),
+    *Q(
+        "order_by_qualified_stays_in_inner_for_non_mssql",
+        "SELECT a.id, a.event_date FROM OrderQualA a ORDER BY a.event_date",
+        _select(["id", "event_date"]),
+        tables=("OrderQualA",),
+        text={"sql": X("ORDER BY", omits="__cpl_subq")},
+        ordered=True,
+    ),
+    *Q(
+        "predicate_only_pushdown",
+        "SELECT region, amount, sale_date FROM Sales",
+        _filter(pl.col("region") == "East"),
+        tables=("Sales",),
+        text={"sql": _SUBQ, "outer": _WHERE},
+    ),
+    *Q(
+        "nested_subquery_wrapping",
+        "SELECT region, amount FROM (SELECT region, amount FROM Sales) AS inner_q",
+        _select(["region"]),
+        tables=("Sales",),
+        text={"sql": _SUBQ},
+    ),
+    # metadata-derived reserved and special-character names stay selectable
+    *Q(
+        "column_selection_quotes_metadata_names",
+        "SELECT * FROM QuotedMetadataColumns",
+        _select(["group", "value with space"]),
+        tables=("QuotedMetadataColumns",),
+        scan={"krb5": False},
+    ),
+    # cast_map narrows a column server side
+    *Q(
+        "cast_map_narrows_column_server_side",
+        "SELECT * FROM RecordTbl",
+        lambda lf: lf.sort("PointID"),
+        tables=("RecordTbl",),
+        scan=_RECORD,
+        ref=_record_dates,
+        ordered=True,
+    ),
+    *Q(
+        "cast_map_pushes_date_predicate_to_sql",
+        "SELECT * FROM RecordTbl",
+        lambda lf: lf.filter(pl.col("RecordDate") == date(2025, 5, 30)).sort("PointID"),
+        tables=("RecordTbl",),
+        scan=_RECORD,
+        ref=_record_dates,
+        ordered=True,
+        text={"sql": X("CAST", "DATE", "RecordDate", "WHERE")},
+        height=2,
+    ),
+    # the inner cast layer lists every column; the outer select prunes
+    *Q(
+        "cast_map_projection_pushdown_still_prunes",
+        "SELECT * FROM RecordTbl",
+        lambda lf: lf.select(["RecordDate", "PointID"]).sort("PointID"),
+        tables=("RecordTbl",),
+        scan=_RECORD,
+        ref=_record_dates,
+        ordered=True,
+        text={"sql": {"startswith": 'SELECT "RECORDDATE", "POINTID" FROM'}},
+    ),
+    # partitioned reads return the unpartitioned rows
+    *[
+        row
+        for every in ["1y", "1mo", "6mo", 90, "1q"]
+        for row in Q(
+            f"by_time_matches_unpartitioned-{every}",
+            "SELECT * FROM CC_Bond",
+            _filter(_DATE_FILTER),
+            scan={"partitions": lambda every=every: cpl.by_time("EventDate", every)},
+        )
+    ],
+    # [2013-01-01, 2017-01-01) split yearly is four windows (exclusive upper bound)
+    *Q(
+        "by_time_partition_count",
+        "SELECT * FROM CC_Bond",
+        _filter(_DATE_FILTER),
+        scan={"partitions": lambda: cpl.by_time("EventDate", "1y")},
+        log=(logging.DEBUG, "running 4 partition(s)"),
+    ),
+    *Q("by_value_derived_from_predicate", "SELECT * FROM CC_Bond", _filter(_COUNTRIES), scan={"partitions": lambda: cpl.by_value("ISOCountryCode")}),
+    *Q(
+        "by_value_explicit_groups",
+        "SELECT * FROM CC_Bond",
+        _filter(_COUNTRIES),
+        scan={"partitions": lambda: cpl.by_value("ISOCountryCode", [["GT", "BD"], "RO"])},
+    ),
+    *Q(
+        "by_range_numeric",
+        "SELECT * FROM CC_Bond",
+        _filter((pl.col("EventYear") >= 2013) & (pl.col("EventYear") < 2055)),
+        scan={"partitions": lambda: cpl.by_range("EventYear", every=10)},
+    ),
+    # every CC_Bond row has FileType 'G'
+    *Q("explicit_read_partition_list", "SELECT * FROM CC_Bond", scan={"partitions": lambda: [cpl.ReadPartition(pl.col("FileType") == "G", key="G")]}),
+    # a one-shot generator of slices, and a projection without the partition column the client-side filter needs
+    *Q(
+        "generator_partitions_retain_columns_under_projection",
+        "SELECT * FROM CC_Bond",
+        _filter(_COUNTRIES, after="CentreCode"),
+        scan={"partitions": _parts("GT", "BD", "RO")},
+    ),
+    *Q(
+        "max_concurrency_matches_unpartitioned",
+        "SELECT * FROM CC_Bond",
+        _filter(_DATE_FILTER),
+        scan={"partitions": lambda: cpl.by_time("EventDate", "1mo"), "max_concurrency": 1},
+    ),
+    # a slice predicate SQL cannot express is applied client side
+    *Q(
+        "untranslatable_predicate_filters_client_side",
+        "SELECT * FROM CC_Bond",
+        scan={"partitions": lambda: [cpl.ReadPartition(pl.col("EventName").map_elements(lambda v: "Day" in v, return_dtype=pl.Boolean), key=0)]},
+        ref=lambda df: df.filter(_DAY),
+    ),
+    *Q(
+        "unbounded_predicate_falls_back_to_single_query",
+        "SELECT * FROM CC_Bond",
+        scan={"partitions": lambda: cpl.by_time("EventDate")},
+        log=(logging.DEBUG, "running 1 partition(s)"),
+    ),
+    # a top-level ORDER BY only loses global order under partitioning: warn, don't raise
+    *Q(
+        "partitioned_query_with_order_by_warns_not_raises",
+        "SELECT * FROM CC_Bond ORDER BY EventDate DESC",
+        _filter(_DATE_FILTER),
+        scan={"partitions": lambda: cpl.by_time("EventDate", "1y")},
+        log=(logging.WARNING, "ORDER BY"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("entry", "query", "kw"), QUERIES)
+def test_scan_matches_native(db, caplog, entry, query, kw):
+    for name in kw["tables"]:
+        db.conn.execute(TABLES[name])
+    op, ref = kw["op"], kw["ref"] or (lambda df: df)
+    lf = ENTRY_POINTS[entry](query, **{k: v() if callable(v) else v for k, v in kw["scan"].items()})
+    start = len(db.calls)
+    level, message = kw["log"] or (logging.WARNING, None)
+    with caplog.at_level(level):
+        got = assert_matches_native(op(lf), op(ref(db.native(query)).lazy()), None, check_row_order=kw["ordered"])
+    assert got.columns == op(ref(db.native(query)).lazy()).collect_schema().names()
+    assert op(lf).collect_schema() == got.schema
+    if message is not None:
+        assert any(message in r.message for r in caplog.records), [r.message for r in caplog.records]
+    if kw["height"] is not None:
+        assert got.height == kw["height"]
+    if kw["calls"] is not None:
+        assert len(db.calls) - start == kw["calls"], db.calls[start:]
+    if kw["text"]:
+        (sql,) = db.queries(start)
+        parts = {"sql": sql, "inner": sql.split("__cpl_subq")[0], "outer": sql.split("__cpl_subq")[-1]}
+        for part, expect in kw["text"].items():
+            assert_text(parts[part], ignore_case=True, **expect)
+    if kw["where"]:
+        where, after = kw["where"]
+        filtered = ENTRY_POINTS[entry](f"{query} WHERE {where}").pipe(after or (lambda lf: lf)).collect()
+        assert_frame_equal(filtered, got, check_row_order=kw["ordered"])
+
+
+def _identity_schema(schema):
+    return schema
+
+
+_PA_SCHEMA = pa.schema([("CenterID", pa.int64()), ("Centre", pa.string())])
+_PAIR = "SELECT CenterID, Centre FROM CC_Bond"
+
+
+@pytest.mark.parametrize(
+    ("query", "kwargs"),
+    [
+        pytest.param("SELECT * FROM CC_Bond", {"query_timeout_sec": 30}, id="query_timeout_sec_passed_to_schema_query"),
+        pytest.param(
+            "SELECT * FROM CC_Bond",
+            {"query_timeout_sec": 30, "login_timeout_sec": 10, "max_text_size": 4096},
+            id="multiple_kwargs_passed_to_both_queries",
+        ),
+        pytest.param(_PAIR, {"query_timeout_sec": 30, "schema": _PA_SCHEMA}, id="schema_kwarg_passed_to_both_queries"),
+        pytest.param(_PAIR, {"query_timeout_sec": 30, "map_schema": _identity_schema}, id="map_schema_kwarg_passed_to_both_queries"),
+        pytest.param(
+            _PAIR,
+            {"query_timeout_sec": 30, "login_timeout_sec": 10, "schema": _PA_SCHEMA, "map_schema": _identity_schema},
+            id="all_kwargs_passed_to_both_queries",
+        ),
+    ],
+)
+def test_arrow_odbc_kwargs_reach_schema_and_data_queries(db, query, kwargs):
+    lf = scan_db(query, krb5=False, **kwargs)
+    lf.collect()
+    for data in (False, True):
+        (call,) = [c for c in db.calls if ("LIMIT 0" not in c["query"]) == data]
+        assert {k: call["kwargs"].get(k) for k in kwargs} == kwargs, call["kwargs"]
+
+
+_CC = "SELECT * FROM CC_Bond"
+_ERR = (ValueError, pl.exceptions.ComputeError)
+
+RAISES = [
+    Case(
+        "max_partitions_guardrail_raises",
+        lambda: scan_db(_CC, partitions=cpl.by_time("EventDate", "1d"), max_partitions=5).filter(_DATE_FILTER).collect(),
+        (pl.exceptions.ComputeError, "exceeds max_partitions"),
+    ),
+    Case("unknown_partition_column_raises", lambda: scan_db(_CC, partitions=cpl.by_time("not_a_column")), (ValueError, "not_a_column")),
+    Case(
+        "explicit_partitions_over_max_raises",
+        lambda: scan_db(_CC, partitions=list(_parts("GT", "BD", "RO")()), max_partitions=2).collect(),
+        (pl.exceptions.ComputeError, "exceeds max_partitions"),
+    ),
+    *[
+        Case(
+            f"partitioned_query_with_unsafe_clause_raises-{match}",
+            lambda q=q: scan_db(q, partitions=cpl.by_time("EventDate", "1y")).filter(_DATE_FILTER).collect(),
+            (_ERR, match),
+        )
+        for q, match in [
+            ("SELECT * FROM CC_Bond ORDER BY EventDate LIMIT 10", "LIMIT"),
+            ("SELECT * FROM CC_Bond OFFSET 5 ROWS", "OFFSET"),
+            ("SELECT *, ROW_NUMBER() OVER (ORDER BY EventDate) AS rn FROM CC_Bond", "window"),
+        ]
+    ],
+    Case(
+        "cast_map_unknown_column_raises",
+        lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"NotAColumn": pl.Date}),
+        (ValueError, "cast_map references column"),
+    ),
+    # Boolean has no server-side narrowing; reporting it while emitting VARCHAR would misrepresent the data
+    Case(
+        "cast_map_rejects_unsupported_dtype",
+        lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"RecordDate": pl.Boolean}),
+        (ValueError, "No SQL type mapping"),
+    ),
+    Case(
+        "cast_map_rejects_time_zone_aware_datetime",
+        lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"RecordDate": pl.Datetime("us", "UTC")}),
+        (ValueError, "time-zone-aware"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("run", "expect"), params(RAISES, "pred", "expect"))
+def test_scan_db_raises(db, run, expect):
+    db.conn.execute(TABLES["RecordTbl"])
+    with pytest.raises(expect[0], match=expect[1]):
+        run()
+
+
+@pytest.mark.parametrize(
+    ("cast_map", "dtype"),
+    [
+        pytest.param({"RecordDate": pl.Date}, pl.Date, id="cast_map_reports_target_dtype_in_schema"),
+        pytest.param(None, pl.Datetime("us"), id="cast_map_none_is_unchanged"),
+    ],
+)
+def test_cast_map_schema(db, cast_map, dtype):
+    db.conn.execute(TABLES["RecordTbl"])
+    schema = scan_db("SELECT * FROM RecordTbl", cast_map=cast_map).collect_schema()
+    assert schema["RecordDate"] == dtype
+    assert set(schema.names()) == {"RecordDate", "PointID", "Rate"}
+
+
+def test_cast_map_hoists_mssql_order_by_out_of_derived_table():
+    """A top-level MSSQL ORDER BY must end up after the cast derived table, not inside it."""
+    from polars_io_tools.io_sources.sql_utils import wrap_query_with_casts
+
+    wrapped = wrap_query_with_casts(parse_one("SELECT * FROM dbo.t ORDER BY x", dialect=MSSQL), MSSQL, ["x", "y"], {"x": pl.Date})
+    sql = apply_polars_io_source_exprs(wrapped.copy(), MSSQL, None, x == date(2025, 5, 30), None, None).sql(dialect=MSSQL)
+    assert_text(sql, ["AS __cpl_cast) AS __cpl_subq", "ORDER BY [x]"], omits="ORDER BY [x]) AS __cpl_cast")
+    assert sql.rstrip().endswith("ORDER BY [x]")
+
+
+def test_cast_map_preserves_decimal_scale():
+    from polars_io_tools.io_sources.sql_utils import polars_dtype_to_sqlglot_type
+
+    assert polars_dtype_to_sqlglot_type(pl.Decimal(10, 2)).sql(dialect=MSSQL) == "NUMERIC(10, 2)"
+
+
+# Row limits: the exact rows depend on completion order, so only the count and values are checked.
+@pytest.mark.parametrize(
+    ("query", "scan", "op", "height", "columns", "values"),
+    [
+        pytest.param(
+            _CC,
+            lambda: cpl.by_time("EventDate", "1y"),
+            lambda lf: lf.filter(_DATE_FILTER).select("CenterID", "EventDate").head(3),
+            3,
+            ["CenterID", "EventDate"],
+            None,
+            id="projection_and_row_limit",
+        ),
+        # no outer predicate, so n_rows reaches the source and the fan-out must honour it
+        pytest.param(
+            _CC,
+            lambda: cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]]),
+            lambda lf: lf.head(3),
+            3,
+            None,
+            ("ISOCountryCode", {"GT", "BD", "RO"}),
+            id="unordered_row_limit",
+        ),
+        # the guard only applies to a partitioned read
+        pytest.param("SELECT * FROM CC_Bond LIMIT 5", None, lambda lf: lf, 5, None, None, id="unpartitioned_query_with_limit_is_allowed"),
+    ],
+)
+def test_row_limit(query, scan, op, height, columns, values):
+    got = op(scan_db(query, **({"partitions": scan()} if scan else {}))).collect()
+    assert got.height == height
+    assert columns is None or got.columns == columns
+    assert values is None or set(got[values[0]]) <= values[1]
+
+
+def test_generator_partitions_are_reusable():
+    """A generator of slices is materialised once, so collecting twice gives the same rows."""
+    lf = scan_db(_CC, partitions=_parts("GT", "BD", "RO")()).filter(_COUNTRIES)
+    first = lf.collect()
+    assert first.height > 0
+    assert_frame_equal(lf.collect(), first, check_row_order=False)
+
+
+# scan_db fans partitions across a thread pool; these tests install a 3-worker pool and, where needed, their own reader.
+@pytest.fixture
+def pool(monkeypatch):
+    workers = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    monkeypatch.setattr(lazy_sql_reader, "_get_sql_executor", lambda: (workers, 3))
+    yield workers
+    workers.shutdown(wait=True)
+
+
+def _install_reader(monkeypatch, read):
+    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=read))
+
+
+_BY_COUNTRY = [["GT"], ["BD"], ["RO"]]
+
+
+@pytest.mark.usefixtures("pool")
+def test_partitioned_head_does_not_push_limit_into_slices(db):
+    """A slice predicate may be enforced client side, so a LIMIT in a slice query could drop rows."""
+    got = scan_db(_CC, partitions=cpl.by_value("ISOCountryCode", _BY_COUNTRY)).head(2).collect()
+    assert got.height == 2
+    slices = [q for q in db.queries() if "IN (" in q]
+    assert slices
+    for q in slices:
+        assert_text(q, omits=["LIMIT", " TOP "], ignore_case=True)
+
+
+@pytest.mark.usefixtures("pool")
+@pytest.mark.parametrize(
+    ("fail_on", "match"),
+    [
+        pytest.param("'GT'", "partition slice", id="partition_worker_error_surfaces_with_slice_sql"),
+        # completion order: an errored worker posts no done marker but must still surface with its slice SQL
+        pytest.param("'RO'", "'RO'", id="partition_worker_error_surfaces"),
+    ],
+)
+def test_partition_worker_error(db, monkeypatch, fail_on, match):
+    def read(query, *args, **kwargs):
+        if fail_on in query:
+            raise RuntimeError("odbc boom")
+        return db.odbc(query, *args, **kwargs)
+
+    _install_reader(monkeypatch, read)
+    with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match=match):
+        scan_db(_CC, partitions=cpl.by_value("ISOCountryCode", _BY_COUNTRY)).collect()
+
+
+def _replicated(db, query):
+    """The query's rows 50 times over, so a slice streams many one-row batches."""
+    table = db.table(query)
+    return pa.concat_tables([table] * 50) if table.num_rows else table
+
+
+@pytest.mark.usefixtures("pool")
+def test_streaming_is_bounded_not_whole_slice(db, monkeypatch):
+    """head(1) reads a few batches; buffering whole slices would read nearly all of them."""
+    produced = [0]
+
+    class CountingReader:
+        def __init__(self, table):
+            self.schema = table.schema
+            self._it = iter(table.to_batches(max_chunksize=1))
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            batch = next(self._it)
+            with db.lock:
+                produced[0] += 1
+            return batch
+
+    _install_reader(monkeypatch, lambda query, *a, **k: CountingReader(_replicated(db, query)))
+    # enumerated slices push no predicate, so head(1) pushes n_rows and exercises early stop
+    lf = scan_db(_CC, partitions=cpl.by_value("EventYear", [[2013], [2021], [2053], [2054]]))
+    full = lf.collect()
+    full_batches, produced[0] = produced[0], 0
+    assert full.height > 9 and full_batches > 20
+    assert lf.head(1).collect().height == 1
+    # the shared queue holds at most k items and each of the k workers parks after its next blocked put
+    assert produced[0] <= 3 * 3, f"head(1) read {produced[0]} batches"
+    assert produced[0] < full_batches
+
+
+@pytest.mark.usefixtures("pool")
+def test_early_stop_joins_running_workers(db, monkeypatch):
+    """On early stop every worker that started streaming has exited when collect returns."""
+    import time
+
+    entered, exited = [0], [0]
+
+    class SlowReader:
+        def __init__(self, table):
+            self.schema = table.schema
+            self._table = table
+
+        def __iter__(self):
+            with db.lock:
+                entered[0] += 1
+            try:
+                for batch in self._table.to_batches(max_chunksize=1):
+                    time.sleep(0.02)
+                    yield batch
+            finally:
+                with db.lock:
+                    exited[0] += 1
+
+    _install_reader(monkeypatch, lambda query, *a, **k: SlowReader(_replicated(db, query)))
+    assert scan_db(_CC, partitions=cpl.by_value("EventYear", [[2013], [2021], [2053]])).head(1).collect().height == 1
+    assert entered[0] >= 1
+    assert entered[0] == exited[0], f"{entered[0] - exited[0]} worker(s) still running"
+
+
+def test_partial_submission_failure_does_not_leak_workers(db, monkeypatch):
+    """When a submission fails partway through the fan-out, the workers already started are told to stop."""
+    real_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+    class FlakyExecutor:
+        n = 0
+
+        def submit(self, *args, **kwargs):
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("submit boom")
+            return real_pool.submit(*args, **kwargs)
+
+    monkeypatch.setattr(lazy_sql_reader, "_get_sql_executor", lambda: (FlakyExecutor(), 3))
+    try:
+        with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="submit boom"):
+            scan_db(_CC, partitions=cpl.by_value("ISOCountryCode", _BY_COUNTRY)).collect()
+        real_pool.shutdown(wait=True)  # hangs if a worker is stranded on a full queue
+    finally:
+        real_pool.shutdown(wait=True)
+
+
+# apply_polars_io_source_exprs: identifier quoting and MSSQL projection-alias stabilization on the parsed query
 @pytest.mark.parametrize(
     ("dialect", "effective_name", "expected_sql"),
     [
@@ -3146,576 +1709,58 @@ def test_mssql_parenthesized_set_operations_only_stabilize_leftmost_output_branc
     ]
 
 
-# Tests for scan_db's server-side cast_map (datetime -> date narrowing pushdown)
-
-
-def _make_record_table(conn):
-    """Create a table whose RecordDate is a TIMESTAMP (the mis-declared-type case)."""
-    conn.execute(
-        """
-        CREATE TABLE RecordTbl AS SELECT * FROM (
-            SELECT CAST('2025-05-30 09:15:00' AS TIMESTAMP) AS RecordDate, 1 AS PointID, 1.5 AS Rate
-            UNION ALL
-            SELECT CAST('2025-05-30 17:45:00' AS TIMESTAMP) AS RecordDate, 2 AS PointID, 2.5 AS Rate
-            UNION ALL
-            SELECT CAST('2025-05-31 00:00:00' AS TIMESTAMP) AS RecordDate, 3 AS PointID, 3.5 AS Rate
-        )
-        """
-    )
-
-
-def test_cast_map_reports_target_dtype_in_schema(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date})
-    schema = lf.collect_schema()
-    assert schema["RecordDate"] == pl.Date
-    # Untouched columns keep their native dtypes and are still present (select * preserved).
-    assert set(schema.names()) == {"RecordDate", "PointID", "Rate"}
-
-
-def test_cast_map_narrows_column_server_side(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    out = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date}).sort("PointID").collect()
-    assert out["RecordDate"].dtype == pl.Date
-    assert out["RecordDate"].to_list() == [date(2025, 5, 30), date(2025, 5, 30), date(2025, 5, 31)]
-
-
-def test_cast_map_pushes_date_predicate_to_sql(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date})
-
-    import arrow_odbc
-
-    captured: list[str] = []
-    original = arrow_odbc.read_arrow_batches_from_odbc
-
-    def capturing(*args, **kwargs):
-        captured.append(args[0] if args else kwargs["query"])
-        return original(*args, **kwargs)
-
-    arrow_odbc.read_arrow_batches_from_odbc = capturing
-    try:
-        out = lf.filter(pl.col("RecordDate") == date(2025, 5, 30)).sort("PointID").collect()
-    finally:
-        arrow_odbc.read_arrow_batches_from_odbc = original
-
-    # Two rows on 2025-05-30 survive the narrowing; the 05-31 row is filtered out.
-    assert out["PointID"].to_list() == [1, 2]
-    assert out["RecordDate"].to_list() == [date(2025, 5, 30), date(2025, 5, 30)]
-
-    # The predicate reached SQL: the executed query casts RecordDate to DATE and filters on it.
-    assert captured, "No SQL captured"
-    sql = captured[-1]
-    assert "CAST" in sql.upper() and "DATE" in sql.upper()
-    assert "RecordDate" in sql
-    assert "WHERE" in sql.upper(), f"date predicate was not pushed to SQL: {sql}"
-
-
-def test_cast_map_projection_pushdown_still_prunes(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Date})
-
-    import arrow_odbc
-
-    captured: list[str] = []
-    original = arrow_odbc.read_arrow_batches_from_odbc
-
-    def capturing(*args, **kwargs):
-        captured.append(args[0] if args else kwargs["query"])
-        return original(*args, **kwargs)
-
-    arrow_odbc.read_arrow_batches_from_odbc = capturing
-    try:
-        out = lf.select(["RecordDate", "PointID"]).sort("PointID").collect()
-    finally:
-        arrow_odbc.read_arrow_batches_from_odbc = original
-
-    assert out.columns == ["RecordDate", "PointID"]
-    assert out["RecordDate"].dtype == pl.Date
-    # The outer projection is pruned to the selected columns (the inner cast layer
-    # still enumerates every column so the DB prunes Rate via the outer select).
-    sql = captured[-1]
-    assert sql.strip().upper().startswith('SELECT "RECORDDATE", "POINTID" FROM')
-
-
-def test_cast_map_unknown_column_raises(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    with pytest.raises(ValueError, match="cast_map references column"):
-        cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"NotAColumn": pl.Date})
-
-
-def test_cast_map_none_is_unchanged(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    lf = cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string")
-    assert lf.collect_schema()["RecordDate"] == pl.Datetime("us")
-
-
-def test_cast_map_hoists_mssql_order_by_out_of_derived_table():
-    """A top-level MSSQL ORDER BY must not end up inside the cast derived table.
-
-    MSSQL rejects ORDER BY in a derived table without TOP/OFFSET (error 1033), so the
-    cast wrapper must hoist it to statement level.
-    """
-    from polars_io_tools.io_sources.sql_utils import apply_polars_io_source_exprs, wrap_query_with_casts
-
-    query = parse_one("SELECT * FROM dbo.t ORDER BY x", dialect=MSSQL)
-    wrapped = wrap_query_with_casts(query, MSSQL, ["x", "y"], {"x": pl.Date})
-    final = apply_polars_io_source_exprs(wrapped.copy(), MSSQL, None, pl.col("x") == date(2025, 5, 30), None, None)
-    sql = final.sql(dialect=MSSQL)
-
-    # ORDER BY sits at the end, after the outermost subquery closes, not inside __cpl_cast.
-    assert "AS __cpl_cast) AS __cpl_subq" in sql
-    assert "ORDER BY [x]" in sql
-    assert sql.rstrip().endswith("ORDER BY [x]")
-    assert "ORDER BY [x]) AS __cpl_cast" not in sql
-
-
-def test_cast_map_preserves_decimal_scale():
-    from polars_io_tools.io_sources.sql_utils import polars_dtype_to_sqlglot_type
-
-    assert polars_dtype_to_sqlglot_type(pl.Decimal(10, 2)).sql(dialect=MSSQL) == "NUMERIC(10, 2)"
-
-
-def test_cast_map_rejects_unsupported_dtype(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    # Boolean has no server-side narrowing mapping; reporting it as the schema while
-    # emitting VARCHAR would misrepresent the data, so it must be rejected.
-    with pytest.raises(ValueError, match="No SQL type mapping"):
-        cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Boolean})
-
-
-def test_cast_map_rejects_time_zone_aware_datetime(duckdb_connection):
-    _make_record_table(duckdb_connection)
-    with pytest.raises(ValueError, match="time-zone-aware"):
-        cpl.scan_db("SELECT * FROM RecordTbl", "fake_connection_string", cast_map={"RecordDate": pl.Datetime("us", "UTC")})
-
-
-class TestIntervalStr:
-    """Unit tests for the ``partitions`` interval-string normaliser."""
-
-    @pytest.mark.parametrize(
-        ("value", "expected"),
-        [
-            ("1mo", "1mo"),
-            ("2w", "2w"),
-            ("5d", "5d"),
-            ("1q", "1q"),
-            ("3y", "3y"),
-            ("mo", "1mo"),
-            ("month", "1mo"),
-            ("quarter", "1q"),
-            (7, "7d"),
-        ],
-    )
-    def test_valid(self, value, expected):
-        from polars_io_tools.io_sources.partitions import _interval_str
-
-        assert _interval_str(value) == expected
-
-    @pytest.mark.parametrize("value", ["", "1", "3h", "-2d", 0, -5, "1mth", True])
-    def test_invalid(self, value):
-        from polars_io_tools.io_sources.partitions import _interval_str
-
-        with pytest.raises((ValueError, TypeError)):
-            _interval_str(value)
-
-
-# scan_db fans partitions across a thread pool; DuckDB rejects concurrent use of a single
-# connection, so these tests install a lock-serialized reader over the shared connection.
-def _install_threadsafe_reader(monkeypatch):
-    lock = threading.Lock()
-
-    def _read(query, batch_size, connection_string, **kwargs):
-        with lock:
-            table = _duckdb_conn.sql(query).to_arrow_table()
-        return FakeBatchReader(table, batch_size)
-
-    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-
-
-class TestScanDbPartitions:
-    """Tests for the opt-in ``partitions=`` reading path in ``scan_db``."""
-
-    QUERY = "SELECT * FROM CC_Bond"
-    # CC_Bond.EventDate spans many years; this window straddles several so buckets are non-trivial.
-    DATE_FILTER = (pl.col("EventDate") >= datetime(2013, 1, 1)) & (pl.col("EventDate") < datetime(2017, 1, 1))
-    COUNTRY_FILTER = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
-
-    @pytest.fixture(autouse=True)
-    def _threadsafe(self, monkeypatch):
-        _install_threadsafe_reader(monkeypatch)
-
-    def _sorted(self, df):
-        return df.sort(by=df.columns)
-
-    @pytest.mark.parametrize("every", ["1y", "1mo", "6mo", 90, "1q"])
-    def test_by_time_matches_unpartitioned(self, every):
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", every)).filter(self.DATE_FILTER).collect()
-        assert got.height > 0
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_by_time_partition_count(self, caplog):
-        # [2013-01-01, 2017-01-01) split yearly is exactly four windows (exclusive upper bound).
-        with caplog.at_level(logging.DEBUG):
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
-        assert any("running 4 partition(s)" in record.message for record in caplog.records)
-
-    def test_by_value_derived_from_predicate(self):
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.COUNTRY_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode")).filter(self.COUNTRY_FILTER).collect()
-        assert got.height > 0
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_by_value_explicit_groups(self):
-        values = [["GT", "BD"], "RO"]
-        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", values)).filter(flt).collect()
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_by_range_numeric(self):
-        flt = (pl.col("EventYear") >= 2013) & (pl.col("EventYear") < 2055)
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_range("EventYear", every=10)).filter(flt).collect()
-        assert got.height > 0
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_explicit_read_partition_list(self):
-        # All CC_Bond rows are FileType 'G', so this single explicit slice returns everything.
-        baseline = cpl.scan_db(self.QUERY, "conn").collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(pl.col("FileType") == "G", key="G")]).collect()
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_generator_partitions_retain_columns_under_projection(self):
-        # A one-shot generator of slices, plus a projection that omits the partition column: the
-        # column must still be retained to evaluate (and drop) the client-side filter.
-        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).select("CentreCode").collect()
-        parts = (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"])
-        got = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt).select("CentreCode").collect()
-        assert got.height > 0
-        assert got.columns == ["CentreCode"]
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_generator_partitions_are_reusable(self):
-        # A generator is materialised once, so re-collecting the same LazyFrame is not empty.
-        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
-        parts = (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"])
-        lf = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt)
-        first, second = lf.collect(), lf.collect()
-        assert first.height > 0
-        assert_frame_equal(self._sorted(first), self._sorted(second))
-
-    def test_unbounded_predicate_falls_back_to_single_query(self, caplog):
-        with caplog.at_level(logging.DEBUG):
-            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate")).collect()
-        baseline = cpl.scan_db(self.QUERY, "conn").collect()
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-        assert any("running 1 partition(s)" in record.message for record in caplog.records)
-
-    def test_max_partitions_guardrail_raises(self):
-        with pytest.raises(pl.exceptions.ComputeError, match="exceeds max_partitions"):
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1d"), max_partitions=5).filter(self.DATE_FILTER).collect()
-
-    def test_projection_and_row_limit(self):
-        got = (
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1y"))
-            .filter(self.DATE_FILTER)
-            .select("CenterID", "EventDate")
-            .head(3)
-            .collect()
-        )
-        assert got.columns == ["CenterID", "EventDate"]
-        assert got.height == 3
-
-    def test_max_concurrency_matches_unpartitioned(self):
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1mo"), max_concurrency=1).filter(self.DATE_FILTER).collect()
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_unknown_partition_column_raises(self):
-        with pytest.raises(ValueError, match="not_a_column"):
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("not_a_column"))
-
-    def test_untranslatable_predicate_filters_client_side(self):
-        # A predicate that cannot be pushed to SQL is still enforced client-side, so the slice
-        # stays exact (here: only rows whose EventName contains "Day").
-        udf = pl.col("EventName").map_elements(lambda s: "Day" in s, return_dtype=pl.Boolean)
-        expected = cpl.scan_db(self.QUERY, "conn").filter(udf).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(udf, key=0)]).collect()
-        assert got.height > 0
-        assert_frame_equal(self._sorted(got), self._sorted(expected))
-
-    def test_explicit_partitions_over_max_raises(self):
-        parts = [cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"]]
-        with pytest.raises(pl.exceptions.ComputeError, match="exceeds max_partitions"):
-            cpl.scan_db(self.QUERY, "conn", partitions=parts, max_partitions=2).collect()
-
-    def test_unordered_matches_unpartitioned(self):
-        # Completion order returns the same rows as an unpartitioned read (order aside).
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1mo")).filter(self.DATE_FILTER).collect()
-        assert got.height > 0
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))
-
-    def test_unordered_row_limit(self):
-        # No outer predicate, so Polars pushes n_rows to the source and the partitioned fan-out
-        # itself must honour the limit (exercising _emit truncation and the early return).
-        groups = [["GT"], ["BD"], ["RO"]]
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", groups)).head(3).collect()
-        assert got.height == 3
-        assert set(got["ISOCountryCode"].to_list()) <= {"GT", "BD", "RO"}
-
-    def test_partitioned_query_with_order_by_warns_not_raises(self, caplog):
-        # A top-level ORDER BY only loses global order under partitioning (row set stays correct):
-        # warn and proceed, don't raise.
-        q = "SELECT * FROM CC_Bond ORDER BY EventDate DESC"
-        with caplog.at_level(logging.WARNING):
-            got = cpl.scan_db(q, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        assert_frame_equal(self._sorted(got), self._sorted(baseline))  # same rows
-        assert any("ORDER BY" in r.message for r in caplog.records)
-
-    @pytest.mark.parametrize(
-        ("query", "match"),
-        [
-            ("SELECT * FROM CC_Bond ORDER BY EventDate LIMIT 10", "LIMIT"),
-            ("SELECT * FROM CC_Bond OFFSET 5 ROWS", "OFFSET"),
-            ("SELECT *, ROW_NUMBER() OVER (ORDER BY EventDate) AS rn FROM CC_Bond", "window"),
-        ],
-    )
-    def test_partitioned_query_with_unsafe_clause_raises(self, query, match):
-        with pytest.raises((ValueError, pl.exceptions.ComputeError), match=match):
-            cpl.scan_db(query, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
-
-    def test_unpartitioned_query_with_limit_is_allowed(self):
-        # The guard only applies to a real (>1 slice) partitioned read; an unpartitioned query keeps
-        # its LIMIT.
-        got = cpl.scan_db("SELECT * FROM CC_Bond LIMIT 5", "conn").collect()
-        assert got.height == 5
-
-    def test_partitioned_head_does_not_push_limit_into_slices(self, monkeypatch):
-        # Per-slice LIMIT is unsafe when a slice predicate is enforced client-side, so it must never
-        # be pushed into a slice query; the client-side row counter trims instead.
-        captured: list[str] = []
-        lock = threading.Lock()
-
-        def _read(query, batch_size, connection_string, **kwargs):
-            with lock:
-                captured.append(query)
-                table = _duckdb_conn.sql(query).to_arrow_table()
-            return FakeBatchReader(table, batch_size)
-
-        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
-        try:
-            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).head(2).collect()
-        finally:
-            pool.shutdown(wait=True)
-        assert got.height == 2
-        slice_sql = [q for q in captured if "IN (" in q]
-        assert slice_sql, "no slice SQL captured"
-        assert not any("LIMIT" in q.upper() or " TOP " in q.upper() for q in slice_sql)
-
-    def test_partition_worker_error_surfaces_with_slice_sql(self, monkeypatch):
-        lock = threading.Lock()
-
-        def _read(query, batch_size, connection_string, **kwargs):
-            if "'GT'" in query:
-                raise RuntimeError("odbc boom")
-            with lock:
-                table = _duckdb_conn.sql(query).to_arrow_table()
-            return FakeBatchReader(table, batch_size)
-
-        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
-        try:
-            with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="partition slice"):
-                cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
-        finally:
-            pool.shutdown(wait=True)
-
-    def test_streaming_is_bounded_not_whole_slice(self, monkeypatch):
-        # Prove the workers STREAM: a bounded head(1) reads only a few batches, whereas whole-slice
-        # buffering would pull (nearly) every batch of every in-flight slice before yielding.
-        produced = [0]
-        lock = threading.Lock()
-
-        class _CountingReader:
-            def __init__(self, table):
-                self.schema = table.schema
-                self._it = iter(table.to_batches(max_chunksize=1))  # one row per batch, deterministically
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                batch = next(self._it)  # raises StopIteration at the end
-                with lock:
-                    produced[0] += 1
-                return batch
-
-        def _read(query, batch_size, connection_string, **kwargs):
-            with lock:
-                table = _duckdb_conn.sql(query).to_arrow_table()
-            # Replicate rows so a slice has *many* one-row batches: this makes "streaming a few
-            # batches" vs "reading the whole slice" a large, unambiguous difference on a tiny fixture.
-            if table.num_rows:
-                table = pa.concat_tables([table] * 50)
-            return _CountingReader(table)
-
-        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
-
-        # Enumerated slices need no pushed predicate, so `.head(1)` (no intervening filter) pushes
-        # n_rows into the source and exercises early-stop; a filter would block that pushdown.
-        parts = cpl.by_value("EventYear", [[2013], [2021], [2053], [2054]])
-        lf = cpl.scan_db(self.QUERY, "conn", partitions=parts)
-        try:
-            full = lf.collect()
-            with lock:
-                full_batches = produced[0]
-            assert full.height > 9 and full_batches > 20  # a full read pulls many batches
-
-            with lock:
-                produced[0] = 0
-            got = lf.head(1).collect()
-            assert got.height == 1
-            with lock:
-                head_batches = produced[0]
-            # The shared queue holds at most k items and each of the k workers parks after its next
-            # blocked put, so head(1) reads only a handful of batches -- far fewer than a whole slice.
-            assert head_batches <= 3 * 3, f"head(1) read {head_batches} batches (streaming should read only a few)"
-            assert head_batches < full_batches
-        finally:
-            pool.shutdown(wait=True)
-
-    def test_early_stop_joins_running_workers(self, monkeypatch):
-        # On n_rows early-stop the generator must not return while slice workers are still fetching:
-        # Future.cancel() cannot stop an already-running worker, so cleanup joins them. Each slice
-        # streams through a generator that records entry and (via finally) exit; when head(1) returns,
-        # every worker that started must also have exited -- else a connection/query is still live.
-        # Without the join a mid-stream worker leaves entered > exited.
-        import time
-
-        entered = [0]
-        exited = [0]
-        lock = threading.Lock()
-
-        class _SlowReader:
-            # Has `.schema` (read by the schema probe, which never iterates) and streams one-row
-            # batches with a per-batch sleep so workers stay mid-stream. __iter__ is a generator:
-            # when _stream_slice abandons it on stop, it is deallocated and its finally runs.
-            def __init__(self, table):
-                self.schema = table.schema
-                self._table = table
-
-            def __iter__(self):
-                with lock:
-                    entered[0] += 1
-                try:
-                    for batch in self._table.to_batches(max_chunksize=1):
-                        time.sleep(0.02)  # hold every worker inside its stream when the limit hits
-                        yield batch
-                finally:
-                    with lock:
-                        exited[0] += 1
-
-        def _read(query, batch_size, connection_string, **kwargs):
-            with lock:
-                table = _duckdb_conn.sql(query).to_arrow_table()
-            if table.num_rows:
-                table = pa.concat_tables([table] * 50)  # many one-row batches, so workers stay mid-stream
-            return _SlowReader(table)
-
-        monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
-
-        parts = cpl.by_value("EventYear", [[2013], [2021], [2053]])  # k == number of slices == 3
-        try:
-            got = cpl.scan_db(self.QUERY, "conn", partitions=parts).head(1).collect()
-            assert got.height == 1
-            with lock:
-                assert entered[0] >= 1, "expected at least one worker to start streaming"
-                assert entered[0] == exited[0], f"{entered[0] - exited[0]} worker(s) still running after collect() returned"
-        finally:
-            pool.shutdown(wait=True)
-
-
-def test_connection_budget_env_parse(monkeypatch):
-    import polars_io_tools.io_sources.lazy_sql_reader as lsr
-
-    # Blank/whitespace is treated as unset (default) -- never crashes import or first use.
-    for blank in ("", " ", "  "):
-        monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", blank)
-        assert lsr._resolve_sql_connection_budget() == min(pl.thread_pool_size(), 8)
-    # Malformed values raise a clear error naming the variable, at use -- not at import.
-    for bad in ("auto", "8.5", "0", "-1"):
-        monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", bad)
+@pytest.mark.parametrize("range_dates", [True, False])
+def test_piot_cache_integration(db, range_dates):
+    """A cached scan_db queries the database once, then answers covered filters from the cache."""
+    emp_lf = scan_db("SELECT * FROM EmployeeTbl").piot.cache(order_by="id", partition_cols=["test_date", "name"])
+
+    def apply_filters(lf, names=("Alice", "Bob"), start=date(2022, 1, 1), end=date(2022, 1, 2)):
+        if range_dates:
+            lf = lf.filter(pl.col.test_date.is_between(start, end))
+        else:
+            lf = lf.filter(pl.col.test_date.is_in(pl.date_range(start, end, closed="both", eager=True).to_list()))
+        return lf.filter(pl.col.name.is_in(list(names)))
+
+    # (names, database queries): the first read misses, repeats and subsets hit. Bartholomew has no rows in the
+    # cached dates, so no partition filter excludes Alice and the cache cannot tell the read is covered.
+    for names, queries in [(("Alice", "Bob"), 1), (("Alice", "Bob"), 0), (("Alice", "Bob"), 0), (("Bartholomew", "Alice"), 1)]:
+        start = len(db.calls)
+        res = emp_lf.pipe(apply_filters, names).collect()
+        assert len(db.calls) - start == queries, names
+        assert_frame_equal(res, employee_df().pipe(apply_filters, names))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1mo", "1mo"), ("2w", "2w"), ("5d", "5d"), ("1q", "1q"), ("3y", "3y"), ("mo", "1mo"), ("month", "1mo"), ("quarter", "1q"), (7, "7d")],
+)
+def test_interval_str_valid(value, expected):
+    from polars_io_tools.io_sources.partitions import _interval_str
+
+    assert _interval_str(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "1", "3h", "-2d", 0, -5, "1mth", True])
+def test_interval_str_invalid(value):
+    from polars_io_tools.io_sources.partitions import _interval_str
+
+    with pytest.raises((ValueError, TypeError)):
+        _interval_str(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    # blank is unset; malformed values raise naming the variable, at use and not at import
+    [("", None), (" ", None), ("  ", None), (" 4 ", 4), ("auto", ValueError), ("8.5", ValueError), ("0", ValueError), ("-1", ValueError)],
+    ids=lambda v: repr(v) if isinstance(v, str) else None,
+)
+def test_connection_budget_env_parse(monkeypatch, value, expected):
+    monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", value)
+    if expected is ValueError:
         with pytest.raises(ValueError, match="POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS"):
-            lsr._resolve_sql_connection_budget()
-    monkeypatch.setenv("POLARS_IO_TOOLS_MAX_SQL_CONNECTIONS", " 4 ")
-    assert lsr._resolve_sql_connection_budget() == 4
-
-
-def test_partition_worker_error_surfaces(monkeypatch):
-    # Exercise the completion-order failure-reconciliation path (shared queue): an errored worker
-    # that posts no done marker must still surface, carrying its slice SQL.
-    lock = threading.Lock()
-
-    def _read(query, batch_size, connection_string, **kwargs):
-        if "'RO'" in query:
-            raise RuntimeError("odbc kaboom")
-        with lock:
-            table = _duckdb_conn.sql(query).to_arrow_table()
-        return FakeBatchReader(table, batch_size)
-
-    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-    monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
-    try:
-        with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="'RO'"):
-            cpl.scan_db("SELECT * FROM CC_Bond", "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
-    finally:
-        pool.shutdown(wait=True)
-
-
-def test_partial_submission_failure_does_not_leak_workers(monkeypatch):
-    # If task submission fails partway through the initial fan-out, the workers that DID start must
-    # still be signalled to stop (the failing submit happens inside the cleanup try/finally).
-    lock = threading.Lock()
-
-    def _read(query, batch_size, connection_string, **kwargs):
-        with lock:
-            table = _duckdb_conn.sql(query).to_arrow_table()
-        return FakeBatchReader(table, batch_size)
-
-    monkeypatch.setitem(sys.modules, "arrow_odbc", SimpleNamespace(read_arrow_batches_from_odbc=_read))
-    real_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-
-    class _FlakyExecutor:
-        def __init__(self):
-            self.n = 0
-
-        def submit(self, *args, **kwargs):
-            self.n += 1
-            if self.n == 2:  # accept the first worker, blow up on the second submission
-                raise RuntimeError("submit boom")
-            return real_pool.submit(*args, **kwargs)
-
-    monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (_FlakyExecutor(), 3))
-    try:
-        with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="submit boom"):
-            cpl.scan_db("SELECT * FROM CC_Bond", "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
-        # The one accepted worker must have exited (stop was set); the pool drains cleanly.
-        real_pool.shutdown(wait=True)  # would hang if a worker were stranded on a full queue
-    finally:
-        real_pool.shutdown(wait=True)
+            lazy_sql_reader._resolve_sql_connection_budget()
+    else:
+        assert lazy_sql_reader._resolve_sql_connection_budget() == (expected or min(pl.thread_pool_size(), 8))
 
 
 @pytest.mark.parametrize("dialect_query", ["duckdb", "tsql"])
@@ -3733,13 +1778,8 @@ def test_partial_submission_failure_does_not_leak_workers(monkeypatch):
     ],
 )
 def test_partition_guard_ast_detection(dialect_query, query, unsafe, order):
-    from sqlglot import parse_one
-
-    from polars_io_tools.io_sources.lazy_sql_reader import _has_top_level_order, _partition_unsafe_clause
-
-    # TOP is MSSQL-only syntax.
     if "TOP" in query and dialect_query != "tsql":
-        return
+        pytest.skip("TOP is MSSQL-only syntax")
     parsed = parse_one(query, dialect=dialect_query)
-    assert _partition_unsafe_clause(parsed) == unsafe
-    assert _has_top_level_order(parsed) == order
+    assert lazy_sql_reader._partition_unsafe_clause(parsed) == unsafe
+    assert lazy_sql_reader._has_top_level_order(parsed) == order
