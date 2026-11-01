@@ -19,7 +19,7 @@ B = pl.Boolean
 
 
 def C(id, pred, expect, col="symbol", schema=None):
-    return Case(id, pred, expect, {"col": col, "schema": schema})
+    return Case(id, pred=pred, col=col, schema=schema, expect=expect)
 
 
 CASES = [

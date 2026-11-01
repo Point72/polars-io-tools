@@ -50,15 +50,15 @@ def read_table(monkeypatch, duckdb_connection):
 
 
 WRITES = [
-    Case("basic_write", lambda lf: cpl.sink_clickhouse(lf, "t", URL, {}), EMPLOYEES),
-    Case("write_empty_dataframe", lambda lf: cpl.sink_clickhouse(lf.head(0), "t", URL, {}), EMPLOYEES.head(0)),
-    Case("write_twice_appends", lambda lf: [cpl.sink_clickhouse(lf, "t", URL, {}) for _ in range(2)], pl.concat([EMPLOYEES, EMPLOYEES])),
-    Case("write_with_batching", lambda lf: cpl.sink_clickhouse(lf, "t", URL, {}, chunk_size=2), EMPLOYEES),
-    Case("piot_sink_clickhouse", lambda lf: lf.piot.sink_clickhouse("t", URL, {}), EMPLOYEES),
+    Case("basic_write", write=lambda lf: cpl.sink_clickhouse(lf, "t", URL, {}), expect=EMPLOYEES),
+    Case("write_empty_dataframe", write=lambda lf: cpl.sink_clickhouse(lf.head(0), "t", URL, {}), expect=EMPLOYEES.head(0)),
+    Case("write_twice_appends", write=lambda lf: [cpl.sink_clickhouse(lf, "t", URL, {}) for _ in range(2)], expect=pl.concat([EMPLOYEES, EMPLOYEES])),
+    Case("write_with_batching", write=lambda lf: cpl.sink_clickhouse(lf, "t", URL, {}, chunk_size=2), expect=EMPLOYEES),
+    Case("piot_sink_clickhouse", write=lambda lf: lf.piot.sink_clickhouse("t", URL, {}), expect=EMPLOYEES),
 ]
 
 
-@pytest.mark.parametrize(("write", "expect"), params(WRITES, "pred", "expect"))
+@pytest.mark.parametrize(("write", "expect"), params(WRITES, "write", "expect"))
 def test_write(read_table, write, expect):
     write(EMPLOYEES.lazy())
     assert_frame_equal(read_table("t"), expect, check_row_order=False)
@@ -72,7 +72,7 @@ def _s(values, dtype):
 # (time: nanoseconds since midnight); categoricals and enums become strings.
 DTYPES = [
     *[
-        Case(f"passthrough_types-{dtype}", _s(values, dtype))
+        Case(f"passthrough_types-{dtype}", series=_s(values, dtype), expect=None)
         for dtype, values in [
             (pl.Boolean, [True, False]),
             *[(t, [1, 2]) for t in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)],
@@ -85,18 +85,22 @@ DTYPES = [
             (pl.Datetime("ms"), [1_000, 2_000]),
         ]
     ],
-    Case("duration_cast_to_int64-us", _s([1_000_000, 2_000_000], pl.Duration("us")), _s([1_000_000, 2_000_000], pl.Int64)),
-    Case("duration_cast_to_int64-ns", _s([1_000_000_000, 2_000_000_000], pl.Duration("ns")), _s([1_000_000_000, 2_000_000_000], pl.Int64)),
-    Case("duration_cast_to_int64-ms", _s([1_000, 2_000], pl.Duration("ms")), _s([1_000, 2_000], pl.Int64)),
+    Case("duration_cast_to_int64-us", series=_s([1_000_000, 2_000_000], pl.Duration("us")), expect=_s([1_000_000, 2_000_000], pl.Int64)),
     Case(
-        "time_cast_to_int64", _s([time(12, 0, 0), time(23, 59, 59)], pl.Time), _s([12 * 3600 * 10**9, (23 * 3600 + 59 * 60 + 59) * 10**9], pl.Int64)
+        "duration_cast_to_int64-ns", series=_s([1_000_000_000, 2_000_000_000], pl.Duration("ns")), expect=_s([1_000_000_000, 2_000_000_000], pl.Int64)
     ),
-    Case("categorical_cast_to_string", _s(["a", "b", "a"], pl.Categorical), _s(["a", "b", "a"], pl.String)),
-    Case("enum_cast_to_string", _s(["c", "a", "b"], ENUM), _s(["c", "a", "b"], pl.String)),
+    Case("duration_cast_to_int64-ms", series=_s([1_000, 2_000], pl.Duration("ms")), expect=_s([1_000, 2_000], pl.Int64)),
+    Case(
+        "time_cast_to_int64",
+        series=_s([time(12, 0, 0), time(23, 59, 59)], pl.Time),
+        expect=_s([12 * 3600 * 10**9, (23 * 3600 + 59 * 60 + 59) * 10**9], pl.Int64),
+    ),
+    Case("categorical_cast_to_string", series=_s(["a", "b", "a"], pl.Categorical), expect=_s(["a", "b", "a"], pl.String)),
+    Case("enum_cast_to_string", series=_s(["c", "a", "b"], ENUM), expect=_s(["c", "a", "b"], pl.String)),
 ]
 
 
-@pytest.mark.parametrize(("series", "expect"), params(DTYPES, "pred", "expect"))
+@pytest.mark.parametrize(("series", "expect"), params(DTYPES, "series", "expect"))
 def test_column_dtype(read_table, series, expect):
     cpl.sink_clickhouse(pl.DataFrame({"col": series}).lazy(), "t", URL, {})
     assert_frame_equal(read_table("t"), pl.DataFrame({"col": series if expect is None else expect}))
@@ -105,6 +109,6 @@ def test_column_dtype(read_table, series, expect):
 def test_all_cast_types_together(read_table):
     """Every column of the dtype table in one frame."""
     n = 2
-    df = pl.DataFrame({c.id: c.pred[:n] for c in DTYPES})
+    df = pl.DataFrame({c.id: c.series[:n] for c in DTYPES})
     cpl.sink_clickhouse(df.lazy(), "t", URL, {})
-    assert_frame_equal(read_table("t"), pl.DataFrame({c.id: (c.pred if c.expect is None else c.expect)[:n] for c in DTYPES}))
+    assert_frame_equal(read_table("t"), pl.DataFrame({c.id: (c.series if c.expect is None else c.expect)[:n] for c in DTYPES}))

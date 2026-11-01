@@ -51,7 +51,7 @@ def _vb1_not_in_right_scan(_result, trackers):
 
 def P(id, frames, build, marks=(), check=None, **expect):
     """A row: ``build`` maps lazy frames by name to the pipeline; ``expect`` maps a source name to ``assert_pushdown`` arguments."""
-    return Case(id, build, expect, {"frames": frames, "check": check}, marks)
+    return Case(id, build=build, expect=expect, kw={"frames": frames, "check": check}, marks=marks)
 
 
 ROWS = [
@@ -211,7 +211,7 @@ class _Frames(dict):
         return super().__getitem__(name).lazy_frame
 
 
-@pytest.mark.parametrize(("build", "expect", "kw"), params(ROWS, "pred", "expect", "kw"))
+@pytest.mark.parametrize(("build", "expect", "kw"), params(ROWS, "build", "expect", "kw"))
 def test_pushdown(build, expect, kw):
     trackers = {name: PredicateTracker(df) for name, df in kw["frames"].items()}
     result = build(_Frames(trackers)).collect()

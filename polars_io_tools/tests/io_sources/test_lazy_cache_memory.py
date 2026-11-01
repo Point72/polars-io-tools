@@ -55,7 +55,7 @@ def _twice_and_two_more(lf):
 
 
 def ONCE(id, source, plan, partition_cols=None, frame=FRAME):
-    return Case(id, plan, 1, {"source": source, "partition_cols": partition_cols, "frame": frame})
+    return Case(id, source=source, plan=plan, partition_cols=partition_cols, frame=frame)
 
 
 _us = pl.col("region") == "us"
@@ -68,7 +68,7 @@ COLLECTS_ONCE = [
 ]
 
 
-@pytest.mark.parametrize(("source", "plan", "partition_cols", "frame"), params(COLLECTS_ONCE, "source", "pred", "partition_cols", "frame"))
+@pytest.mark.parametrize(("source", "plan", "partition_cols", "frame"), params(COLLECTS_ONCE, "source", "plan", "partition_cols", "frame"))
 def test_collects_once(source, plan, partition_cols, frame):
     """The builder or, for a scan source, the upstream scan runs once however often the frame is referenced."""
     calls: list = []
@@ -100,7 +100,7 @@ def test_collects_once_across_collect_all_fanout():
 
 def BUILDS(id, steps, partition_cols="region", frame=PFRAME):
     """Each step is (query, expected sorted ``v``, builds so far)."""
-    return Case(id, steps, None, {"partition_cols": partition_cols, "frame": frame})
+    return Case(id, steps=steps, partition_cols=partition_cols, frame=frame)
 
 
 _G = pl.DataFrame({"g": ["a", None, "a", None], "v": [1, 2, 3, 4]})
@@ -130,7 +130,7 @@ PARTITION_BUILDS = [
 ]
 
 
-@pytest.mark.parametrize(("steps", "partition_cols", "frame"), params(PARTITION_BUILDS, "pred", "partition_cols", "frame"))
+@pytest.mark.parametrize(("steps", "partition_cols", "frame"), params(PARTITION_BUILDS, "steps", "partition_cols", "frame"))
 def test_partition_builds(steps, partition_cols, frame):
     """A partition predicate builds only the matching partitions, null partitions included; built ones are reused."""
     calls: list = []
@@ -155,7 +155,7 @@ def test_callable_schema(collect):
 
 
 def NATIVE(id, query, partition_cols=None, frame=FRAME):
-    return Case(id, query, None, {"partition_cols": partition_cols, "frame": frame})
+    return Case(id, query=query, partition_cols=partition_cols, frame=frame)
 
 
 NATIVE_QUERIES = [
@@ -176,7 +176,7 @@ NATIVE_QUERIES = [
 ]
 
 
-@pytest.mark.parametrize(("query", "partition_cols", "frame"), params(NATIVE_QUERIES, "pred", "partition_cols", "frame"))
+@pytest.mark.parametrize(("query", "partition_cols", "frame"), params(NATIVE_QUERIES, "query", "partition_cols", "frame"))
 def test_matches_native(query, partition_cols, frame):
     kwargs = {} if partition_cols is None else {"partition_cols": partition_cols}
     lf = cache_memory(lambda: frame.lazy(), schema=frame.schema, **kwargs)
@@ -252,7 +252,7 @@ class BadStringError(Exception):
 
 
 def FAIL(id, exc, fanout, partition_cols=None, marks=()):
-    return Case(id, exc, fanout, {"partition_cols": partition_cols}, marks)
+    return Case(id, exc=exc, fanout=fanout, partition_cols=partition_cols, marks=marks)
 
 
 BUILD_FAILURES = [
@@ -267,7 +267,7 @@ BUILD_FAILURES = [
 ]
 
 
-@pytest.mark.parametrize(("exc", "fanout", "partition_cols"), params(BUILD_FAILURES, "pred", "expect", "partition_cols"))
+@pytest.mark.parametrize(("exc", "fanout", "partition_cols"), params(BUILD_FAILURES, "exc", "fanout", "partition_cols"))
 def test_failed_build_is_terminal(exc, fanout, partition_cols):
     attempts: list = []
 

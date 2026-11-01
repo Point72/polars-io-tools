@@ -137,7 +137,7 @@ _by_id_date = _sorted_by("id", "date")
 
 def R(id, frame, parts, query, tasks=None, native=None):
     """``frame()`` distributed by ``parts`` (keyword arguments if a dict) then ``query`` equals ``native`` (default: ``query``) on ``frame()``."""
-    return Case(id, query, tasks, {"frame": frame, "parts": parts, "native": native})
+    return Case(id, frame=frame, parts=parts, query=query, tasks=tasks, native=native)
 
 
 def _f(*a, **k):
@@ -324,7 +324,7 @@ DISTRIBUTED = [
 ]
 
 
-@pytest.mark.parametrize(("frame", "parts", "query", "tasks", "native"), params(DISTRIBUTED, "frame", "parts", "pred", "expect", "native"))
+@pytest.mark.parametrize(("frame", "parts", "query", "tasks", "native"), params(DISTRIBUTED, "frame", "parts", "query", "tasks", "native"))
 def test_distributed_matches_single_frame(monkeypatch, frame, parts, query, tasks, native):
     calls = _count_tasks(monkeypatch)
     lf = frame()

@@ -37,7 +37,7 @@ DENSE_ON = {"smart": False, "dense": True}
 
 def V(id, query, modes, df=DENSE, **kw):
     """A row: ``query`` maps the pivoted frame to the query; ``modes`` maps each mode to ``assert_pushdown`` arguments."""
-    return Case(id, query, modes, {"df": df, "pivot": KW, **kw})
+    return Case(id, query=query, modes=modes, kw={"df": df, "pivot": KW} | kw)
 
 
 def _rows_named(expected: dict):
@@ -97,8 +97,8 @@ ROWS = [
 
 def _params():
     for row in ROWS:
-        for mode, observed in row.expect.items():
-            yield pytest.param(mode, row.pred, observed, row.kw, id=f"{mode}-{row.id}")
+        for mode, observed in row.modes.items():
+            yield pytest.param(mode, row.query, observed, row.kw, id=f"{mode}-{row.id}")
 
 
 @pytest.mark.parametrize(("mode", "query", "observed", "kw"), list(_params()))
@@ -125,21 +125,21 @@ def test_aggregate_function_not_implemented():
 def _first_pivoted(name, df, on_columns):
     kw = {"on": "kind", "on_columns": on_columns, "index": "id", "values": "v"}
     col = df.lazy().pivot(**kw).collect_schema().names()[1]
-    return Case(f"filter_on_first_pivoted_column_matches_bare-{name}", df, lambda lf: lf.filter(c(col) < 15).select("id", col), kw)
+    return Case(f"filter_on_first_pivoted_column_matches_bare-{name}", df=df, query=lambda lf: lf.filter(c(col) < 15).select("id", col), kw=kw)
 
 
 def _decimal_on(name, extra):
     df = pl.DataFrame({"id": [1, 1, 1], "kind": pl.Series([1, 2, 3], dtype=pl.Decimal(3, 0)), "v": [10, 20, 30]})
     cols = ["id", "1", "2", *(["1000"] if extra else [])]
     kw = {"on": "kind", "on_columns": [Decimal(1), Decimal(2), Decimal(3), *extra], "index": "id", "values": "v"}
-    return Case(f"decimal_on_values_filter_matches_bare-{name}", df, lambda lf: lf.filter(c("1") < c("2")).select(cols), kw)
+    return Case(f"decimal_on_values_filter_matches_bare-{name}", df=df, query=lambda lf: lf.filter(c("1") < c("2")).select(cols), kw=kw)
 
 
 def _series_on(name, days):
     df = pl.DataFrame({"id": [1, 1, 1], "kind": days, "v": [0, 1, 2]})
     kw = {"on": "kind", "on_columns": days, "index": "id", "values": "v"}
     cols = df.lazy().pivot(**kw).collect_schema().names()[:3]
-    return Case(f"series_on_columns_are_named_in_their_unit-{name}", df, lambda lf: lf.select(cols), kw)
+    return Case(f"series_on_columns_are_named_in_their_unit-{name}", df=df, query=lambda lf: lf.select(cols), kw=kw)
 
 
 _FOLD_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
@@ -170,5 +170,5 @@ MATCHES_BARE = [
 
 @pytest.mark.parametrize("case", MATCHES_BARE, ids=lambda case: case.id)
 def test_wrapped_matches_bare(case):
-    df, query, kw = case.pred, case.expect, case.kw
+    df, query, kw = case.df, case.query, case.kw
     assert_matches_native(query(pushdown_pivot(df.lazy(), **kw)), query(df.lazy().pivot(**kw)), None)

@@ -109,7 +109,7 @@ _HOUR_POINTS = _series(_HOUR[0].replace(tzinfo=UTC), [1.0, 5.0], 1800, ["tag:val
 
 def D(id, op, expect, calls, response=None, pickle=False, **scan):
     """``expect`` is the result's height or the exception collecting raises."""
-    return Case(id, op, expect, {"response": response, "calls": calls, "pickle": pickle, "scan": scan})
+    return Case(id, op=op, expect=expect, response=response, calls=calls, pickle=pickle, scan=scan)
 
 
 RUNS = [
@@ -135,9 +135,7 @@ RUNS = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("op", "expect", "response", "calls", "pickle", "scan"), params(RUNS, "pred", "expect", "response", "calls", "pickle", "scan")
-)
+@pytest.mark.parametrize(("op", "expect", "response", "calls", "pickle", "scan"), params(RUNS, "op", "expect", "response", "calls", "pickle", "scan"))
 def test_scan_datadog(mock_metric_query, op, expect, response, calls, pickle, scan):
     mock_metric_query.return_value = response
     lf = op(cpl.scan_datadog(query="avg:my.metric{tag:value} by {user}", api_key=API_KEY, app_key=APP_KEY, **scan))

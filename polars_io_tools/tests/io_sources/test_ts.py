@@ -79,14 +79,19 @@ def test_linked_business_days(lookahead, upper):
 # Forward fill through a linked column (EventDate == 4 Jan becomes Date == 4 Jan) or the index itself (Date == 3 Jan, on
 # four rows). The lookback must reach 1 Jan; a sub-day remainder reaches it only on a Date index, rounded out to whole days.
 WINDOWED_FILLS = [
-    Case("ts_ffill", "linked", None, {"days": 3, "reach": 3, "ts": {"linked_cols": ["EventDate"]}, "filter": c("EventDate") == date(2023, 1, 4)}),
-    Case("ts_ffill_no_indexed_column", "index", None, {"days": 4, "reach": 2, "ts": {}, "filter": c("Date") == date(2023, 1, 3)}),
+    Case(
+        "ts_ffill",
+        via="linked",
+        expect=None,
+        kw={"days": 3, "reach": 3, "ts": {"linked_cols": ["EventDate"]}, "filter": c("EventDate") == date(2023, 1, 4)},
+    ),
+    Case("ts_ffill_no_indexed_column", via="index", expect=None, kw={"days": 4, "reach": 2, "ts": {}, "filter": c("Date") == date(2023, 1, 3)}),
 ]
 
 
 @pytest.mark.parametrize("index_dtype", [pl.Date, pl.Datetime], ids=["Date", "Datetime"])
 @pytest.mark.parametrize("short", [None, timedelta(days=1), timedelta(hours=6), timedelta()], ids=["none", "day_short", "hours_short", "reaches"])
-@pytest.mark.parametrize(("via", "kw"), params(WINDOWED_FILLS, "pred", "kw"))
+@pytest.mark.parametrize(("via", "kw"), params(WINDOWED_FILLS, "via", "kw"))
 def test_windowed_forward_fill(via, kw, short, index_dtype):
     """``short`` is how far the lookback falls short of 1 Jan; ``None`` is no lookback."""
     lookback = None if short is None else timedelta(days=kw["reach"]) - short
@@ -112,13 +117,13 @@ def _ffill_callable(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 # The window reaches back for the fill even where a later filter drops the row it fills from.
 FILLS = [
-    Case("ts_ffill_multiple_filters-date", [FFILL.cast(pl.Float64)], c("Date") > date(2023, 1, 1)),
-    Case("ts_ffill_multiple_filters-dummy", [FFILL.cast(pl.Float64)], c("DummyValue") > 1),
-    Case("ts_with_columns_callable_expression", _ffill_callable, None),
+    Case("ts_ffill_multiple_filters-date", exprs=[FFILL.cast(pl.Float64)], extra=c("Date") > date(2023, 1, 1)),
+    Case("ts_ffill_multiple_filters-dummy", exprs=[FFILL.cast(pl.Float64)], extra=c("DummyValue") > 1),
+    Case("ts_with_columns_callable_expression", exprs=_ffill_callable, extra=None),
 ]
 
 
-@pytest.mark.parametrize(("exprs", "extra"), params(FILLS, "pred", "expect"))
+@pytest.mark.parametrize(("exprs", "extra"), params(FILLS, "exprs", "extra"))
 def test_forward_fill_reaches_back(exprs, extra):
     lf = _frame(pl.Date).lazy().piot.ts_with_columns(exprs, **LINKED).filter(c("EventDate") == date(2023, 1, 4))
     lf = lf if extra is None else lf.filter(extra)
@@ -132,13 +137,21 @@ def _between_3_and_4(**cols) -> pl.DataFrame:
 
 # (positional arguments to ts_with_columns) -> the rows with EventDate in [3 Jan, 4 Jan]
 BETWEEN = [
-    Case("ts_rolling_mean", [[c("DummyValue").sum().rolling(index_column="Date", period="2d")]], _between_3_and_4(DummyValue=[3, 5])),
-    Case("ts_with_columns_args-list", [[c("DummyValue").alias("col1"), c("DummyValue").alias("col2")]], _between_3_and_4(col1=[2, 3], col2=[2, 3])),
-    Case("ts_with_columns_args-varargs", [c("DummyValue").alias("col1"), c("DummyValue").alias("col2")], _between_3_and_4(col1=[2, 3], col2=[2, 3])),
+    Case("ts_rolling_mean", args=[[c("DummyValue").sum().rolling(index_column="Date", period="2d")]], expected=_between_3_and_4(DummyValue=[3, 5])),
+    Case(
+        "ts_with_columns_args-list",
+        args=[[c("DummyValue").alias("col1"), c("DummyValue").alias("col2")]],
+        expected=_between_3_and_4(col1=[2, 3], col2=[2, 3]),
+    ),
+    Case(
+        "ts_with_columns_args-varargs",
+        args=[c("DummyValue").alias("col1"), c("DummyValue").alias("col2")],
+        expected=_between_3_and_4(col1=[2, 3], col2=[2, 3]),
+    ),
 ]
 
 
-@pytest.mark.parametrize(("args", "expected"), params(BETWEEN, "pred", "expect"))
+@pytest.mark.parametrize(("args", "expected"), params(BETWEEN, "args", "expected"))
 def test_linked_range(args, expected):
     result = (
         _frame(pl.Date).lazy().piot.ts_with_columns(*args, **LINKED).filter(c("EventDate").is_between(date(2023, 1, 3), date(2023, 1, 4))).collect()

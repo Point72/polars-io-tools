@@ -83,7 +83,7 @@ def parts(dates, col="date", **extra) -> pl.DataFrame:
 
 
 def EP(id, pred, expect, time_unit="monthly", extra=(), col="date"):
-    return Case(id, pred, expect, {"extra": list(extra), "time_unit": time_unit, "col": col})
+    return Case(id, pred=pred, expect=expect, extra=list(extra), time_unit=time_unit, col=col)
 
 
 def _months(*ms, year=2024):
@@ -163,7 +163,7 @@ _inf = portion.inf
 
 
 def CL(id, interval, existing, expect, time_unit="daily", region=None):
-    return Case(id, interval, expect, {"existing": existing, "time_unit": time_unit, "region": region})
+    return Case(id, interval=interval, existing=existing, expect=expect, time_unit=time_unit, region=region)
 
 
 CLIPPED = [
@@ -190,7 +190,7 @@ CLIPPED = [
 
 
 @pytest.mark.parametrize(
-    ("interval", "existing", "expect", "time_unit", "region"), params(CLIPPED, "pred", "existing", "expect", "time_unit", "region")
+    ("interval", "existing", "expect", "time_unit", "region"), params(CLIPPED, "interval", "existing", "expect", "time_unit", "region")
 )
 def test_compute_clipped_expected_partitions(interval, existing, expect, time_unit, region):
     if existing is None:
@@ -394,7 +394,7 @@ def test_cachemode_pydantic_json_schema_and_default():
 
 
 def LAY(id, time_unit, fmt, dates, files):
-    return Case(id, None, files, {"time_unit": time_unit, "fmt": fmt, "dates": dates})
+    return Case(id, time_unit=time_unit, fmt=fmt, dates=dates, files=files)
 
 
 _JFM = [D(2023, 1, 15), D(2023, 2, 20), D(2023, 3, 25)]
@@ -410,7 +410,7 @@ LAYOUTS = [
 _DEFAULT_FORMAT = {"daily": "$year-$month-$day", "monthly": "$year-$month", "yearly": "$year"}
 
 
-@pytest.mark.parametrize(("time_unit", "fmt", "dates", "files"), params(LAYOUTS, "time_unit", "fmt", "dates", "expect"))
+@pytest.mark.parametrize(("time_unit", "fmt", "dates", "files"), params(LAYOUTS, "time_unit", "fmt", "dates", "files"))
 def test_layout(tmp_path, time_unit, fmt, dates, files):
     source = _frame(date=dates, value=list(range(1, len(dates) + 1)))
     result = cache_parquet(source, tmp_path, "date", time_unit=time_unit, partition_format=fmt)
@@ -900,7 +900,7 @@ def UP(id, seed, upstream, pred, calls, kept=None, **kwargs):
 
     ``calls`` is the number of upstream calls; ``kept`` is what the last pushed predicate keeps of ``_PROBE``.
     """
-    return Case(id, pred, (calls, kept), {"seed": seed, "upstream": upstream, "kwargs": {"date_column": "date", "time_unit": "daily"} | kwargs})
+    return Case(id, seed=seed, upstream=upstream, pred=pred, expect=(calls, kept), kwargs={"date_column": "date", "time_unit": "daily"} | kwargs)
 
 
 _D123 = pl.DataFrame({"date": [D(2024, 6, 1), D(2024, 6, 2), D(2024, 6, 3)], "value": [1, 2, 3]})
@@ -1107,7 +1107,7 @@ _BOUNDED_SOURCE = pl.DataFrame({"date": [D(2023, 1, 10)] * 5, "x": [1, 2, 3, 4, 
 
 
 def WB(id, pred, result, on_disk, mode=CacheMode.REBUILD, bounding=("x",)):
-    return Case(id, pred, (result, on_disk), {"mode": mode, "bounding": list(bounding) if bounding else None})
+    return Case(id, pred=pred, expect=(result, on_disk), mode=mode, bounding=list(bounding) if bounding else None)
 
 
 WRITE_BOUNDING = [

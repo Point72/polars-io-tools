@@ -26,7 +26,9 @@ ABC = [pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}), pl.DataFrame({"a": [7, 8,
 
 def P(id, sources, names, pred, expect, query=None):
     """A pruning row: ``sources`` maps an identifier to (frame, what it must receive); ``expect`` is the result."""
-    return Case(id, pred, pl.DataFrame(expect) if isinstance(expect, dict) else expect, {"sources": sources, "names": names, "query": query})
+    return Case(
+        id, pred=pred, expect=pl.DataFrame(expect) if isinstance(expect, dict) else expect, kw={"sources": sources, "names": names, "query": query}
+    )
 
 
 PRUNING = [
@@ -213,33 +215,33 @@ ERRORS = [
     *[
         Case(
             f"concat_named_unspecified_decimal_does_not_round-{dtype}",
-            {(decimal.Decimal("1.5"),): None},
-            TypeError,
-            {"names": [("identifier", dtype)]},
+            keys={(decimal.Decimal("1.5"),): None},
+            error=TypeError,
+            kw={"names": [("identifier", dtype)]},
         )
         for dtype in (pl.Decimal, decimal.Decimal)
     ],
     *[
         Case(
             f"concat_named_rejects_out_of_range_nanoseconds-{dtype}-{s}",
-            {(s,): None},
-            pl.exceptions.InvalidOperationError,
-            {"names": [("identifier", dtype)], "match": "nanosecond.*range"},
+            keys={(s,): None},
+            error=pl.exceptions.InvalidOperationError,
+            kw={"names": [("identifier", dtype)], "match": "nanosecond.*range"},
         )
         for dtype in (pl.Datetime("ns"), pl.Datetime("ns", "UTC"))
         for s in ["1600-01-01T00:00:00", "1600-01-01T00:00:00+05:30", "2500-01-01T00:00:00Z"]
     ],
-    Case("concat_named_empty_dict", {}, ValueError, {"names": ["source"]}),
+    Case("concat_named_empty_dict", keys={}, error=ValueError, kw={"names": ["source"]}),
     Case(
         "concat_named_mismatched_columns_keys",
-        {("foo",): None, ("bar",): None},
-        ValueError,
-        {"names": ["source", "type"], "match": "Number of unique columns 2 does not match number of keys 1"},
+        keys={("foo",): None, ("bar",): None},
+        error=ValueError,
+        kw={"names": ["source", "type"], "match": "Number of unique columns 2 does not match number of keys 1"},
     ),
 ]
 
 
-@pytest.mark.parametrize(("keys", "error", "kw"), params(ERRORS, "pred", "expect", "kw"))
+@pytest.mark.parametrize(("keys", "error", "kw"), params(ERRORS, "keys", "error", "kw"))
 def test_concat_named_error(keys, error, kw):
     with pytest.raises(error, match=kw.get("match")):
         cpl.concat_named({key: pl.LazyFrame({"value": [1]}) for key in keys}, kw["names"]).collect()

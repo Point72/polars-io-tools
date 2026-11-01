@@ -43,7 +43,7 @@ def dt(*a) -> datetime:
 
 
 def R(id, pred, expect, col="value_col", **kwargs):
-    return Case(id, pred, expect, {"col": col, "kwargs": kwargs})
+    return Case(id, pred=pred, col=col, kwargs=kwargs, expect=expect)
 
 
 def _unit_point(x):

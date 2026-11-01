@@ -20,9 +20,9 @@ WIDE = pl.DataFrame({"id": [1, 2, 3], "A": [10, 20, 30], "B": [100, 200, 300], "
 NOT_PUSHED = {"predicate": False, "projection": False}
 
 
-def U(id, build, bare=None, wrapped=None, lock_in=False, **kw):
+def U(id, build, bare=None, wrapped=None, lock_in=False, columns=None):
     """A row: ``build`` maps the unpivoted frame to the query; ``bare``/``wrapped`` are ``assert_pushdown`` arguments."""
-    return Case(id, build, {"bare": bare or {}, "wrapped": wrapped or {}}, {"lock_in": lock_in, **kw})
+    return Case(id, build=build, observed={"bare": bare or {}, "wrapped": wrapped or {}}, lock_in=lock_in, columns=columns)
 
 
 ROWS = [
@@ -52,8 +52,8 @@ ROWS = [
 def _params():
     for row in ROWS:
         for mode in ("bare", "wrapped"):
-            marks = gap if mode == "bare" and row.kw["lock_in"] else ()
-            yield pytest.param(mode, row.pred, row.expect[mode], row.kw.get("columns"), id=f"{mode}-{row.id}", marks=marks)
+            marks = gap if mode == "bare" and row.lock_in else ()
+            yield pytest.param(mode, row.build, row.observed[mode], row.columns, id=f"{mode}-{row.id}", marks=marks)
 
 
 @pytest.mark.parametrize(("mode", "build", "observed", "columns"), list(_params()))
@@ -73,30 +73,30 @@ MATCHES_BARE = [
     # Mixed value dtypes promote to a common supertype even when a variable filter keeps only the Int column.
     Case(
         "mixed_dtype_value_unification_wrapped",
-        pl.DataFrame({"id": [1, 2], "i": [10, 20], "f": [1.5, 2.5]}),
-        lambda lf: lf.filter(c("variable") == "i"),
-        {"index": ["id"]},
+        df=pl.DataFrame({"id": [1, 2], "i": [10, 20], "f": [1.5, 2.5]}),
+        query=lambda lf: lf.filter(c("variable") == "i"),
+        index=["id"],
     ),
-    Case("select_id_only_row_count_invariant_wrapped", WIDE.drop("C"), lambda lf: lf.select("id"), {"index": ["id"]}),
+    Case("select_id_only_row_count_invariant_wrapped", df=WIDE.drop("C"), query=lambda lf: lf.select("id"), index=["id"]),
     Case(
         "restricted_unpivot_matches_bare-no_index",
-        pl.DataFrame({"A": [10, 20], "B": [30, 40]}),
-        lambda lf: lf.filter(c("variable") == "A").select("variable"),
-        {"index": []},
+        df=pl.DataFrame({"A": [10, 20], "B": [30, 40]}),
+        query=lambda lf: lf.filter(c("variable") == "A").select("variable"),
+        index=[],
     ),
     # The subset (i, f) has supertype Float64, but the full unpivot casts i straight to String.
     Case(
         "restricted_unpivot_matches_bare-string_supertype",
-        pl.DataFrame({"id": [1], "i": [10], "f": [1.5], "s": ["abc"]}),
-        lambda lf: lf.filter(c("variable").is_in(["i", "f"]) & (c("value") == "10")),
-        {"index": "id"},
+        df=pl.DataFrame({"id": [1], "i": [10], "f": [1.5], "s": ["abc"]}),
+        query=lambda lf: lf.filter(c("variable").is_in(["i", "f"]) & (c("value") == "10")),
+        index="id",
     ),
 ]
 
 
 @pytest.mark.parametrize("case", MATCHES_BARE, ids=lambda case: case.id)
 def test_wrapped_matches_bare(case):
-    df, query, index = case.pred, case.expect, case.kw["index"]
+    df, query, index = case.df, case.query, case.index
     assert_matches_native(query(pushdown_unpivot(df.lazy(), index=index)), query(df.lazy().unpivot(index=index)), None)
 
 

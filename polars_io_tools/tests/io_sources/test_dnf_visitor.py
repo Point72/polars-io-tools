@@ -30,7 +30,7 @@ B = pl.Boolean
 
 
 def D(id, pred, expect=..., schema=None, df=None, exact=False):
-    return Case(id, pred, expect, {"schema": schema, "df": df, "exact": exact})
+    return Case(id, pred=pred, expect=expect, schema=schema, df=df, exact=exact)
 
 
 _NULL_MIX = pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]})

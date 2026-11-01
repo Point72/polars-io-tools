@@ -1,31 +1,26 @@
 """Test data shared across modules: table rows, dtypes and values, standard frames, and predicate shapes.
 
-Nothing here asserts. A table-driven test feeds ``Case`` rows to ``pytest.mark.parametrize`` through ``params``;
-what ``expect`` means is up to the test or assertion that consumes the row.
+Nothing here asserts. A table-driven test feeds ``Case`` rows to ``pytest.mark.parametrize`` through ``params``.
 """
 
-from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 
-@dataclass(frozen=True)
-class Case:
-    """One row of a table-driven test, identified by ``id`` in the test report."""
+class Case(SimpleNamespace):
+    """One row of a table-driven test: ``id`` names it in the test report, ``marks`` are its pytest marks, and every
+    other keyword is the value of the test argument of that name."""
 
-    id: str
-    pred: Any
-    expect: Any = None
-    kw: dict = field(default_factory=dict)
-    marks: tuple = ()
+    def __init__(self, id: str, *, marks=(), **values):
+        super().__init__(id=id, marks=marks, **values)
 
 
-def params(cases: list[Case], *fields: str) -> list:
-    """``pytest.param`` per row with the row's id and marks; a field is a ``Case`` attribute or a key of ``kw``."""
-    return [pytest.param(*(c.kw[f] if f in c.kw else getattr(c, f) for f in fields), id=c.id, marks=c.marks) for c in cases]
+def params(cases: list[Case], *names: str) -> list:
+    """``pytest.param`` per row with the row's values of ``names`` in order; a name the row leaves out is ``None``."""
+    return [pytest.param(*(getattr(c, n, None) for n in names), id=c.id, marks=c.marks) for c in cases]
 
 
 # Dtypes and values
@@ -76,15 +71,15 @@ def _d(day: int) -> date:
 
 
 DATE_PREDICATES = [
-    Case("ge", pl.col("date") >= _d(5)),
-    Case("le", pl.col("date") <= _d(5)),
-    Case("eq", pl.col("date") == _d(5)),
-    Case("between", pl.col("date").is_between(_d(3), _d(7))),
-    Case("is_in", pl.col("date").is_in([_d(2), _d(9)])),
-    Case("or_disjoint", (pl.col("date") < _d(3)) | (pl.col("date") > _d(12))),
-    Case("ne_in_window", pl.col("date").is_between(_d(2), _d(8)) & (pl.col("date") != _d(5))),
-    Case("contradiction", (pl.col("date") > _d(9)) & (pl.col("date") < _d(3))),
-    Case("with_other_col", (pl.col("date") >= _d(4)) & (pl.col("val") % 2 == 0)),
-    Case("dt_date", pl.col("date").cast(pl.Date) <= _d(6)),
-    Case("none", None),
+    Case("ge", pred=pl.col("date") >= _d(5)),
+    Case("le", pred=pl.col("date") <= _d(5)),
+    Case("eq", pred=pl.col("date") == _d(5)),
+    Case("between", pred=pl.col("date").is_between(_d(3), _d(7))),
+    Case("is_in", pred=pl.col("date").is_in([_d(2), _d(9)])),
+    Case("or_disjoint", pred=(pl.col("date") < _d(3)) | (pl.col("date") > _d(12))),
+    Case("ne_in_window", pred=pl.col("date").is_between(_d(2), _d(8)) & (pl.col("date") != _d(5))),
+    Case("contradiction", pred=(pl.col("date") > _d(9)) & (pl.col("date") < _d(3))),
+    Case("with_other_col", pred=(pl.col("date") >= _d(4)) & (pl.col("val") % 2 == 0)),
+    Case("dt_date", pred=pl.col("date").cast(pl.Date) <= _d(6)),
+    Case("none", pred=None),
 ]

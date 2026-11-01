@@ -72,24 +72,29 @@ def _pickled(lf):
 
 # (native source, how it becomes a Polars LazyFrame, eager result expected) -> the transformation equals Polars'.
 CONVERSIONS = [
-    Case("from_narwhals_dataframe", pd.DataFrame(DATA), True, {"convert": lambda src: cpl.from_narwhals(nw.from_native(src))}),
-    Case("from_narwhals_lazyframe", pd.DataFrame(DATA), False, {"convert": _lazy}),
-    Case("from_narwhals_stable_lazyframe", pd.DataFrame(DATA), False, {"convert": lambda src: _lazy(src, nw_stable)}),
-    Case("from_narwhals_pickle_pandas_backed", pd.DataFrame(DATA), False, {"convert": lambda src: _pickled(_lazy(src))}),
+    Case("from_narwhals_dataframe", source=pd.DataFrame(DATA), eager=True, convert=lambda src: cpl.from_narwhals(nw.from_native(src))),
+    Case("from_narwhals_lazyframe", source=pd.DataFrame(DATA), eager=False, convert=_lazy),
+    Case("from_narwhals_stable_lazyframe", source=pd.DataFrame(DATA), eager=False, convert=lambda src: _lazy(src, nw_stable)),
+    Case("from_narwhals_pickle_pandas_backed", source=pd.DataFrame(DATA), eager=False, convert=lambda src: _pickled(_lazy(src))),
     Case(
         "from_narwhals_pickle_pandas_dataframe",
-        pd.DataFrame(DATA),
-        False,
-        {"convert": lambda src: _pickled(cpl.from_narwhals(nw.from_native(src)).lazy())},
+        source=pd.DataFrame(DATA),
+        eager=False,
+        convert=lambda src: _pickled(cpl.from_narwhals(nw.from_native(src)).lazy()),
     ),
     Case(
-        "from_narwhals_pickle_pyarrow_backed", pa.table(DATA), False, {"convert": lambda src: _pickled(cpl.from_narwhals(nw.from_native(src)).lazy())}
+        "from_narwhals_pickle_pyarrow_backed",
+        source=pa.table(DATA),
+        eager=False,
+        convert=lambda src: _pickled(cpl.from_narwhals(nw.from_native(src)).lazy()),
     ),
-    Case("from_narwhals_pickle_with_filter", pd.DataFrame(DATA), False, {"convert": lambda src: _pickled(_lazy(src).filter(pl.col("a") > 3))}),
+    Case(
+        "from_narwhals_pickle_with_filter", source=pd.DataFrame(DATA), eager=False, convert=lambda src: _pickled(_lazy(src).filter(pl.col("a") > 3))
+    ),
 ]
 
 
-@pytest.mark.parametrize(("source", "eager", "convert"), params(CONVERSIONS, "pred", "expect", "convert"))
+@pytest.mark.parametrize(("source", "eager", "convert"), params(CONVERSIONS, "source", "eager", "convert"))
 def test_conversion(source, eager, convert):
     frame = convert(source)
     assert isinstance(frame, pl.DataFrame if eager else pl.LazyFrame)
@@ -172,7 +177,7 @@ def F(id, source, pred, ref=None, **kw):
 
     By default the reference is Polars' own conversion of the native source.
     """
-    return Case(id, pred, kw={"source": source, "ref": ref or (lambda src, lf: _from_native(src).lazy()), **kw})
+    return Case(id, pred=pred, source=source, ref=ref or (lambda src, lf: _from_native(src).lazy()), kw=kw)
 
 
 SOURCES = [
@@ -229,7 +234,7 @@ SOURCES = [
 
 @pytest.mark.parametrize(
     ("pred", "source", "ref", "kw"),
-    params([Case(c.id, c.pred, kw={k: c.kw[k] for k in ("source", "ref")} | {"kw": c.kw}) for c in SOURCES], "pred", "source", "ref", "kw"),
+    params(SOURCES, "pred", "source", "ref", "kw"),
 )
 def test_from_narwhals_matches_polars(pred, source, ref, kw):
     src = source()

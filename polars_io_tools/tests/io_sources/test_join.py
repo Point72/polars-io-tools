@@ -63,7 +63,7 @@ NEVER = "never scanned"
 
 def J(id, left, right, kwargs, expect=None, exact=True, query=None, marks=()):
     """A filtered_join row: ``expect`` maps right columns to their constraint, or is NEVER; ``query`` runs on the result."""
-    return Case(id, query, expect, {"left": left, "right": right, "join": kwargs, "exact": exact}, marks)
+    return Case(id, query=query, expect=expect, kw={"left": left, "right": right, "join": kwargs, "exact": exact}, marks=marks)
 
 
 FILTERED_JOINS = [
@@ -193,7 +193,7 @@ FILTERED_JOINS = [
 ]
 
 
-@pytest.mark.parametrize(("query", "expect", "kw"), params(FILTERED_JOINS, "pred", "expect", "kw"))
+@pytest.mark.parametrize(("query", "expect", "kw"), params(FILTERED_JOINS, "query", "expect", "kw"))
 def test_filtered_join(query, expect, kw):
     seen = []
     right = io_source_assert(kw["right"], seen.append)
@@ -463,36 +463,59 @@ ASOF_MATCHES = [
     # A joined frame collected with one filter and then another must not keep the first filter.
     Case(
         "filtered_join_asof_collects_do_not_retain_previous_filters",
-        [c("t") >= date(2025, 1, 10), c("t") <= date(2025, 1, 2), None],
-        (pl.DataFrame({"t": [date(2025, 1, 2), date(2025, 1, 11)]}), pl.DataFrame({"t": [date(2025, 1, 1), date(2025, 1, 10)], "value": [10, 20]})),
-        {"on": "t", "tolerance": timedelta(days=2)},
+        preds=[c("t") >= date(2025, 1, 10), c("t") <= date(2025, 1, 2), None],
+        frames=(
+            pl.DataFrame({"t": [date(2025, 1, 2), date(2025, 1, 11)]}),
+            pl.DataFrame({"t": [date(2025, 1, 1), date(2025, 1, 10)], "value": [10, 20]}),
+        ),
+        kwargs={"on": "t", "tolerance": timedelta(days=2)},
     ),
-    Case("filtered_join_asof_empty_left_dataframe", [None], (_EMPTY_TS, _TWO_QUOTES), {"on": "timestamp", "strategy": "backward"}),
+    Case(
+        "filtered_join_asof_empty_left_dataframe", preds=[None], frames=(_EMPTY_TS, _TWO_QUOTES), kwargs={"on": "timestamp", "strategy": "backward"}
+    ),
     Case(
         "filtered_join_asof_empty_right_dataframe",
-        [None],
-        (pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 9)], "value": [1]}), pl.DataFrame(schema={"timestamp": pl.Datetime, "data": pl.Utf8})),
-        {"on": "timestamp", "strategy": "backward"},
+        preds=[None],
+        frames=(
+            pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 9)], "value": [1]}),
+            pl.DataFrame(schema={"timestamp": pl.Datetime, "data": pl.Utf8}),
+        ),
+        kwargs={"on": "timestamp", "strategy": "backward"},
     ),
-    Case("filtered_join_asof_keeps_matches-cast_date", [c("t").cast(pl.Date) < datetime(2024, 1, 1, 12)], (_DT_LEFT, _DT_RIGHT), _HOUR),
-    Case("filtered_join_asof_keeps_matches-cast_ms", [c("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1)], (_DT_LEFT, _DT_RIGHT), _HOUR),
+    Case(
+        "filtered_join_asof_keeps_matches-cast_date",
+        preds=[c("t").cast(pl.Date) < datetime(2024, 1, 1, 12)],
+        frames=(_DT_LEFT, _DT_RIGHT),
+        kwargs=_HOUR,
+    ),
+    Case(
+        "filtered_join_asof_keeps_matches-cast_ms",
+        preds=[c("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1)],
+        frames=(_DT_LEFT, _DT_RIGHT),
+        kwargs=_HOUR,
+    ),
     Case(
         "filtered_join_asof_keeps_matches-date_forward",
-        [c("t") < datetime(2024, 1, 1, 12)],
-        (_DATE_LEFT, _DATE_RIGHT),
-        {"on": "t", "strategy": "forward", "tolerance": timedelta(hours=1)},
+        preds=[c("t") < datetime(2024, 1, 1, 12)],
+        frames=(_DATE_LEFT, _DATE_RIGHT),
+        kwargs={"on": "t", "strategy": "forward", "tolerance": timedelta(hours=1)},
     ),
     Case(
         "filtered_join_asof_keeps_matches-date_backward",
-        [c("t") < datetime(2024, 1, 1, 12)],
-        (_DATE_LEFT, _DATE_RIGHT),
-        {"on": "t", "strategy": "backward", "tolerance": timedelta(days=1)},
+        preds=[c("t") < datetime(2024, 1, 1, 12)],
+        frames=(_DATE_LEFT, _DATE_RIGHT),
+        kwargs={"on": "t", "strategy": "backward", "tolerance": timedelta(days=1)},
     ),
-    Case("filtered_join_asof_keeps_matches-utc", [c("t") >= datetime(2024, 1, 1, tzinfo=UTC)], (_DT_LEFT.cast(_UTC), _DT_RIGHT.cast(_UTC)), _HOUR),
+    Case(
+        "filtered_join_asof_keeps_matches-utc",
+        preds=[c("t") >= datetime(2024, 1, 1, tzinfo=UTC)],
+        frames=(_DT_LEFT.cast(_UTC), _DT_RIGHT.cast(_UTC)),
+        kwargs=_HOUR,
+    ),
 ]
 
 
-@pytest.mark.parametrize(("preds", "frames", "kwargs"), params(ASOF_MATCHES, "pred", "expect", "kw"))
+@pytest.mark.parametrize(("preds", "frames", "kwargs"), params(ASOF_MATCHES, "preds", "frames", "kwargs"))
 def test_filtered_join_asof_matches_native(preds, frames, kwargs):
     on = kwargs["on"]
     left, right = (df.lazy().set_sorted(on) for df in frames)
@@ -527,18 +550,18 @@ WINDOWS = pl.DataFrame({"event_id": ["A", "B"], "window_start": [datetime(2023, 
 JOIN_BETWEEN = [
     Case(
         "basic_range_join_no_by",
-        (
+        frames=(
             _trades([D(2024, 1, 15), D(2024, 2, 15), D(2024, 3, 15)]).drop("security_id"),
             _prices([D(2024, 1, 1), D(2024, 2, 1), D(2024, 3, 1)], [D(2024, 1, 31), D(2024, 2, 29), D(2024, 3, 31)], [10.0, 20.0, 30.0]).drop(
                 "security_id"
             ),
         ),
-        _expect(trade_id=[1, 2, 3], price=[10.0, 20.0, 30.0]),
-        TRADE,
+        expect=_expect(trade_id=[1, 2, 3], price=[10.0, 20.0, 30.0]),
+        kwargs=TRADE,
     ),
     Case(
         "equi_join_with_by_column",
-        (
+        frames=(
             _trades([D(2024, 1, 15), D(2024, 2, 15)] * 2, ["AAPL", "AAPL", "GOOG", "GOOG"]),
             _prices(
                 [D(2024, 1, 1), D(2024, 2, 1)] * 2,
@@ -547,56 +570,69 @@ JOIN_BETWEEN = [
                 ["AAPL", "AAPL", "GOOG", "GOOG"],
             ),
         ),
-        _expect(trade_id=[1, 2, 3, 4], price=[150.0, 155.0, 140.0, 145.0]),
-        BY_SECURITY,
+        expect=_expect(trade_id=[1, 2, 3, 4], price=[150.0, 155.0, 140.0, 145.0]),
+        kwargs=BY_SECURITY,
     ),
     Case(
         "left_join_preserves_rows_when_by_not_in_right",
-        (_trades([D(2024, 1, 15)] * 3, ["AAPL", "MSFT", "GOOG"]), TWO_SECURITIES),
-        _expect(trade_id=[1, 2, 3], price=[150.0, None, 140.0]),
-        {**BY_SECURITY, "how": "left"},
+        frames=(_trades([D(2024, 1, 15)] * 3, ["AAPL", "MSFT", "GOOG"]), TWO_SECURITIES),
+        expect=_expect(trade_id=[1, 2, 3], price=[150.0, None, 140.0]),
+        kwargs={**BY_SECURITY, "how": "left"},
     ),
     Case(
         "inner_join_drops_rows_when_by_not_in_right",
-        (_trades([D(2024, 1, 15)] * 3, ["AAPL", "MSFT", "GOOG"]), TWO_SECURITIES),
-        _expect(trade_id=[1, 3], price=[150.0, 140.0]),
-        {**BY_SECURITY, "how": "inner"},
+        frames=(_trades([D(2024, 1, 15)] * 3, ["AAPL", "MSFT", "GOOG"]), TWO_SECURITIES),
+        expect=_expect(trade_id=[1, 3], price=[150.0, 140.0]),
+        kwargs={**BY_SECURITY, "how": "inner"},
     ),
     Case(
         "equi_join_with_composite_key",
-        (
+        frames=(
             _trades([D(2024, 1, 15)] * 2, "ABC", source=["Bloomberg", "Reuters"]),
             _prices([JAN[0]] * 2, [JAN[1]] * 2, [100.0, 101.0], "ABC", source=["Bloomberg", "Reuters"]),
         ),
-        _expect(trade_id=[1, 2], price=[100.0, 101.0]),
-        {**TRADE, "by": ["security_id", "source"]},
+        expect=_expect(trade_id=[1, 2], price=[100.0, 101.0]),
+        kwargs={**TRADE, "by": ["security_id", "source"]},
     ),
     Case(
         "left_join_preserves_unmatched_range",
-        (_trades([D(2024, 1, 15), D(2024, 6, 15), D(2024, 3, 15)]), JAN_MAR),
-        _expect(trade_id=[1, 2, 3], price=[10.0, None, 30.0]),
-        {**BY_SECURITY, "how": "left"},
+        frames=(_trades([D(2024, 1, 15), D(2024, 6, 15), D(2024, 3, 15)]), JAN_MAR),
+        expect=_expect(trade_id=[1, 2, 3], price=[10.0, None, 30.0]),
+        kwargs={**BY_SECURITY, "how": "left"},
     ),
     Case(
         "inner_join_excludes_unmatched_range",
-        (_trades([D(2024, 1, 15), D(2024, 6, 15), D(2024, 3, 15)]), JAN_MAR),
-        _expect(trade_id=[1, 3], price=[10.0, 30.0]),
-        {**BY_SECURITY, "how": "inner"},
+        frames=(_trades([D(2024, 1, 15), D(2024, 6, 15), D(2024, 3, 15)]), JAN_MAR),
+        expect=_expect(trade_id=[1, 3], price=[10.0, 30.0]),
+        kwargs={**BY_SECURITY, "how": "inner"},
     ),
     Case(
-        "gap_between_ranges_returns_null", (_trades([D(2024, 2, 15)]), JAN_MAR), _expect(trade_id=[1], price=[None]), {**BY_SECURITY, "how": "left"}
+        "gap_between_ranges_returns_null",
+        frames=(_trades([D(2024, 2, 15)]), JAN_MAR),
+        expect=_expect(trade_id=[1], price=[None]),
+        kwargs={**BY_SECURITY, "how": "left"},
     ),
-    Case("date_before_all_ranges", (_trades([D(2023, 12, 15)]), JAN_ONLY), _expect(trade_id=[1], price=[None]), {**BY_SECURITY, "how": "left"}),
-    Case("date_after_all_ranges", (_trades([D(2024, 12, 15)]), JAN_ONLY), _expect(trade_id=[1], price=[None]), {**BY_SECURITY, "how": "left"}),
+    Case(
+        "date_before_all_ranges",
+        frames=(_trades([D(2023, 12, 15)]), JAN_ONLY),
+        expect=_expect(trade_id=[1], price=[None]),
+        kwargs={**BY_SECURITY, "how": "left"},
+    ),
+    Case(
+        "date_after_all_ranges",
+        frames=(_trades([D(2024, 12, 15)]), JAN_ONLY),
+        expect=_expect(trade_id=[1], price=[None]),
+        kwargs={**BY_SECURITY, "how": "left"},
+    ),
     Case(
         "boundary_dates_inclusive",
-        (_trades([D(2024, 1, 1), D(2024, 1, 15), D(2024, 1, 31)]), JAN_ONLY),
-        _expect(trade_id=[1, 2, 3], price=[10.0] * 3),
-        BY_SECURITY,
+        frames=(_trades([D(2024, 1, 1), D(2024, 1, 15), D(2024, 1, 31)]), JAN_ONLY),
+        expect=_expect(trade_id=[1, 2, 3], price=[10.0] * 3),
+        kwargs=BY_SECURITY,
     ),
     Case(
         "with_datetime_columns",
-        (
+        frames=(
             pl.DataFrame(
                 {"event_id": [1, 2, 3], "session_type": ["trading"] * 3, "event_time": [datetime(2024, 1, 15, h, 30) for h in (10, 14, 18)]}
             ),
@@ -609,46 +645,46 @@ JOIN_BETWEEN = [
                 }
             ),
         ),
-        _expect(event_id=[1, 2, 3], session_name=["Morning", "Afternoon", None]),
-        {"left_on": "event_time", "right_on_start": "session_start", "right_on_end": "session_end", "by": "session_type", "how": "left"},
+        expect=_expect(event_id=[1, 2, 3], session_name=["Morning", "Afternoon", None]),
+        kwargs={"left_on": "event_time", "right_on_start": "session_start", "right_on_end": "session_end", "by": "session_type", "how": "left"},
     ),
     # Regressions: a name shared by both sides, or by right_on_end or right_on_start and left_on.
     Case(
         "column_name_collision_nulls_right_not_left",
-        (pl.DataFrame({"ts": [5], "value": ["left"]}), pl.DataFrame({"start": [1], "end": [3], "value": ["right"]})),
-        _expect(value=["left"], value_right=[None]),
-        {"left_on": "ts", "right_on_start": "start", "right_on_end": "end", "how": "left"},
+        frames=(pl.DataFrame({"ts": [5], "value": ["left"]}), pl.DataFrame({"start": [1], "end": [3], "value": ["right"]})),
+        expect=_expect(value=["left"], value_right=[None]),
+        kwargs={"left_on": "ts", "right_on_start": "start", "right_on_end": "end", "how": "left"},
     ),
     # Window B ends at 10:00:04, before the reading at 10:00:05.
     Case(
         "right_on_end_name_collision_validation",
-        (
+        frames=(
             pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 10, 0, 5)], "value": [99]}),
             WINDOWS.with_columns(timestamp=pl.Series([datetime(2023, 1, 1, 10, 0, 10), datetime(2023, 1, 1, 10, 0, 4)])),
         ),
-        _expect(value=pl.Series([], dtype=pl.Int64)),
-        {"left_on": "timestamp", "right_on_start": "window_start", "right_on_end": "timestamp", "how": "inner"},
+        expect=_expect(value=pl.Series([], dtype=pl.Int64)),
+        kwargs={"left_on": "timestamp", "right_on_start": "window_start", "right_on_end": "timestamp", "how": "inner"},
     ),
     Case(
         "right_on_start_equal_left_on_preserves_left_key",
-        (pl.DataFrame({"x": [10]}), pl.DataFrame({"x": [1], "end": [5], "payload": [99]})),
-        _expect(x=[10], end=pl.Series([None], dtype=pl.Int64), payload=pl.Series([None], dtype=pl.Int64)),
-        {"left_on": "x", "right_on_start": "x", "right_on_end": "end", "how": "left"},
+        frames=(pl.DataFrame({"x": [10]}), pl.DataFrame({"x": [1], "end": [5], "payload": [99]})),
+        expect=_expect(x=[10], end=pl.Series([None], dtype=pl.Int64), payload=pl.Series([None], dtype=pl.Int64)),
+        kwargs={"left_on": "x", "right_on_start": "x", "right_on_end": "end", "how": "left"},
     ),
     # At most one match per left row: the window with the nearest start (B), though A contains 10:00:04 too.
     Case(
         "overlapping_intervals_returns_single_match",
-        (
+        frames=(
             pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 10, 0, 4)], "value": [99]}),
             WINDOWS.with_columns(window_end=pl.Series([datetime(2023, 1, 1, 10, 0, 5), datetime(2023, 1, 1, 10, 0, 8)])),
         ),
-        _expect(event_id=["B"]),
-        {"left_on": "timestamp", "right_on_start": "window_start", "right_on_end": "window_end", "how": "inner"},
+        expect=_expect(event_id=["B"]),
+        kwargs={"left_on": "timestamp", "right_on_start": "window_start", "right_on_end": "window_end", "how": "inner"},
     ),
 ]
 
 
-@pytest.mark.parametrize(("frames", "expect", "kwargs"), params(JOIN_BETWEEN, "pred", "expect", "kw"))
+@pytest.mark.parametrize(("frames", "expect", "kwargs"), params(JOIN_BETWEEN, "frames", "expect", "kwargs"))
 def test_join_between(frames, expect, kwargs):
     left, right = (df.lazy() for df in frames)
     result = join_between(left, right, **kwargs).collect()

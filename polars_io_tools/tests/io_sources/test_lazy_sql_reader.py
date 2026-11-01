@@ -157,7 +157,7 @@ def _visit(predicate: pl.Expr, dialect) -> exp.Expression | None:
 
 
 def T(id, pred, dialect, expect, render="same", strict=False, **opts):
-    return Case(id, pred, expect, {"dialect": dialect, "render": dialect if render == "same" else render, "strict": strict, "opts": opts})
+    return Case(id, pred=pred, dialect=dialect, render=dialect if render == "same" else render, strict=strict, opts=opts, expect=expect)
 
 
 def X(*contains, omits=(), equals=None):
@@ -303,33 +303,33 @@ _DAYS = "DATEDIFF(DAY, StartDate, EndDate)"
 
 NODES = [
     # LOGICAL_OR / LOGICAL_AND come from Polars' optimizer; unmapped they fell back to client-side filtering
-    Case("logical_or_operator", _logical(OperatorType.LOGICAL_OR), (None, X("OR", "A > 5", "B > 10")), {"dialect": "tsql"}),
-    Case("logical_and_operator", _logical(OperatorType.LOGICAL_AND), (None, X("AND", "A > 5", "B > 10")), {"dialect": "tsql"}),
-    Case("visit_column", _my_col, (exp.Column, X(equals="my_column")), {"dialect": "tsql"}),
-    Case("visit_literal-number", LiteralNode(expr=pl.lit(42), value=42), (exp.Literal, X(equals="42")), {"dialect": "tsql"}),
-    Case("visit_literal-null", LiteralNode(expr=pl.lit(None), value=None), (exp.Null, X(equals="NULL")), {"dialect": "tsql"}),
+    Case("logical_or_operator", node=_logical(OperatorType.LOGICAL_OR), expect=(None, X("OR", "A > 5", "B > 10")), dialect="tsql"),
+    Case("logical_and_operator", node=_logical(OperatorType.LOGICAL_AND), expect=(None, X("AND", "A > 5", "B > 10")), dialect="tsql"),
+    Case("visit_column", node=_my_col, expect=(exp.Column, X(equals="my_column")), dialect="tsql"),
+    Case("visit_literal-number", node=LiteralNode(expr=pl.lit(42), value=42), expect=(exp.Literal, X(equals="42")), dialect="tsql"),
+    Case("visit_literal-null", node=LiteralNode(expr=pl.lit(None), value=None), expect=(exp.Null, X(equals="NULL")), dialect="tsql"),
     Case(
         "visit_function_is_null",
-        FunctionNode(expr=pl.col("my_column").is_null(), inputs=[_my_col], function_type=BooleanFunctionType.IS_NULL),
-        (exp.Is, X(equals="my_column IS NULL")),
-        {"dialect": "tsql"},
+        node=FunctionNode(expr=pl.col("my_column").is_null(), inputs=[_my_col], function_type=BooleanFunctionType.IS_NULL),
+        expect=(exp.Is, X(equals="my_column IS NULL")),
+        dialect="tsql",
     ),
-    Case("total_days_to_datediff-days", _span(TemporalFunctionType.TOTAL_DAYS), (exp.DateDiff, X(equals=_DAYS)), {"dialect": "tsql"}),
+    Case("total_days_to_datediff-days", node=_span(TemporalFunctionType.TOTAL_DAYS), expect=(exp.DateDiff, X(equals=_DAYS)), dialect="tsql"),
     Case(
         "total_days_to_datediff-hours",
-        _span(TemporalFunctionType.TOTAL_HOURS),
-        (exp.DateDiff, X(equals="DATEDIFF(HOUR, StartDate, EndDate)")),
-        {"dialect": "tsql"},
+        node=_span(TemporalFunctionType.TOTAL_HOURS),
+        expect=(exp.DateDiff, X(equals="DATEDIFF(HOUR, StartDate, EndDate)")),
+        dialect="tsql",
     ),
     # the MSSQL class and None normalize to "tsql", so the TSQL-only DATEDIFF still applies
     *[
-        Case(f"visitor_dialect_normalization-{n}", _span(TemporalFunctionType.TOTAL_DAYS), (exp.DateDiff, X(equals=_DAYS)), {"dialect": d})
+        Case(f"visitor_dialect_normalization-{n}", node=_span(TemporalFunctionType.TOTAL_DAYS), expect=(exp.DateDiff, X(equals=_DAYS)), dialect=d)
         for n, d in [("tsql", "tsql"), ("MSSQL", MSSQL), ("None", None)]
     ],
 ]
 
 
-@pytest.mark.parametrize(("node", "dialect", "expect"), params(NODES, "pred", "dialect", "expect"))
+@pytest.mark.parametrize(("node", "dialect", "expect"), params(NODES, "node", "dialect", "expect"))
 def test_visit_node(node, dialect, expect):
     visitor = SQLExpressionVisitor(dialect=dialect)
     visitor.visit(node)
@@ -345,19 +345,19 @@ def test_total_days_parses_to_function_node():
 
 
 LITERALS = [
-    Case("create_sqlglot_literal_various_types-none", None, (exp.Null, "NULL")),
-    Case("create_sqlglot_literal_various_types-int", 123, (exp.Literal, "123")),
-    Case("create_sqlglot_literal_various_types-float", 12.34, (exp.Literal, "12.34")),
-    Case("create_sqlglot_literal_various_types-str", "abc", (exp.Literal, "'abc'")),
-    Case("create_sqlglot_literal_various_types-date", date(2025, 1, 2), (exp.Literal, "'2025-01-02'")),
+    Case("create_sqlglot_literal_various_types-none", value=None, expect=(exp.Null, "NULL")),
+    Case("create_sqlglot_literal_various_types-int", value=123, expect=(exp.Literal, "123")),
+    Case("create_sqlglot_literal_various_types-float", value=12.34, expect=(exp.Literal, "12.34")),
+    Case("create_sqlglot_literal_various_types-str", value="abc", expect=(exp.Literal, "'abc'")),
+    Case("create_sqlglot_literal_various_types-date", value=date(2025, 1, 2), expect=(exp.Literal, "'2025-01-02'")),
     # booleans are SQL booleans, not the strings 'True'/'False'
-    Case("create_sqlglot_literal_various_types-true", True, (exp.Boolean, "TRUE")),
-    Case("create_sqlglot_literal_various_types-false", False, (exp.Boolean, "FALSE")),
-    Case("naive_datetime_literal_unchanged", datetime(2026, 1, 15, 12, 30), (exp.Literal, "'2026-01-15 12:30:00'")),
+    Case("create_sqlglot_literal_various_types-true", value=True, expect=(exp.Boolean, "TRUE")),
+    Case("create_sqlglot_literal_various_types-false", value=False, expect=(exp.Boolean, "FALSE")),
+    Case("naive_datetime_literal_unchanged", value=datetime(2026, 1, 15, 12, 30), expect=(exp.Literal, "'2026-01-15 12:30:00'")),
 ]
 
 
-@pytest.mark.parametrize(("value", "expect"), params(LITERALS, "pred", "expect"))
+@pytest.mark.parametrize(("value", "expect"), params(LITERALS, "value", "expect"))
 def test_create_sqlglot_literal(value, expect):
     result = create_sqlglot_literal(value)
     assert isinstance(result, expect[0])
@@ -411,34 +411,38 @@ def test_nanosecond_datetime_pushdown_clickhouse_preserves_precision():
 
 # MSSQL rendering: bracket quoting, qualified stars, and case kept for anonymous nodes (table-valued functions).
 MSSQL_RENDER = [
-    Case("mssql_bracket_quoting-plain", exp.Column(this="CenterID"), X(equals="[CenterID]")),
-    Case("mssql_bracket_quoting-reserved", exp.Column(this="GROUP"), X(equals="[GROUP]")),
-    Case("mssql_bracket_quoting-bracket", exp.Column(this="Some ] Column"), X(equals="[Some ]] Column]")),
-    Case("mssql_bracket_quoting-qualified", exp.Column(this="Amount", table="Sales"), X(equals="[Sales].[Amount]")),
+    Case("mssql_bracket_quoting-plain", source=exp.Column(this="CenterID"), expect=X(equals="[CenterID]")),
+    Case("mssql_bracket_quoting-reserved", source=exp.Column(this="GROUP"), expect=X(equals="[GROUP]")),
+    Case("mssql_bracket_quoting-bracket", source=exp.Column(this="Some ] Column"), expect=X(equals="[Some ]] Column]")),
+    Case("mssql_bracket_quoting-qualified", source=exp.Column(this="Amount", table="Sales"), expect=X(equals="[Sales].[Amount]")),
     Case(
         "qualified_star_in_join",
-        "SELECT a.*, b.SomeCol FROM ServerA.dbo.vTableOne a LEFT JOIN ServerB.dbo.vTableTwo b"
+        source="SELECT a.*, b.SomeCol FROM ServerA.dbo.vTableOne a LEFT JOIN ServerB.dbo.vTableTwo b"
         " ON a.JoinKey = b.JoinKey AND a.AsOfDate BETWEEN b.StartDate AND b.EndDate",
-        X("[a].*", omits="[*]"),
+        expect=X("[a].*", omits="[*]"),
     ),
-    Case("qualified_star_without_join", "SELECT t.* FROM SomeDB.dbo.SomeTable t", X("[t].*", omits="[*]")),
-    Case("unqualified_star", "SELECT * FROM SomeTable", X("SELECT *", omits="[*]")),
+    Case("qualified_star_without_join", source="SELECT t.* FROM SomeDB.dbo.SomeTable t", expect=X("[t].*", omits="[*]")),
+    Case("unqualified_star", source="SELECT * FROM SomeTable", expect=X("SELECT *", omits="[*]")),
     Case(
         "tvf_with_literal_args_preserves_case",
-        "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')",
-        X("f_GetFuturesMaxVolAsOfDate", omits="F_GETFUTURESMAXVOLASOFDATE"),
+        source="SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')",
+        expect=X("f_GetFuturesMaxVolAsOfDate", omits="F_GETFUTURESMAXVOLASOFDATE"),
     ),
-    Case("table_with_nolock_hint_preserves_case", "SELECT * FROM MyTable (nolock)", X("MyTable", omits="MYTABLE")),
-    Case("tvf_with_multiple_args_preserves_case", "SELECT * FROM [db].[dbo].fn_GetData('2026-01-01', 42)", X("fn_GetData", omits="FN_GETDATA")),
+    Case("table_with_nolock_hint_preserves_case", source="SELECT * FROM MyTable (nolock)", expect=X("MyTable", omits="MYTABLE")),
+    Case(
+        "tvf_with_multiple_args_preserves_case",
+        source="SELECT * FROM [db].[dbo].fn_GetData('2026-01-01', 42)",
+        expect=X("fn_GetData", omits="FN_GETDATA"),
+    ),
     Case(
         "tvf_roundtrip_preserves_full_query",
-        "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')",
-        X("[FuturesData]", "[dbo]", "f_GetFuturesMaxVolAsOfDate('2026-02-06')"),
+        source="SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')",
+        expect=X("[FuturesData]", "[dbo]", "f_GetFuturesMaxVolAsOfDate('2026-02-06')"),
     ),
 ]
 
 
-@pytest.mark.parametrize(("source", "expect"), params(MSSQL_RENDER, "pred", "expect"))
+@pytest.mark.parametrize(("source", "expect"), params(MSSQL_RENDER, "source", "expect"))
 def test_mssql_render(source, expect):
     node = parse_one(source, dialect=MSSQL) if isinstance(source, str) else source
     assert_text(node.sql(dialect=MSSQL), **expect)
@@ -447,27 +451,37 @@ def test_mssql_render(source, expect):
 # _prepare_inner_for_subquery: MSSQL rejects ORDER BY in a derived table without TOP/OFFSET (error 1033), so it and
 # OPTION hints move to the outer query. Expect: (inner keeps ORDER BY, hoisted ORDER BY text or None, hoisted OPTIONs).
 HOISTING = [
-    Case("mssql_order_by_without_top_is_moved_to_outer", "SELECT region, amount FROM Sales ORDER BY amount DESC", (False, X("amount"), [])),
-    Case("mssql_order_by_with_limit_stays_in_inner", "SELECT TOP 2 region, amount FROM Sales ORDER BY amount DESC", (True, None, [])),
+    Case(
+        "mssql_order_by_without_top_is_moved_to_outer",
+        query="SELECT region, amount FROM Sales ORDER BY amount DESC",
+        expect=(False, X("amount"), []),
+        dialect=MSSQL,
+    ),
+    Case(
+        "mssql_order_by_with_limit_stays_in_inner",
+        query="SELECT TOP 2 region, amount FROM Sales ORDER BY amount DESC",
+        expect=(True, None, []),
+        dialect=MSSQL,
+    ),
     # the table alias only exists inside the subquery
     Case(
         "mssql_order_by_hoisted_with_table_qualifiers_stripped",
-        "SELECT cb.region, cb.amount FROM Sales cb ORDER BY cb.amount DESC",
-        (False, X("amount", omits="cb."), []),
+        query="SELECT cb.region, cb.amount FROM Sales cb ORDER BY cb.amount DESC",
+        expect=(False, X("amount", omits="cb."), []),
+        dialect=MSSQL,
     ),
     Case(
         "mssql_order_by_with_offset_stays_in_inner",
-        "SELECT region, amount FROM Sales ORDER BY amount OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
-        (True, None, []),
+        query="SELECT region, amount FROM Sales ORDER BY amount OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
+        expect=(True, None, []),
+        dialect=MSSQL,
     ),
-    Case("mssql_option_hints_hoisted", "SELECT region FROM Sales OPTION (HASH JOIN)", (False, None, ["HASH JOIN"])),
-    Case("non_mssql_no_hoisting", "SELECT region, amount FROM Sales ORDER BY amount DESC", (True, None, []), {"dialect": "duckdb"}),
+    Case("mssql_option_hints_hoisted", query="SELECT region FROM Sales OPTION (HASH JOIN)", expect=(False, None, ["HASH JOIN"]), dialect=MSSQL),
+    Case("non_mssql_no_hoisting", query="SELECT region, amount FROM Sales ORDER BY amount DESC", expect=(True, None, []), dialect="duckdb"),
 ]
 
 
-@pytest.mark.parametrize(
-    ("query", "dialect", "expect"), params([Case(c.id, c.pred, c.expect, {"dialect": MSSQL, **c.kw}) for c in HOISTING], "pred", "dialect", "expect")
-)
+@pytest.mark.parametrize(("query", "dialect", "expect"), params(HOISTING, "query", "dialect", "expect"))
 def test_prepare_inner_for_subquery(query, dialect, expect):
     inner_order, hoisted, options = expect
     inner, order, hoisted_options = _prepare_inner_for_subquery(parse_one(query, dialect=MSSQL), dialect=dialect)
@@ -505,7 +519,7 @@ _UNTRANSLATABLE = s.str.len_chars() == 3
 b = pl.col("b")
 
 KEEPS = [
-    Case(f"pushed_predicate_keeps_all_matching_rows-{p}", p, kw={"data": _PUSHDOWN_DF, "dialect": "duckdb"})
+    Case(f"pushed_predicate_keeps_all_matching_rows-{p}", pred=p, data=_PUSHDOWN_DF, dialect="duckdb")
     for p in [
         ~pl.when(a > 2).then(b > 100).otherwise(b > 0),
         a.is_between(2, 4).is_null(),
@@ -534,7 +548,7 @@ KEEPS = [
     ]
 ] + [
     # where Polars and SQL semantics differ
-    Case(f"pushed_predicate_keeps_polars_semantics-{p}", p, kw={"data": pl.DataFrame(data), "dialect": d})
+    Case(f"pushed_predicate_keeps_polars_semantics-{p}", pred=p, data=pl.DataFrame(data), dialect=d)
     for data, p, d in [
         ({"x": [2]}, x.cast(pl.Boolean) == True, "duckdb"),
         ({"x": [1]}, (~x).cast(pl.Boolean), "duckdb"),
@@ -1312,20 +1326,20 @@ _ERR = (ValueError, pl.exceptions.ComputeError)
 RAISES = [
     Case(
         "max_partitions_guardrail_raises",
-        lambda: scan_db(_CC, partitions=cpl.by_time("EventDate", "1d"), max_partitions=5).filter(_DATE_FILTER).collect(),
-        (pl.exceptions.ComputeError, "exceeds max_partitions"),
+        run=lambda: scan_db(_CC, partitions=cpl.by_time("EventDate", "1d"), max_partitions=5).filter(_DATE_FILTER).collect(),
+        expect=(pl.exceptions.ComputeError, "exceeds max_partitions"),
     ),
-    Case("unknown_partition_column_raises", lambda: scan_db(_CC, partitions=cpl.by_time("not_a_column")), (ValueError, "not_a_column")),
+    Case("unknown_partition_column_raises", run=lambda: scan_db(_CC, partitions=cpl.by_time("not_a_column")), expect=(ValueError, "not_a_column")),
     Case(
         "explicit_partitions_over_max_raises",
-        lambda: scan_db(_CC, partitions=list(_parts("GT", "BD", "RO")()), max_partitions=2).collect(),
-        (pl.exceptions.ComputeError, "exceeds max_partitions"),
+        run=lambda: scan_db(_CC, partitions=list(_parts("GT", "BD", "RO")()), max_partitions=2).collect(),
+        expect=(pl.exceptions.ComputeError, "exceeds max_partitions"),
     ),
     *[
         Case(
             f"partitioned_query_with_unsafe_clause_raises-{match}",
-            lambda q=q: scan_db(q, partitions=cpl.by_time("EventDate", "1y")).filter(_DATE_FILTER).collect(),
-            (_ERR, match),
+            run=lambda q=q: scan_db(q, partitions=cpl.by_time("EventDate", "1y")).filter(_DATE_FILTER).collect(),
+            expect=(_ERR, match),
         )
         for q, match in [
             ("SELECT * FROM CC_Bond ORDER BY EventDate LIMIT 10", "LIMIT"),
@@ -1335,24 +1349,24 @@ RAISES = [
     ],
     Case(
         "cast_map_unknown_column_raises",
-        lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"NotAColumn": pl.Date}),
-        (ValueError, "cast_map references column"),
+        run=lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"NotAColumn": pl.Date}),
+        expect=(ValueError, "cast_map references column"),
     ),
     # Boolean has no server-side narrowing; reporting it while emitting VARCHAR would misrepresent the data
     Case(
         "cast_map_rejects_unsupported_dtype",
-        lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"RecordDate": pl.Boolean}),
-        (ValueError, "No SQL type mapping"),
+        run=lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"RecordDate": pl.Boolean}),
+        expect=(ValueError, "No SQL type mapping"),
     ),
     Case(
         "cast_map_rejects_time_zone_aware_datetime",
-        lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"RecordDate": pl.Datetime("us", "UTC")}),
-        (ValueError, "time-zone-aware"),
+        run=lambda: scan_db("SELECT * FROM RecordTbl", cast_map={"RecordDate": pl.Datetime("us", "UTC")}),
+        expect=(ValueError, "time-zone-aware"),
     ),
 ]
 
 
-@pytest.mark.parametrize(("run", "expect"), params(RAISES, "pred", "expect"))
+@pytest.mark.parametrize(("run", "expect"), params(RAISES, "run", "expect"))
 def test_scan_db_raises(db, run, expect):
     db.conn.execute(TABLES["RecordTbl"])
     with pytest.raises(expect[0], match=expect[1]):

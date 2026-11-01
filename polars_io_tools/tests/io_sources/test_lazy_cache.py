@@ -253,7 +253,7 @@ _ALL5 = {c: 1 for c in ("x", "p", "x2", "y2", "p2")}
 
 
 def STEPS(id, queries, partition_cols=(), column_granularity=True):
-    return Case(id, queries, None, {"partition_cols": partition_cols, "column_granularity": column_granularity})
+    return Case(id, queries=queries, partition_cols=partition_cols, column_granularity=column_granularity)
 
 
 CACHE_STEPS = [
@@ -311,7 +311,7 @@ CACHE_STEPS = [
 ]
 
 
-@pytest.mark.parametrize(("queries", "partition_cols", "column_granularity"), params(CACHE_STEPS, "pred", "partition_cols", "column_granularity"))
+@pytest.mark.parametrize(("queries", "partition_cols", "column_granularity"), params(CACHE_STEPS, "queries", "partition_cols", "column_granularity"))
 def test_cache_steps(source, df, queries, partition_cols, column_granularity):
     cache = {}
     df_cache = df.piot.cache(cache, order_by="x", partition_cols=partition_cols, column_granularity=column_granularity)
@@ -368,7 +368,7 @@ def test_docstring():
 
 
 def C(id, expr, expected, schema=None):
-    return Case(id, expr, expected, {"schema": schema})
+    return Case(id, expr=expr, expected=expected, schema=schema)
 
 
 x, a, b, c = pl.col("x"), pl.col("a"), pl.col("b"), pl.col("c")
@@ -425,7 +425,7 @@ CONTRADICTIONS = [
 ]
 
 
-@pytest.mark.parametrize(("expr", "schema", "expected"), params(CONTRADICTIONS, "pred", "schema", "expect"))
+@pytest.mark.parametrize(("expr", "schema", "expected"), params(CONTRADICTIONS, "expr", "schema", "expected"))
 def test_lazy_cache_is_contradiction(expr, schema, expected):
     assert (_is_contradiction(expr) if schema is None else _is_contradiction(expr, schema)) == expected
 

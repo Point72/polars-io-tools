@@ -118,30 +118,40 @@ def _datetime_literal_shape() -> N:
 
 
 PARSE_CASES = [
-    Case("parse_simple_column", c("test_column"), Col("test_column")),
+    Case("parse_simple_column", expr=c("test_column"), shape=Col("test_column")),
     # literals
-    Case("value_property_on_different_node_types-literal", pl.lit(42), N(LiteralNode, value=42, can_extract_literal=True)),
-    Case("parse_literal-string", pl.lit("hello"), Lit("hello")),
-    Case("parse_literal-boolean", pl.lit(True), Lit(True)),
-    Case("parse_literal-none", pl.lit(None), Lit(None)),
-    Case("parse_literal-list", pl.lit([1, 2, 3]), Lit([1, 2, 3])),
-    Case("special_literals-nan", pl.lit(float("nan")), Lit(math.isnan)),
-    Case("special_literals-inf", pl.lit(float("inf")), Lit(float("inf"))),
-    Case("special_literals-neg_inf", pl.lit(float("-inf")), Lit(float("-inf"))),
-    Case("date_time_literals_parsed-datetime", pl.lit(_DT), _datetime_literal_shape()),
-    Case("date_time_literals_parsed-date", pl.lit(date(2023, 1, 1)), Lit(date(2023, 1, 1))),
-    Case("date_time_literals_parsed-time", pl.lit(time(12, 30, 45)), Lit(time(12, 30, 45))),
-    Case("complex_literals-dict", pl.lit({"a": 1, "b": 2}), Lit({"a": 1, "b": 2}) if polars_has("struct_literal_parsed") else N(ErrorNode)),
-    Case("complex_literals-nested_list", pl.lit([[1, 2], [3, 4]]), Lit([[1, 2], [3, 4]])),
-    Case("value_property_on_different_node_types-column", c("x"), N(ColumnNode, value=None, can_extract_literal=False)),
-    Case("value_property_on_different_node_types-function", c("x").str.to_uppercase(), N(FunctionNode, value=None, can_extract_literal=False)),
-    Case("value_property_on_different_node_types-cast_literal", pl.lit(42).cast(pl.Float64), N(CastNode, value=42.0, can_extract_literal=True)),
+    Case("value_property_on_different_node_types-literal", expr=pl.lit(42), shape=N(LiteralNode, value=42, can_extract_literal=True)),
+    Case("parse_literal-string", expr=pl.lit("hello"), shape=Lit("hello")),
+    Case("parse_literal-boolean", expr=pl.lit(True), shape=Lit(True)),
+    Case("parse_literal-none", expr=pl.lit(None), shape=Lit(None)),
+    Case("parse_literal-list", expr=pl.lit([1, 2, 3]), shape=Lit([1, 2, 3])),
+    Case("special_literals-nan", expr=pl.lit(float("nan")), shape=Lit(math.isnan)),
+    Case("special_literals-inf", expr=pl.lit(float("inf")), shape=Lit(float("inf"))),
+    Case("special_literals-neg_inf", expr=pl.lit(float("-inf")), shape=Lit(float("-inf"))),
+    Case("date_time_literals_parsed-datetime", expr=pl.lit(_DT), shape=_datetime_literal_shape()),
+    Case("date_time_literals_parsed-date", expr=pl.lit(date(2023, 1, 1)), shape=Lit(date(2023, 1, 1))),
+    Case("date_time_literals_parsed-time", expr=pl.lit(time(12, 30, 45)), shape=Lit(time(12, 30, 45))),
+    Case(
+        "complex_literals-dict", expr=pl.lit({"a": 1, "b": 2}), shape=Lit({"a": 1, "b": 2}) if polars_has("struct_literal_parsed") else N(ErrorNode)
+    ),
+    Case("complex_literals-nested_list", expr=pl.lit([[1, 2], [3, 4]]), shape=Lit([[1, 2], [3, 4]])),
+    Case("value_property_on_different_node_types-column", expr=c("x"), shape=N(ColumnNode, value=None, can_extract_literal=False)),
+    Case(
+        "value_property_on_different_node_types-function",
+        expr=c("x").str.to_uppercase(),
+        shape=N(FunctionNode, value=None, can_extract_literal=False),
+    ),
+    Case(
+        "value_property_on_different_node_types-cast_literal",
+        expr=pl.lit(42).cast(pl.Float64),
+        shape=N(CastNode, value=42.0, can_extract_literal=True),
+    ),
     # binary operators
-    Case("parse_binary_operation-eq", c("a") == c("b"), Bin(Op.EQ, N(ColumnNode), N(ColumnNode))),
-    Case("parse_binary_operation-plus", c("a") + pl.lit(5), Bin(Op.PLUS, N(ColumnNode), N(LiteralNode))),
-    Case("binary_expr_node_contents", c("a") + c("b"), Bin(Op.PLUS, Col("a"), Col("b"))),
+    Case("parse_binary_operation-eq", expr=c("a") == c("b"), shape=Bin(Op.EQ, N(ColumnNode), N(ColumnNode))),
+    Case("parse_binary_operation-plus", expr=c("a") + pl.lit(5), shape=Bin(Op.PLUS, N(ColumnNode), N(LiteralNode))),
+    Case("binary_expr_node_contents", expr=c("a") + c("b"), shape=Bin(Op.PLUS, Col("a"), Col("b"))),
     *[
-        Case(f"parse_all_comparison_operators-{op.name.lower()}", fn(c("a"), pl.lit(10)), N(BinaryExprNode, op=op))
+        Case(f"parse_all_comparison_operators-{op.name.lower()}", expr=fn(c("a"), pl.lit(10)), shape=N(BinaryExprNode, op=op))
         for fn, op in [
             (lambda a, b: a == b, Op.EQ),
             (lambda a, b: a != b, Op.NOT_EQ),
@@ -152,7 +162,7 @@ PARSE_CASES = [
         ]
     ],
     *[
-        Case(f"parse_all_arithmetic_operators-{op.name.lower()}", fn(c("a"), pl.lit(10)), N(BinaryExprNode, op=op))
+        Case(f"parse_all_arithmetic_operators-{op.name.lower()}", expr=fn(c("a"), pl.lit(10)), shape=N(BinaryExprNode, op=op))
         for fn, op in [
             (lambda a, b: a + b, Op.PLUS),
             (lambda a, b: a - b, Op.MINUS),
@@ -160,37 +170,37 @@ PARSE_CASES = [
             (lambda a, b: a / b, Op.TRUE_DIVIDE),
         ]
     ],
-    Case("parse_all_logical_operators-and", (c("a") > 5) & (c("b") < 10), N(BinaryExprNode, op=Op.AND)),
-    Case("parse_all_logical_operators-or", (c("a") > 5) | (c("b") < 10), N(BinaryExprNode, op=Op.OR)),
+    Case("parse_all_logical_operators-and", expr=(c("a") > 5) & (c("b") < 10), shape=N(BinaryExprNode, op=Op.AND)),
+    Case("parse_all_logical_operators-or", expr=(c("a") > 5) | (c("b") < 10), shape=N(BinaryExprNode, op=Op.OR)),
     Case(
         "nested_alias",
-        c("a").alias("b").alias("c"),
-        N(AliasNode, name="c", input=N(AliasNode, name="b", input=Col("a"))),
+        expr=c("a").alias("b").alias("c"),
+        shape=N(AliasNode, name="c", input=N(AliasNode, name="b", input=Col("a"))),
         marks=(pytest.mark.skipif(polars_has("nested_alias_dropped"), reason="meta.pop() drops a nested alias"),),
     ),
     # functions
-    Case("parse_string_function-contains", c("text").str.contains("pattern"), Fn(Str.CONTAINS, Col("text"), Lit("pattern"))),
-    Case("parse_string_function-uppercase", c("text").str.to_uppercase(), Fn(Str.UPPERCASE, Col("text"))),
-    Case("parse_not", ~c("flag"), N(FunctionNode, inputs=[Col("flag")])),
-    Case("parse_boolean_function-is_null", c("value").is_null(), Fn(Bool.IS_NULL, Col("value"))),
-    Case("parse_boolean_function-is_not_null", c("value").is_not_null(), Fn(Bool.IS_NOT_NULL, Col("value"))),
-    Case("parse_is_in_function-list", c("value").is_in([1, 2, 3]), Fn(Bool.IS_IN, Col("value"), Lit([1, 2, 3]))),
-    Case("parse_is_in_function-column", c("value").is_in(c("other_list")), Fn(Bool.IS_IN, Col("value"), Col("other_list"))),
-    Case("parse_is_between-default", c("value").is_between(1, 10), Fn(Bool.IS_BETWEEN, *_IS_BETWEEN_INPUTS, options={"closed": "Both"})),
+    Case("parse_string_function-contains", expr=c("text").str.contains("pattern"), shape=Fn(Str.CONTAINS, Col("text"), Lit("pattern"))),
+    Case("parse_string_function-uppercase", expr=c("text").str.to_uppercase(), shape=Fn(Str.UPPERCASE, Col("text"))),
+    Case("parse_not", expr=~c("flag"), shape=N(FunctionNode, inputs=[Col("flag")])),
+    Case("parse_boolean_function-is_null", expr=c("value").is_null(), shape=Fn(Bool.IS_NULL, Col("value"))),
+    Case("parse_boolean_function-is_not_null", expr=c("value").is_not_null(), shape=Fn(Bool.IS_NOT_NULL, Col("value"))),
+    Case("parse_is_in_function-list", expr=c("value").is_in([1, 2, 3]), shape=Fn(Bool.IS_IN, Col("value"), Lit([1, 2, 3]))),
+    Case("parse_is_in_function-column", expr=c("value").is_in(c("other_list")), shape=Fn(Bool.IS_IN, Col("value"), Col("other_list"))),
+    Case("parse_is_between-default", expr=c("value").is_between(1, 10), shape=Fn(Bool.IS_BETWEEN, *_IS_BETWEEN_INPUTS, options={"closed": "Both"})),
     *[
         Case(
             f"parse_is_between-{closed}",
-            c("value").is_between(1, 10, closed=closed),
-            Fn(Bool.IS_BETWEEN, *_IS_BETWEEN_INPUTS, options={"closed": closed.capitalize()}),
+            expr=c("value").is_between(1, 10, closed=closed),
+            shape=Fn(Bool.IS_BETWEEN, *_IS_BETWEEN_INPUTS, options={"closed": closed.capitalize()}),
         )
         for closed in ("both", "left", "right", "none")
     ],
     *[
-        Case(f"parse_cast-{dtype.__name__}", c("value").cast(dtype), N(CastNode))
+        Case(f"parse_cast-{dtype.__name__}", expr=c("value").cast(dtype), shape=N(CastNode))
         for dtype in [pl.Int32, pl.Float64, pl.Utf8, pl.Boolean, pl.Date, pl.Datetime]
     ],
     *[
-        Case(f"parse_datetime_functions-{name}", expr, N(FunctionNode, function_type=kind_of(TemporalFunctionType)))
+        Case(f"parse_datetime_functions-{name}", expr=expr, shape=N(FunctionNode, function_type=kind_of(TemporalFunctionType)))
         for name, expr in [
             ("year", c("date").dt.year()),
             ("month", c("date").dt.month()),
@@ -202,7 +212,7 @@ PARSE_CASES = [
         ]
     ],
     *[
-        Case(f"parse_string_manipulation-{name}", expr, N(FunctionNode, function_type=kind_of(StringFunctionType)))
+        Case(f"parse_string_manipulation-{name}", expr=expr, shape=N(FunctionNode, function_type=kind_of(StringFunctionType)))
         for name, expr in [
             ("to_lowercase", c("text").str.to_lowercase()),
             ("starts_with", c("text").str.starts_with("prefix")),
@@ -212,26 +222,28 @@ PARSE_CASES = [
             ("join", c("text").str.join("other")),
         ]
     ],
-    Case("unknown_expressions", pl.coalesce(c("a"), c("b"), c("c")), N(FunctionNode, function_type=GenericFunctionType.UNKNOWN)),
+    Case("unknown_expressions", expr=pl.coalesce(c("a"), c("b"), c("c")), shape=N(FunctionNode, function_type=GenericFunctionType.UNKNOWN)),
     Case(
         "ternary_operations",
-        pl.when(c("a") > 0).then(1).otherwise(0),
-        N(TernaryNode, predicate=N(BinaryExprNode, op=Op.GT), truthy=Lit(1), falsy=Lit(0)),
+        expr=pl.when(c("a") > 0).then(1).otherwise(0),
+        shape=N(TernaryNode, predicate=N(BinaryExprNode, op=Op.GT), truthy=Lit(1), falsy=Lit(0)),
     ),
     Case(
         "fill_null_function_parsing",
-        c("nullable").fill_null(42) > 50,
-        Bin(Op.GT, Fn(GenericFunctionType.FILL_NULL, Col("nullable"), Lit(42)), Lit(50)),
+        expr=c("nullable").fill_null(42) > 50,
+        shape=Bin(Op.GT, Fn(GenericFunctionType.FILL_NULL, Col("nullable"), Lit(42)), Lit(50)),
     ),
     Case(
         "fill_null_with_expression",
-        c("nullable").fill_null(pl.when(c("id") > 5).then(100).otherwise(0)) > 50,
-        N(BinaryExprNode, op=Op.GT, left=Fn(GenericFunctionType.FILL_NULL, Col("nullable"), N(TernaryNode, predicate=N(BinaryExprNode, op=Op.GT)))),
+        expr=c("nullable").fill_null(pl.when(c("id") > 5).then(100).otherwise(0)) > 50,
+        shape=N(
+            BinaryExprNode, op=Op.GT, left=Fn(GenericFunctionType.FILL_NULL, Col("nullable"), N(TernaryNode, predicate=N(BinaryExprNode, op=Op.GT)))
+        ),
     ),
     Case(
         "parse_complex_expression",
-        (c("age") >= 18) & c("country").is_in(["USA", "Canada", "Mexico"]),
-        Bin(
+        expr=(c("age") >= 18) & c("country").is_in(["USA", "Canada", "Mexico"]),
+        shape=Bin(
             Op.AND,
             Bin(Op.GT_EQ, Col("age"), Lit(18)),
             Fn(Bool.IS_IN, Col("country"), Lit(["USA", "Canada", "Mexico"]), options={"nulls_equal": False}),
@@ -239,10 +251,10 @@ PARSE_CASES = [
     ),
     Case(
         "parse_complex_nested_expressions",
-        pl.when((c("a") > 10) & ((c("b") < 5) | c("c").is_in([1, 2, 3])))
+        expr=pl.when((c("a") > 10) & ((c("b") < 5) | c("c").is_in([1, 2, 3])))
         .then(c("d") * 2 + c("e").cast(pl.Float64))
         .otherwise(c("f").str.to_uppercase().str.contains("X") | c("g").is_null()),
-        N(
+        shape=N(
             TernaryNode,
             predicate=Bin(Op.AND, Bin(Op.GT, Col("a"), Lit(10)), Bin(Op.OR, Bin(Op.LT, Col("b"), Lit(5)), Fn(Bool.IS_IN, Col("c"), Lit([1, 2, 3])))),
             truthy=Bin(Op.PLUS, Bin(Op.MULTIPLY, Col("d"), Lit(2)), N(CastNode, input=Col("e"), dtype=pl.Float64)),
@@ -252,7 +264,7 @@ PARSE_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("expr", "shape"), params(PARSE_CASES, "pred", "expect"))
+@pytest.mark.parametrize(("expr", "shape"), params(PARSE_CASES, "expr", "shape"))
 def test_parse(expr, shape):
     shape.match(get_parsed_expr(expr))
 
@@ -397,41 +409,41 @@ _NOW, _TODAY = datetime.now(), date.today()
 _STRUCT = {"name": "test", "values": [1, 2, 3], "metadata": {"active": True}}
 
 LITERAL_CASES = [
-    Case("basic_literals-int", pl.lit(5), 5),
-    Case("basic_literals-string", pl.lit("test"), "test"),
-    Case("basic_literals-true", pl.lit(True), True),
-    Case("basic_literals-none", pl.lit(None), None),
-    Case("boolean_literals-false", pl.lit(False), False),
-    Case("list_literals-list", pl.lit([1, 2, 3]), [1, 2, 3]),
-    Case("list_literals-tuple", pl.lit((4, 5, 6)), lambda v: v in ((4, 5, 6), [4, 5, 6])),
-    Case("non_literal_expressions", c("non_existent"), lambda v: v is FAILED_LITERAL_RESULT),
-    Case("numeric_literals-int", pl.lit(42), 42),
-    Case("numeric_literals-float", pl.lit(3.14), 3.14),
-    Case("numeric_literals-negative", pl.lit(-10), -10),
-    Case("numeric_literals-zero", pl.lit(0), 0),
-    Case("numeric_literals-inf", pl.lit(float("inf")), float("inf")),
-    Case("numeric_literals-nan", pl.lit(float("nan")), math.isnan),
-    Case("string_literals_special_cases-empty", pl.lit(""), ""),
-    Case("string_literals_special_cases-space", pl.lit(" "), " "),
-    Case("string_literals_special_cases-punctuation", pl.lit("Special chars: !@#$%^&*()"), "Special chars: !@#$%^&*()"),
-    Case("string_literals_special_cases-newline", pl.lit("Line1\nLine2"), "Line1\nLine2"),
-    Case("date_time_literals-date", pl.lit(_TODAY), _TODAY),
-    Case("date_time_literals-datetime", pl.lit(_NOW), _NOW),
-    Case("get_literal_value-datetime", pl.lit(datetime(2023, 1, 1)), datetime(2023, 1, 1)),
-    Case("date_time_literals-time", pl.lit(time(12, 30, 45)), time(12, 30, 45)),
-    Case("date_time_literals-timedelta", pl.lit(timedelta(days=1, hours=2)), timedelta(days=1, hours=2)),
-    Case("complex_nested_structures-dict", pl.lit({"a": 1, "b": 2}), {"a": 1, "b": 2}),
-    Case("complex_nested_structures-nested_list", pl.lit([[1, 2], [3, 4]]), [[1, 2], [3, 4]]),
-    Case("complex_nested_structures-mixed", pl.lit(_STRUCT), _STRUCT),
-    Case("edge_cases-large_int", pl.lit(10**20), 10**20),
-    Case("edge_cases-long_string", pl.lit("a" * 10000), "a" * 10000),
-    Case("compound_expressions-sum", pl.lit(5) + pl.lit(3), 8),
-    Case("compound_expressions-function", pl.lit("test").str.to_uppercase(), "TEST"),
-    Case("binary_data", pl.lit(b"binary\x00data"), b"binary\x00data"),
+    Case("basic_literals-int", expr=pl.lit(5), expect=5),
+    Case("basic_literals-string", expr=pl.lit("test"), expect="test"),
+    Case("basic_literals-true", expr=pl.lit(True), expect=True),
+    Case("basic_literals-none", expr=pl.lit(None), expect=None),
+    Case("boolean_literals-false", expr=pl.lit(False), expect=False),
+    Case("list_literals-list", expr=pl.lit([1, 2, 3]), expect=[1, 2, 3]),
+    Case("list_literals-tuple", expr=pl.lit((4, 5, 6)), expect=lambda v: v in ((4, 5, 6), [4, 5, 6])),
+    Case("non_literal_expressions", expr=c("non_existent"), expect=lambda v: v is FAILED_LITERAL_RESULT),
+    Case("numeric_literals-int", expr=pl.lit(42), expect=42),
+    Case("numeric_literals-float", expr=pl.lit(3.14), expect=3.14),
+    Case("numeric_literals-negative", expr=pl.lit(-10), expect=-10),
+    Case("numeric_literals-zero", expr=pl.lit(0), expect=0),
+    Case("numeric_literals-inf", expr=pl.lit(float("inf")), expect=float("inf")),
+    Case("numeric_literals-nan", expr=pl.lit(float("nan")), expect=math.isnan),
+    Case("string_literals_special_cases-empty", expr=pl.lit(""), expect=""),
+    Case("string_literals_special_cases-space", expr=pl.lit(" "), expect=" "),
+    Case("string_literals_special_cases-punctuation", expr=pl.lit("Special chars: !@#$%^&*()"), expect="Special chars: !@#$%^&*()"),
+    Case("string_literals_special_cases-newline", expr=pl.lit("Line1\nLine2"), expect="Line1\nLine2"),
+    Case("date_time_literals-date", expr=pl.lit(_TODAY), expect=_TODAY),
+    Case("date_time_literals-datetime", expr=pl.lit(_NOW), expect=_NOW),
+    Case("get_literal_value-datetime", expr=pl.lit(datetime(2023, 1, 1)), expect=datetime(2023, 1, 1)),
+    Case("date_time_literals-time", expr=pl.lit(time(12, 30, 45)), expect=time(12, 30, 45)),
+    Case("date_time_literals-timedelta", expr=pl.lit(timedelta(days=1, hours=2)), expect=timedelta(days=1, hours=2)),
+    Case("complex_nested_structures-dict", expr=pl.lit({"a": 1, "b": 2}), expect={"a": 1, "b": 2}),
+    Case("complex_nested_structures-nested_list", expr=pl.lit([[1, 2], [3, 4]]), expect=[[1, 2], [3, 4]]),
+    Case("complex_nested_structures-mixed", expr=pl.lit(_STRUCT), expect=_STRUCT),
+    Case("edge_cases-large_int", expr=pl.lit(10**20), expect=10**20),
+    Case("edge_cases-long_string", expr=pl.lit("a" * 10000), expect="a" * 10000),
+    Case("compound_expressions-sum", expr=pl.lit(5) + pl.lit(3), expect=8),
+    Case("compound_expressions-function", expr=pl.lit("test").str.to_uppercase(), expect="TEST"),
+    Case("binary_data", expr=pl.lit(b"binary\x00data"), expect=b"binary\x00data"),
 ]
 
 
-@pytest.mark.parametrize(("expr", "expect"), params(LITERAL_CASES, "pred", "expect"))
+@pytest.mark.parametrize(("expr", "expect"), params(LITERAL_CASES, "expr", "expect"))
 def test_get_literal_value(expr, expect):
     _match(get_literal_value(expr), expect, "value")
 
@@ -439,50 +451,62 @@ def test_get_literal_value(expr, expect):
 # --- column extraction ------------------------------------------------------------------------------------------------
 
 COLUMN_CASES = [
-    Case("extract_column_name-cast_int", c("test_column1").cast(pl.Int32), "test_column1", {"fn": extract_column_name, "schema": None}),
-    Case("extract_column_name-cast_datetime", c("test_column2").cast(pl.Datetime), "test_column2", {"fn": extract_column_name, "schema": None}),
+    Case("extract_column_name-cast_int", expr=c("test_column1").cast(pl.Int32), expect="test_column1", fn=extract_column_name, schema=None),
+    Case("extract_column_name-cast_datetime", expr=c("test_column2").cast(pl.Datetime), expect="test_column2", fn=extract_column_name, schema=None),
     Case(
-        "extract_column_name-cast_datetime_ns", c("test_column3").cast(pl.Datetime("ns")), "test_column3", {"fn": extract_column_name, "schema": None}
+        "extract_column_name-cast_datetime_ns",
+        expr=c("test_column3").cast(pl.Datetime("ns")),
+        expect="test_column3",
+        fn=extract_column_name,
+        schema=None,
     ),
-    Case("extract_column_name-struct", pl.struct(c("a"), c("b")), None, {"fn": extract_column_name, "schema": None}),
-    Case("extract_column_name-arithmetic", c("b").mul(2).cast(pl.Float64), None, {"fn": extract_column_name, "schema": None}),
-    Case("extract_column_name-alias", c("b").alias("big_b"), "b", {"fn": extract_column_name, "schema": None}),
+    Case("extract_column_name-struct", expr=pl.struct(c("a"), c("b")), expect=None, fn=extract_column_name, schema=None),
+    Case("extract_column_name-arithmetic", expr=c("b").mul(2).cast(pl.Float64), expect=None, fn=extract_column_name, schema=None),
+    Case("extract_column_name-alias", expr=c("b").alias("big_b"), expect="b", fn=extract_column_name, schema=None),
     Case(
-        "extract_column_name-cast_and_aliases", c("b").cast(pl.Int64).alias("first").alias("second"), "b", {"fn": extract_column_name, "schema": None}
+        "extract_column_name-cast_and_aliases",
+        expr=c("b").cast(pl.Int64).alias("first").alias("second"),
+        expect="b",
+        fn=extract_column_name,
+        schema=None,
     ),
     # ``dt.date()`` floors to day granularity, order-preserving like ``cast(pl.Date)``.
-    Case("extract_column_name-dt_date", c("ts").dt.date(), "ts", {"fn": extract_column_name, "schema": None}),
-    Case("extract_column_name-dt_date_alias", c("ts").dt.date().alias("d"), "ts", {"fn": extract_column_name, "schema": None}),
+    Case("extract_column_name-dt_date", expr=c("ts").dt.date(), expect="ts", fn=extract_column_name, schema=None),
+    Case("extract_column_name-dt_date_alias", expr=c("ts").dt.date().alias("d"), expect="ts", fn=extract_column_name, schema=None),
     # The strict extractor unwraps a cast only when the schema proves it value-preserving.
-    Case("extract_value_preserving_column_name-alias", c("b").alias("big_b"), "b", {"fn": extract_value_preserving_column_name, "schema": None}),
+    Case("extract_value_preserving_column_name-alias", expr=c("b").alias("big_b"), expect="b", fn=extract_value_preserving_column_name, schema=None),
     Case(
         "extract_value_preserving_column_name-cast_no_schema",
-        c("a").cast(pl.Int32),
-        None,
-        {"fn": extract_value_preserving_column_name, "schema": None},
+        expr=c("a").cast(pl.Int32),
+        expect=None,
+        fn=extract_value_preserving_column_name,
+        schema=None,
     ),
     Case(
         "extract_value_preserving_column_name-narrowing",
-        c("a").cast(pl.Int8, wrap_numerical=True),
-        None,
-        {"fn": extract_value_preserving_column_name, "schema": {"a": pl.Int64}},
+        expr=c("a").cast(pl.Int8, wrap_numerical=True),
+        expect=None,
+        fn=extract_value_preserving_column_name,
+        schema={"a": pl.Int64},
     ),
     Case(
         "extract_value_preserving_column_name-widening",
-        c("a").cast(pl.Int64),
-        "a",
-        {"fn": extract_value_preserving_column_name, "schema": {"a": pl.Int8}},
+        expr=c("a").cast(pl.Int64),
+        expect="a",
+        fn=extract_value_preserving_column_name,
+        schema={"a": pl.Int8},
     ),
     Case(
         "extract_value_preserving_column_name-decimal_widening",
-        c("x").cast(pl.Decimal(38, 2)),
-        "x",
-        {"fn": extract_value_preserving_column_name, "schema": {"x": pl.Decimal(10, 2)}},
+        expr=c("x").cast(pl.Decimal(38, 2)),
+        expect="x",
+        fn=extract_value_preserving_column_name,
+        schema={"x": pl.Decimal(10, 2)},
     ),
 ]
 
 
-@pytest.mark.parametrize(("fn", "expr", "schema", "expect"), params(COLUMN_CASES, "fn", "pred", "schema", "expect"))
+@pytest.mark.parametrize(("fn", "expr", "schema", "expect"), params(COLUMN_CASES, "fn", "expr", "schema", "expect"))
 def test_extract_column(fn, expr, schema, expect):
     node = get_parsed_expr(expr)
     assert (fn(node) if schema is None else fn(node, schema)) == expect
@@ -513,7 +537,7 @@ def P(id, expr, pushed=True, results=False, check=None, df=None, marks=()):
     """``pushed``: whether the source receives a predicate (``None``: not checked); ``results``: also compare a plain
     filtered read; ``check(original, pushed)``: inspect the pushed predicate; ``df``: the source frame, else ``tester``.
     """
-    return Case(id, expr, pushed, {"results": results, "check": check, "df": df}, marks)
+    return Case(id, expr=expr, pushed=pushed, results=results, check=check, df=df, marks=marks)
 
 
 def _pushed_on(name: str):
@@ -687,7 +711,7 @@ PUSHDOWN_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("expr", "pushed", "results", "check", "df"), params(PUSHDOWN_CASES, "pred", "expect", "results", "check", "df"))
+@pytest.mark.parametrize(("expr", "pushed", "results", "check", "df"), params(PUSHDOWN_CASES, "expr", "pushed", "results", "check", "df"))
 def test_pushdown(request, expr, pushed, results, check, df):
     tracker = request.getfixturevalue("tester") if df is None else PredicateTracker(df)
     if pushed is not None:

@@ -35,7 +35,7 @@ def _combined(col: str):
 def A(id, df, pred, temporal=None, discrete=None, binary_nodes=1, wrap=None):
     """``temporal``/``discrete``: column -> the bounds / value sets of every filter the analyzer finds on it.
     ``binary_nodes``: the least number of binary nodes in the pushed predicate."""
-    return Case(id, pred, kw={"df": df, "wrap": wrap, "temporal": temporal or {}, "discrete": discrete or {}, "binary_nodes": binary_nodes})
+    return Case(id, pred=pred, df=df, wrap=wrap, temporal=temporal or {}, discrete=discrete or {}, binary_nodes=binary_nodes)
 
 
 date_, cat = pl.col("date"), pl.col("category")
@@ -150,67 +150,65 @@ _WINDOW = pl.col("val") > pl.col("val").mean()
 
 # tracker assertion call -> passes (None) or raises (exception, match)
 ASSERTIONS = [
-    Case("assert_results_match_passing", _VALS, None, {"call": lambda t: t.assert_results_match(pl.col("val") > 2)}),
-    Case("assert_predicate_pushed_down_passing", _VALS, None, {"call": lambda t: t.assert_predicate_pushed_down(pl.col("val") > 2)}),
+    Case("assert_results_match_passing", df=_VALS, expect=None, call=lambda t: t.assert_results_match(pl.col("val") > 2)),
+    Case("assert_predicate_pushed_down_passing", df=_VALS, expect=None, call=lambda t: t.assert_predicate_pushed_down(pl.col("val") > 2)),
     Case(
         "assert_predicate_pushed_down_expected_not_pushed",
-        _FLOATS,
-        None,
-        {"call": lambda t: t.assert_predicate_pushed_down(_WINDOW, expected_pushed_down=False)},
+        df=_FLOATS,
+        expect=None,
+        call=lambda t: t.assert_predicate_pushed_down(_WINDOW, expected_pushed_down=False),
     ),
     Case(
         "assert_predicate_pushed_down_fails_when_not_pushed",
-        _FLOATS,
-        (AssertionError, "not pushed down"),
-        {"call": lambda t: t.assert_predicate_pushed_down(_WINDOW, expected_pushed_down=True)},
+        df=_FLOATS,
+        expect=(AssertionError, "not pushed down"),
+        call=lambda t: t.assert_predicate_pushed_down(_WINDOW, expected_pushed_down=True),
     ),
     Case(
         "assert_predicate_pushed_down_fails_when_unexpectedly_pushed",
-        _VALS,
-        (AssertionError, "pushed down when it shouldn't"),
-        {"call": lambda t: t.assert_predicate_pushed_down(pl.col("val") > 2, expected_pushed_down=False)},
+        df=_VALS,
+        expect=(AssertionError, "pushed down when it shouldn't"),
+        call=lambda t: t.assert_predicate_pushed_down(pl.col("val") > 2, expected_pushed_down=False),
     ),
     Case(
         "assert_projection_pushed_down_wrong_expected_columns",
-        _ABC,
-        (AssertionError, "does not match"),
-        {"call": lambda t: t.assert_projection_pushed_down(["a"], expected_columns={"a", "b"})},
+        df=_ABC,
+        expect=(AssertionError, "does not match"),
+        call=lambda t: t.assert_projection_pushed_down(["a"], expected_columns={"a", "b"}),
     ),
     Case(
         "assert_projection_pushed_down_unexpected_pushdown",
-        _ABC,
-        (AssertionError, "when it shouldn't"),
-        {"call": lambda t: t.assert_projection_pushed_down(["a"], expected_pushed_down=False)},
+        df=_ABC,
+        expect=(AssertionError, "when it shouldn't"),
+        call=lambda t: t.assert_projection_pushed_down(["a"], expected_pushed_down=False),
     ),
-    Case("assert_pushed_down_requires_at_least_one", _ABC, (ValueError, "At least one"), {"call": lambda t: t.assert_pushed_down()}),
+    Case("assert_pushed_down_requires_at_least_one", df=_ABC, expect=(ValueError, "At least one"), call=lambda t: t.assert_pushed_down()),
     Case(
         "assert_pushed_down_predicate_not_pushed_branch",
-        _FLOATS,
-        None,
-        {"call": lambda t: t.assert_pushed_down(predicate=_WINDOW, expected_predicate_pushed=False)},
+        df=_FLOATS,
+        expect=None,
+        call=lambda t: t.assert_pushed_down(predicate=_WINDOW, expected_predicate_pushed=False),
     ),
     # the predicate may use a column the projection drops: the filter runs before the select
     Case(
         "assert_pushed_down_combined_axes",
-        _ABC,
-        None,
-        {
-            "call": lambda t: t.assert_pushed_down(
-                predicate=pl.col("a") > 1, projection=["b"], expected_predicate_pushed=True, expected_projection_pushed=True
-            )
-        },
+        df=_ABC,
+        expect=None,
+        call=lambda t: t.assert_pushed_down(
+            predicate=pl.col("a") > 1, projection=["b"], expected_predicate_pushed=True, expected_projection_pushed=True
+        ),
     ),
     # a generator projection must not be exhausted before the reference is computed
     Case(
         "assert_pushed_down_normalizes_iterable_projection",
-        _ABC,
-        None,
-        {"call": lambda t: t.assert_pushed_down(projection=(c for c in ["a", "b"]), expected_projection_pushed=True, expected_columns={"a", "b"})},
+        df=_ABC,
+        expect=None,
+        call=lambda t: t.assert_pushed_down(projection=(c for c in ["a", "b"]), expected_projection_pushed=True, expected_columns={"a", "b"}),
     ),
 ]
 
 
-@pytest.mark.parametrize(("df", "call", "expect"), params(ASSERTIONS, "pred", "call", "expect"))
+@pytest.mark.parametrize(("df", "call", "expect"), params(ASSERTIONS, "df", "call", "expect"))
 def test_tracker_assertion(df, call, expect):
     tracker = PredicateTracker(df)
     if expect is None:
@@ -237,17 +235,20 @@ def _fail(pred):
 
 # (frame, filter, assertion on the pushed predicate) -> the result equals Polars', or the assertion's error surfaces
 IO_SOURCE_ASSERT = [
-    Case("assertion_called_with_predicate", pl.col("val") > 2, None, {"df": _VALS, "check": None}),
-    Case("assertion_passes", pl.col("val") > 2, None, {"df": _VALS, "check": lambda p: None}),
-    Case("assertion_fails", pl.col("val") > 2, ((pl.exceptions.ComputeError, AssertionError), "Intentional failure"), {"df": _VALS, "check": _fail}),
-    Case("no_predicate_when_no_filter", None, None, {"df": pl.DataFrame({"val": [1, 2, 3]}), "check": None}),
+    Case("assertion_called_with_predicate", pred=pl.col("val") > 2, expect=None, df=_VALS, check=None),
+    Case("assertion_passes", pred=pl.col("val") > 2, expect=None, df=_VALS, check=lambda p: None),
+    Case(
+        "assertion_fails", pred=pl.col("val") > 2, expect=((pl.exceptions.ComputeError, AssertionError), "Intentional failure"), df=_VALS, check=_fail
+    ),
+    Case("no_predicate_when_no_filter", pred=None, expect=None, df=pl.DataFrame({"val": [1, 2, 3]}), check=None),
     Case(
         "result_is_filtered_correctly",
-        pl.col("a") > 2,
-        None,
-        {"df": pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": ["x", "y", "z", "x", "y"]}), "check": None},
+        pred=pl.col("a") > 2,
+        expect=None,
+        df=pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": ["x", "y", "z", "x", "y"]}),
+        check=None,
     ),
-    Case("with_predicate_analyzer", date_ >= _d(3), None, {"df": _days(5, val=[1, 2, 3, 4, 5]), "check": _bounds_from_jan3}),
+    Case("with_predicate_analyzer", pred=date_ >= _d(3), expect=None, df=_days(5, val=[1, 2, 3, 4, 5]), check=_bounds_from_jan3),
 ]
 
 

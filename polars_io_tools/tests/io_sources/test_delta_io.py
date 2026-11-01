@@ -83,7 +83,7 @@ def _polars_sink(lf, path, **kw):
 
 
 def R(id, df, mapping, sink=cpl.sink_delta, sink_kw=None, scan_kw=None):
-    return Case(id, df, mapping, {"sink": sink, "sink_kw": sink_kw or {}, "scan_kw": scan_kw or {}})
+    return Case(id, df=df, mapping=mapping, sink=sink, sink_kw=sink_kw or {}, scan_kw=scan_kw or {})
 
 
 ROUNDTRIPS = [
@@ -126,7 +126,7 @@ ROUNDTRIPS = [
 ]
 
 
-@pytest.mark.parametrize(("df", "mapping", "sink", "sink_kw", "scan_kw"), params(ROUNDTRIPS, "pred", "expect", "sink", "sink_kw", "scan_kw"))
+@pytest.mark.parametrize(("df", "mapping", "sink", "sink_kw", "scan_kw"), params(ROUNDTRIPS, "df", "mapping", "sink", "sink_kw", "scan_kw"))
 def test_roundtrip(tmp_path, df, mapping, sink, sink_kw, scan_kw):
     path = str(tmp_path / "t")
     sink(df.lazy(), path, mode="overwrite", **sink_kw)
@@ -288,7 +288,7 @@ def P(id, table, pred, op=None, plan=False, uris=None, extra=None, **scan):
     """``plan``: the filter is pushed into the scan (SELECTION, no FILTER). ``uris``: how deltalake listed files —
     "unused" (no partition pruning attempted), "used", or "unpruned" (listed without partition filters). ``extra``:
     rows the scan may also return beyond Polars' filter, depending on the Polars version."""
-    return Case(id, pred, kw={"table": table, "op": op, "plan": plan, "uris": uris, "extra": extra, "scan": scan})
+    return Case(id, pred=pred, kw={"table": table, "op": op, "plan": plan, "uris": uris, "extra": extra, "scan": scan})
 
 
 p, ts = pl.col("p"), pl.col("ts")
@@ -362,7 +362,7 @@ PREDICATES = [
 ]
 
 
-@pytest.mark.parametrize(("pred", "kw"), [pytest.param(c.pred, c.kw, id=c.id) for c in PREDICATES])
+@pytest.mark.parametrize(("pred", "kw"), params(PREDICATES, "pred", "kw"))
 def test_scan_delta_matches_polars(delta_tables, monkeypatch, pred, kw):
     calls = {"partition_uris": 0, "file_uris_filters": []}
     get_uris, file_uris = delta_io._get_partition_uris, DeltaTable.file_uris

@@ -1155,30 +1155,30 @@ def test_constant_false_predicate_reads_nothing(pred):
 
 # Specs and helpers ------------------------------------------------------------------------------------------------------
 SPEC_FIELDS = [
-    Case("filter_spec-defaults", F(), {"source_col": None, "lookback": timedelta(), "lookahead": timedelta(), "value_mapping": None}),
-    Case("source_col_override", F(source_col="DataDate"), {"source_col": "DataDate"}),
-    Case("lookback_override", F(lookback=days(5)), {"lookback": days(5)}),
-    Case("lookahead_override", F(lookahead=days(3)), {"lookahead": days(3)}),
-    Case("value_mapping_dict", F(value_mapping={"A": "a", "B": "b"}), {"value_mapping": {"A": "a", "B": "b"}}),
-    Case("value_mapping_callable", F(value_mapping=str.upper), {"value_mapping": str.upper}),
+    Case("filter_spec-defaults", spec=F(), fields={"source_col": None, "lookback": timedelta(), "lookahead": timedelta(), "value_mapping": None}),
+    Case("source_col_override", spec=F(source_col="DataDate"), fields={"source_col": "DataDate"}),
+    Case("lookback_override", spec=F(lookback=days(5)), fields={"lookback": days(5)}),
+    Case("lookahead_override", spec=F(lookahead=days(3)), fields={"lookahead": days(3)}),
+    Case("value_mapping_dict", spec=F(value_mapping={"A": "a", "B": "b"}), fields={"value_mapping": {"A": "a", "B": "b"}}),
+    Case("value_mapping_callable", spec=F(value_mapping=str.upper), fields={"value_mapping": str.upper}),
     Case(
         "combined_options",
-        F(source_col="col", lookback=days(5), lookahead=days(3), value_mapping={"x": "y"}),
-        {"source_col": "col", "lookback": days(5), "lookahead": days(3), "value_mapping": {"x": "y"}},
+        spec=F(source_col="col", lookback=days(5), lookahead=days(3), value_mapping={"x": "y"}),
+        fields={"source_col": "col", "lookback": days(5), "lookahead": days(3), "value_mapping": {"x": "y"}},
     ),
     Case(
         "interval_spec-defaults",
-        IntervalFilterSpec(start_col="s", end_col="e"),
-        {"start_col": "s", "end_col": "e", "closed": "both", "value_mapping": None},
+        spec=IntervalFilterSpec(start_col="s", end_col="e"),
+        fields={"start_col": "s", "end_col": "e", "closed": "both", "value_mapping": None},
     ),
     *[
-        Case(f"valid_closed_accepted-{closed}", IntervalFilterSpec(start_col="s", end_col="e", closed=closed), {"closed": closed})
+        Case(f"valid_closed_accepted-{closed}", spec=IntervalFilterSpec(start_col="s", end_col="e", closed=closed), fields={"closed": closed})
         for closed in CLOSED
     ],
 ]
 
 
-@pytest.mark.parametrize(("spec", "fields"), params(SPEC_FIELDS, "pred", "expect"))
+@pytest.mark.parametrize(("spec", "fields"), params(SPEC_FIELDS, "spec", "fields"))
 def test_spec_fields(spec, fields):
     assert {name: getattr(spec, name) for name in fields} == fields
 
@@ -1190,17 +1190,17 @@ def test_invalid_closed_raises():
 
 # (values, mapping) -> (mapped, unmapped); an unmapped value is not pushed.
 VALUE_MAPPINGS = [
-    Case("none_mapping", ({"a", "b", "c"}, None), ({"a", "b", "c"}, set())),
-    Case("dict_mapping_all_keys_present", ({"USE4S", "CNE5S"}, {"USE4S": "US4S", "CNE5S": "CN5S"}), ({"US4S", "CN5S"}, set())),
-    Case("dict_mapping_partial_keys", ({"USE4S", "UNKNOWN"}, {"USE4S": "US4S"}), ({"US4S"}, {"UNKNOWN"})),
-    Case("dict_mapping_no_keys_present", ({"UNKNOWN1", "UNKNOWN2"}, {"USE4S": "US4S"}), (set(), {"UNKNOWN1", "UNKNOWN2"})),
-    Case("callable_mapping", ({"foo", "bar"}, str.upper), ({"FOO", "BAR"}, set())),
-    Case("callable_mapping_custom_function", ({1, 2, 3}, lambda x: x * 2), ({2, 4, 6}, set())),
-    Case("empty_values", (set(), {"a": "b"}), (set(), set())),
+    Case("none_mapping", args=({"a", "b", "c"}, None), expect=({"a", "b", "c"}, set())),
+    Case("dict_mapping_all_keys_present", args=({"USE4S", "CNE5S"}, {"USE4S": "US4S", "CNE5S": "CN5S"}), expect=({"US4S", "CN5S"}, set())),
+    Case("dict_mapping_partial_keys", args=({"USE4S", "UNKNOWN"}, {"USE4S": "US4S"}), expect=({"US4S"}, {"UNKNOWN"})),
+    Case("dict_mapping_no_keys_present", args=({"UNKNOWN1", "UNKNOWN2"}, {"USE4S": "US4S"}), expect=(set(), {"UNKNOWN1", "UNKNOWN2"})),
+    Case("callable_mapping", args=({"foo", "bar"}, str.upper), expect=({"FOO", "BAR"}, set())),
+    Case("callable_mapping_custom_function", args=({1, 2, 3}, lambda x: x * 2), expect=({2, 4, 6}, set())),
+    Case("empty_values", args=(set(), {"a": "b"}), expect=(set(), set())),
 ]
 
 
-@pytest.mark.parametrize(("args", "expect"), params(VALUE_MAPPINGS, "pred", "expect"))
+@pytest.mark.parametrize(("args", "expect"), params(VALUE_MAPPINGS, "args", "expect"))
 def test_apply_value_mapping(args, expect):
     assert _apply_value_mapping(*args) == expect
 
@@ -1213,13 +1213,17 @@ def test_get_source_col(spec, expect):
 
 
 OUTPUT_SCHEMAS = [
-    Case("simple_join_schema", lambda s: s["left"].join(s["right"], on="a"), {"a": pl.Int64, "b": pl.Int64, "c": pl.Int64}),
-    Case("with_columns_schema", lambda s: s["left"].select("a").with_columns(pl.lit(42).alias("new_col")), {"a": pl.Int64, "new_col": pl.Int32}),
-    Case("select_schema", lambda s: s["left"].select("a", "b"), {"a": pl.Int64, "b": pl.Int64}),
+    Case("simple_join_schema", combine=lambda s: s["left"].join(s["right"], on="a"), expect={"a": pl.Int64, "b": pl.Int64, "c": pl.Int64}),
+    Case(
+        "with_columns_schema",
+        combine=lambda s: s["left"].select("a").with_columns(pl.lit(42).alias("new_col")),
+        expect={"a": pl.Int64, "new_col": pl.Int32},
+    ),
+    Case("select_schema", combine=lambda s: s["left"].select("a", "b"), expect={"a": pl.Int64, "b": pl.Int64}),
 ]
 
 
-@pytest.mark.parametrize(("combine", "expect"), params(OUTPUT_SCHEMAS, "pred", "expect"))
+@pytest.mark.parametrize(("combine", "expect"), params(OUTPUT_SCHEMAS, "combine", "expect"))
 def test_compute_output_schema(combine, expect):
     sources = {"left": (pl.LazyFrame({"a": [1], "b": [2]}), {}), "right": (pl.LazyFrame({"a": [1], "c": [3]}), {})}
     assert dict(_compute_output_schema(sources, combine)) == expect

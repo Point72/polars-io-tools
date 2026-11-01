@@ -14,7 +14,7 @@ def _ids(n, **more):
 
 
 def R(id, lf, marks=(), **kw):
-    return Case(id, lf, kw=kw, marks=marks)
+    return Case(id, lf=lf, kw=kw, marks=marks)
 
 
 _AB = pl.LazyFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
@@ -76,7 +76,7 @@ ROWS = [
 ]
 
 
-@pytest.mark.parametrize(("lf", "kw"), params(ROWS, "pred", "kw"))
+@pytest.mark.parametrize(("lf", "kw"), params(ROWS, "lf", "kw"))
 def test_iter_rows(lf, kw):
     got = list(lf.piot.iter_rows(**kw))
     want = lf.collect().rows(named=kw.get("named", False))

@@ -57,15 +57,19 @@ def _values(lf: pl.LazyFrame) -> list:
 # January is cached from values 0 and 1; upstream now holds 90, 91 and 92. READ_ONLY fills the gaps from upstream,
 # CACHE_ONLY serves the cache alone, and neither changes the cache.
 NO_WRITE_READS = [
-    Case("finite", JAN_FEB, {"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
-    Case("unbounded", pl.col("date") >= D(2024, 1, 1), {"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
-    Case("unconstrained", None, {"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
-    Case("not_equal_date_keeps_enclosing_partition", JAN_FEB & (pl.col("date") != D(2024, 1, 15)), {"READ_ONLY": [0, 92], "CACHE_ONLY": [0]}),
+    Case("finite", predicate=JAN_FEB, expected={"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
+    Case("unbounded", predicate=pl.col("date") >= D(2024, 1, 1), expected={"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
+    Case("unconstrained", predicate=None, expected={"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
+    Case(
+        "not_equal_date_keeps_enclosing_partition",
+        predicate=JAN_FEB & (pl.col("date") != D(2024, 1, 15)),
+        expected={"READ_ONLY": [0, 92], "CACHE_ONLY": [0]},
+    ),
 ]
 
 
 @pytest.mark.parametrize("mode", ["READ_ONLY", "CACHE_ONLY"])
-@pytest.mark.parametrize(("predicate", "expected"), params(NO_WRITE_READS, "pred", "expect"))
+@pytest.mark.parametrize(("predicate", "expected"), params(NO_WRITE_READS, "predicate", "expected"))
 def test_no_write_mode_reads(jan_cached, mode, predicate, expected):
     before = _snapshot(jan_cached)
     lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode[mode])

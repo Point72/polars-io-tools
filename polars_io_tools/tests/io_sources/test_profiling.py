@@ -180,7 +180,7 @@ def S(id, start, attrs, drive="list", raises=None, closed=None):
     raises); "sleepy" (sleeps between pulls); "close" / "pull_close" (closes twice, after no or one pull).
     ``raises``: the exception (class, or the very object) the consumer sees. ``closed``: whether the inner iterator
     was closed. ``attrs`` values may be predicates; ABSENT means the attribute is not set."""
-    return Case(id, start, attrs, {"drive": drive, "raises": raises, "closed": closed})
+    return Case(id, start=start, attrs=attrs, drive=drive, raises=raises, closed=closed)
 
 
 SPANS = [
@@ -268,7 +268,7 @@ SPANS = [
 ]
 
 
-@pytest.mark.parametrize(("start", "attrs", "drive", "raises", "closed"), params(SPANS, "pred", "expect", "drive", "raises", "closed"))
+@pytest.mark.parametrize(("start", "attrs", "drive", "raises", "closed"), params(SPANS, "start", "attrs", "drive", "raises", "closed"))
 def test_span(monkeypatch, start, attrs, drive, raises, closed):
     iterator, inner = start(monkeypatch)
     expected_error = pytest.raises(raises if isinstance(raises, type) else type(raises)) if raises is not None else contextlib.nullcontext()

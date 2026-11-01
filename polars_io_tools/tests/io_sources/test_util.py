@@ -50,7 +50,7 @@ _COMPLEX = pl.DataFrame(
 def F(id, df, expr, pushed_plans=False):
     """``pushed_plans``: also check the plans: a normal filter and the disabled variant push into the source
     (SELECTION, no FILTER); filter_no_pushdown keeps a FILTER and pushes nothing."""
-    return Case(id, expr, kw={"df": df, "pushed_plans": pushed_plans})
+    return Case(id, expr=expr, df=df, pushed_plans=pushed_plans)
 
 
 _LIST_LEN = pl.col("list_col").list.len()
@@ -105,7 +105,7 @@ NO_PUSHDOWN = [
 ]
 
 
-@pytest.mark.parametrize(("expr", "df", "pushed_plans"), params(NO_PUSHDOWN, "pred", "df", "pushed_plans"))
+@pytest.mark.parametrize(("expr", "df", "pushed_plans"), params(NO_PUSHDOWN, "expr", "df", "pushed_plans"))
 def test_filter_no_pushdown(expr, df, pushed_plans):
     """filter_no_pushdown gives the rows a normal filter gives, without pushing the filter into the source."""
     lf = io_source_assert(df, lambda _: True)
@@ -233,8 +233,8 @@ def X(*contains, omits=()):
 ERRORS = [
     Case(
         "error_catching_catches_exceptions",
-        (_raises(CustomError("Something went wrong!")), (), _STD),
-        (
+        call=(_raises(CustomError("Something went wrong!")), (), _STD),
+        expect=(
             [],
             CustomError,
             X(
@@ -250,33 +250,33 @@ ERRORS = [
     # the first batch comes through; the error surfaces on the next
     Case(
         "error_catching_with_generator_exception",
-        (_raises(ValueError("Generator failed"), yields_first=True), (), _STD),
-        ([{"x": [1]}], ValueError, X("IO Source 'failing_io_source' failed", "Generator failed")),
+        call=(_raises(ValueError("Generator failed"), yields_first=True), (), _STD),
+        expect=([{"x": [1]}], ValueError, X("IO Source 'failing_io_source' failed", "Generator failed")),
     ),
     Case(
         "error_catching_preserves_arguments_in_error",
-        (_raises(Exception("Test error")), (), {"with_columns": ["x", "y"], "predicate": _PRED, "n_rows": 10, "batch_size": 100}),
-        ([], Exception, X("Call Arguments:", "with_columns", "predicate", "n_rows", "batch_size", str(_PRED))),
+        call=(_raises(Exception("Test error")), (), {"with_columns": ["x", "y"], "predicate": _PRED, "n_rows": 10, "batch_size": 100}),
+        expect=([], Exception, X("Call Arguments:", "with_columns", "predicate", "n_rows", "batch_size", str(_PRED))),
     ),
     # expressions in arguments appear in full, not as a truncated repr
     Case(
         "error_catching_converts_expr_in_args_to_string",
-        (_raises(Exception("e")), (None, _LONG, None, 100000), {}),
-        ([], Exception, X("data_date", "is_between", "region", "value", omits="<Expr [")),
+        call=(_raises(Exception("e")), (None, _LONG, None, 100000), {}),
+        expect=([], Exception, X("data_date", "is_between", "region", "value", omits="<Expr [")),
     ),
     Case(
         "error_catching_handles_mixed_args_and_kwargs",
-        (
+        call=(
             _raises(Exception("e")),
             (pl.col("x").cast(pl.Float64) + pl.col("y"), "normal_arg"),
             {"predicate": pl.col("z").is_in([1, 2, 3]), "other": "value"},
         ),
-        ([], Exception, X(("cast", "Float64"), "is_in", omits="<Expr [")),
+        expect=([], Exception, X(("cast", "Float64"), "is_in", omits="<Expr [")),
     ),
 ]
 
 
-@pytest.mark.parametrize(("call", "expect"), params(ERRORS, "pred", "expect"))
+@pytest.mark.parametrize(("call", "expect"), params(ERRORS, "call", "expect"))
 def test_error_catching_raises_with_context(call, expect):
     source, args, kwargs = call
     batches = wrap_io_source_with_error_catching(source, identifier="test")(*args, **kwargs)
@@ -322,7 +322,7 @@ def _topo_accessor(lf, exprs):
 
 def T(id, base, exprs, expect, call=_topo):
     """``expect`` holds the expected output columns; ``None`` means the input frame unchanged."""
-    return Case(id, exprs, expect, {"base": base, "call": call})
+    return Case(id, base=base, exprs=exprs, call=call, expect=expect)
 
 
 _X = {"x": [1, 2, 3]}
@@ -369,7 +369,7 @@ TOPO_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("base", "exprs", "call", "expect"), params(TOPO_CASES, "base", "pred", "call", "expect"))
+@pytest.mark.parametrize(("base", "exprs", "call", "expect"), params(TOPO_CASES, "base", "exprs", "call", "expect"))
 def test_with_columns_topo(base, exprs, call, expect):
     lf = pl.LazyFrame(base)
     out = call(lf, exprs)
@@ -533,7 +533,7 @@ def test_with_columns_topo_with_implicit_selector_and_dependency():
 def S(id, uri, pyarrow, polars, *, region=None, creds=None, env=None, profile=None, log=None):
     """A ``_storage_options_for`` row: boto3 has ``region`` and ``creds`` (access key, secret, token) and the
     environment holds ``env``; the expected option dicts follow."""
-    return Case(id, uri, (pyarrow, polars), {"region": region, "creds": creds, "env": env or {}, "profile": profile, "log": log})
+    return Case(id, uri=uri, expect=(pyarrow, polars), region=region, creds=creds, env=env or {}, profile=profile, log=log)
 
 
 _ENV_BOTH = {"AWS_ENDPOINT_URL": "https://endpoint-url", "AWS_S3_ENDPOINT": "https://s3-endpoint"}
@@ -624,7 +624,7 @@ STORAGE_OPTIONS = [
 
 @pytest.mark.parametrize(
     ("uri", "expect", "region", "creds", "env", "profile", "log"),
-    params(STORAGE_OPTIONS, "pred", "expect", "region", "creds", "env", "profile", "log"),
+    params(STORAGE_OPTIONS, "uri", "expect", "region", "creds", "env", "profile", "log"),
 )
 def test_storage_options_for(monkeypatch, caplog, uri, expect, region, creds, env, profile, log):
     import socket

@@ -23,7 +23,7 @@ B = pl.Boolean
 
 def R(id, pred, columns, expect, node=False, undo_aliases=False):
     """``node`` passes the parsed node instead of the expression; ``undo_aliases`` compares the result without aliases."""
-    return Case(id, pred, expect, {"columns": columns, "node": node, "undo_aliases": undo_aliases})
+    return Case(id, pred=pred, columns=columns, node=node, undo_aliases=undo_aliases, expect=expect)
 
 
 _COMPLEX = ((sym == "US") & (price > 100)) | ((sym == "EU") & (price > 200))

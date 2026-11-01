@@ -45,7 +45,7 @@ _IS_IN_ISSUE = pytest.mark.xfail(
 def V(id, stored, mapping, pred, expect="exact", via="visitor", marks=()):
     """``expect``: "exact" keeps the rows the logical filter keeps, "superset" at least those ("nonempty": and there are some), a list the
     given row numbers, None means nothing is translated. ``pred`` may be a function, for one that fails to build."""
-    return Case(id, pred, expect, {"stored": stored, "mapping": mapping, "via": via}, marks=marks)
+    return Case(id, pred=pred, stored=stored, mapping=mapping, via=via, expect=expect, marks=marks)
 
 
 CASES = [

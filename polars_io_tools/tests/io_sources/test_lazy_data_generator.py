@@ -37,7 +37,7 @@ def _lstsq(X, y, weights=None, intercept=False):
 
 def B(id, scan, kwargs, fits, n_features):
     """``fits``: (rows to fit on or None, response, true betas, tolerance, weighted, intercept)."""
-    return Case(id, (scan, kwargs), fits, {"features": [f"x{i}" for i in range(n_features)]})
+    return Case(id, scan=(scan, kwargs), fits=fits, features=[f"x{i}" for i in range(n_features)])
 
 
 _BETAS5 = np.array([0.45, 0.23, -0.42, 0.22, -0.88])
@@ -109,7 +109,7 @@ BETA_FITS = [
 ]
 
 
-@pytest.mark.parametrize(("scan", "fits", "features"), params(BETA_FITS, "pred", "expect", "features"))
+@pytest.mark.parametrize(("scan", "fits", "features"), params(BETA_FITS, "scan", "fits", "features"))
 def test_beta_recovery(scan, fits, features):
     scanner, kwargs = scan
     df = scanner(**kwargs).collect()
@@ -132,7 +132,7 @@ def _collect(lf):
 def D(id, scan, kwargs, a, b, columns=None, same=True):
     """Generating with extra arguments ``a`` and ``b`` (a dict, or a collect function) gives the same ``columns``.
     ``same=False``: the frames share schema and shape but differ."""
-    return Case(id, (scan, kwargs), same, {"a": a, "b": b, "columns": columns})
+    return Case(id, scan=(scan, kwargs), same=same, a=a, b=b, columns=columns)
 
 
 _REG_1000 = {"n_samples": 1000, "n_features": 3, "seed": 42}
@@ -202,7 +202,7 @@ DETERMINISM = [
 ]
 
 
-@pytest.mark.parametrize(("scan", "same", "a", "b", "columns"), params(DETERMINISM, "pred", "expect", "a", "b", "columns"))
+@pytest.mark.parametrize(("scan", "same", "a", "b", "columns"), params(DETERMINISM, "scan", "same", "a", "b", "columns"))
 def test_same_data(scan, same, a, b, columns):
     """``same`` True: equal frames; False: same schema and shape, different values; None: same schema and shape."""
     scanner, kwargs = scan
@@ -247,42 +247,48 @@ def test_n_workers_head_pushdown_terminates_early():
 _P4 = {"start_date": _PANEL_START, "end_date": _PANEL_END_4}
 
 INVALID = [
-    Case("invalid_args-n_features", lambda: REG(n_samples=10, n_features=0), "n_features"),
-    Case("invalid_args-epsilon_scale", lambda: REG(n_samples=10, n_features=2, epsilon_scale=-1.0), "epsilon_scale"),
-    Case("invalid_args-betas", lambda: REG(n_samples=10, n_features=2, betas=np.zeros((3, 1))), "betas must have shape"),
-    Case("invalid_args-weights", lambda: REG(n_samples=10, n_features=2, use_weights=True, weights_low=1.0, weights_high=0.5), "weights_low"),
-    Case("panel_group_by_invalid_args-no_values", lambda: PANEL(**_P4, n_symbols=3, n_features=2, group_by=("g", [])), "group_by values"),
+    Case("invalid_args-n_features", make=lambda: REG(n_samples=10, n_features=0), match="n_features"),
+    Case("invalid_args-epsilon_scale", make=lambda: REG(n_samples=10, n_features=2, epsilon_scale=-1.0), match="epsilon_scale"),
+    Case("invalid_args-betas", make=lambda: REG(n_samples=10, n_features=2, betas=np.zeros((3, 1))), match="betas must have shape"),
+    Case(
+        "invalid_args-weights", make=lambda: REG(n_samples=10, n_features=2, use_weights=True, weights_low=1.0, weights_high=0.5), match="weights_low"
+    ),
+    Case("panel_group_by_invalid_args-no_values", make=lambda: PANEL(**_P4, n_symbols=3, n_features=2, group_by=("g", [])), match="group_by values"),
     # betas must be (n_groups, n_features, n_responses)
     Case(
         "panel_group_by_invalid_args-betas",
-        lambda: PANEL(**_P4, n_symbols=3, n_features=2, group_by=("g", ["A", "B", "C"]), betas=np.zeros((2, 2, 1))),
-        "betas must have shape",
+        make=lambda: PANEL(**_P4, n_symbols=3, n_features=2, group_by=("g", ["A", "B", "C"]), betas=np.zeros((2, 2, 1))),
+        match="betas must have shape",
     ),
-    Case("panel_group_by_invalid_args-feature_name", lambda: PANEL(**_P4, n_symbols=3, n_features=2, group_by=("x0", ["A", "B"])), "group_by name"),
+    Case(
+        "panel_group_by_invalid_args-feature_name",
+        make=lambda: PANEL(**_P4, n_symbols=3, n_features=2, group_by=("x0", ["A", "B"])),
+        match="group_by name",
+    ),
     Case(
         "panel_group_by_invalid_args-category_name",
-        lambda: PANEL(**_P4, n_symbols=3, n_features=2, categories=[["u", "v"]], group_by=("category_0", ["A", "B"])),
-        "group_by name",
+        make=lambda: PANEL(**_P4, n_symbols=3, n_features=2, categories=[["u", "v"]], group_by=("category_0", ["A", "B"])),
+        match="group_by name",
     ),
-    Case("panel_invalid_args-n_symbols", lambda: PANEL(**_P4, n_symbols=0, n_features=2), "n_symbols"),
-    Case("panel_invalid_args-n_features", lambda: PANEL(**_P4, n_symbols=5, n_features=0), "n_features"),
-    Case("panel_invalid_args-betas", lambda: PANEL(**_P4, n_symbols=5, n_features=2, betas=np.zeros((3, 1))), "betas must have shape"),
-    Case("panel_invalid_args-categories", lambda: PANEL(**_P4, n_symbols=5, n_features=2, categories=[[]]), "categories"),
+    Case("panel_invalid_args-n_symbols", make=lambda: PANEL(**_P4, n_symbols=0, n_features=2), match="n_symbols"),
+    Case("panel_invalid_args-n_features", make=lambda: PANEL(**_P4, n_symbols=5, n_features=0), match="n_features"),
+    Case("panel_invalid_args-betas", make=lambda: PANEL(**_P4, n_symbols=5, n_features=2, betas=np.zeros((3, 1))), match="betas must have shape"),
+    Case("panel_invalid_args-categories", make=lambda: PANEL(**_P4, n_symbols=5, n_features=2, categories=[[]]), match="categories"),
     Case(
         "panel_invalid_args-weights",
-        lambda: PANEL(**_P4, n_symbols=3, n_features=2, use_weights=True, weights_low=1.0, weights_high=0.5),
-        "weights_low",
+        make=lambda: PANEL(**_P4, n_symbols=3, n_features=2, use_weights=True, weights_low=1.0, weights_high=0.5),
+        match="weights_low",
     ),
-    Case("n_workers_invalid-regression", lambda: REG(n_samples=10, n_features=2, seed=1, n_workers=0), "n_workers must be >= 1"),
+    Case("n_workers_invalid-regression", make=lambda: REG(n_samples=10, n_features=2, seed=1, n_workers=0), match="n_workers must be >= 1"),
     Case(
         "n_workers_invalid-panel",
-        lambda: PANEL(start_date=date(2020, 1, 1), end_date=date(2020, 1, 3), n_features=2, seed=1, n_workers=0),
-        "n_workers must be >= 1",
+        make=lambda: PANEL(start_date=date(2020, 1, 1), end_date=date(2020, 1, 3), n_features=2, seed=1, n_workers=0),
+        match="n_workers must be >= 1",
     ),
 ]
 
 
-@pytest.mark.parametrize(("make", "match"), params(INVALID, "pred", "expect"))
+@pytest.mark.parametrize(("make", "match"), params(INVALID, "make", "match"))
 def test_invalid_args(make, match):
     with pytest.raises(ValueError, match=match):
         make()
