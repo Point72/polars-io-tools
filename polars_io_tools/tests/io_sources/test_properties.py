@@ -10,6 +10,7 @@ import itertools
 import logging
 import math
 import operator
+import shutil
 import time
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -18,7 +19,7 @@ import narwhals as nw
 import polars as pl
 import portion
 import pytest
-from hypothesis import HealthCheck, assume, example, given, note, settings, strategies as st
+from hypothesis import assume, example, given, note, settings, strategies as st
 from polars.io.plugins import register_io_source
 from polars.testing import assert_frame_equal
 
@@ -150,7 +151,7 @@ def dnf_expr(dnf: list, schema: dict | None = None) -> pl.Expr:
     return pl.any_horizontal(clauses) if clauses else pl.lit(False)
 
 
-SETTINGS = settings(deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much, HealthCheck.data_too_large])
+SETTINGS = settings(deadline=None)
 
 
 # ---------------------------------------------------------------------------
@@ -754,14 +755,19 @@ _PARTITION_POOLS = {
     "float": pl.Series([0.0, -0.0, float("nan"), 1.5, None]),
     "bool": pl.Series([True, False, None]),
 }
+# Known bug, see test_cache_parquet_on_sub_second_time_keys: older Polars names Time partitions to the second.
+_CACHE_PARQUET_POOLS = (
+    _PARTITION_POOLS if polars_has("time_partition_subsecond") else _PARTITION_POOLS | {"time": pl.Series([0, 10**9, 61 * 10**9, None]).cast(pl.Time)}
+)
 _DAYS = [date(2024, 1, 31), date(2024, 2, 1), date(2024, 2, 29), date(2024, 3, 1), None]
 
 
 @st.composite
-def _partitioned_cases(draw):
-    """A frame with a date column, a partition column ``x`` and a row id, and three predicates on them."""
-    kind = draw(st.sampled_from(sorted(_PARTITION_POOLS)))
-    pool = _PARTITION_POOLS[kind]
+def _partitioned_cases(draw, pools=_PARTITION_POOLS):
+    """A frame with a date column, a partition column ``x`` of values from one of ``pools`` and a row id, and three
+    predicates on them."""
+    kind = draw(st.sampled_from(sorted(pools)))
+    pool = pools[kind]
     zoned = draw(st.booleans())
     n = draw(st.integers(1, 12))
     xs = draw(st.lists(st.integers(0, len(pool) - 1), min_size=n, max_size=n))
@@ -828,32 +834,48 @@ def _check_cache_keeps_filtered_rows(lf: pl.LazyFrame, frame: pl.DataFrame, pred
 
 
 @SETTINGS
-@given(case=_partitioned_cases(), time_unit=st.sampled_from(["daily", "monthly"]))
+@given(case=_partitioned_cases(_CACHE_PARQUET_POOLS), time_unit=st.sampled_from(["daily", "monthly"]))
+# A query that caches only null keys once broke later queries.
+@example(
+    case=(
+        pl.DataFrame({"date": [date(2024, 1, 31), date(2024, 2, 1)], "x": [None, 1], "i": [0, 1]}),
+        [pl.col("date") < date(2024, 2, 1), pl.col("x") == 1],
+    ),
+    time_unit="monthly",
+)
 def test_cache_parquet_keeps_the_rows_a_filter_keeps(tmp_path_factory, case, time_unit):
     frame, predicates = case
-    # Known bug, see test_cache_parquet_on_sub_second_time_keys.
-    assume(polars_has("time_partition_subsecond") or frame["x"].dtype != pl.Time or frame["x"].dt.nanosecond().fill_null(0).eq(0).all())
-    # Known crash, see test_cache_parquet_after_caching_only_null_partition_keys: a query that caches only null keys
-    # breaks later queries, so the partition column holds no null here.
-    assume(frame["x"].null_count() == 0)
     root = tmp_path_factory.mktemp("cache")
-    for cache_mode in (CacheMode.CACHE, CacheMode.CACHE, CacheMode.READ_ONLY):
-        _check_cache_keeps_filtered_rows(
-            cache_parquet(frame.lazy(), root, "date", time_unit=time_unit, extra_partition_cols="x", cache_mode=cache_mode),
-            frame,
-            predicates,
-        )
+    try:
+        for cache_mode in (CacheMode.CACHE, CacheMode.CACHE, CacheMode.READ_ONLY):
+            _check_cache_keeps_filtered_rows(
+                cache_parquet(frame.lazy(), root, "date", time_unit=time_unit, extra_partition_cols="x", cache_mode=cache_mode),
+                frame,
+                predicates,
+            )
+    finally:
+        shutil.rmtree(root)
 
 
 @SETTINGS
 @given(case=_partitioned_cases(), partition_cols=st.sampled_from([("x",), ("date", "x"), ()]))
+# A literal the predicate analysis cannot read, so the query names no partition.
+@example(
+    case=(pl.DataFrame({"x": [0.0, float("nan")], "i": [0, 1]}), [pl.lit(True), pl.col("x") == pl.lit(pl.Series([0.0])).first(), pl.lit(True)]),
+    partition_cols=("x",),
+)
 def test_cache_memory_keeps_the_rows_a_filter_keeps(case, partition_cols):
     frame, predicates = case
     _check_cache_keeps_filtered_rows(cache_memory(frame.lazy(), schema=frame.schema, partition_cols=partition_cols), frame, predicates)
 
 
+_NAN_KEY = (pl.DataFrame({"x": [float("nan")], "i": [0]}), [pl.col("x").is_nan()])
+
+
 @SETTINGS
 @given(case=_partitioned_cases(), partition_cols=st.sampled_from([("x",), ("date", "x"), ()]), column_granularity=st.booleans())
+@example(case=_NAN_KEY, partition_cols=("x",), column_granularity=True)
+@example(case=_NAN_KEY, partition_cols=("x",), column_granularity=False)
 def test_cache_keeps_the_rows_a_filter_keeps(case, partition_cols, column_granularity):
     frame, predicates = case
     _check_cache_keeps_filtered_rows(
@@ -876,27 +898,12 @@ def test_cache_memory_keeps_the_rows_of_random_predicates(case):
     _check_cache_keeps_filtered_rows(cache_memory(frame.lazy(), schema=frame.schema, partition_cols=frame.columns[1:]), frame, [pred])
 
 
-def test_cache_parquet_after_caching_only_null_partition_keys(tmp_path):
-    frame = pl.DataFrame({"date": [date(2024, 1, 31), date(2024, 2, 1)], "x": [None, 1], "i": [0, 1]})
-    lf = cache_parquet(frame.lazy(), tmp_path, "date", extra_partition_cols="x")
-    for pred in [pl.col("date") < date(2024, 2, 1), pl.col("x") == 1]:
-        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
-
-
 @xfail_unless("time_partition_subsecond", reason="Polars 1.37 names Time partitions to the second")
 def test_cache_parquet_on_sub_second_time_keys(tmp_path):
     frame = pl.DataFrame({"date": [date(2024, 1, 31)] * 2, "x": pl.Series([0, 1000]).cast(pl.Time), "i": [0, 1]})
     lf = cache_parquet(frame.lazy(), tmp_path, "date", time_unit="daily", extra_partition_cols="x")
     for pred in [pl.col("x") == pl.lit(frame["x"].slice(0, 1)).first(), pl.lit(True)]:
         assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
-
-
-@pytest.mark.parametrize("column_granularity", [True, False])
-def test_cache_on_a_nan_partition_key(column_granularity):
-    frame = pl.DataFrame({"x": [float("nan")], "i": [0]})
-    lf = frame.lazy().piot.cache({}, order_by="i", partition_cols=("x",), column_granularity=column_granularity)
-    for pred in [pl.col("x").is_nan(), pl.lit(True)]:
-        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
 
 
 @pytest.mark.xfail(strict=True, raises=(pl.exceptions.PanicException, pl.exceptions.ComputeError), reason="keys Python cannot hold")
@@ -908,14 +915,6 @@ def test_cache_on_a_partition_key_beyond_python_datetime(wrap):
     else:
         lf = cache_memory(frame.lazy(), schema=frame.schema, partition_cols="t")
     assert_frame_equal(lf.filter(pl.col("i") >= 0).collect(), frame, check_row_order=False)
-
-
-def test_cache_memory_on_a_nan_partition_key():
-    frame = pl.DataFrame({"x": [0.0, float("nan")], "i": [0, 1]})
-    lf = cache_memory(frame.lazy(), schema=frame.schema, partition_cols="x")
-    # A literal the predicate analysis cannot read, so the query names no partition.
-    for pred in [pl.lit(True), pl.col("x") == pl.lit(pl.Series([0.0])).first(), pl.lit(True)]:
-        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
 
 
 def _via_delta(lf, path):
@@ -989,15 +988,19 @@ def test_scan_delta_pruning_keeps_the_rows_a_filter_keeps(tmp_path_factory, case
     pytest.importorskip("deltalake")
     frame, partition_by, pred = case
     note(f"partition_by={partition_by} pred={show(pred)}")
-    table_path = str(tmp_path_factory.mktemp("delta") / "table")
-    sink_delta(frame.lazy(), table_path, mode="overwrite", delta_write_options={"partition_by": partition_by})
-    unpruned = scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False)
+    root = tmp_path_factory.mktemp("delta")
+    table_path = str(root / "table")
     try:
-        kept, unpruned_kept = set(unpruned.collect().filter(pred)["v"]), set(unpruned.filter(pred).collect()["v"])
-    except POLARS_ERRORS:
-        return
-    # Filtering a scan of hive partitions may keep null partition values that filtering the collected frame drops.
-    assert kept <= set(scan_delta(table_path, credential_provider=None).filter(pred).collect()["v"]) <= unpruned_kept
+        sink_delta(frame.lazy(), table_path, mode="overwrite", delta_write_options={"partition_by": partition_by})
+        unpruned = scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False)
+        try:
+            kept, unpruned_kept = set(unpruned.collect().filter(pred)["v"]), set(unpruned.filter(pred).collect()["v"])
+        except POLARS_ERRORS:
+            return
+        # Filtering a scan of hive partitions may keep null partition values that filtering the collected frame drops.
+        assert kept <= set(scan_delta(table_path, credential_provider=None).filter(pred).collect()["v"]) <= unpruned_kept
+    finally:
+        shutil.rmtree(root)
 
 
 # ---------------------------------------------------------------------------
