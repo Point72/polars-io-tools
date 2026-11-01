@@ -10,7 +10,7 @@ import os
 import pickle
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from datetime import timedelta
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -456,31 +456,47 @@ def test_complex(tmp_path):
 
 @dataclass(frozen=True)
 class Step:
-    """One read: ``source`` through the cache in ``mode``, filtered by ``pred``.
+    """One read: ``source`` through the cache in ``mode``, filtered by ``predicate``.
 
-    ``expect`` is the ``value`` column of the result in any order; ``None`` means what native Polars returns for the
-    same source and predicate.
+    With ``compare_native`` the result equals native Polars on the same source and predicate; otherwise its ``value``
+    column holds ``expected_values`` in any order.
     """
 
     source: Any
-    pred: Any = None
+    _: KW_ONLY
+    predicate: pl.Expr | None = None
     mode: CacheMode = CacheMode.CACHE
-    expect: Any = None
-    kw: dict = field(default_factory=dict)
+    compare_native: bool = True
+    expected_values: list | None = None
+
+    def __post_init__(self):
+        assert self.compare_native == (self.expected_values is None), "set compare_native=False with expected_values"
 
 
-def run_steps(root, steps, column="value", **kwargs):
-    for step in steps:
-        lf = cache_parquet(step.source, root, cache_mode=step.mode, **(kwargs | step.kw))
-        got = collect_filtered(lf, step.pred)
-        if step.expect is None:
-            assert_frame_equal(got, collect_filtered(step.source, step.pred), check_row_order=False)
+@dataclass(frozen=True)
+class Scenario:
+    """A cache driven by ``steps`` in order, then holding ``expected_files`` (see ``assert_cache_files``)."""
+
+    id: str
+    _: KW_ONLY
+    steps: list[Step]
+    expected_files: dict[str, list | None]
+    # no file exists beyond those listed with values
+    only_expected_files: bool = False
+    cache_kwargs: dict = field(default_factory=dict)
+
+
+def run_steps(root, steps: list[Step], **kwargs) -> None:
+    for i, step in enumerate(steps):
+        context = f"step {i}: predicate {step.predicate}, mode {step.mode.name}"
+        got = collect_filtered(cache_parquet(step.source, root, cache_mode=step.mode, **kwargs), step.predicate)
+        if step.compare_native:
+            try:
+                assert_frame_equal(got, collect_filtered(step.source, step.predicate), check_row_order=False)
+            except AssertionError as exc:
+                raise AssertionError(f"{context}: {exc}") from exc
         else:
-            assert sorted(got[column].to_list()) == sorted(step.expect)
-
-
-def S(id, steps, files, column="value", exact=False, **kwargs):
-    return Case(id, steps, files, {"column": column, "exact": exact, "kwargs": {"date_column": "date"} | kwargs})
+            assert sorted(got["value"].to_list()) == sorted(step.expected_values), context
 
 
 def _daily(days, values=None, month=6, **extra):
@@ -498,303 +514,315 @@ _EMPTY = pl.LazyFrame(schema={"date": pl.Date, "value": pl.Int64})
 
 STEPS = [
     # empty files mark queried partitions without rows
-    S(
+    Scenario(
         "missing_written",
-        [Step(_frame(date=[D(2023, 1, 15)], value=[1]), pl.col("date").is_between(D(2023, 1, 1), D(2023, 3, 31)))],
-        {"monthly/2023-01.parquet": [1], "monthly/2023-02.parquet": [], "monthly/2023-03.parquet": []},
-        exact=True,
+        steps=[Step(_frame(date=[D(2023, 1, 15)], value=[1]), predicate=pl.col("date").is_between(D(2023, 1, 1), D(2023, 3, 31)))],
+        expected_files={"monthly/2023-01.parquet": [1], "monthly/2023-02.parquet": [], "monthly/2023-03.parquet": []},
+        only_expected_files=True,
     ),
-    S(
+    Scenario(
         "empty_partitions_with_extra_cols",
-        [Step(_MAY10, pl.col("region").is_in(["NA", "EU", "APAC"]) & (pl.col("date") == D(2024, 5, 10)))],
-        {"daily/NA/2024-05-10.parquet": [100], "daily/EU/2024-05-10.parquet": [200], "daily/APAC/2024-05-10.parquet": []},
-        exact=True,
-        **_RG,
+        steps=[Step(_MAY10, predicate=pl.col("region").is_in(["NA", "EU", "APAC"]) & (pl.col("date") == D(2024, 5, 10)))],
+        expected_files={"daily/NA/2024-05-10.parquet": [100], "daily/EU/2024-05-10.parquet": [200], "daily/APAC/2024-05-10.parquet": []},
+        only_expected_files=True,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "missing_written_daily_with_extra_cols",
-        [Step(_MAY10, pl.col("region").is_in(["NA", "EU", "APAC"]) & pl.col("date").is_between(D(2024, 5, 10), D(2024, 5, 11)))],
-        {
+        steps=[Step(_MAY10, predicate=pl.col("region").is_in(["NA", "EU", "APAC"]) & pl.col("date").is_between(D(2024, 5, 10), D(2024, 5, 11)))],
+        expected_files={
             f"daily/{r}/2024-05-{d}.parquet": v
             for r, d, v in [("NA", 10, [100]), ("EU", 10, [200]), ("NA", 11, []), ("EU", 11, []), ("APAC", 10, []), ("APAC", 11, [])]
         },
-        exact=True,
-        **_RG,
+        only_expected_files=True,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "missing_written_daily_with_extra_cols_gap",
-        [
+        steps=[
             Step(
                 _MAY_GAP,
-                pl.col("region").is_in(["NA", "EU", "APAC"])
+                predicate=pl.col("region").is_in(["NA", "EU", "APAC"])
                 & pl.col("date").is_between(D(2024, 5, 10), D(2024, 5, 14))
                 & (pl.col("date") != D(2024, 5, 11)),
             )
         ],
-        {f"daily/{r}/2024-05-11.parquet": None for r in ["NA", "EU", "APAC"]}
+        expected_files={f"daily/{r}/2024-05-11.parquet": None for r in ["NA", "EU", "APAC"]}
         | {"daily/NA/2024-05-10.parquet": [100], "daily/APAC/2024-05-14.parquet": []},
-        **_RG,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "missing_written_daily_with_extra_cols_gap2",
-        [Step(_MAY_GAP, pl.col("region").is_in(["EU", "NA"]) & pl.col("region").ne("NA") & pl.col("date").eq(D(2024, 5, 10)))],
-        {"daily/NA/2024-05-10.parquet": None, "daily/EU/2024-05-10.parquet": []},
-        exact=True,
-        **_RG,
+        steps=[Step(_MAY_GAP, predicate=pl.col("region").is_in(["EU", "NA"]) & pl.col("region").ne("NA") & pl.col("date").eq(D(2024, 5, 10)))],
+        expected_files={"daily/NA/2024-05-10.parquet": None, "daily/EU/2024-05-10.parquet": []},
+        only_expected_files=True,
+        cache_kwargs=_RG,
     ),
     # one-sided reads write whole partitions that have rows, and no empty files beyond the cached range
-    S(
+    Scenario(
         "one_sided_with_extra_cols_no_empty_writes",
-        [Step(_ONE_SIDED), Step(_ONE_SIDED, (pl.col("date") >= D(2024, 6, 2)) & _REGIONS)],
-        {
+        steps=[Step(_ONE_SIDED), Step(_ONE_SIDED, predicate=(pl.col("date") >= D(2024, 6, 2)) & _REGIONS)],
+        expected_files={
             "daily/US/2024-06-02.parquet": [20],
             "daily/EU/2024-06-05.parquet": [50],
             "daily/APAC/2024-06-02.parquet": None,
             "daily/APAC/2024-06-05.parquet": None,
         },
-        **_RG,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "one_sided_upper_bound_with_extra_cols",
-        [Step(_ONE_SIDED), Step(_ONE_SIDED, (pl.col("date") <= D(2024, 6, 2)) & _REGIONS)],
-        {
+        steps=[Step(_ONE_SIDED), Step(_ONE_SIDED, predicate=(pl.col("date") <= D(2024, 6, 2)) & _REGIONS)],
+        expected_files={
             "daily/US/2024-06-01.parquet": [10],
             "daily/US/2024-06-02.parquet": [20],
             "daily/APAC/2024-06-01.parquet": None,
             "daily/APAC/2024-06-02.parquet": None,
         },
-        **_RG,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "one_sided_lower_bound_reads_cache_and_upstream",
-        [Step(_daily([1, 2])), Step(pl.concat([_daily([5], [5]), _daily([1, 2])]), pl.col("date") >= D(2024, 6, 2))],
-        {"daily/2024-06-01.parquet": [1], "daily/2024-06-02.parquet": [2], "daily/2024-06-05.parquet": [5]},
-        time_unit="daily",
+        steps=[Step(_daily([1, 2])), Step(pl.concat([_daily([5], [5]), _daily([1, 2])]), predicate=pl.col("date") >= D(2024, 6, 2))],
+        expected_files={"daily/2024-06-01.parquet": [1], "daily/2024-06-02.parquet": [2], "daily/2024-06-05.parquet": [5]},
+        cache_kwargs={"time_unit": "daily"},
     ),
-    S(
+    Scenario(
         "unbounded_above_fills_gaps_up_to_existing_max",
-        [Step(_daily([1, 3, 5], [1, 3, 5])), Step(_daily([1, 3, 5], [1, 3, 5]), pl.col("date") >= D(2024, 6, 2))],
-        {f"daily/2024-06-0{d}.parquet": v for d, v in [(1, [1]), (2, []), (3, [3]), (4, []), (5, [5]), (6, None), (7, None)]},
-        exact=True,
-        time_unit="daily",
+        steps=[Step(_daily([1, 3, 5], [1, 3, 5])), Step(_daily([1, 3, 5], [1, 3, 5]), predicate=pl.col("date") >= D(2024, 6, 2))],
+        expected_files={f"daily/2024-06-0{d}.parquet": v for d, v in [(1, [1]), (2, []), (3, [3]), (4, []), (5, [5]), (6, None), (7, None)]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
-    S(
+    Scenario(
         "unbounded_below_fills_gaps_down_to_existing_min",
-        [Step(_daily([3, 5, 7], [3, 5, 7])), Step(_daily([3, 5, 7], [3, 5, 7]), pl.col("date") <= D(2024, 6, 6))],
-        {f"daily/2024-06-0{d}.parquet": v for d, v in [(1, None), (2, None), (3, [3]), (4, []), (5, [5]), (6, []), (7, [7])]},
-        exact=True,
-        time_unit="daily",
+        steps=[Step(_daily([3, 5, 7], [3, 5, 7])), Step(_daily([3, 5, 7], [3, 5, 7]), predicate=pl.col("date") <= D(2024, 6, 6))],
+        expected_files={f"daily/2024-06-0{d}.parquet": v for d, v in [(1, None), (2, None), (3, [3]), (4, []), (5, [5]), (6, []), (7, [7])]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
-    S(
+    Scenario(
         "unbounded_with_extra_cols_fills_gaps",
-        [Step(_daily([1, 3], [1, 3], region=["US", "US"])), Step(_daily([1, 3], [1, 3], region=["US", "US"]), pl.col("date") >= D(2024, 6, 1))],
-        {
+        steps=[
+            Step(_daily([1, 3], [1, 3], region=["US", "US"])),
+            Step(_daily([1, 3], [1, 3], region=["US", "US"]), predicate=pl.col("date") >= D(2024, 6, 1)),
+        ],
+        expected_files={
             "daily/US/2024-06-01.parquet": [1],
             "daily/US/2024-06-02.parquet": [],
             "daily/US/2024-06-03.parquet": [3],
             "daily/US/2024-06-04.parquet": None,
         },
-        exact=True,
-        **_RG,
+        only_expected_files=True,
+        cache_kwargs=_RG,
     ),
     # REBUILD reads upstream, overwrites the partitions in scope, and keeps the others
-    S(
+    Scenario(
         "overwrite",
-        [Step(_frame(date=[D(2023, 1, 15)], value=[42])), Step(_frame(date=[D(2023, 1, 15)], value=[99]), mode=CacheMode.REBUILD)],
-        {"monthly/2023-01.parquet": [99]},
-        exact=True,
+        steps=[Step(_frame(date=[D(2023, 1, 15)], value=[42])), Step(_frame(date=[D(2023, 1, 15)], value=[99]), mode=CacheMode.REBUILD)],
+        expected_files={"monthly/2023-01.parquet": [99]},
+        only_expected_files=True,
     ),
-    S(
+    Scenario(
         "rebuild_preserves_other_partitions",
-        [
+        steps=[
             Step(_JAN_MAR),
-            Step(_frame(date=[D(2024, 2, 20)], value=[999]), pl.col("date").is_between(D(2024, 2, 1), D(2024, 2, 28)), CacheMode.REBUILD),
+            Step(
+                _frame(date=[D(2024, 2, 20)], value=[999]), predicate=pl.col("date").is_between(D(2024, 2, 1), D(2024, 2, 28)), mode=CacheMode.REBUILD
+            ),
         ],
-        {"monthly/2024-01.parquet": [100], "monthly/2024-02.parquet": [999], "monthly/2024-03.parquet": [300]},
-        exact=True,
-        time_unit="monthly",
+        expected_files={"monthly/2024-01.parquet": [100], "monthly/2024-02.parquet": [999], "monthly/2024-03.parquet": [300]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "monthly"},
     ),
-    S(
+    Scenario(
         "rebuild_overwrites_existing_partition",
-        [
+        steps=[
             Step(_frame(date=[D(2024, 5, 10)], region=["US"], value=[100])),
             Step(
                 _frame(date=[D(2024, 5, 10)], region=["US"], value=[999]),
-                (pl.col("date") == D(2024, 5, 10)) & (pl.col("region") == "US"),
-                CacheMode.REBUILD,
+                predicate=(pl.col("date") == D(2024, 5, 10)) & (pl.col("region") == "US"),
+                mode=CacheMode.REBUILD,
             ),
         ],
-        {"daily/US/2024-05-10.parquet": [999]},
-        exact=True,
-        **_RG,
+        expected_files={"daily/US/2024-05-10.parquet": [999]},
+        only_expected_files=True,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "rebuild_writes_empty_files_for_missing_data",
-        [Step(_daily([1, 3], [10, 30]), pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3)), CacheMode.REBUILD)],
-        {"daily/2024-06-01.parquet": [10], "daily/2024-06-02.parquet": [], "daily/2024-06-03.parquet": [30]},
-        exact=True,
-        time_unit="daily",
+        steps=[Step(_daily([1, 3], [10, 30]), predicate=pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3)), mode=CacheMode.REBUILD)],
+        expected_files={"daily/2024-06-01.parquet": [10], "daily/2024-06-02.parquet": [], "daily/2024-06-03.parquet": [30]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
-    S(
+    Scenario(
         "rebuild_overwrites_previously_empty_partition",
-        [
-            Step(_daily([1, 3], [10, 30]), pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3))),
-            Step(_daily([1, 2, 3], [10, 20, 30]), pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3)), CacheMode.REBUILD),
+        steps=[
+            Step(_daily([1, 3], [10, 30]), predicate=pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3))),
+            Step(_daily([1, 2, 3], [10, 20, 30]), predicate=pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3)), mode=CacheMode.REBUILD),
         ],
-        {"daily/2024-06-01.parquet": [10], "daily/2024-06-02.parquet": [20], "daily/2024-06-03.parquet": [30]},
-        exact=True,
-        time_unit="daily",
+        expected_files={"daily/2024-06-01.parquet": [10], "daily/2024-06-02.parquet": [20], "daily/2024-06-03.parquet": [30]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
-    S(
+    Scenario(
         "rebuild_with_extra_cols_preserves_other_regions",
-        [
+        steps=[
             Step(_frame(date=[D(2024, 8, 1)] * 2, region=["US", "EU"], value=[100, 200])),
             Step(
                 _frame(date=[D(2024, 8, 1)], region=["US"], value=[999]),
-                (pl.col("date") == D(2024, 8, 1)) & (pl.col("region") == "US"),
-                CacheMode.REBUILD,
+                predicate=(pl.col("date") == D(2024, 8, 1)) & (pl.col("region") == "US"),
+                mode=CacheMode.REBUILD,
             ),
         ],
-        {"daily/US/2024-08-01.parquet": [999], "daily/EU/2024-08-01.parquet": [200]},
-        exact=True,
-        **_RG,
+        expected_files={"daily/US/2024-08-01.parquet": [999], "daily/EU/2024-08-01.parquet": [200]},
+        only_expected_files=True,
+        cache_kwargs=_RG,
     ),
-    S(
+    Scenario(
         "rebuild_no_date_column",
-        [Step(_frame(region=["US", "EU"], value=[100, 200])), Step(_frame(region=["US"], value=[999]), pl.col("region") == "US", CacheMode.REBUILD)],
-        {"null/US.parquet": [999], "null/EU.parquet": [200]},
-        exact=True,
-        date_column=None,
-        extra_partition_cols="region",
-    ),
-    S(
-        "rebuild_empty_to_data",
-        [
-            Step(_EMPTY, pl.col("date") == D(2024, 9, 1), CacheMode.REBUILD),
-            Step(_frame(date=[D(2024, 9, 1)], value=[42]), pl.col("date") == D(2024, 9, 1), CacheMode.REBUILD),
+        steps=[
+            Step(_frame(region=["US", "EU"], value=[100, 200])),
+            Step(_frame(region=["US"], value=[999]), predicate=pl.col("region") == "US", mode=CacheMode.REBUILD),
         ],
-        {"daily/2024-09-01.parquet": [42]},
-        exact=True,
-        time_unit="daily",
+        expected_files={"null/US.parquet": [999], "null/EU.parquet": [200]},
+        only_expected_files=True,
+        cache_kwargs={"date_column": None, "extra_partition_cols": "region"},
     ),
-    S(
+    Scenario(
+        "rebuild_empty_to_data",
+        steps=[
+            Step(_EMPTY, predicate=pl.col("date") == D(2024, 9, 1), mode=CacheMode.REBUILD),
+            Step(_frame(date=[D(2024, 9, 1)], value=[42]), predicate=pl.col("date") == D(2024, 9, 1), mode=CacheMode.REBUILD),
+        ],
+        expected_files={"daily/2024-09-01.parquet": [42]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
+    ),
+    Scenario(
         "rebuild_data_to_empty",
-        [Step(_frame(date=[D(2024, 10, 1)], value=[42])), Step(_EMPTY, pl.col("date") == D(2024, 10, 1), CacheMode.REBUILD)],
-        {"daily/2024-10-01.parquet": []},
-        exact=True,
-        time_unit="daily",
+        steps=[Step(_frame(date=[D(2024, 10, 1)], value=[42])), Step(_EMPTY, predicate=pl.col("date") == D(2024, 10, 1), mode=CacheMode.REBUILD)],
+        expected_files={"daily/2024-10-01.parquet": []},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
     # reads served from the cache
-    S(
+    Scenario(
         "between_pred_uses_existing_partitions",
-        [
-            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[10, 20]), pl.col("date") == D(2021, 3, 1)),
-            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[10, 20]), pl.col("date") == D(2021, 3, 2)),
-            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[0, 0]), pl.col("date").is_between(D(2021, 3, 1), D(2021, 3, 2)), expect=[10, 20]),
+        steps=[
+            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[10, 20]), predicate=pl.col("date") == D(2021, 3, 1)),
+            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[10, 20]), predicate=pl.col("date") == D(2021, 3, 2)),
+            Step(
+                _frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[0, 0]),
+                predicate=pl.col("date").is_between(D(2021, 3, 1), D(2021, 3, 2)),
+                compare_native=False,
+                expected_values=[10, 20],
+            ),
         ],
-        {"daily/2021-03-01.parquet": [10], "daily/2021-03-02.parquet": [20]},
-        exact=True,
-        time_unit="daily",
+        expected_files={"daily/2021-03-01.parquet": [10], "daily/2021-03-02.parquet": [20]},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
-    S(
+    Scenario(
         "custom_partition_format_cache_readback",
-        [Step(_daily([1, 2, 3], [10, 20, 30])), Step(_daily([4, 5], [40, 50]), expect=[10, 20, 30, 40, 50])],
-        {f"daily/theYear=2024/theMonth=06/theDay=0{d}.parquet": [10 * d] for d in range(1, 6)},
-        exact=True,
-        time_unit="daily",
-        partition_format="theYear=$year/theMonth=$month/theDay=$day",
+        steps=[Step(_daily([1, 2, 3], [10, 20, 30])), Step(_daily([4, 5], [40, 50]), compare_native=False, expected_values=[10, 20, 30, 40, 50])],
+        expected_files={f"daily/theYear=2024/theMonth=06/theDay=0{d}.parquet": [10 * d] for d in range(1, 6)},
+        only_expected_files=True,
+        cache_kwargs={"time_unit": "daily", "partition_format": "theYear=$year/theMonth=$month/theDay=$day"},
     ),
-    S(
+    Scenario(
         "empty_result_from_cache",
-        [Step(_frame(date=[D(2024, 2, 1)], value=[1]), pl.col("date") == D(2025, 1, 1))],
-        {"monthly/2025-01.parquet": []},
-        exact=True,
+        steps=[Step(_frame(date=[D(2024, 2, 1)], value=[1]), predicate=pl.col("date") == D(2025, 1, 1))],
+        expected_files={"monthly/2025-01.parquet": []},
+        only_expected_files=True,
     ),
-    S(
+    Scenario(
         "extra_partition_columns",
-        [Step(_frame(date=[D(2024, 1, 3), D(2024, 1, 4)] * 2, country=["US", "CA"] * 2, value=[1, 2, 3, 4]))],
-        {"monthly/US/2024-01.parquet": [1, 3], "monthly/CA/2024-01.parquet": [2, 4]},
-        exact=True,
-        extra_partition_cols=["country"],
+        steps=[Step(_frame(date=[D(2024, 1, 3), D(2024, 1, 4)] * 2, country=["US", "CA"] * 2, value=[1, 2, 3, 4]))],
+        expected_files={"monthly/US/2024-01.parquet": [1, 3], "monthly/CA/2024-01.parquet": [2, 4]},
+        only_expected_files=True,
+        cache_kwargs={"extra_partition_cols": ["country"]},
     ),
     # no date column: one file per extra-column value under null/, or null/data.parquet
-    S(
+    Scenario(
         "cache_parquet_no_date_single_extra_col",
-        [
+        steps=[
             Step(_frame(region=["US", "US", "EU", "EU", "APAC"], value=[100, 200, 150, 250, 180])),
-            Step(_frame(region=["US"], value=[0]), expect=[100, 200, 150, 250, 180]),
+            Step(_frame(region=["US"], value=[0]), compare_native=False, expected_values=[100, 200, 150, 250, 180]),
         ],
-        {"null/US.parquet": [100, 200], "null/EU.parquet": [150, 250], "null/APAC.parquet": [180]},
-        exact=True,
-        date_column=None,
-        extra_partition_cols="region",
+        expected_files={"null/US.parquet": [100, 200], "null/EU.parquet": [150, 250], "null/APAC.parquet": [180]},
+        only_expected_files=True,
+        cache_kwargs={"date_column": None, "extra_partition_cols": "region"},
     ),
-    S(
+    Scenario(
         "cache_parquet_no_date_multiple_extra_cols",
-        [Step(_frame(region=["US", "US", "EU", "EU", "APAC", "APAC"], product=["A", "B"] * 3, value=[100, 200, 150, 250, 180, 220]))],
-        {f"null/{r}/{p}.parquet": [v] for (r, p), v in zip([(r, p) for r in ["US", "EU", "APAC"] for p in "AB"], [100, 200, 150, 250, 180, 220])},
-        exact=True,
-        date_column=None,
-        extra_partition_cols=["region", "product"],
+        steps=[Step(_frame(region=["US", "US", "EU", "EU", "APAC", "APAC"], product=["A", "B"] * 3, value=[100, 200, 150, 250, 180, 220]))],
+        expected_files={
+            f"null/{r}/{p}.parquet": [v] for (r, p), v in zip([(r, p) for r in ["US", "EU", "APAC"] for p in "AB"], [100, 200, 150, 250, 180, 220])
+        },
+        only_expected_files=True,
+        cache_kwargs={"date_column": None, "extra_partition_cols": ["region", "product"]},
     ),
-    S(
+    Scenario(
         "cache_parquet_no_date_no_extra_cols",
-        [Step(_frame(value=[100, 200, 150], name=["Alice", "Bob", "Charlie"])), Step(_frame(value=[0], name=["x"]), expect=[100, 200, 150])],
-        {"null/data.parquet": [100, 200, 150]},
-        exact=True,
-        date_column=None,
+        steps=[
+            Step(_frame(value=[100, 200, 150], name=["Alice", "Bob", "Charlie"])),
+            Step(_frame(value=[0], name=["x"]), compare_native=False, expected_values=[100, 200, 150]),
+        ],
+        expected_files={"null/data.parquet": [100, 200, 150]},
+        only_expected_files=True,
+        cache_kwargs={"date_column": None},
     ),
-    S(
+    Scenario(
         "cache_parquet_no_date_with_predicate",
-        [
+        steps=[
             Step(_frame(region=["US", "US", "EU", "EU", "APAC"], category=list("XYXYX"), value=[100, 200, 150, 250, 180])),
             Step(
                 _frame(region=["US", "US", "EU", "EU", "APAC"], category=list("XYXYX"), value=[100, 200, 150, 250, 180]).filter(
                     pl.col("region") == "US"
                 ),
-                expect=[100, 200, 150, 250, 180],
+                compare_native=False,
+                expected_values=[100, 200, 150, 250, 180],
             ),
         ],
-        {"null/US/X.parquet": [100], "null/APAC/X.parquet": [180]},
-        date_column=None,
-        extra_partition_cols=["region", "category"],
+        expected_files={"null/US/X.parquet": [100], "null/APAC/X.parquet": [180]},
+        cache_kwargs={"date_column": None, "extra_partition_cols": ["region", "category"]},
     ),
-    S(
+    Scenario(
         "cache_parquet_no_date_different_cache_modes",
-        [
+        steps=[
             Step(_frame(category=list("ABAB"), value=[100, 200, 150, 250]), mode=CacheMode.IGNORE),
             Step(_frame(category=list("ABAB"), value=[100, 200, 150, 250]), mode=CacheMode.CACHE),
             Step(_frame(category=list("ABAB"), value=[100, 200, 150, 250]), mode=CacheMode.REBUILD),
         ],
-        {"null/A.parquet": [100, 150], "null/B.parquet": [200, 250]},
-        exact=True,
-        date_column=None,
-        extra_partition_cols=["category"],
+        expected_files={"null/A.parquet": [100, 150], "null/B.parquet": [200, 250]},
+        only_expected_files=True,
+        cache_kwargs={"date_column": None, "extra_partition_cols": ["category"]},
     ),
-    S(
+    Scenario(
         "no_date_with_extra_unconstrained_queries_upstream_for_new_partitions",
-        [
+        steps=[
             Step(_frame(region=["US"], value=[1])),
-            Step(_frame(region=["EU"], value=[2]), expect=[1, 2]),
-            Step(_frame(region=["EU"], value=[3]), expect=[1, 2]),
+            Step(_frame(region=["EU"], value=[2]), compare_native=False, expected_values=[1, 2]),
+            Step(_frame(region=["EU"], value=[3]), compare_native=False, expected_values=[1, 2]),
         ],
-        {"null/US.parquet": [1], "null/EU.parquet": [2]},
-        exact=True,
-        date_column=None,
-        extra_partition_cols="region",
+        expected_files={"null/US.parquet": [1], "null/EU.parquet": [2]},
+        only_expected_files=True,
+        cache_kwargs={"date_column": None, "extra_partition_cols": "region"},
     ),
-    S(
+    Scenario(
         "sequential_cache_parquet",
-        [Step(_frame(date=[D(2024, 1, 1), D(2024, 1, 2), D(2024, 2, 1)], value=[1, 3, 5]))],
-        {"monthly/2024-01.parquet": [1, 3], "monthly/2024-02.parquet": [5]},
+        steps=[Step(_frame(date=[D(2024, 1, 1), D(2024, 1, 2), D(2024, 2, 1)], value=[1, 3, 5]))],
+        expected_files={"monthly/2024-01.parquet": [1, 3], "monthly/2024-02.parquet": [5]},
     ),
 ]
 
 
-@pytest.mark.parametrize(("steps", "files", "column", "exact", "kwargs"), params(STEPS, "pred", "expect", "column", "exact", "kwargs"))
-def test_steps(tmp_path, steps, files, column, exact, kwargs):
-    run_steps(tmp_path, steps, column, **kwargs)
-    assert_cache_files(tmp_path, files, column, exact=exact)
+@pytest.mark.parametrize("scenario", [pytest.param(sc, id=sc.id) for sc in STEPS])
+def test_steps(tmp_path, scenario):
+    run_steps(tmp_path, scenario.steps, **{"date_column": "date"} | scenario.cache_kwargs)
+    assert_cache_files(tmp_path, scenario.expected_files, exact=scenario.only_expected_files)
 
 
 def test_sequential_cache_parquet_chained(tmp_path):
