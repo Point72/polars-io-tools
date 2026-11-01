@@ -6,6 +6,7 @@ The contracts:
 - superset: what a source is asked for keeps every row the user's predicate keeps; pushdown is never lossy.
 - pushed bounds / pushed discrete: the predicate a source receives has the expected temporal bounds or values.
 - translated text: the SQL or filter string a predicate becomes holds, or leaves out, given fragments.
+- pushdown: whether a predicate or a projection reached a source at all.
 """
 
 from collections.abc import Callable
@@ -102,6 +103,23 @@ def assert_pushed_discrete(tracker: PredicateTracker, col: str, values: set) -> 
     pushed = tracker.last_predicate
     assert pushed is not None and PredicateAnalyzer(pushed).find_discrete_filter(col) is not None, f"no discrete filter on {col!r}: {pushed}"
     assert convert_expr_to_valid_values(pushed, col) == values, pushed
+
+
+def assert_pushdown(
+    tracker: PredicateTracker, *, predicate: bool | None = None, projection: bool | set | None = None, calls: int | None = None
+) -> None:
+    """What reached ``tracker``: ``True`` if a predicate or projection was pushed, ``False`` if none was, a set for the exact
+    projected columns, and ``calls`` scans. ``None`` checks nothing."""
+    if predicate is not None:
+        assert (tracker.last_predicate is not None) == predicate, f"pushed predicate: {tracker.last_predicate!r}"
+    if isinstance(projection, bool):
+        assert (tracker.last_with_columns is not None) == projection, f"pushed projection: {tracker.last_with_columns!r}"
+    elif projection is not None:
+        assert tracker.last_with_columns is not None and set(tracker.last_with_columns) == projection, (
+            f"pushed projection: {tracker.last_with_columns!r}"
+        )
+    if calls is not None:
+        assert tracker.call_count == calls, f"{tracker.call_count} scans, expected {calls}"
 
 
 # Entry points: (source frame, tmp_path) -> (lazy frame under test, tracker on the source)

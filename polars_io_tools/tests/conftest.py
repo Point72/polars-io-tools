@@ -19,6 +19,7 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "benchmark: mark test as benchmark")
+    config.addinivalue_line("markers", "gap: a pushdown Polars could perform but does not (locked in so a change is noticed)")
 
 
 def pytest_collection_modifyitems(config, items):

@@ -1,19 +1,17 @@
+"""pushdown_pivot against bare ``LazyFrame.pivot``, and what each pushes to the source.
+
+Lazy pivot is a group_by with one ``filter().item()`` aggregation per ``on_columns`` value. Bare, a filter on the index
+reaches the source and selecting only the index prunes the source to it; nothing else is pushed, which is correct:
+
+* a filter on a pivoted column is a HAVING on an aggregate, so pushing ``score > 2`` would drop rows a group needs;
+* ``is_not_null`` on a pivoted column rewritten as ``subject == "m"`` would null the other pivoted columns;
+* selecting ``[name, m]`` rewritten as the source filter ``subject == "m"`` drops index values with no "m" row when the
+  source is sparse over ``on``, which bare pivot keeps with ``m = null``.
+
+The wrapper pushes that filter when the caller asserts density (``dense_on=True``, mode ``dense``); by default (mode
+``smart``) a second narrow scan recovers the index values the filter dropped. Rows run in the modes they name, and
+every wrapped mode except ``dense`` on sparse data must return what bare pivot returns.
 """
-Result-equivalence and pushdown matrix for ``polars_io_tools.pushdown_pivot``.
-
-These tests complement the bare characterization suite in ``tests/pushdown/test_pivot.py``. Each scenario is checked against bare
-``pl.LazyFrame.pivot`` to verify the wrapper preserves semantics, and against the :class:`PredicateTracker` to verify the
-wrapper actually drives pushdown.
-
-Two ``dense_on`` modes are exercised:
-
-* ``dense_on=False`` (default, *smart*): a second narrow scan recovers index values that the synthesized ``on ∈ S`` filter
-  would have dropped. Always matches bare; works on sparse data.
-* ``dense_on=True`` (*fast*): the recovery scan is skipped. Faster, but silently drops rows on sparse data (the precondition
-  the caller asserted has been violated).
-"""
-
-from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
@@ -21,225 +19,156 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
-from polars.testing import assert_frame_equal
 
 from polars_io_tools import pushdown_pivot
 from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.catalogue import Case
+from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_pushdown
 
-DENSE_DF = pl.DataFrame(
-    {
-        "name": ["A", "A", "A", "B", "B", "B"],
-        "subject": ["m", "p", "x", "m", "p", "x"],
-        "score": [1, 2, 3, 4, 5, 6],
-    }
-)
-
-SPARSE_DF = pl.DataFrame(
-    {
-        # A is missing subject "m"; B is missing subject "x"; C only has "p".
-        "name": ["A", "A", "B", "B", "C"],
-        "subject": ["p", "x", "m", "p", "p"],
-        "score": [1, 2, 3, 4, 5],
-    }
-)
-
+c = pl.col
+DENSE = pl.DataFrame({"name": ["A", "A", "A", "B", "B", "B"], "subject": ["m", "p", "x", "m", "p", "x"], "score": [1, 2, 3, 4, 5, 6]})
+# A has no "m", B no "x", and C only "p".
+SPARSE = pl.DataFrame({"name": ["A", "A", "B", "B", "C"], "subject": ["p", "x", "m", "p", "p"], "score": [1, 2, 3, 4, 5]})
+WIDE = DENSE.with_columns(pl.lit(0.0).alias("extra1"), pl.lit(0.0).alias("extra2"))
+ORDERED = pl.DataFrame({"name": ["B", "A", "A", "B"], "subject": ["m", "p", "m", "p"], "score": [1, 2, 3, 4]})
 KW = {"on": "subject", "on_columns": ["m", "p", "x"], "index": "name", "values": "score"}
+DENSE_ON = {"smart": False, "dense": True}
 
 
-def _bare(df: pl.DataFrame, *, transform):
-    return transform(df.lazy().pivot(**KW)).sort("name").collect()
+def V(id, query, modes, df=DENSE, **kw):
+    """A row: ``query`` maps the pivoted frame to the query; ``modes`` maps each mode to ``assert_pushdown`` arguments."""
+    return Case(id, query, modes, {"df": df, "pivot": KW, **kw})
 
 
-def _wrapped(df: pl.DataFrame, *, transform, dense_on: bool):
-    tracker = PredicateTracker(df)
-    out = transform(pushdown_pivot(tracker.lazy_frame, dense_on=dense_on, **KW)).sort("name").collect()
-    return out, tracker
+def _rows_named(expected: dict):
+    def check(got):
+        assert dict(zip(got["name"], got["m"])) == expected
+
+    return check
 
 
-@pytest.mark.parametrize("dense_on", [False, True])
-def test_full_select_matches_bare_dense(dense_on):
-    """No projection pruning → no synthesized on-filter; both modes match bare."""
-    bare = _bare(DENSE_DF, transform=lambda lf: lf)
-    out, _ = _wrapped(DENSE_DF, transform=lambda lf: lf, dense_on=dense_on)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
+ROWS = [
+    V("filter_on_index_is_pushed", lambda lf: lf.filter(c("name") == "A"), {m: {"predicate": True} for m in ("bare", "smart", "dense")}),
+    V("filter_on_pivoted_output_NOT_pushed", lambda lf: lf.filter(c("m") > 2), {"bare": {"predicate": False}}),
+    V("filter_on_pivoted_output_is_not_null_NOT_pushed", lambda lf: lf.filter(c("m").is_not_null()), {"bare": {"predicate": False}}),
+    V(
+        "select_index_only",
+        lambda lf: lf.select("name"),
+        {"bare": {"projection": {"name"}}, "smart": {"projection": True}, "dense": {"projection": True}},
+    ),
+    V("full_select_matches_bare_dense", lambda lf: lf, {"smart": {}, "dense": {}}),
+    # The source holds exactly the columns the pivot needs, so no projection is pushed.
+    V("select_subset", lambda lf: lf.select("name", "m"), {"bare": {"projection": False}, "smart": {}, "dense": {"predicate": True}}),
+    V("select_two_pivoted_outputs", lambda lf: lf.select("name", "m", "p"), {"bare": {"projection": False}, "dense": {"predicate": True}}),
+    V(
+        "select_subset_dense_on_True_pushes_projection_on_wide_source",
+        lambda lf: lf.select("name", "m"),
+        {"dense": {"predicate": True, "projection": {"name", "subject", "score"}}},
+        df=WIDE,
+    ),
+    V(
+        "sparse_data_dense_on_False_matches_bare",
+        lambda lf: lf.select("name", "m"),
+        {"smart": {}},
+        df=SPARSE,
+        check=_rows_named({"A": None, "B": 3, "C": None}),
+    ),
+    # Opting into the fast path on sparse data drops A and C, as documented.
+    V(
+        "sparse_data_dense_on_True_drops_rows_as_documented",
+        lambda lf: lf.select("name", "m"),
+        {"dense": {}},
+        df=SPARSE,
+        native=False,
+        check=_rows_named({"B": 3}),
+    ),
+    # The on-filter could change the order of first appearance, so it is not pushed.
+    V(
+        "maintain_order_suppresses_on_filter",
+        lambda lf: lf.select("name", "m"),
+        {"smart": {"predicate": False}, "dense": {"predicate": False}},
+        df=ORDERED,
+        pivot={"on": "subject", "on_columns": ["m", "p"], "index": "name", "values": "score", "maintain_order": True},
+    ),
+    # A filter on p with select("name") still materialises p and pushes the on-filter.
+    V("predicate_on_dropped_pivoted_column_dense_on_True", lambda lf: lf.filter(c("p") > 3).select("name"), {"dense": {"predicate": True}}),
+]
 
 
-@pytest.mark.parametrize("dense_on", [False, True])
-def test_select_index_only_matches_bare(dense_on):
-    bare = _bare(DENSE_DF, transform=lambda lf: lf.select("name"))
-    out, tracker = _wrapped(DENSE_DF, transform=lambda lf: lf.select("name"), dense_on=dense_on)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
-    assert tracker.last_with_columns is not None, "selecting only the index should push a projection"
+def _params():
+    for row in ROWS:
+        for mode, observed in row.expect.items():
+            yield pytest.param(mode, row.pred, observed, row.kw, id=f"{mode}-{row.id}")
 
 
-@pytest.mark.parametrize("dense_on", [False, True])
-def test_filter_on_index_matches_bare_and_pushes(dense_on):
-    bare = _bare(DENSE_DF, transform=lambda lf: lf.filter(pl.col("name") == "A"))
-    out, tracker = _wrapped(DENSE_DF, transform=lambda lf: lf.filter(pl.col("name") == "A"), dense_on=dense_on)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
-    assert tracker.last_predicate is not None, "filter on index should be pushed in either mode"
-
-
-def test_select_subset_dense_on_True_pushes_synthesized_filter():
-    """`select([name, m])` with `dense_on=True` synthesizes upstream `subject == "m"`.
-
-    (No projection is pushed because the source's only columns are exactly those internally needed —
-    ``[name, subject, score]`` — so polars treats the projection as a no-op.)
-    """
-    bare = _bare(DENSE_DF, transform=lambda lf: lf.select(["name", "m"]))
-    out, tracker = _wrapped(DENSE_DF, transform=lambda lf: lf.select(["name", "m"]), dense_on=True)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
-    assert tracker.last_predicate is not None, "expected synthesized on-filter to be pushed"
-
-
-def test_select_subset_dense_on_False_matches_bare_via_recovery():
-    """Default smart mode: prefiltered pivot + index recovery, matches bare."""
-    bare = _bare(DENSE_DF, transform=lambda lf: lf.select(["name", "m"]))
-    out, _ = _wrapped(DENSE_DF, transform=lambda lf: lf.select(["name", "m"]), dense_on=False)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
-
-
-def test_select_subset_dense_on_True_pushes_projection_on_wide_source():
-    """With extra source columns, the synthesized projection narrows the scan to just `[index, on, values]` (and the
-    synthesized filter is still pushed)."""
-    df = DENSE_DF.with_columns(
-        pl.lit(0.0).alias("extra1"),
-        pl.lit(0.0).alias("extra2"),
-    )
-    tracker = PredicateTracker(df)
-    out = (
-        pushdown_pivot(tracker.lazy_frame, on="subject", on_columns=["m", "p", "x"], index="name", values="score", dense_on=True)
-        .select(["name", "m"])
-        .collect()
-    )
-    bare = df.lazy().pivot("subject", on_columns=["m", "p", "x"], index="name", values="score").select(["name", "m"]).sort("name").collect()
-    assert_frame_equal(out.sort("name"), bare, check_dtypes=True, check_column_order=False)
-    assert tracker.last_predicate is not None
-    assert set(tracker.last_with_columns) == {"name", "subject", "score"}
-
-    bare = _bare(DENSE_DF, transform=lambda lf: lf.select(["name", "m", "p"]))
-    out, tracker = _wrapped(DENSE_DF, transform=lambda lf: lf.select(["name", "m", "p"]), dense_on=True)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
-    assert tracker.last_predicate is not None
-
-
-def test_sparse_data_dense_on_False_matches_bare():
-    """Headline correctness regression: smart mode preserves dropped index rows."""
-    bare = _bare(SPARSE_DF, transform=lambda lf: lf.select(["name", "m"]))
-    out, _ = _wrapped(SPARSE_DF, transform=lambda lf: lf.select(["name", "m"]), dense_on=False)
-    assert_frame_equal(out, bare, check_dtypes=True, check_column_order=False)
-    # Sanity: A and C both appear with null `m` (they had no `subject == "m"` row).
-    rows = {r["name"]: r["m"] for r in out.to_dicts()}
-    assert rows == {"A": None, "B": 3, "C": None}
-
-
-def test_sparse_data_dense_on_True_drops_rows_as_documented():
-    """Precondition-violation case: opting into the fast path on sparse data is documented to drop rows. Test pins that
-    behavior so a future silent change is caught."""
-    out, _ = _wrapped(SPARSE_DF, transform=lambda lf: lf.select(["name", "m"]), dense_on=True)
-    rows = {r["name"]: r["m"] for r in out.to_dicts()}
-    assert rows == {"B": 3}, "dense_on=True on sparse data should drop A and C"
-
-
-def test_maintain_order_suppresses_on_filter():
-    """With ``maintain_order=True`` the wrapper does not synthesize the on-filter (it could change first-appearance
-    ordering); the result still matches bare in either dense_on mode."""
-    df = pl.DataFrame(
-        {
-            "name": ["B", "A", "A", "B"],
-            "subject": ["m", "p", "m", "p"],
-            "score": [1, 2, 3, 4],
-        }
-    )
-    bare = df.lazy().pivot("subject", on_columns=["m", "p"], index="name", values="score", maintain_order=True).select(["name", "m"]).collect()
-    for dense_on in (False, True):
-        tracker = PredicateTracker(df)
-        out = (
-            pushdown_pivot(
-                tracker.lazy_frame,
-                on="subject",
-                on_columns=["m", "p"],
-                index="name",
-                values="score",
-                maintain_order=True,
-                dense_on=dense_on,
-            )
-            .select(["name", "m"])
-            .collect()
-        )
-        assert tracker.last_predicate is None, f"on-filter must not be pushed when maintain_order=True (dense_on={dense_on})"
-        assert_frame_equal(out, bare, check_dtypes=True)
-
-
-def test_predicate_on_dropped_pivoted_column_dense_on_True():
-    """Filter on `p` plus `select("name")` materializes `p` internally, pushes the synthesized on-filter, and matches bare."""
-    bare = DENSE_DF.lazy().pivot(**KW).filter(pl.col("p") > 3).select("name").collect()
-    tracker = PredicateTracker(DENSE_DF)
-    wrapped = pushdown_pivot(tracker.lazy_frame, dense_on=True, **KW).filter(pl.col("p") > 3).select("name").collect()
-    assert tracker.last_predicate is not None
-    assert_frame_equal(wrapped, bare, check_dtypes=True, check_row_order=False)
+@pytest.mark.parametrize(("mode", "query", "observed", "kw"), list(_params()))
+def test_pivot(mode, query, observed, kw):
+    tracker = PredicateTracker(kw["df"])
+    pivot = kw["pivot"]
+    lf = tracker.lazy_frame.pivot(**pivot) if mode == "bare" else pushdown_pivot(tracker.lazy_frame, dense_on=DENSE_ON[mode], **pivot)
+    if mode != "bare" and kw.get("native", True):
+        reference = query(tracker.lazy_frame.pivot(**pivot)).collect()
+        tracker.reset()
+        got = assert_matches_native(query(lf), reference.lazy(), None, check_row_order=pivot.get("maintain_order", False))
+    else:
+        got = query(lf).collect()
+    assert_pushdown(tracker, **observed)
+    if "check" in kw:
+        kw["check"](got)
 
 
 def test_aggregate_function_not_implemented():
     with pytest.raises(NotImplementedError):
-        pushdown_pivot(
-            DENSE_DF.lazy(),
-            on="subject",
-            on_columns=["m"],
-            index="name",
-            values="score",
-            aggregate_function="sum",
-        )
+        pushdown_pivot(DENSE.lazy(), on="subject", on_columns=["m"], index="name", values="score", aggregate_function="sum")
 
 
-_FOLD_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
-
-
-@pytest.mark.parametrize(
-    ("df", "on_columns"),
-    [
-        # Null index value must survive the recovery join.
-        (pl.DataFrame({"id": [None, None, 1, 1], "kind": ["A", "B", "A", "B"], "v": [10, 20, 30, 40]}), ["A", "B"]),
-        # Null ``on`` category must survive the synthesized ``on`` filter.
-        (pl.DataFrame({"id": [1, 1], "kind": [None, "B"], "v": [10, 20]}), [None, "B"]),
-        (pl.DataFrame({"id": [1, 1], "kind": [None, "B"], "v": [10, 20]}), [None, "B", "C"]),
-        # DST-fold datetimes compare equal in Python but are distinct categories.
-        (
-            pl.DataFrame(
-                {"id": [1, 1], "kind": pl.Series([_FOLD_EARLY, _FOLD_EARLY.replace(fold=1)]).cast(pl.Datetime("us", "America/New_York")), "v": [1, 2]}
-            ),
-            [_FOLD_EARLY, _FOLD_EARLY.replace(fold=1)],
-        ),
-    ],
-)
-def test_filter_on_first_pivoted_column_matches_bare(df, on_columns):
+def _first_pivoted(name, df, on_columns):
     kw = {"on": "kind", "on_columns": on_columns, "index": "id", "values": "v"}
     col = df.lazy().pivot(**kw).collect_schema().names()[1]
-    bare = df.lazy().pivot(**kw).filter(pl.col(col) < 15).select("id", col).collect()
-    wrapped = pushdown_pivot(df.lazy(), **kw).filter(pl.col(col) < 15).select("id", col).collect()
-    assert_frame_equal(wrapped, bare, check_row_order=False)
+    return Case(f"filter_on_first_pivoted_column_matches_bare-{name}", df, lambda lf: lf.filter(c(col) < 15).select("id", col), kw)
 
 
-@pytest.mark.parametrize("extra", [[], [Decimal(1000)]], ids=["in_range", "out_of_range"])
-def test_decimal_on_values_filter_matches_bare(extra):
+def _decimal_on(name, extra):
     df = pl.DataFrame({"id": [1, 1, 1], "kind": pl.Series([1, 2, 3], dtype=pl.Decimal(3, 0)), "v": [10, 20, 30]})
-    kw = {"on": "kind", "on_columns": [Decimal(1), Decimal(2), Decimal(3), *extra], "index": "id", "values": "v"}
     cols = ["id", "1", "2", *(["1000"] if extra else [])]
-    bare = df.lazy().pivot(**kw).filter(pl.col("1") < pl.col("2")).select(cols).collect()
-    wrapped = pushdown_pivot(df.lazy(), **kw).filter(pl.col("1") < pl.col("2")).select(cols).collect()
-    assert_frame_equal(wrapped, bare)
+    kw = {"on": "kind", "on_columns": [Decimal(1), Decimal(2), Decimal(3), *extra], "index": "id", "values": "v"}
+    return Case(f"decimal_on_values_filter_matches_bare-{name}", df, lambda lf: lf.filter(c("1") < c("2")).select(cols), kw)
 
 
-_DAYS = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2), datetime(2024, 1, 3)])
-
-
-@pytest.mark.parametrize(
-    "days",
-    [_DAYS.cast(pl.Datetime("ms")), _DAYS.cast(pl.Datetime("ns")), pl.Series([1000, 1001, 1002]).cast(pl.Datetime("ns"))],
-    ids=["ms", "ns", "ns_sub_us"],
-)
-def test_series_on_columns_are_named_in_their_unit(days):
+def _series_on(name, days):
     df = pl.DataFrame({"id": [1, 1, 1], "kind": days, "v": [0, 1, 2]})
     kw = {"on": "kind", "on_columns": days, "index": "id", "values": "v"}
     cols = df.lazy().pivot(**kw).collect_schema().names()[:3]
-    assert_frame_equal(pushdown_pivot(df.lazy(), **kw).select(cols).collect(), df.lazy().pivot(**kw).select(cols).collect())
+    return Case(f"series_on_columns_are_named_in_their_unit-{name}", df, lambda lf: lf.select(cols), kw)
+
+
+_FOLD_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+_DAYS = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2), datetime(2024, 1, 3)])
+_NULL_KIND = pl.DataFrame({"id": [1, 1], "kind": [None, "B"], "v": [10, 20]})
+# (frame, query, pivot arguments) the default wrapper must answer as bare pivot does.
+MATCHES_BARE = [
+    # A null index value survives the recovery join.
+    _first_pivoted("null_index", pl.DataFrame({"id": [None, None, 1, 1], "kind": ["A", "B", "A", "B"], "v": [10, 20, 30, 40]}), ["A", "B"]),
+    # A null ``on`` category survives the synthesized ``on`` filter.
+    _first_pivoted("null_on", _NULL_KIND, [None, "B"]),
+    _first_pivoted("null_on_extra_column", _NULL_KIND, [None, "B", "C"]),
+    # DST-fold datetimes compare equal in Python but are distinct categories.
+    _first_pivoted(
+        "dst_fold",
+        pl.DataFrame(
+            {"id": [1, 1], "kind": pl.Series([_FOLD_EARLY, _FOLD_EARLY.replace(fold=1)]).cast(pl.Datetime("us", "America/New_York")), "v": [1, 2]}
+        ),
+        [_FOLD_EARLY, _FOLD_EARLY.replace(fold=1)],
+    ),
+    _decimal_on("in_range", []),
+    _decimal_on("out_of_range", [Decimal(1000)]),
+    _series_on("ms", _DAYS.cast(pl.Datetime("ms"))),
+    _series_on("ns", _DAYS.cast(pl.Datetime("ns"))),
+    _series_on("ns_sub_us", pl.Series([1000, 1001, 1002]).cast(pl.Datetime("ns"))),
+]
+
+
+@pytest.mark.parametrize("case", MATCHES_BARE, ids=lambda case: case.id)
+def test_wrapped_matches_bare(case):
+    df, query, kw = case.pred, case.expect, case.kw
+    assert_matches_native(query(pushdown_pivot(df.lazy(), **kw)), query(df.lazy().pivot(**kw)), None)
