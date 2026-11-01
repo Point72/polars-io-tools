@@ -28,8 +28,8 @@ from polars_io_tools.io_sources.pushdown_combine import (
     pushdown_combine,
 )
 from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker, io_source_assert
-from polars_io_tools.tests.helpers.catalogue import GROUP_FRAME, Case, daily_frame, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_pushed_bounds
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_pushed_bounds
+from polars_io_tools.tests.helpers.cases import GROUP_FRAME, Case, daily_frame, params
 
 c = pl.col
 UTC_ZONE = ZoneInfo("UTC")

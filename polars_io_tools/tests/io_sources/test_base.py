@@ -42,8 +42,8 @@ from polars_io_tools.io_sources.enum import (
     StringFunctionType,
     TemporalFunctionType,
 )
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.quirks import quirk
+from polars_io_tools.tests.helpers.cases import Case, params
+from polars_io_tools.tests.helpers.polars_versions import polars_has
 
 from .conftest import PredicateTracker
 
@@ -111,7 +111,7 @@ _IS_BETWEEN_INPUTS = [Col("value"), Lit(1), Lit(10)]
 
 
 def _datetime_literal_shape() -> N:
-    if quirk("datetime_literal_unwrapped"):
+    if polars_has("datetime_literal_unwrapped"):
         return Lit(_DT)
     # Older Polars wraps the literal in a cast to the naive dtype.
     return N(CastNode, input=N(BaseExprNode, value=_DT.replace(tzinfo=UTC)))
@@ -131,7 +131,7 @@ PARSE_CASES = [
     Case("date_time_literals_parsed-datetime", pl.lit(_DT), _datetime_literal_shape()),
     Case("date_time_literals_parsed-date", pl.lit(date(2023, 1, 1)), Lit(date(2023, 1, 1))),
     Case("date_time_literals_parsed-time", pl.lit(time(12, 30, 45)), Lit(time(12, 30, 45))),
-    Case("complex_literals-dict", pl.lit({"a": 1, "b": 2}), Lit({"a": 1, "b": 2}) if quirk("struct_literal_parsed") else N(ErrorNode)),
+    Case("complex_literals-dict", pl.lit({"a": 1, "b": 2}), Lit({"a": 1, "b": 2}) if polars_has("struct_literal_parsed") else N(ErrorNode)),
     Case("complex_literals-nested_list", pl.lit([[1, 2], [3, 4]]), Lit([[1, 2], [3, 4]])),
     Case("value_property_on_different_node_types-column", c("x"), N(ColumnNode, value=None, can_extract_literal=False)),
     Case("value_property_on_different_node_types-function", c("x").str.to_uppercase(), N(FunctionNode, value=None, can_extract_literal=False)),
@@ -166,7 +166,7 @@ PARSE_CASES = [
         "nested_alias",
         c("a").alias("b").alias("c"),
         N(AliasNode, name="c", input=N(AliasNode, name="b", input=Col("a"))),
-        marks=(pytest.mark.skipif(quirk("nested_alias_dropped"), reason="meta.pop() drops a nested alias"),),
+        marks=(pytest.mark.skipif(polars_has("nested_alias_dropped"), reason="meta.pop() drops a nested alias"),),
     ),
     # functions
     Case("parse_string_function-contains", c("text").str.contains("pattern"), Fn(Str.CONTAINS, Col("text"), Lit("pattern"))),
@@ -272,7 +272,7 @@ def test_parse_long_addition_chain(start, first, count):
 
 def test_list_eval():
     expr = c("list_column").list.eval(pl.element() > 0)
-    if not quirk("list_eval_serializes"):
+    if not polars_has("list_eval_serializes"):
         node = get_parsed_expr(expr)
         assert isinstance(node, ErrorNode)
         assert "serialization not supported for this 'opaque' function" in node.error
@@ -517,8 +517,8 @@ def P(id, expr, pushed=True, results=False, check=None, df=None, marks=()):
 
 
 def _pushed_on(name: str):
-    """Pushed from the Polars version with behaviour ``name``; unchecked before it."""
-    return True if quirk(name) else None
+    """Pushed from the Polars version with behavior ``name``; unchecked before it."""
+    return True if polars_has(name) else None
 
 
 def _pushed_is_and_of_negations(original, pushed):
@@ -538,7 +538,7 @@ _NS_FRAME = pl.DataFrame(
 )
 _PADDED = pl.DataFrame({"padded": ["  A  ", "  B  ", "  C  ", " D ", "E"]})
 _NAMES = pl.DataFrame({"first": ["A", "B", "C"], "last": ["X", "Y", "Z"]})
-_needs_implicit_casts = pytest.mark.skipif(not quirk("pushes_implicit_casts"), reason="implicit casts block pushdown before Polars 1.28")
+_needs_implicit_casts = pytest.mark.skipif(not polars_has("pushes_implicit_casts"), reason="implicit casts block pushdown before Polars 1.28")
 
 PUSHDOWN_CASES = [
     P("numeric_predicates-gt", c("id") > 5),
@@ -580,7 +580,12 @@ PUSHDOWN_CASES = [
     ),
     P("temporal_predicates-dt_day", c("date_val").dt.day() == 3, pushed=_pushed_on("pushes_function_predicates")),
     # a nanosecond column compared with microsecond Python datetimes
-    P("temporal_schema_edge_case-python_datetimes", c("timestamp").is_between(_DT_18, _DT_END), pushed=quirk("pushes_implicit_casts"), df=_NS_FRAME),
+    P(
+        "temporal_schema_edge_case-python_datetimes",
+        c("timestamp").is_between(_DT_18, _DT_END),
+        pushed=polars_has("pushes_implicit_casts"),
+        df=_NS_FRAME,
+    ),
     P(
         "temporal_schema_edge_case-polars_datetimes",
         c("timestamp").is_between(convert_datetime_to_polars(_DT_18), convert_datetime_to_polars(_DT_END)),
@@ -611,7 +616,7 @@ PUSHDOWN_CASES = [
         P(
             f"compare_float_gt_int_with_int_to_float_cast_pushed_down-strict={s}",
             c("float_val") > c("int_val").cast(pl.Float64, strict=s),
-            pushed=quirk("pushes_implicit_casts"),
+            pushed=polars_has("pushes_implicit_casts"),
         )
         for s in (True, False)
     ],
@@ -619,7 +624,7 @@ PUSHDOWN_CASES = [
         P(
             f"compare_float_gt_int_with_float_to_int_cast_pushed_down-strict={s}",
             c("float_val").cast(pl.Int64, strict=s) > c("int_val"),
-            pushed=quirk("pushes_implicit_casts"),
+            pushed=polars_has("pushes_implicit_casts"),
         )
         for s in (True, False)
     ],
@@ -629,13 +634,13 @@ PUSHDOWN_CASES = [
         "map_batches",
         c("int_val").map_batches(lambda x: x > 5, return_dtype=pl.Boolean, is_elementwise=True),
         check=lambda original, pushed: N(AnonymousFunctionNode).match(get_parsed_expr(pushed)),
-        marks=(pytest.mark.xfail(quirk("anonymous_function_not_pushed"), reason="not pushed down properly from Polars 1.32.0", run=False),),
+        marks=(pytest.mark.xfail(polars_has("anonymous_function_not_pushed"), reason="not pushed down properly from Polars 1.32.0", run=False),),
     ),
     P(
         "fill_null_constant",
         c("nullable").fill_null(pl.when(c("id") > 5).then(100).otherwise(0)) > 50,
-        pushed=quirk("pushes_fill_null_predicates"),
-        check=_pushed_fill_null if quirk("pushes_fill_null_predicates") else None,
+        pushed=polars_has("pushes_fill_null_predicates"),
+        check=_pushed_fill_null if polars_has("pushes_fill_null_predicates") else None,
     ),
     # results match whether or not the predicate is pushed
     P("all_results_match_regardless_of_pushdown-id_gt", c("id") > 5, results=True),
@@ -644,8 +649,8 @@ PUSHDOWN_CASES = [
         P(
             f"all_results_match_regardless_of_pushdown-{name}",
             expr,
-            pushed=quirk("pushes_function_predicates"),
-            results=quirk("pushes_function_predicates"),
+            pushed=polars_has("pushes_function_predicates"),
+            results=polars_has("pushes_function_predicates"),
         )
         for name, expr in [
             ("sin", c("float_val").sin() > 0),

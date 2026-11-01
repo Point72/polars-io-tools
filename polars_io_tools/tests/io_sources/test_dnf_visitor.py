@@ -20,8 +20,8 @@ from polars_io_tools.io_sources.dnf_visitor import (
     is_contradiction,
     negate_dnf,
 )
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_keeps_rows
+from polars_io_tools.tests.helpers.assertions import assert_keeps_rows
+from polars_io_tools.tests.helpers.cases import Case, params
 from polars_io_tools.tests.io_sources.conftest import assert_dnf_equal
 
 c = pl.col
@@ -318,7 +318,7 @@ DNF_CASES = [
 
 
 def _dnf_to_expr(dnf: list[list[tuple]]) -> pl.Expr:
-    """A DNF materialised back into a Polars predicate (null -> drop, like a scan filter)."""
+    """A DNF materialized back into a Polars predicate (null -> drop, like a scan filter)."""
 
     def term(col, op, value):
         col = pl.col(col)

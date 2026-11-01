@@ -15,7 +15,7 @@ from polars.exceptions import ComputeError
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 API_KEY = "dummy_api_key_for_testing"
 APP_KEY = "dummy_app_key_for_testing"

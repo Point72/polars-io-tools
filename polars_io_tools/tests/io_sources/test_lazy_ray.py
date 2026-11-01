@@ -24,11 +24,11 @@ import polars_io_tools.io_sources.lazy_ray  # explicit import needed if using py
 from polars_io_tools.io_sources.lazy_ray import RayPartition, cartesian_partitions, discrete_partitions
 from polars_io_tools.io_sources.partitions import by_key, by_time, by_value
 from polars_io_tools.io_sources.pushdown_combine import FilterSpec, pushdown_combine
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 # Ray's task cancellation is unstable on Windows (its Windows support is beta): cancelling an
 # in-flight task while the Polars source generator is being closed early (n_rows satisfied, or a
-# failing partition) can segfault the interpreter. The behaviour under test is platform-agnostic
+# failing partition) can segfault the interpreter. The behavior under test is platform-agnostic
 # and fully covered on Linux/macOS, so these early-termination cases are skipped on Windows.
 _ray_cancel_flaky_on_windows = pytest.mark.skipif(
     sys.platform == "win32",
@@ -539,7 +539,7 @@ def test_pruning_python_udf_no_false_prune():
 
 
 def test_explicit_generator_partitions_are_reusable():
-    """A generator of partitions is materialised once, so a second collect is not empty."""
+    """A generator of partitions is materialized once, so a second collect is not empty."""
     lf = generate_sample_lazyframe(datetime.datetime(2023, 1, 1), datetime.datetime(2023, 3, 31))
 
     def gen():

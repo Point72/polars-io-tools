@@ -25,8 +25,8 @@ from polars_io_tools.io_sources.delta_io import (
     metadata_to_mapping,
 )
 from polars_io_tools.io_sources.util import _storage_options_for, extract_description_block, inject_description_block
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.cases import Case, params
 
 deltalake = pytest.importorskip("deltalake")
 DeltaTable, write_deltalake = deltalake.DeltaTable, deltalake.write_deltalake

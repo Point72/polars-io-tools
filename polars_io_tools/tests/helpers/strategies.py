@@ -12,7 +12,7 @@ from decimal import Context, Decimal
 import polars as pl
 from hypothesis import strategies as st
 
-from polars_io_tools.tests.helpers.catalogue import COLUMN_DTYPES, DST_US, INT64, TEXT
+from polars_io_tools.tests.helpers.cases import COLUMN_DTYPES, DST_US, INT64, TEXT
 
 POLARS_ERRORS = (Exception, pl.exceptions.PanicException)
 """What evaluating an expression with Polars can raise; a Rust panic is not an ``Exception``."""

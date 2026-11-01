@@ -20,7 +20,7 @@ from urllib3.response import HTTPResponse
 from polars_io_tools._compat import POLARS_HAS_COLLECT_BATCHES
 from polars_io_tools.io_sources import lazy_clickhouse_reader as ch_mod
 from polars_io_tools.io_sources.lazy_clickhouse_reader import get_batch_reader_http
-from polars_io_tools.tests.helpers.oracles import assert_text
+from polars_io_tools.tests.helpers.assertions import assert_text
 from polars_io_tools.tests.helpers.sql_backends import ENTRY_POINTS, Backend, cc_bond_df, connect, install
 
 scan_clickhouse = ENTRY_POINTS["scan_clickhouse"]

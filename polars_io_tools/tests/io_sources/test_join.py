@@ -15,9 +15,9 @@ from polars.testing import assert_frame_equal
 from polars_io_tools import join_between
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, FunctionNode, LiteralNode, get_literal_value, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native
-from polars_io_tools.tests.helpers.quirks import quirk
+from polars_io_tools.tests.helpers.assertions import assert_matches_native
+from polars_io_tools.tests.helpers.cases import Case, params
+from polars_io_tools.tests.helpers.polars_versions import polars_has
 
 from .conftest import io_source_assert
 
@@ -76,7 +76,7 @@ FILTERED_JOINS = [
             {"on": "ham", "how": how, "maintain_order": "left"},
             NEVER,
             query=lambda lf: lf.filter(c("ham") == "d"),
-            marks=pytest.mark.skipif(quirk("pushes_join_filters"), reason="Polars pushes the filter to the right source itself"),
+            marks=pytest.mark.skipif(polars_has("pushes_join_filters"), reason="Polars pushes the filter to the right source itself"),
         )
         for how in ("inner", "left")
     ],
@@ -102,7 +102,7 @@ FILTERED_JOINS = [
         pl.DataFrame({"id": [1, 2, 3, 4], "category": ["A", "B", "A", "C"], "value": [10, 20, 30, 40]}),
         pl.DataFrame({"id": [1, 2, 3, 5], "category": ["A", "B", "A", "D"], "score": [15, 25, 35, 55], "active": [True, False, True, False]}),
         {"on": ["id", "category"], "maintain_order": "left_right"},
-        {"id": [1, 2, 3, 4], "category": ["A", "B", "C"], "active": ("==", True) if not quirk("pushes_asof_filter") else True},
+        {"id": [1, 2, 3, 4], "category": ["A", "B", "C"], "active": ("==", True) if not polars_has("pushes_asof_filter") else True},
         exact=False,
         query=lambda lf: lf.filter(c("active") == pl.lit(True)),
     ),
@@ -210,7 +210,7 @@ def test_filtered_join(query, expect, kw):
 @pytest.mark.parametrize("how", ["inner", "left"])
 def test_filtered_join_complex_workflow(how):
     """Only the join keys and the filter on the right column reach the right source, not the filters on derived columns."""
-    if how == "left" and not quirk("pushes_join_filters"):
+    if how == "left" and not polars_has("pushes_join_filters"):
         pytest.skip("Polars before 1.32 does not rewrite this left join as an inner join, so only the keys are pushed")
     left, right_df = pl.DataFrame({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}), pl.DataFrame({"id": [1, 2, 3, 5], "multiplier": [2, 3, 4, 5]})
     seen = []
@@ -426,7 +426,7 @@ def test_filtered_join_asof_no_tolerance(strategy):
         # lower bound on the raw filter value (never tolerance-widened).
         if predicate is None:
             return
-        assert quirk("pushes_asof_filter") and strategy == "forward", f"unexpected right-side predicate for {strategy}: {predicate!r}"
+        assert polars_has("pushes_asof_filter") and strategy == "forward", f"unexpected right-side predicate for {strategy}: {predicate!r}"
         for atom in _flatten_conjuncts(get_parsed_expr(predicate)):
             assert isinstance(atom, BinaryExprNode) and isinstance(atom.right, LiteralNode)
             assert atom.left.name == "timestamp"

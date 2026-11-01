@@ -1,4 +1,4 @@
-"""cache_parquet: planning helpers as tables, then cache behaviour as (steps -> result, files, upstream calls) tables.
+"""cache_parquet: planning helpers as tables, then cache behavior as (steps -> result, files, upstream calls) tables.
 
 The table-driven tests check results against native Polars with ``assert_cached_matches_native`` and the files left
 behind with ``assert_cache_files``. Tests that patch writers, clocks or locks stay functions.
@@ -47,7 +47,7 @@ from polars_io_tools.tests.helpers.cache_parquet_shared import (
     collect_filtered,
     exercise_daily_cache_parquet,
 )
-from polars_io_tools.tests.helpers.catalogue import DATE_PREDICATES, TEMPORAL_DTYPES, Case, daily_frame, params
+from polars_io_tools.tests.helpers.cases import DATE_PREDICATES, TEMPORAL_DTYPES, Case, daily_frame, params
 
 D = datetime.date
 DT = datetime.datetime
@@ -810,7 +810,7 @@ def test_no_date_metadata(tmp_path):
             assert (meta[b"__piot__time_unit"], meta[b"__piot__partitioned_by"]) == (b"null", by)
 
 
-# Every cache mode over the catalogue's predicate shapes and temporal dtypes: what a read returns equals native Polars,
+# Every cache mode over the shared predicate shapes and temporal dtypes: what a read returns equals native Polars,
 # cold and warm. CACHE_ONLY returns nothing from an empty cache and serves a full one; IGNORE leaves no files.
 
 

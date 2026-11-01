@@ -16,7 +16,7 @@ from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources import cache_memory
 from polars_io_tools.tests.helpers.cache_parquet_shared import UpstreamSpy
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 FRAME = pl.DataFrame({"a": pl.Series([1, 2], dtype=pl.Int64), "b": ["x", "y"]})
 PFRAME = pl.DataFrame({"region": ["us", "us", "eu", "eu"], "id": [1, 2, 3, 4], "v": [10, 20, 30, 40]})

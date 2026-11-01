@@ -12,7 +12,7 @@ import pytest
 from polars_io_tools.io_sources.base import BinaryExprNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.set_visitor import SetVisitor, convert_expr_to_valid_values
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 s, p, v, x = pl.col("symbol"), pl.col("price"), pl.col("volume"), pl.col("x")
 B = pl.Boolean
@@ -154,7 +154,7 @@ def test_set_visitor_creates_new_sets(col, first, second, first_expect, expect):
 
 
 def test_logical_and_operator_handling():
-    """Regression: LOGICAL_AND, the spelling before Polars optimises a plan, is handled like AND."""
+    """Regression: LOGICAL_AND, the spelling before Polars optimizes a plan, is handled like AND."""
     node = get_parsed_expr((pl.col("date_partition") == date(2009, 10, 2)) & (s == "AAPL US"))
     assert isinstance(node, BinaryExprNode)
     forced = BinaryExprNode(expr=node.expr, can_extract_literal=False, left=node.left, right=node.right, op=OperatorType.LOGICAL_AND)

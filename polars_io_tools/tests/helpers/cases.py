@@ -1,7 +1,7 @@
 """Test data shared across modules: table rows, dtypes and values, standard frames, and predicate shapes.
 
 Nothing here asserts. A table-driven test feeds ``Case`` rows to ``pytest.mark.parametrize`` through ``params``;
-what ``expect`` means is up to the test or oracle that consumes the row.
+what ``expect`` means is up to the test or assertion that consumes the row.
 """
 
 from dataclasses import dataclass, field

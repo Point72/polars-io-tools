@@ -1,6 +1,6 @@
-"""Polars behaviour that depends on the installed version, in one table.
+"""Polars behavior that depends on the installed version, in one table.
 
-Tests read ``quirk("name")`` instead of comparing version strings, so a behaviour change is recorded once with the
+Tests read ``polars_has("name")`` instead of comparing version strings, so a behavior change is recorded once with the
 first Polars version that has it.
 """
 
@@ -10,8 +10,8 @@ from packaging.version import Version
 
 POLARS = Version(pl.__version__)
 
-# name -> (first Polars version with the behaviour, what changes)
-QUIRKS: dict[str, tuple[str, str]] = {
+# name -> (first Polars version with the behavior, what changes)
+POLARS_BEHAVIORS: dict[str, tuple[str, str]] = {
     "pushes_function_predicates": ("1.25.2", "string and temporal-component predicates such as str.contains and dt.day reach the source"),
     "pushes_python_datetime_comparison": ("1.26.0", "a comparison with a Python datetime literal reaches the source"),
     "pushes_implicit_casts": ("1.28.0", "a predicate holding an implicit or explicit numeric/temporal cast reaches the source"),
@@ -31,18 +31,18 @@ QUIRKS: dict[str, tuple[str, str]] = {
 }
 
 
-def quirk(name: str) -> bool:
-    """Whether the installed Polars has the behaviour ``name``."""
-    return POLARS >= Version(QUIRKS[name][0])
+def polars_has(name: str) -> bool:
+    """Whether the installed Polars has the behavior ``name``."""
+    return POLARS >= Version(POLARS_BEHAVIORS[name][0])
 
 
 def xfail_unless(name: str, reason: str = "") -> pytest.MarkDecorator:
-    """A strict xfail on Polars versions without the behaviour ``name``."""
-    since, what = QUIRKS[name]
-    return pytest.mark.xfail(not quirk(name), reason=reason or f"needs Polars >= {since}: {what}", strict=True)
+    """A strict xfail on Polars versions without the behavior ``name``."""
+    since, what = POLARS_BEHAVIORS[name]
+    return pytest.mark.xfail(not polars_has(name), reason=reason or f"needs Polars >= {since}: {what}", strict=True)
 
 
 def xfail_if(name: str, reason: str = "") -> pytest.MarkDecorator:
-    """A strict xfail on Polars versions with the behaviour ``name``."""
-    since, what = QUIRKS[name]
-    return pytest.mark.xfail(quirk(name), reason=reason or f"fails from Polars {since}: {what}", strict=True)
+    """A strict xfail on Polars versions with the behavior ``name``."""
+    since, what = POLARS_BEHAVIORS[name]
+    return pytest.mark.xfail(polars_has(name), reason=reason or f"fails from Polars {since}: {what}", strict=True)

@@ -37,8 +37,8 @@ from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_ra
 from polars_io_tools.io_sources.restrict_visitor import restrict_expr_to_columns
 from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import NY
-from polars_io_tools.tests.helpers.quirks import quirk, xfail_if, xfail_unless
+from polars_io_tools.tests.helpers.cases import NY
+from polars_io_tools.tests.helpers.polars_versions import polars_has, xfail_if, xfail_unless
 from polars_io_tools.tests.helpers.strategies import (
     IMPLODE,
     POLARS_ERRORS,
@@ -48,7 +48,7 @@ from polars_io_tools.tests.helpers.strategies import (
 )
 
 # ---------------------------------------------------------------------------
-# Oracles: rows native Polars keeps, and rows library output keeps
+# Expected rows: rows native Polars keeps, and rows library output keeps
 # ---------------------------------------------------------------------------
 
 
@@ -305,7 +305,7 @@ def check_predicate(frame: pl.DataFrame, pred: pl.Expr) -> None:
         check_adapters(frame, pred, keep, known)
     pushed = delivered(frame, pred)
     if pushed is not None:
-        # Polars may rewrite the predicate it delivers (``is_in([])`` becomes ``false``), so it is its own oracle.
+        # Polars may rewrite the predicate it delivers (``is_in([])`` becomes ``false``), so it is checked against its own native result.
         pushed_keep = native_keep(frame, pushed)
         if pushed_keep is not None:
             for known in (dict(frame.schema), None):
@@ -498,7 +498,7 @@ def _overlapping(s, mapped: pl.Expr) -> pl.LazyFrame:
 
 
 # Each shape: specs per entry (entry -> (frame, specs)) and a combine whose output rows depend only on source rows inside
-# the declared neighbourhoods. Output columns: date (Date), key (Int64) and, for the lookup shape, name (String).
+# the declared neighborhoods. Output columns: date (Date), key (Int64) and, for the lookup shape, name (String).
 _SHAPES = {
     "rowwise": (
         {"s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()})},
@@ -589,7 +589,7 @@ def _old_polars_null_key_bug(shape, frames):
     """Polars 1.37 matches a null ``by`` key in ``join_asof``, and returns wrong rows for a cross join of two IO
     sources filtered on a null key; such inputs are skipped there."""
     nulls = frames["src"]["key"].null_count() or frames["other"]["key"].null_count()
-    return not quirk("join_asof_null_by_unmatched") and shape in ("asof_join", "self_join_two_entries") and bool(nulls)
+    return not polars_has("join_asof_null_by_unmatched") and shape in ("asof_join", "self_join_two_entries") and bool(nulls)
 
 
 @st.composite
@@ -676,7 +676,7 @@ def test_generated_combine_matches_native(data, shape):
     assert_frame_equal(result, _native(entries, combine, frames).filter(pred).collect(), check_row_order=False)
 
 
-def _neighbourhood(spec, value):
+def _neighborhood(spec, value):
     """The source rows an output value depends on under ``spec``, as a predicate on a source row."""
     if isinstance(spec, IntervalFilterSpec):
         mapping = spec.value_mapping
@@ -696,8 +696,8 @@ def _neighbourhood(spec, value):
 
 @SETTINGS
 @given(data=st.data(), shape=st.sampled_from(sorted(_SHAPES)))
-def test_generated_combine_depends_only_on_declared_neighbourhoods(data, shape):
-    """Deleting source rows outside an output row's declared neighbourhoods keeps that row's multiplicity.
+def test_generated_combine_depends_only_on_declared_neighborhoods(data, shape):
+    """Deleting source rows outside an output row's declared neighborhoods keeps that row's multiplicity.
 
     This checks the shapes above declare their specs correctly, so that the comparison with native Polars tests the
     pushdown rather than the shapes."""
@@ -720,7 +720,7 @@ def test_generated_combine_depends_only_on_declared_neighbourhoods(data, shape):
         inside = [
             all(
                 row.get(o) is None
-                or (_neighbourhood(sp, row[o])(w) if isinstance(sp, IntervalFilterSpec) else _neighbourhood(sp, row[o])(w[sp.source_col or o]))
+                or (_neighborhood(sp, row[o])(w) if isinstance(sp, IntervalFilterSpec) else _neighborhood(sp, row[o])(w[sp.source_col or o]))
                 for o, sp in specs.items()
             )
             for w in df.iter_rows(named=True)
@@ -832,7 +832,7 @@ def _check_cache_keeps_filtered_rows(lf: pl.LazyFrame, frame: pl.DataFrame, pred
 def test_cache_parquet_keeps_the_rows_a_filter_keeps(tmp_path_factory, case, time_unit):
     frame, predicates = case
     # Known bug, see test_cache_parquet_on_sub_second_time_keys.
-    assume(quirk("time_partition_subsecond") or frame["x"].dtype != pl.Time or frame["x"].dt.nanosecond().fill_null(0).eq(0).all())
+    assume(polars_has("time_partition_subsecond") or frame["x"].dtype != pl.Time or frame["x"].dt.nanosecond().fill_null(0).eq(0).all())
     # Known crash, see test_cache_parquet_after_caching_only_null_partition_keys: a query that caches only null keys
     # breaks later queries, so the partition column holds no null here.
     assume(frame["x"].null_count() == 0)

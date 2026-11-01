@@ -12,8 +12,8 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_pushed_bounds
+from polars_io_tools.tests.helpers.assertions import assert_pushed_bounds
+from polars_io_tools.tests.helpers.cases import Case, params
 
 c = pl.col
 FFILL = c("Value").forward_fill(3).alias("ForwardFill")

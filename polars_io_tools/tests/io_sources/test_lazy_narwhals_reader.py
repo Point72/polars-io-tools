@@ -23,8 +23,8 @@ from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_ra
 from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
 from polars_io_tools.io_sources.sql_utils import convert_predicate_to_sql
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.cases import Case, params
 
 pd = pytest.importorskip("pandas", exc_type=ImportError)
 

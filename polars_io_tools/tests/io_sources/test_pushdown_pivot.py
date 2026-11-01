@@ -22,8 +22,8 @@ import pytest
 
 from polars_io_tools import pushdown_pivot
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_pushdown
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_pushdown
+from polars_io_tools.tests.helpers.cases import Case
 
 c = pl.col
 DENSE = pl.DataFrame({"name": ["A", "A", "A", "B", "B", "B"], "subject": ["m", "p", "x", "m", "p", "x"], "score": [1, 2, 3, 4, 5, 6]})
@@ -90,7 +90,7 @@ ROWS = [
         df=ORDERED,
         pivot={"on": "subject", "on_columns": ["m", "p"], "index": "name", "values": "score", "maintain_order": True},
     ),
-    # A filter on p with select("name") still materialises p and pushes the on-filter.
+    # A filter on p with select("name") still materializes p and pushes the on-filter.
     V("predicate_on_dropped_pivoted_column_dense_on_True", lambda lf: lf.filter(c("p") > 3).select("name"), {"dense": {"predicate": True}}),
 ]
 

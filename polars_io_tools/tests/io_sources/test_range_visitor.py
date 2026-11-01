@@ -27,8 +27,8 @@ from polars_io_tools.io_sources.range_visitor import (
     convert_expr_to_range,
 )
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_keeps_rows, assert_matches_native
+from polars_io_tools.tests.helpers.assertions import assert_keeps_rows, assert_matches_native
+from polars_io_tools.tests.helpers.cases import Case, params
 
 ALL = P.open(-P.inf, P.inf)
 EMPTY = P.empty()

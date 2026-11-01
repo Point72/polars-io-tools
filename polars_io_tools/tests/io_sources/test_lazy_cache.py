@@ -20,7 +20,7 @@ from polars.testing import assert_frame_equal
 import polars_io_tools.io_sources  # noqa: F401
 from polars_io_tools.io_sources.lazy_cache import _is_contradiction
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 
 @dataclass

@@ -16,7 +16,7 @@ from polars_io_tools.io_sources.translated_source import (
     metadata_to_mapping,
     translate_polars_predicate,
 )
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 
 def _ns(dt: datetime) -> int:

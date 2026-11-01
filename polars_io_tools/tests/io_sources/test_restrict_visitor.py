@@ -12,8 +12,8 @@ import polars_io_tools as cpl
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.restrict_visitor import RestrictPredicateVisitor, restrict_expr_to_columns
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native
+from polars_io_tools.tests.helpers.assertions import assert_matches_native
+from polars_io_tools.tests.helpers.cases import Case, params
 
 c = pl.col
 p, q, xc = c("p"), c("q"), c("x")
@@ -60,7 +60,7 @@ CASES = [
     R("complex_nested_expression-node", _COMPLEX, {"symbol"}, (sym == "US") | (sym == "EU"), node=True),
     R("complex_nested_expression-all_columns_expr", _COMPLEX, {"symbol", "price"}, _COMPLEX),
     R("complex_nested_expression-all_columns_node", _COMPLEX, {"symbol", "price"}, _COMPLEX, node=True),
-    # De Morgan is not applied: the Polars optimiser pushes NOT down before a source sees the predicate.
+    # De Morgan is not applied: the Polars optimizer pushes NOT down before a source sees the predicate.
     R("not_node_restriction", ~(sym == "US") & (price > 100), {"symbol"}, ~(sym == "US")),
     R("is_null_restriction", sym.is_null() & (price > 100), {"symbol"}, sym.is_null()),
     R("is_in_restriction", sym.is_in(["US", "EU"]) & (price > 100), {"symbol"}, sym.is_in(["US", "EU"])),

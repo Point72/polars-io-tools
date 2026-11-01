@@ -1,4 +1,4 @@
-"""Shared cache test logic and the cache oracles: cached reads match native Polars, upstream calls are counted."""
+"""Shared cache test logic and the cache assertions: cached reads match native Polars, upstream calls are counted."""
 
 import datetime
 from pathlib import Path

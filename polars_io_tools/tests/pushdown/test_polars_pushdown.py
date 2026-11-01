@@ -10,9 +10,9 @@ import polars as pl
 import pytest
 
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_pushdown
-from polars_io_tools.tests.helpers.quirks import quirk
+from polars_io_tools.tests.helpers.assertions import assert_pushdown
+from polars_io_tools.tests.helpers.cases import Case, params
+from polars_io_tools.tests.helpers.polars_versions import polars_has
 
 c = pl.col
 gap = pytest.mark.gap
@@ -63,7 +63,7 @@ ROWS = [
         lambda t: t["x"].with_columns(c("x").cast(pl.Int64)).filter(c("x") > 2),
         gap,
         _x_is_3_4_5,
-        x={"predicate": quirk("pushes_widening_cast")},
+        x={"predicate": polars_has("pushes_widening_cast")},
     ),
     # concat
     P(

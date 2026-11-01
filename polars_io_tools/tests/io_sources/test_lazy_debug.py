@@ -5,7 +5,7 @@ import logging
 import polars as pl
 
 import polars_io_tools.io_sources  # noqa: F401
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_text
 
 DF = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
 NONE_PUSHED = "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`"

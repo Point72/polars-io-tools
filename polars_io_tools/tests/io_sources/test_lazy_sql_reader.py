@@ -36,8 +36,8 @@ from polars_io_tools.io_sources.sql_utils import (
     convert_predicate_to_sql,
     create_sqlglot_literal,
 )
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.cases import Case, params
 from polars_io_tools.tests.helpers.sql_backends import ENTRY_POINTS, Backend, cc_bond_df, connect, employee_df, install
 
 ELECTION_CSV = (
@@ -1282,7 +1282,7 @@ def test_cast_map_preserves_decimal_scale():
             None,
             id="projection_and_row_limit",
         ),
-        # no outer predicate, so n_rows reaches the source and the fan-out must honour it
+        # no outer predicate, so n_rows reaches the source and the fan-out must honor it
         pytest.param(
             _CC,
             lambda: cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]]),
@@ -1304,7 +1304,7 @@ def test_row_limit(query, scan, op, height, columns, values):
 
 
 def test_generator_partitions_are_reusable():
-    """A generator of slices is materialised once, so collecting twice gives the same rows."""
+    """A generator of slices is materialized once, so collecting twice gives the same rows."""
     lf = scan_db(_CC, partitions=_parts("GT", "BD", "RO")()).filter(_COUNTRIES)
     first = lf.collect()
     assert first.height > 0

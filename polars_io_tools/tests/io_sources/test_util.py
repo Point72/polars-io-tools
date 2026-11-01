@@ -20,9 +20,9 @@ from polars_io_tools.io_sources.util import (
     wrap_io_source_with_error_catching,
 )
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
-from polars_io_tools.tests.helpers.quirks import quirk
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_text
+from polars_io_tools.tests.helpers.cases import Case, params
+from polars_io_tools.tests.helpers.polars_versions import polars_has
 
 from .conftest import io_source_assert
 
@@ -129,7 +129,7 @@ class TestRegisterIoSourceWithIsPure:
         lf = register_io_source_with_is_pure(_tracking_source(tracker), schema=tracker.df.schema)
         result = lf.join(lf, on="id", how="inner").collect(engine="in-memory" if POLARS_GE_2 else "auto")
         assert_frame_equal(result, pl.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30], "value_right": [10, 20, 30]}), check_row_order=False)
-        if quirk("pure_udf_cse"):
+        if polars_has("pure_udf_cse"):
             assert tracker.call_count == 1
 
     @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])

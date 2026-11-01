@@ -13,7 +13,7 @@ from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
 from polars_io_tools.io_sources import lazy_clickhouse_writer
-from polars_io_tools.tests.helpers.catalogue import ENUM, Case, params
+from polars_io_tools.tests.helpers.cases import ENUM, Case, params
 
 URL = "http://localhost:8123"
 

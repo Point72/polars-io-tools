@@ -13,7 +13,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 from .conftest import io_source_assert
 

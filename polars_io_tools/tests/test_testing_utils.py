@@ -12,8 +12,8 @@ import pytest
 from polars_io_tools.io_sources.base import BinaryExprNode
 from polars_io_tools.io_sources.pushdown_combine import FilterSpec, pushdown_combine
 from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker, io_source_assert
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native
+from polars_io_tools.tests.helpers.assertions import assert_matches_native
+from polars_io_tools.tests.helpers.cases import Case, params
 
 
 def _d(day: int) -> date:

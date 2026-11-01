@@ -11,8 +11,8 @@ import pytest
 
 from polars_io_tools import pushdown_unpivot
 from polars_io_tools.testing import PredicateTracker
-from polars_io_tools.tests.helpers.catalogue import Case
-from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_pushdown
+from polars_io_tools.tests.helpers.assertions import assert_matches_native, assert_pushdown
+from polars_io_tools.tests.helpers.cases import Case
 
 c = pl.col
 gap = pytest.mark.gap

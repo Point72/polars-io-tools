@@ -22,7 +22,7 @@ from polars_io_tools.io_sources.profiling import (
     wrap_io_source_with_profiling,
 )
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 _EXPORTER = InMemorySpanExporter()
 

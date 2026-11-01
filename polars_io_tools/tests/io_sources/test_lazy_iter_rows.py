@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 
 from polars_io_tools._compat import POLARS_HAS_COLLECT_BATCHES
-from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.cases import Case, params
 
 
 def _ids(n, **more):

@@ -13,8 +13,8 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources import scan_synthetic_panel, scan_synthetic_regression
-from polars_io_tools.tests.helpers.catalogue import Case, params
-from polars_io_tools.tests.helpers.oracles import assert_matches_native
+from polars_io_tools.tests.helpers.assertions import assert_matches_native
+from polars_io_tools.tests.helpers.cases import Case, params
 
 REG, PANEL = scan_synthetic_regression, scan_synthetic_panel
 _PANEL_START = date(2020, 1, 6)  # Monday
