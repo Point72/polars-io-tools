@@ -955,6 +955,14 @@ def test_an_integer_operand_of_all_horizontal_is_filtered(entry_point, tmp_path)
     assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False, check_column_order=False)
 
 
+@pytest.mark.xfail(strict=True, raises=pl.exceptions.ComputeError, reason="Polars passes a bitwise NOT of the integer operand to the IO source")
+def test_a_negated_integer_operand_of_all_horizontal_is_filtered():
+    frame = pl.DataFrame({"i": range(6), "c0": pl.Series([0, 1, 2, 3, -1, None], dtype=pl.Int8)})
+    lf = cache_memory(frame.lazy(), schema=frame.schema, partition_cols="c0")
+    expected = frame.filter(~((pl.col("c0") != 0) & (pl.col("c0") > 0)))
+    assert_frame_equal(lf.filter(~pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0)).collect(), expected, check_row_order=False)
+
+
 # ---------------------------------------------------------------------------
 # scan_delta: partition pruning against a read of every file
 # ---------------------------------------------------------------------------
