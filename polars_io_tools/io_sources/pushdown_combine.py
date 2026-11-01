@@ -149,9 +149,10 @@ class IntervalFilterSpec:
 
         value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform the request
             bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
-            values (e.g. a business-day offset applied to the request date). A callable is applied to
-            each finite bound; a dict maps finite bounds present in it and leaves absent bounds
-            unmapped (that bound's predicate is then not pushed). ``None`` passes bounds through.
+            values (e.g. a business-day offset applied to the request date). Every day of a bounded
+            ``Date`` request is mapped and the pushed range spans the mapped days. Nothing is pushed
+            for other requests, or when a dict lacks a requested day or a day maps to None. ``None``
+            passes bounds through.
 
     Notes:
         The pushdown is **conservative** -- it may keep non-overlapping rows, but never drops an
@@ -162,8 +163,8 @@ class IntervalFilterSpec:
 
           - **Disjoint requests** (e.g. ``date in [Jan1..Jan5] OR [Feb1..Feb5]``) collapse to their
             outer hull ``[Jan1, Feb5]``, so windows overlapping only the gap survive the pushdown.
-          - **A dict ``value_mapping`` missing a bound** skips that side's predicate entirely, so that
-            side is left unconstrained.
+          - **A ``value_mapping``** pushes the range spanning the mapped days, which may also cover
+            windows that no single requested day needs.
     """
 
     start_col: str
@@ -359,12 +360,20 @@ def _apply_interval_filter(
 
     enclosure = date_range.enclosure
     lo, hi = enclosure.lower, enclosure.upper
+    mapping = spec.value_mapping
+    if mapping is not None:
+        # The mapping need not be monotone, so every requested day is mapped, not only the range ends.
+        mapped = [_map_bound(day, mapping) for day in _enumerate_days(date_range) or ()]
+        # A day the mapping does not know (a missing dict key or a null result) pushes nothing.
+        if not mapped or not all(ok and v is not None for v, ok in mapped):
+            return filtered_lf
+        lo, hi, mapping = min(v for v, _ in mapped), max(v for v, _ in mapped), None
 
     conditions: list[pl.Expr] = []
 
     # end_col >= lo  (drops expired/seed rows). Skipped for an unbounded lower request bound.
     if lo != -portion.inf:
-        lo_mapped, ok = _map_bound(lo, spec.value_mapping)
+        lo_mapped, ok = _map_bound(lo, mapping)
         if ok:
             expr = _bound_expr(lo_mapped, spec.end_col, source_schema[spec.end_col], is_lower=True, boundary=_CLOSED_TO_LEFT[spec.closed])
             if expr is not None:
@@ -372,7 +381,7 @@ def _apply_interval_filter(
 
     # start_col <= hi  (drops windows starting after the request). Skipped for an unbounded upper bound.
     if hi != portion.inf:
-        hi_mapped, ok = _map_bound(hi, spec.value_mapping)
+        hi_mapped, ok = _map_bound(hi, mapping)
         if ok:
             expr = _bound_expr(hi_mapped, spec.start_col, source_schema[spec.start_col], is_lower=False, boundary=_CLOSED_TO_RIGHT[spec.closed])
             if expr is not None:
