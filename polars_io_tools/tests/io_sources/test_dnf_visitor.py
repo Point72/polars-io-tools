@@ -4,9 +4,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 import pytest
 
-from polars_io_tools.io_sources.base import (
-    ExprParser,
-)
+from polars_io_tools.io_sources.base import get_parsed_expr
 from polars_io_tools.io_sources.dnf_visitor import (
     DNFClause,
     DNFTuple,
@@ -17,7 +15,7 @@ from polars_io_tools.io_sources.dnf_visitor import (
     is_contradiction,
     negate_dnf,
 )
-from polars_io_tools.tests.io_sources.conftest import assert_dnf_equal, skip_unoptimized_expression_shape
+from polars_io_tools.tests.io_sources.conftest import assert_dnf_equal
 
 
 # Fixtures for common expressions
@@ -374,8 +372,7 @@ def test_dnf_visitor_direct():
     expr = (pl.col("x") == 10) & (pl.col("y") > 5)
 
     # Parse the expression
-    parser = ExprParser()
-    node = parser.parse(expr)
+    node = get_parsed_expr(expr)
 
     # Apply the visitor
     visitor = DNFVisitor()
@@ -383,38 +380,6 @@ def test_dnf_visitor_direct():
     result = visitor.process_results()
     # Verify the result
     assert result == [[("x", "=", 10), ("y", ">", 5)]]
-
-
-@skip_unoptimized_expression_shape
-def test_all_horizontal():
-    expr = pl.all_horizontal(
-        pl.col("x") > 5,
-        pl.col("y") == 10,
-        pl.col("z") < 7.2,
-    )
-    expected = [
-        [("x", ">", 5), ("y", "=", 10), ("z", "<", 7.2)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-@skip_unoptimized_expression_shape
-def test_any_horizontal():
-    expr = pl.any_horizontal(
-        pl.col("x") > 5,
-        pl.col("y") == 10,
-        pl.col("z") < 7.2,
-    )
-    expected = [
-        [("x", ">", 5)],
-        [("y", "=", 10)],
-        [("z", "<", 7.2)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
 
 
 def test_any_horizontal_nested_with_and():
@@ -649,34 +614,6 @@ def test_ternary_multiple_when_with_multiple_conditions():
         [("result", "=", "category_3"), ("y", "!=", "B"), ("y", "is", None)],
         [("result", "=", "category_3"), ("x", "is", None), ("y", "is", None)],
         [("result", "=", "category_3"), ("y", "is", None), ("y", "is", None)],
-    ]
-
-    result = convert_expr_to_dnf(expr)
-    assert_dnf_equal(result, expected)
-
-
-@skip_unoptimized_expression_shape
-def test_ternary_complex_with_function_conditions():
-    """Test when expressions with multiple conditions including functions."""
-    # Using function calls within the multiple conditions
-    expr = (
-        pl.when(pl.col("x").is_in([1, 2, 3]), pl.col("y").str.contains("test"), pl.col("z").is_not_null())
-        .then(pl.col("result") == "match")
-        .otherwise(pl.col("result") == "no_match")
-    )
-
-    # Expected DNF:
-    # ((x in [1,2,3]) AND (y ~ .*test.*) AND (z is not null) AND (result == "match")) OR
-    # ((x not in [1,2,3]) AND (result == "no_match")) OR
-    # ((y !~ .*test.*) AND (result == "no_match")) OR
-    # ((z is null) AND (result == "no_match"))
-    expected = [
-        [("x", "in", [1, 2, 3]), ("y", "~", "test"), ("z", "is not", None), ("result", "=", "match")],
-        [("x", "!in", [1, 2, 3]), ("result", "=", "no_match")],
-        [("y", "!~", "test"), ("result", "=", "no_match")],
-        [("z", "is", None), ("result", "=", "no_match")],
-        [("result", "=", "no_match"), ("x", "is", None)],
-        [("result", "=", "no_match"), ("y", "is", None)],
     ]
 
     result = convert_expr_to_dnf(expr)
@@ -935,24 +872,6 @@ def test_alias_logical_operations():
     expr = (pl.col("x").alias("x_alias") == 10) & (pl.col("y").alias("y_alias") > 5)
     result = convert_expr_to_dnf(expr)
     expected = [[("x", "=", 10), ("y", ">", 5)]]
-    assert_dnf_equal(result, expected)
-
-
-@skip_unoptimized_expression_shape
-def test_alias_nested_expression():
-    """Test aliases on complex nested expressions."""
-    expr = ((pl.col("x") == 10) | (pl.col("y") == "test")).alias("complex_expr")
-    result = convert_expr_to_dnf(expr)
-    expected = [[("x", "=", 10)], [("y", "=", "test")]]
-    assert_dnf_equal(result, expected)
-
-
-@skip_unoptimized_expression_shape
-def test_alias_with_functions():
-    """Test aliases with function calls like is_in."""
-    expr = pl.col("symbol").is_in(["US", "EU"]).alias("symbol_filter")
-    result = convert_expr_to_dnf(expr)
-    expected = [[("symbol", "in", ["US", "EU"])]]
     assert_dnf_equal(result, expected)
 
 

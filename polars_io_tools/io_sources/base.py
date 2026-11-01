@@ -1,7 +1,5 @@
 import datetime
-import json
 import logging
-import os
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Generic, TypeVar
@@ -15,7 +13,7 @@ except ImportError:
     from polars.polars import _expr_nodes as en  # polars < 1.32
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, model_validator
 
-from .enum import (
+from .enum import (  # noqa: F401 -- DataType, Expr and TimeUnit stay importable from this module
     DataType,
     Expr,
     FunctionType,
@@ -544,527 +542,6 @@ class ExprVisitor(Generic[T]):
         self.default_visit(node)
 
 
-class ExprParser:
-    """
-    Advanced parser that converts Polars expressions to a structured node hierarchy.
-    This parser handles a comprehensive range of expression types based on the Rust implementation. It is designed to be called after polars optimizations have been applied, such as when registering a custom io plugin. Thus, it only covers a subset of the full expression set from polars.
-    """
-
-    def __init__(self):
-        # Define the parser map using Expr enum values as keys
-        self._parser_map = {
-            Expr.BinaryExpr: self._parse_binary_expr,
-            Expr.Column: self._parse_column,
-            Expr.Columns: self._parse_columns,
-            Expr.Literal: self._parse_literal,
-            Expr.Alias: self._parse_alias,
-            Expr.Function: self._parse_function_expr,
-            Expr.Cast: self._parse_cast,
-            Expr.Sort: self._parse_sort,
-            Expr.Gather: self._parse_gather,
-            Expr.SortBy: self._parse_sort_by,
-            Expr.Ternary: self._parse_ternary,
-            Expr.Explode: self._parse_explode,
-            Expr.Filter: self._parse_filter,
-            Expr.Slice: self._parse_slice,
-            Expr.Exclude: self._parse_exclude,
-            Expr.KeepName: self._parse_keep_name,
-            Expr.Len: self._parse_len,
-            Expr.Nth: self._parse_nth,
-            Expr.Field: self._parse_field,
-            Expr.Wildcard: self._parse_wildcard,
-            Expr.AnonymousFunction: self._parse_anon_function,
-            Expr.Selector: self._parse_selector,
-        }
-
-    def parse(self, expr: pl.Expr) -> BaseExprNode:
-        """Parse a Polars expression into structured node types using a map-based approach."""
-        try:
-            # Get the serialized representation
-            expr_json = expr.meta.serialize(format="json")
-            expr_dict = json.loads(expr_json)
-
-            # Check if expr_dict contains exactly one key
-            if len(expr_dict) == 1:
-                expr_type_str = next(iter(expr_dict))
-                try:
-                    # Convert string to Expr enum value
-                    expr_type = Expr(expr_type_str)
-                    if expr_type in self._parser_map:
-                        # Call the appropriate parser function
-                        return self._parser_map[expr_type](expr, expr_dict)
-                except ValueError:
-                    # Invalid expression type (not in Expr enum)
-                    pass
-
-            # If we reach here, either the dict doesn't have exactly one key
-            # or the expression type isn't in our parser map
-            return UnknownNode(expr=expr, data=expr_dict)
-
-        except Exception as e:
-            log.warning(f"Error parsing expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=str(e))
-
-    # Simple parser methods
-    def _parse_column(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a column expression."""
-        return ColumnNode(expr=expr, name=expr_dict["Column"])
-
-    def _parse_columns(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a columns expression."""
-        return ColumnsNode(expr=expr, names=expr_dict["Columns"])
-
-    def _parse_literal(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a literal expression."""
-        return LiteralNode(expr=expr)
-
-    def _parse_len(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a len expression."""
-        return LenNode(expr=expr)
-
-    def _parse_wildcard(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a wildcard expression."""
-        return WildcardNode(expr=expr)
-
-    def _parse_selector(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        core_dict = expr_dict.pop(Expr.Selector.name)
-        if "ByName" in core_dict:
-            vals = core_dict["ByName"]
-            names = vals["names"]
-            strict = vals["strict"]
-            return SelectorNode(expr=expr, names=names, strict=strict)
-        elif "ByIndex" in core_dict:
-            vals = core_dict["ByName"]
-            indices = vals["indices"]
-            strict = vals["strict"]
-            return SelectorNode(expr=expr, indices=indices, strict=strict)
-        else:
-            raise ValueError(f"Unhandled selector {expr = } with serialization {expr_dict}")
-
-    def _parse_binary_expr(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse binary expressions (comparisons, arithmetic, and logical operators)."""
-        try:
-            binary_expr = expr_dict.get("BinaryExpr", {})
-            op_str = binary_expr.get("op") if isinstance(binary_expr, dict) else binary_expr
-
-            # Handle case where op is None or not a string
-            if not op_str or not isinstance(op_str, str):
-                return UnknownNode(expr=expr, data={"error": "Invalid operation type"})
-
-            # Convert the string to our enum type
-            try:
-                op = OperatorType(op_str)
-            except ValueError:
-                log.warning(f"Unknown binary operator: {op_str}")
-                return UnknownNode(expr=expr, data={"unknown_op": op_str})
-
-            # Get operands (reverse to preserve original order)
-            inputs = list(reversed(expr.meta.pop()))
-            if len(inputs) != 2:
-                return ErrorNode(expr=expr, error=f"Expected 2 inputs for binary expression, got {len(inputs)}")
-
-            left_expr, right_expr = inputs
-            left_node = self.parse(left_expr)
-            right_node = self.parse(right_expr)
-
-            # Create a proper BinaryExprNode
-            return BinaryExprNode(expr=expr, left=left_node, op=op, right=right_node)
-
-        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
-            log.warning(f"Error parsing binary expression: {e}")
-            return ErrorNode(expr=expr, error=f"Binary expression parsing error: {e!s}")
-
-    def _parse_alias(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse an alias expression."""
-        # Extract the alias name
-        alias_info = expr_dict.get("Alias", {})
-        alias_name = None
-        if len(alias_info) > 1:
-            alias_name = alias_info[1]  # the name is the second argument
-
-        # Get the inner expression
-        inputs = list(expr.meta.pop())
-        if not inputs:
-            # In polars 1.31.0-beta.1 .meta.pop does not work properly for alias expressions.
-            # When that is fixed, we should remove this check.
-            root_names = expr.meta.root_names()
-            if len(root_names) != 1:
-                return ErrorNode(expr=expr, error="No input expression found for alias")
-            inner_expr = pl.col(root_names[0])  # Use the root name as the inner expression
-        else:
-            inner_expr = inputs[0]
-        inner_node = self.parse(inner_expr)
-
-        return AliasNode(expr=expr, input=inner_node, name=alias_name)
-
-    def _parse_function_expr(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse function expressions using a simplified approach with a single function node type."""
-        try:
-            func_dict = expr_dict.get("Function", {})
-
-            # Get function inputs (reverse to preserve original order)
-            inputs = list(reversed(expr.meta.pop()))
-            input_nodes = [self.parse(input_expr) for input_expr in inputs]
-
-            # Check for typed functions
-            if "function" in func_dict:
-                function_info = func_dict["function"]
-
-                # Handle direct function names (like FillNull) and categorized functions
-                if isinstance(function_info, str):
-                    # Direct function name (e.g., "FillNull")
-                    function_name = function_info
-                    options = {}
-
-                    # Check if it's a known generic function
-                    try:
-                        function_enum = GenericFunctionType(function_name)
-                    except ValueError:
-                        function_enum = GenericFunctionType.UNKNOWN
-
-                    return FunctionNode(expr=expr, function_type=function_enum, inputs=input_nodes, options=options)
-
-                elif isinstance(function_info, dict):
-                    # Categorized function (e.g., {"StringExpr": "Contains"})
-                    category = next(iter(function_info.keys()), None)
-
-                    if category is not None:
-                        # Get the function data associated with this category
-                        func_data = function_info[category]
-
-                        # Extract function name and options
-                        if isinstance(func_data, dict):
-                            # The function data is a dict with one key (function name) and value (options)
-                            function_name = next(iter(func_data.keys()), "")
-                            if isinstance(func_data[function_name], dict):
-                                options = func_data[function_name]
-                            else:
-                                # The "option" is just a single value
-                                # We include it to preserve the information
-                                # even though the structure is a bit altered now
-                                # (we provide the key ourselves)
-                                options = func_data
-                        else:
-                            # The function data is just a string (the function name)
-                            function_name = str(func_data)
-                            options = {}
-
-                        # Use our helper to get the corresponding enum
-                        function_enum = get_function_enum(category, function_name)
-                        if function_enum is None:
-                            function_enum = GenericFunctionType.UNKNOWN
-
-                        # Create a unified function node
-                        return FunctionNode(expr=expr, function_type=function_enum, inputs=input_nodes, options=options)
-
-                # Fallback for unknown cases
-                return FunctionNode(expr=expr, function_type=GenericFunctionType.UNKNOWN, inputs=input_nodes)
-
-            # Fallback if "function" key not in func_dict
-            return FunctionNode(expr=expr, function_type=GenericFunctionType.UNKNOWN, inputs=input_nodes)
-
-        except Exception as e:
-            log.warning(f"Error parsing function expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=str(e))
-
-    def _parse_cast(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a cast expression."""
-        try:
-            cast_info = expr_dict.get("Cast", {})
-
-            # Get the input expression
-            inputs = list(expr.meta.pop())
-            if not inputs:
-                return ErrorNode(expr=expr, error="No input found for cast operation")
-
-            input_expr = inputs[0]
-            input_node = self.parse(input_expr)
-
-            # Extract dtype and options
-            dtype = cast_info.get("dtype") if isinstance(cast_info, dict) else cast_info
-            # Convert dtype string to polars DataType if needed
-            # HERE We handle the case with DataTypeExpr
-            # https://github.com/pola-rs/polars/blob/383f1b37a0a313815fa94b5ede5450e4d7a73f33/crates/polars-plan/src/dsl/datatype_expr.rs#L14
-            if isinstance(dtype, dict):
-                if "Literal" in dtype:
-                    # If it's a literal, we can extract the type directly
-                    dtype = dtype["Literal"]
-                elif "OfExpr" in dtype:
-                    return ErrorNode(expr=expr, error="DataTypeExpr not handled yet.")
-
-            if isinstance(dtype, str):
-                pos_args = None
-            elif isinstance(dtype, dict):
-                dtype, pos_args = next(iter(dtype.items()))
-            else:
-                return ErrorNode(expr=expr, error="Invalid dtype format")
-
-            dtype = DataType(dtype).get_class()
-            if isinstance(pos_args, str):
-                pos_args = [pos_args]
-            if dtype in (pl.Datetime, pl.Duration) and pos_args:
-                # TODO: This is a hack to handle datetime parsing
-                pos_args[0] = TimeUnit(pos_args[0]).to_datetime_conversion()
-            # pl.Unknown cannot be called with arguments
-            if pos_args and dtype != pl.Unknown:
-                dtype = dtype(*pos_args)
-            else:
-                dtype = dtype()
-
-            return CastNode(
-                expr=expr,
-                input=input_node,
-                dtype=dtype,
-                options=cast_info.get("options") if isinstance(cast_info, dict) else None,
-            )
-
-        except Exception as e:
-            log.warning(f"Error parsing Cast expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Cast parsing error: {e!s}")
-
-    def _parse_sort(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a sort expression."""
-        try:
-            sort_info = expr_dict.get("Sort", {})
-
-            # Get the input expression
-            inputs = list(expr.meta.pop())
-            if not inputs:
-                return ErrorNode(expr=expr, error="No input found for sort operation")
-
-            input_expr = inputs[0]
-            input_node = self.parse(input_expr)
-
-            # Extract options
-            options = {}
-            if isinstance(sort_info, dict):
-                options = sort_info.get("options", {})
-
-            return SortNode(expr=expr, input=input_node, options=options)
-
-        except Exception as e:
-            log.warning(f"Error parsing Sort expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Sort parsing error: {e!s}")
-
-    def _parse_gather(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a gather expression."""
-        try:
-            gather_info = expr_dict.get("Gather", {})
-
-            # Get the input expressions
-            inputs = list(expr.meta.pop())
-            if len(inputs) < 2:
-                return ErrorNode(expr=expr, error="Not enough inputs for gather operation")
-
-            input_expr = inputs[0]
-            idx_expr = inputs[1]
-
-            input_node = self.parse(input_expr)
-            idx_node = self.parse(idx_expr)
-
-            # Extract returns_scalar option
-            returns_scalar = False
-            if isinstance(gather_info, dict):
-                returns_scalar = gather_info.get("returns_scalar", False)
-
-            return GatherNode(expr=expr, input=input_node, idx=idx_node, returns_scalar=returns_scalar)
-
-        except Exception as e:
-            log.warning(f"Error parsing Gather expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Gather parsing error: {e!s}")
-
-    def _parse_sort_by(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a sort_by expression."""
-        try:
-            sort_by_info = expr_dict.get("SortBy", {})
-
-            # Get all inputs
-            inputs = list(expr.meta.pop())
-            if len(inputs) < 2:  # Need at least one expression and one sort key
-                return ErrorNode(expr=expr, error="Not enough inputs for sort_by operation")
-
-            # First input is the expression to sort
-            input_expr = inputs[0]
-            input_node = self.parse(input_expr)
-
-            # Rest are the sort keys
-            by_nodes = [self.parse(key_expr) for key_expr in inputs[1:]]
-
-            # Extract options
-            options = {}
-            if isinstance(sort_by_info, dict):
-                options = sort_by_info.get("sort_options", {})
-
-            return SortByNode(expr=expr, input=input_node, by=by_nodes, options=options)
-
-        except Exception as e:
-            log.warning(f"Error parsing SortBy expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"SortBy parsing error: {e!s}")
-
-    def _parse_ternary(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a ternary expression."""
-        try:
-            # Get all three inputs: predicate, truthy, falsy
-            # We don't reverse here
-            inputs = list(expr.meta.pop())
-            if len(inputs) != 3:
-                return ErrorNode(expr=expr, error="Expected 3 inputs for ternary expression")
-
-            # Note the order!
-            predicate_expr, falsy_expr, truthy_expr = inputs
-
-            predicate_node = self.parse(predicate_expr)
-            truthy_node = self.parse(truthy_expr)
-            falsy_node = self.parse(falsy_expr)
-
-            return TernaryNode(expr=expr, predicate=predicate_node, truthy=truthy_node, falsy=falsy_node)
-
-        except Exception as e:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
-            log.warning(f"Error parsing Ternary expression: {e}")
-            return ErrorNode(expr=expr, error=f"Ternary parsing error: {e!s}")
-
-    def _parse_explode(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse an explode expression."""
-        try:
-            # Get the input expression
-            inputs = list(expr.meta.pop())
-            if not inputs:
-                return ErrorNode(expr=expr, error="No input found for explode operation")
-
-            input_expr = inputs[0]
-            input_node = self.parse(input_expr)
-
-            return ExplodeNode(expr=expr, input=input_node)
-
-        except Exception as e:
-            log.warning(f"Error parsing Explode expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Explode parsing error: {e!s}")
-
-    def _parse_filter(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a filter expression."""
-        try:
-            # Get the input expressions
-            inputs = list(expr.meta.pop())
-            if len(inputs) < 2:
-                return ErrorNode(expr=expr, error="Not enough inputs for filter operation")
-
-            input_expr = inputs[0]
-            by_expr = inputs[1]
-
-            input_node = self.parse(input_expr)
-            by_node = self.parse(by_expr)
-
-            return FilterNode(expr=expr, input=input_node, by=by_node)
-
-        except Exception as e:
-            log.warning(f"Error parsing Filter expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Filter parsing error: {e!s}")
-
-    def _parse_slice(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a slice expression."""
-        try:
-            # Get the input expressions
-            inputs = list(expr.meta.pop())
-            if len(inputs) < 3:  # Need input, offset, and length
-                return ErrorNode(expr=expr, error="Not enough inputs for slice operation")
-
-            input_expr = inputs[0]
-            offset_expr = inputs[1]
-            length_expr = inputs[2]
-
-            input_node = self.parse(input_expr)
-            offset_node = self.parse(offset_expr)
-            length_node = self.parse(length_expr)
-
-            return SliceNode(expr=expr, input=input_node, offset=offset_node, length=length_node)
-
-        except Exception as e:
-            log.warning(f"Error parsing Slice expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Slice parsing error: {e!s}")
-
-    def _parse_exclude(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse an exclude expression."""
-        try:
-            # Get the input expression
-            inputs = list(expr.meta.pop())
-            if not inputs or len(inputs) < 2:  # Need at least one input and one exclude parameter
-                return ErrorNode(expr=expr, error="Not enough inputs for exclude operation")
-
-            input_expr = inputs[0]
-            input_node = self.parse(input_expr)
-
-            # Rest are exclusions (typically column names)
-            exclude_items = []
-            for i in range(1, len(inputs)):
-                # Try to get literal values or other identifiers
-                try:
-                    exclude_val = get_literal_value(inputs[i])
-                    exclude_items.append(exclude_val)
-                except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
-                    # If we can't get a literal, try parsing as a expression
-                    exclude_node = self.parse(inputs[i])
-                    if isinstance(exclude_node, LiteralNode):
-                        exclude_items.append(exclude_node.value)
-                    else:
-                        # For now, we'll just use a string representation
-                        exclude_items.append(str(inputs[i]))
-
-            return ExcludeNode(expr=expr, input=input_node, exclude=exclude_items)
-
-        except Exception as e:
-            log.warning(f"Error parsing Exclude expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Exclude parsing error: {e!s}")
-
-    def _parse_keep_name(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a keep_name expression."""
-        try:
-            # Get the input expression
-            inputs = list(expr.meta.pop())
-            if not inputs:
-                return ErrorNode(expr=expr, error="No input found for keep_name operation")
-
-            input_expr = inputs[0]
-            input_node = self.parse(input_expr)
-
-            return KeepNameNode(expr=expr, input=input_node)
-
-        except Exception as e:
-            log.warning(f"Error parsing KeepName expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"KeepName parsing error: {e!s}")
-
-    def _parse_nth(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse an nth expression."""
-        try:
-            nth_info = expr_dict.get("Nth")
-
-            if not isinstance(nth_info, int):
-                return ErrorNode(expr=expr, error="Invalid Nth index value")
-
-            return NthNode(expr=expr, index=nth_info)
-
-        except Exception as e:
-            log.warning(f"Error parsing Nth expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Nth parsing error: {e!s}")
-
-    def _parse_field(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        """Parse a field expression."""
-        try:
-            field_info = expr_dict.get("Field")
-
-            if not isinstance(field_info, list):
-                field_info = [field_info] if field_info else []
-
-            return FieldNode(expr=expr, fields=field_info)
-
-        except Exception as e:
-            log.warning(f"Error parsing Field expression: {e}", exc_info=True)
-            return ErrorNode(expr=expr, error=f"Field parsing error: {e!s}")
-
-    def _parse_anon_function(self, expr: pl.Expr, expr_dict: dict) -> BaseExprNode:
-        input_node = self.parse(expr.meta.pop()[0])
-        return AnonymousFunctionNode(expr=expr, input=input_node)
-
-
 # ---------------------------------------------------------------------------
 # NodeTraverser-based parser
 #
@@ -1072,8 +549,7 @@ class ExprParser:
 # a typed view of expression nodes after polars' DSL→IR conversion, which is exactly the shape that arrives at a custom IO source plugin via
 # ``polars.io.plugins.register_io_source``. Structural traversal is driven by ``expr.meta.pop()`` so each sub-node receives an accurate ``pl.Expr``
 # (downstream visitors rely on ``node.expr.meta.root_names()`` and ``~node.expr``); the traverser is used purely for typed dispatch and for direct
-# access to ``Operator``, function-category enums, ``Literal.value``/``dtype`` and ``Cast.dtype``. This is the default parser; the legacy
-# JSON-serialization based :class:`ExprParser` above remains reachable for one release via the ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER`` env var.
+# access to ``Operator``, function-category enums, ``Literal.value``/``dtype`` and ``Cast.dtype``.
 # ---------------------------------------------------------------------------
 
 _OPERATOR_NAME_MAP: dict[str, OperatorType] = {op.value: op for op in OperatorType}
@@ -1101,13 +577,10 @@ _CAST_OPTIONS_MAP = {0: "Strict", 1: "NonStrict", 2: "Overflowing"}
 class NodeTraverserParser:
     """Parse a :class:`pl.Expr` into a :class:`BaseExprNode` tree using polars' ``NodeTraverser`` for typed dispatch and ``expr.meta.pop()``
     for sub-expression attribution.
-
-    Mirrors the structure of :class:`ExprParser` above (dispatch via a class-keyed parser map, one ``_parse_<kind>`` method per node type) so
-    that the eventual Phase B swap is a near-mechanical replacement.
     """
 
     def __init__(self) -> None:
-        # Dispatch on the polars typed-view class, mirroring ExprParser._parser_map.
+        # Dispatch on the polars typed-view class.
         self._parser_map: dict[type, Any] = {
             en.Column: self._parse_column,
             en.Literal: self._parse_literal,
@@ -1153,8 +626,7 @@ class NodeTraverserParser:
     def _parse(self, expr: pl.Expr, visitor: Any) -> BaseExprNode:
         """Parse a single expression node by dispatching on the polars typed view's class.
 
-        Per-subtree errors are isolated here (matching the legacy ``ExprParser``'s per-method try/except behavior): a failure in one
-        ``_parse_<kind>`` method collapses that subtree to an :class:`ErrorNode` rather than the whole top-level expression.
+        Per-subtree errors are isolated here: a failure in one ``_parse_<kind>`` method collapses that subtree to an :class:`ErrorNode` rather than the whole top-level expression.
         """
         # The typed view skips naming wrappers (alias, name.keep, ...), so skip them here too, or the children taken from
         # ``meta.pop()`` would belong to the wrapper.
@@ -1165,8 +637,7 @@ class NodeTraverserParser:
             # polars' NodeTraverser has no typed view for a few IR nodes that can appear in a pushed-down
             # predicate -- notably list functions (``col.list.*``) and array functions (``col.arr.*``), which
             # raise ``NotImplementedError`` from ``view_expression``. Those subtrees degrade to ``UnknownNode``
-            # here, so predicates containing them are not pushed down under this parser (the legacy parser, via
-            # ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER=1``, still handles them). Recovering them requires polars to
+            # here, so predicates containing them are not pushed down. Recovering them requires polars to
             # expose ``ListFunction`` / ``ArrayFunction`` typed views *and* a matching entry in
             # ``_FUNCTION_CATEGORY_MAP`` here; it will not resolve automatically from the polars change alone.
             return UnknownNode(expr=expr, data={"reason": "node_traverser_refused"})
@@ -1463,15 +934,9 @@ def extract_value_preserving_column_name(node: BaseExprNode, schema: pl.Schema |
 
 
 def get_parsed_expr(expr_or_node: pl.Expr | BaseExprNode) -> BaseExprNode | None:
-    """Parse a Polars expression or return the node if it's already parsed. This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars window functions or aggregations.
-
-    Set ``POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER=1`` to fall back to the legacy parser if you hit a problem with the default.
-    """
+    """Parse a Polars expression or return the node if it's already parsed. This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars window functions or aggregations."""
     if isinstance(expr_or_node, BaseExprNode):
         return expr_or_node
-
-    if os.environ.get("POLARS_IO_TOOLS_USE_LEGACY_EXPR_PARSER") == "1":
-        return ExprParser().parse(expr_or_node)
     return NodeTraverserParser().parse(expr_or_node)
 
 

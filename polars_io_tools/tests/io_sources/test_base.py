@@ -15,16 +15,13 @@ from polars_io_tools.io_sources.base import (
     BinaryExprNode,
     CastNode,
     ColumnNode,
-    ColumnsNode,
     ErrorNode,
-    ExplodeNode,
     ExprVisitor,
     FunctionNode,
     KeepNameNode,
     LiteralNode,
     NodeTraverserParser,
     OperatorType,
-    SelectorNode,
     TernaryNode,
     UnknownNode,
     convert_datetime_to_polars,
@@ -38,13 +35,11 @@ from polars_io_tools.io_sources.base import (
 from polars_io_tools.io_sources.enum import (
     BooleanFunctionType,
     GenericFunctionType,
-    ListFunctionType,
     StringFunctionType,
-    StructFunctionType,
     TemporalFunctionType,
 )
 
-from .conftest import PredicateTracker, skip_unoptimized_expression_shape
+from .conftest import PredicateTracker
 
 
 def assert_node_type(node: BaseExprNode, expected_type: type[BaseExprNode]) -> None:
@@ -131,22 +126,6 @@ def test_parse_simple_column():
 
     assert_node_type(node, ColumnNode)
     assert node.name == "test_column"
-
-
-@skip_unoptimized_expression_shape
-def test_parse_multiple_columns():
-    """Test parsing expressions with multiple column references."""
-    expr = pl.col(["a", "b", "c"])
-    node = get_parsed_expr(expr)
-
-    # Depending on the polars version, this might be parsed differently
-    # but we should get a valid node
-    if version.parse(pl.__version__) > version.parse("1.31.0"):
-        # TODO: Handle selectors
-        assert isinstance(node, SelectorNode)
-    else:
-        assert isinstance(node, ColumnsNode)
-    assert node.names == ["a", "b", "c"]
 
 
 def test_parse_literal():
@@ -454,19 +433,6 @@ def test_binary_expr_node_contents():
     # Check right side
     assert_node_type(binary_node.right, ColumnNode)
     assert binary_node.right.name == "b"
-
-
-@skip_unoptimized_expression_shape
-def test_parse_alias():
-    """Test parsing aliases."""
-    expr = pl.col("test_column").alias("renamed")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, AliasNode)
-    alias_node = node
-    assert alias_node.name == "renamed"
-    assert_node_type(alias_node.input, ColumnNode)
-    assert alias_node.input.name == "test_column"
 
 
 def test_nested_alias():
@@ -865,55 +831,6 @@ def test_parse_string_manipulation():
         assert isinstance(node.function_type, StringFunctionType)
 
 
-@skip_unoptimized_expression_shape
-def test_multiple_string_operations():
-    """Test parsing multiple chained string operations."""
-    expr = pl.col("text").str.to_lowercase().str.replace(" ", "_").str.replace_all("[^a-z0-9_]", "")
-
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    # assert isinstance(node.function_type, StringFunctionType)
-    assert node.function_type == StringFunctionType.REPLACE
-    assert node.options["n"] == -1  # this means we replace all
-
-    assert len(node.inputs) == 3
-    assert isinstance(node.inputs[1], LiteralNode)
-    assert node.inputs[1].value == "[^a-z0-9_]"
-
-    assert isinstance(node.inputs[2], LiteralNode)
-    assert node.inputs[2].value == ""
-
-    first_input = node.inputs[0]
-    assert isinstance(first_input, FunctionNode)
-    assert first_input.function_type == StringFunctionType.REPLACE
-    assert first_input.options["n"] == 1  # this means we replace all
-
-
-@skip_unoptimized_expression_shape
-def test_parse_list_functions():
-    """Test parsing list functions."""
-    list_col = pl.col("list")
-
-    # Test various list functions
-    expressions = [
-        list_col.list.len(),
-        list_col.list.sum(),
-        list_col.list.first(),
-        list_col.list.last(),
-        list_col.list.get(0),
-        list_col.list.join("-"),
-        list_col.list.slice(0, 5),
-        list_col.list.gather([0, 2, 4]),
-    ]
-
-    for expr in expressions:
-        node = get_parsed_expr(expr)
-        # Verify it's parsed without errors
-        assert isinstance(node, FunctionNode)
-        assert isinstance(node.function_type, ListFunctionType)
-
-
 class ExampleTestVisitor(ExprVisitor[list[str]]):
     """Visitor that collects node type names during traversal."""
 
@@ -1017,41 +934,6 @@ def test_ternary_operations():
 
     assert node.truthy.value == 1
     assert node.falsy.value == 0
-
-
-@skip_unoptimized_expression_shape
-def test_explode_operations():
-    """Test parsing explode operations."""
-    expr = pl.col("list_column").explode()
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, ExplodeNode)
-    assert node.input.name == "list_column"
-
-
-@skip_unoptimized_expression_shape
-def test_struct_operations():
-    """Test parsing struct operations."""
-    expr = pl.col("struct_col").struct.field("our_field_name")
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == StructFunctionType.FIELD_BY_NAME
-    assert len(node.inputs) == 1
-    assert node.inputs[0].name == "struct_col"
-    assert node.options == {node.function_type.value: "our_field_name"}
-
-    expr = pl.col("struct_col").struct.field("our_field_name") > 5
-    node = get_parsed_expr(expr)
-    assert isinstance(node, BinaryExprNode)
-    assert node.op == OperatorType.GT
-    assert isinstance(node.left, FunctionNode)
-    assert node.left.function_type == StructFunctionType.FIELD_BY_NAME
-    assert len(node.left.inputs) == 1
-    assert node.left.inputs[0].name == "struct_col"
-    assert node.left.options == {node.left.function_type.value: "our_field_name"}
-    assert node.right.can_extract_literal
-    assert node.right.value == 5
 
 
 def test_unknown_expressions():
@@ -1621,8 +1503,7 @@ class TestLimitNotPushedWithFilter:
 # ---------------------------------------------------------------------------
 def test_node_traverser_parser_isolates_subtree_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     """A deep failure in one ``_parse_<kind>`` collapses only the affected subtree to ``ErrorNode``; the rest of the tree continues to
-    parse normally. Mirrors the legacy ``ExprParser``'s per-method try/except behavior and guards against a future simplification of
-    ``_parse`` silently dropping the isolation.
+    parse normally. Guards against a future simplification of ``_parse`` silently dropping the isolation.
     """
 
     def boom(self: NodeTraverserParser, expr: pl.Expr, obj: object, visitor: object) -> BaseExprNode:
