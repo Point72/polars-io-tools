@@ -55,7 +55,10 @@ def _lossy_python_key(dtype: pl.DataType) -> bool:
 def _is_in_collection(values: list, dtype: pl.DataType) -> list | pl.Expr:
     """Collection for ``pl.col(...).is_in`` holding non-null ``values`` of a column of ``dtype``."""
     # A plain list of Decimals is inferred as Decimal(38, s), which is_in rejects
-    return pl.lit(values, dtype=pl.List(dtype)) if isinstance(dtype, pl.Decimal) else values
+    if isinstance(dtype, pl.Decimal):
+        return pl.lit(values, dtype=pl.List(dtype))
+    # Python temporal values are inferred at microsecond precision, which is_in rejects or misreads on other units
+    return pl.lit(pl.Series(values, dtype=dtype).implode()) if dtype.is_temporal() else values
 
 
 def _membership_supported(values: list, dtype: pl.DataType) -> bool:
