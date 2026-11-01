@@ -510,7 +510,8 @@ _SHAPES = {
         lambda s: _rolling(s["s"]).rename({"data_date": "date"}),
     ),
     "business_day_mapped": (
-        {"s": ("src", {"date": FilterSpec(source_col="data_date", lookback=timedelta(days=3), value_mapping=_previous_business_day)})},
+        # FilterSpec: an open range's window must also cover the mapping's offset, so lookback = offset (3d) + rolling window (3d).
+        {"s": ("src", {"date": FilterSpec(source_col="data_date", lookback=timedelta(days=3 + 3), value_mapping=_previous_business_day)})},
         lambda s: _rolling(s["s"]).with_columns(pl.col("data_date").dt.add_business_days(1, roll="backward").alias("date")),
     ),
     "inner_join": (
