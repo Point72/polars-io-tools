@@ -4169,3 +4169,37 @@ def test_monthly_cache_retains_history_after_verified_finalization(tmp_path, set
     assert_frame_equal(pl.concat([pl.read_parquet(path) for path in monthly_root.rglob("*.parquet")]).sort("date"), expected)
     assert _mtimes(monthly_root) == finalized
     assert calls == []
+
+
+def test_values_without_a_path_segment_of_their_own_are_read_from_upstream(tmp_path):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 6, "x": ["BRK/B", "None", "", "..", None, "ok"], "v": [1, 2, 3, 4, 5, 6]})
+    jan = pl.col("date").is_between(D(2024, 1, 1), D(2024, 1, 31))
+    for pred in [jan, jan & (pl.col("x") == "BRK/B"), jan & pl.col("x").is_in(["None", ""]), jan & pl.col("x").is_null(), jan]:
+        out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(pred).collect()
+        assert_frame_equal(out, src.filter(pred).collect(), check_row_order=False)
+    # Only the null and "ok" partitions are cached, and no other file is left behind.
+    assert len(list(tmp_path.rglob("*.*"))) == 2
+
+
+@pytest.mark.parametrize(
+    ("date_column", "legacy_file", "mode"),
+    [(None, "null/a/b.parquet", CacheMode.CACHE), ("date", "monthly/a/b/2024-01.parquet", CacheMode.REBUILD)],
+    ids=["no_date", "date"],
+)
+def test_files_with_names_that_are_not_cache_keys_are_not_read(tmp_path, date_column, legacy_file, mode):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": ["a/b", "ok"], "v": [1, 2]})
+    stale = tmp_path / legacy_file
+    stale.parent.mkdir(parents=True)
+    src.with_columns(v=pl.lit(0, pl.Int64)).collect().write_parquet(stale)
+    out = cache_parquet(src, tmp_path, date_column, extra_partition_cols="x", cache_mode=mode).collect()
+    assert_frame_equal(out, src.collect(), check_row_order=False)
+
+
+def test_unnamed_partition_files_are_removed_when_the_file_visitor_raises(tmp_path):
+    def visitor(path):
+        raise RuntimeError("visitor failed")
+
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": ["a/b", "ok"], "v": [1, 2]})
+    with pytest.raises(Exception, match="visitor failed"):
+        cache_parquet(src, tmp_path, "date", extra_partition_cols="x", file_visitor=visitor).collect()
+    assert not list(tmp_path.rglob("*.tmp"))

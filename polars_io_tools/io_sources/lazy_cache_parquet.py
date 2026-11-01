@@ -6,6 +6,7 @@ import logging
 import operator
 import os
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
@@ -512,7 +513,23 @@ def _split_custom_partition_keys(
 
 # Null partition values: "None" from PartitionBy (polars >= 1.38), "null" from PartitionByKey
 _NULL_KEY_TOKENS = ("None", "null")
+_UNNAMED_DIR = "__piot_unnamed__"
 _BOOL_KEYS = {"True": True, "true": True, "False": False, "false": False}
+
+
+def _unnamed_expr(cols: list[str], schema: pl.Schema) -> pl.Expr | None:
+    """Rows with a partition value that is not one path segment of its own, distinct from the null partition's.
+
+    None when no value of ``cols`` can lack a name.
+    """
+    exprs = []
+    for c in cols:
+        if schema[c] == pl.Time:
+            exprs.append(pl.col(c).dt.nanosecond() % 1000 != 0)
+        elif schema[c] in (pl.String, pl.Categorical) or isinstance(schema[c], pl.Enum):
+            name = pl.col(c).cast(pl.String)
+            exprs.append(name.is_in(["", ".", "..", *_NULL_KEY_TOKENS]) | name.str.contains(r"[/\\\x00-\x1f]"))
+    return pl.any_horizontal(exprs).fill_null(False) if exprs else None
 
 
 def _key_decoder(dtype: pl.DataType) -> Callable[[str], Any] | None:
@@ -606,6 +623,8 @@ def _construct_partitions_df_from_existing(
         raw_schema = {**{k: pl.Utf8 for k in all_partition_cols}, file_key_column: pl.String}
         logical_keys = [(unquote(part) if decode_file_keys else part, part) for part in existing_files]
         raw_data = [[*logical.split("/"), physical] if all_partition_cols else [physical] for logical, physical in logical_keys]
+        # Keys with another number of segments are not cache files of this layout.
+        raw_data = [row for row in raw_data if len(row) == len(raw_schema)]
         df = pl.DataFrame(raw_data, schema=raw_schema, orient="row")
     return _cast_partition_keys(df, partition_schema_dict).cast(partition_schema_dict)
 
@@ -1438,8 +1457,12 @@ def _sink_cache_partitions(
     protected_keys: set[str],
     fs: "pa_fs.FileSystem",
     fs_path_prefix: str,
+    unnamed_files: list[str] | None,
 ) -> set[str]:
     """Sink one file per partition and return the logical keys written.
+
+    Unless ``unnamed_files`` is None, the last key expression flags partitions that are written to files appended to it, which are not
+    cache files.
 
     If the sink fails, every file it opened is deleted (best effort), so a partially written partition is refetched rather than read as complete.
     Physical keys in ``protected_keys`` belong to completed batches and are never replaced or removed.
@@ -1461,9 +1484,16 @@ def _sink_cache_partitions(
             # A reopened sink overwrites its earlier file; fail rather than silently dropping rows.
             if ctx.index_in_partition != 0:
                 raise reopened(ctx.partition_keys.row(0))
-            values = [_partition_key_component(v) for v in ctx.partition_keys.row(0)]
+            keys = list(ctx.partition_keys.row(0))
+            unnamed = unnamed_files is not None and keys.pop()
+            values = [_partition_key_component(v) for v in keys]
         else:
-            values = [unquote(k.str_value) for k in ctx.keys]
+            keys = list(ctx.keys)
+            unnamed = unnamed_files is not None and keys.pop().raw_value
+            values = [unquote(k.str_value) for k in keys]
+        if unnamed:
+            unnamed_files.append(f"{_UNNAMED_DIR}/{uuid.uuid4().hex}.tmp")
+            return unnamed_files[-1]
         logical_key = "/".join(values)
         key = physical_key(logical_key)
         if key in protected_keys:
@@ -1513,13 +1543,13 @@ def _sink_cache_partitions(
     except BaseException:  # PanicException derives from BaseException.
         if written:
             log.warning("Cache write failed; deleting %d partition file(s) it opened: %s", len(written), sorted(written))
-        for key in sorted(written):
+        for path in [f"{key}.parquet" for key in sorted(written)] + (unnamed_files or []):
             try:
-                fs.delete_file(f"{fs_path_prefix}/{key}.parquet")
+                fs.delete_file(f"{fs_path_prefix}/{path}")
             except FileNotFoundError:
                 pass
             except Exception as e:  # noqa: BLE001 -- keep the original error; this file may hold incomplete data
-                log.warning("Failed to delete partition %s after a failed cache write: %s", key, e)
+                log.warning("Failed to delete partition %s after a failed cache write: %s", path, e)
         raise
     log.debug("Wrote %i new partition(s): %s", len(written), sorted(written))
     return written_logical
@@ -1550,6 +1580,8 @@ def _missing_empty_keys(
     if rebuild_scope is not None:
         expected = expected.filter(rebuild_scope)
     expected = expected.drop_nulls()
+    if (unnamed := _unnamed_expr(extra_cols, expected.schema)) is not None:
+        expected = expected.filter(~unnamed)
     known = written_parts_df.select(part_info.join_cols).cast(expected.schema)
     if cache_mode != CacheMode.REBUILD:
         existing_rows = part_info.existing_parts_df.select(part_info.join_cols).cast(expected.schema)
@@ -1680,7 +1712,8 @@ def cache_parquet(
         date_column (str, optional): Name of the column that contains dates or datetimes. If None, only extra_partition_cols
             will be used for partitioning (no date-based organization).
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
-            Duration and nanosecond Datetime columns are not supported.
+            Duration and nanosecond Datetime columns are not supported. Rows whose value cannot name a path segment of its own (for
+            example a string containing ``/``, ``""``, ``"None"``, or a Time with a sub-microsecond part) are always read from upstream.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
         partition_format (str, optional): Format using ``$year``, ``$month``, ``$day`` placeholders. If None, defaults based on time_unit:
 
@@ -1945,6 +1978,8 @@ def cache_parquet(
         key_exprs.append(pl.col(date_column).dt.strftime(partition_format).alias("__piot_key_date__"))
     if not key_exprs:
         key_exprs = [pl.lit("data").alias("__piot_key_single__")]
+    if (unnamed_key := _unnamed_expr(_extra_cols, schema)) is not None:
+        key_exprs.append(unnamed_key.alias("__piot_key_unnamed__"))
 
     no_write = cache_mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY)
 
@@ -1966,6 +2001,22 @@ def cache_parquet(
         predicate: pl.Expr | None,
         n_rows: int | None,
         batch_size: int | None,
+    ) -> Iterator[pl.DataFrame]:
+        # Rows of partitions without a name of their own are written to these files, read once, and never cached.
+        unnamed_files: list[str] = []
+        try:
+            yield from generate(with_columns, predicate, n_rows, batch_size, unnamed_files)
+        finally:
+            for f in unnamed_files:
+                with contextlib.suppress(FileNotFoundError):
+                    fs.delete_file(f"{fs_path_prefix}/{f}")
+
+    def generate(
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,
+        unnamed_files: list[str],
     ) -> Iterator[pl.DataFrame]:
         log.debug("Running with %s against location %s with columns '%s' and predicate: '%s'", cache_mode, time_unit_dir, with_columns, predicate)
 
@@ -2153,6 +2204,7 @@ def cache_parquet(
                         protected_keys=completed_keys,
                         fs=fs,
                         fs_path_prefix=fs_path_prefix,
+                        unnamed_files=unnamed_files if unnamed_key is not None else None,
                     )
                     written_logical_parts |= batch_written
                     batch_files = {physical_key(key) for key in batch_written}
@@ -2190,8 +2242,8 @@ def cache_parquet(
                 write_empty(empty_keys - written_parts - emptied)
 
                 # Refresh the file listing to avoid scanning an empty cache after writes.
-                existing_parts, refreshed_parts_df = list_cache()
-                part_info = replace(part_info, existing_parts_df=refreshed_parts_df)
+                existing_parts, existing_parts_df = list_cache()
+                part_info = replace(part_info, existing_parts_df=existing_parts_df)
             elif refresh_keys and cache_mode == CacheMode.CACHE:
                 # Nothing was written, so read every cached file.
                 part_info = replace(part_info, existing_parts_df=existing_parts_df)
@@ -2206,13 +2258,21 @@ def cache_parquet(
 
         if refresh_keys and no_write and read_plan.use_paths is None:
             # Upstream supplies the expired partitions, so scan only the other cached files.
-            read_plan = ReadPlan(use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(plan_parts)])
+            read_plan = ReadPlan(
+                use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(plan_parts & set(existing_parts_df[file_key_column]))]
+            )
+        if read_plan.use_paths is None and len(set(existing_parts_df[file_key_column])) < len(existing_parts):
+            # A glob would also read the files whose names are not cache keys (e.g. written by older versions).
+            read_plan = ReadPlan(use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(set(existing_parts_df[file_key_column]))])
 
         scan_kwargs = _storage_kwargs(polars_opts, credential_provider)
         scan_kwargs.update(read_kwargs)
 
         def make_scan() -> pl.LazyFrame:
             cache_scan = _cache_scan_from_read_plan(read_plan, time_unit_dir, scan_kwargs, schema)
+            if unnamed_files:
+                unnamed_scan = pl.scan_parquet([f"{time_unit_dir}/{f}" for f in unnamed_files], **{**scan_kwargs, "glob": False})
+                cache_scan = pl.concat([cache_scan, unnamed_scan], how="vertical")
             if no_write and upstream_lf is not None:
                 cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
                 if "n_rows" in read_kwargs:
