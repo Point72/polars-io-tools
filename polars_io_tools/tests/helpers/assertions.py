@@ -39,9 +39,9 @@ def assert_matches_native(actual: pl.LazyFrame, reference: pl.LazyFrame, pred: p
         return None
     got = _apply(actual, pred).collect()
     if check_row_order:
-        assert_frame_equal(got, want.select(got.columns))
+        assert_frame_equal(got, want)
     else:
-        assert_frame_equal(_sorted(got), _sorted(want.select(got.columns)))
+        assert_frame_equal(_sorted(got), _sorted(want))
     return got
 
 

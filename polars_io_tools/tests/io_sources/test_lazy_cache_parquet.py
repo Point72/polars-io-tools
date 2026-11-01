@@ -209,8 +209,9 @@ def test_compute_clipped_expected_partitions(interval, existing, expect, time_un
     dates = [D(2024, 6, d) if isinstance(d, int) else d for d in expect]
     want = pl.DataFrame({"date": dates}, schema={"date": pl.Date})
     if region:
-        want = want.join(pl.DataFrame({"region": region}), how="cross")
-    assert_frame_equal(result, want.select(result.columns), check_row_order=False)
+        # Partition frames hold the extra columns before the date.
+        want = pl.DataFrame({"region": region}).join(want, how="cross")
+    assert_frame_equal(result, want, check_row_order=False)
 
 
 # Small helpers
