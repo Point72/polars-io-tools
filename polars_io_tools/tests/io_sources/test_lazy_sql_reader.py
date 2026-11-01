@@ -66,7 +66,7 @@ def duckdb_connection():
     conn.close()
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def db(monkeypatch, duckdb_connection):
     """The backend both readers query, inside a transaction rolled back after the test."""
     backend = Backend(duckdb_connection)
@@ -1250,6 +1250,13 @@ def tables(request, db):
         db.conn.execute(TABLES[name])
 
 
+@pytest.fixture
+def record_tbl(db):
+    """``db`` holding RecordTbl inside the test's transaction."""
+    db.conn.execute(TABLES["RecordTbl"])
+    return db
+
+
 def _native(db, case: QueryCase) -> pl.LazyFrame:
     df = db.native(case.query)
     return case.op((case.native_transform(df) if case.native_transform else df).lazy())
@@ -1259,12 +1266,13 @@ def _native(db, case: QueryCase) -> pl.LazyFrame:
 def test_scan_matches_native(db, tables, caplog, entry, case):
     lf = ENTRY_POINTS[entry](case.query, **{k: v() if callable(v) else v for k, v in case.scan_kwargs.items()})
     start = len(db.calls)
+    want = _native(db, case)
     with caplog.at_level(case.log_level):
-        got = assert_matches_native(case.op(lf), _native(db, case), None, check_row_order=case.check_row_order)
+        got = assert_matches_native(case.op(lf), want, None, check_row_order=case.check_row_order)
     sent = db.queries(start)
     calls = len(db.calls) - start
 
-    assert got.columns == _native(db, case).collect_schema().names()
+    assert got.columns == want.collect_schema().names()
     assert case.op(lf).collect_schema() == got.schema
     if case.expected_height is not None:
         assert got.height == case.expected_height
@@ -1367,8 +1375,7 @@ RAISES = [
 
 
 @pytest.mark.parametrize(("run", "expect"), params(RAISES, "run", "expect"))
-def test_scan_db_raises(db, run, expect):
-    db.conn.execute(TABLES["RecordTbl"])
+def test_scan_db_raises(record_tbl, run, expect):
     with pytest.raises(expect[0], match=expect[1]):
         run()
 
@@ -1380,8 +1387,7 @@ def test_scan_db_raises(db, run, expect):
         pytest.param(None, pl.Datetime("us"), id="cast_map_none_is_unchanged"),
     ],
 )
-def test_cast_map_schema(db, cast_map, dtype):
-    db.conn.execute(TABLES["RecordTbl"])
+def test_cast_map_schema(record_tbl, cast_map, dtype):
     schema = scan_db("SELECT * FROM RecordTbl", cast_map=cast_map).collect_schema()
     assert schema["RecordDate"] == dtype
     assert set(schema.names()) == {"RecordDate", "PointID", "Rate"}
@@ -1430,6 +1436,7 @@ def test_cast_map_preserves_decimal_scale():
         pytest.param("SELECT * FROM CC_Bond LIMIT 5", None, lambda lf: lf, 5, None, None, id="unpartitioned_query_with_limit_is_allowed"),
     ],
 )
+@pytest.mark.usefixtures("db")
 def test_row_limit(query, scan, op, height, columns, values):
     got = op(scan_db(query, **({"partitions": scan()} if scan else {}))).collect()
     assert got.height == height
@@ -1437,6 +1444,7 @@ def test_row_limit(query, scan, op, height, columns, values):
     assert values is None or set(got[values[0]]) <= values[1]
 
 
+@pytest.mark.usefixtures("db")
 def test_generator_partitions_are_reusable():
     """A generator of slices is materialized once, so collecting twice gives the same rows."""
     lf = scan_db(_CC, partitions=_parts("GT", "BD", "RO")()).filter(_COUNTRIES)

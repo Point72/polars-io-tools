@@ -68,16 +68,27 @@ COLLECTS_ONCE = [
 ]
 
 
-@pytest.mark.parametrize(("source", "plan", "partition_cols", "frame"), params(COLLECTS_ONCE, "source", "plan", "partition_cols", "frame"))
+@pytest.fixture
+def source(request):
+    """For the source kind in ``request.param``: frame -> (what cache_memory is given, a list growing by one per build
+    or upstream scan)."""
+
+    def make(frame: pl.DataFrame):
+        if request.param == "builder":
+            calls: list = []
+            return _counted(frame, calls), calls
+        spy = UpstreamSpy(frame, is_pure=True)
+        return ((lambda: spy.lazy) if request.param == "lambda_scan" else spy.lazy), spy.predicates
+
+    return make
+
+
+@pytest.mark.parametrize(
+    ("source", "plan", "partition_cols", "frame"), params(COLLECTS_ONCE, "source", "plan", "partition_cols", "frame"), indirect=["source"]
+)
 def test_collects_once(source, plan, partition_cols, frame):
     """The builder or, for a scan source, the upstream scan runs once however often the frame is referenced."""
-    calls: list = []
-    if source == "builder":
-        arg = _counted(frame, calls)
-    else:
-        spy = UpstreamSpy(frame, is_pure=True)
-        calls = spy.predicates
-        arg = (lambda: spy.lazy) if source == "lambda_scan" else spy.lazy
+    arg, calls = source(frame)
     kwargs = {} if partition_cols is None else {"partition_cols": partition_cols}
     lf = cache_memory(arg, schema=frame.schema, **kwargs)
     for query in plan(lf):

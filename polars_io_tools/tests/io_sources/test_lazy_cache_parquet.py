@@ -9,7 +9,6 @@ import datetime
 import os
 import pickle
 import shutil
-import time
 from dataclasses import KW_ONLY, dataclass, field
 from datetime import timedelta
 from pathlib import Path, PureWindowsPath
@@ -1182,11 +1181,11 @@ def test_non_enumerable_predicate(tmp_path, populated, pred):
 def test_populated_cache_not_rewritten(tmp_path):
     """CACHE mode must not rewrite existing partition files on a filtered read."""
     cache_parquet(_SYMBOLS.lazy(), tmp_path, **_SYM_KW).collect()
-    before = {p: (tmp_path / p).stat().st_mtime_ns for p in cache_files(tmp_path)}
-    time.sleep(0.05)
+    _set_mtime(tmp_path, T(2026, 3, 1))
+    before = _mtimes(tmp_path)
     for pred in (pl.col("v") > 2, _s != "s0"):
         cache_parquet(_SYMBOLS.lazy(), tmp_path, **_SYM_KW).filter(pred).collect()
-    assert {p: (tmp_path / p).stat().st_mtime_ns for p in cache_files(tmp_path)} == before
+    assert _mtimes(tmp_path) == before
 
 
 def test_date_partitioned_negative_predicate_reads_cache(tmp_path):
