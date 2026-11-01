@@ -838,8 +838,9 @@ def test_no_date_metadata(tmp_path):
             assert (meta[b"__piot__time_unit"], meta[b"__piot__partitioned_by"]) == (b"null", by)
 
 
-# Every cache mode over the shared predicate shapes and temporal dtypes: what a read returns equals native Polars,
-# cold and warm. CACHE_ONLY returns nothing from an empty cache and serves a full one; IGNORE leaves no files.
+# What a read returns equals native Polars, cold and warm: every cache mode over the shared predicate shapes on a daily
+# Date cache, and the default CACHE mode over two of those shapes on a monthly cache of each other temporal dtype.
+# CACHE_ONLY returns nothing from an empty cache and serves a full one; IGNORE leaves no files.
 
 
 @pytest.mark.parametrize("mode", [m for m in MODES if m != CacheMode.CACHE_ONLY], ids=lambda m: m.name)
