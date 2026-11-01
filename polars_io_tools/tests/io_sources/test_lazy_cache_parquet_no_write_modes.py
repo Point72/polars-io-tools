@@ -16,6 +16,7 @@ from polars.testing import assert_frame_equal
 from polars_io_tools.io_sources import lazy_cache_parquet
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, cache_parquet
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
+from polars_io_tools.tests.helpers.catalogue import Case, params
 
 D = datetime.date
 
@@ -53,43 +54,23 @@ def _values(lf: pl.LazyFrame) -> list:
     return sorted(lf.collect()["value"].to_list())
 
 
-@pytest.mark.parametrize(
-    "predicate",
-    [
-        pytest.param(JAN_FEB, id="finite"),
-        pytest.param(pl.col("date") >= D(2024, 1, 1), id="unbounded"),
-        pytest.param(None, id="unconstrained"),
-    ],
-)
-def test_read_only_serves_cached_partitions_and_fills_gaps_from_upstream(jan_cached, predicate):
-    lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.READ_ONLY)
-    if predicate is not None:
-        lf = lf.filter(predicate)
-    # January comes from the cache (0, 1), February from upstream (92); no duplicates.
-    assert _values(lf) == [0, 1, 92]
+# January is cached from values 0 and 1; upstream now holds 90, 91 and 92. READ_ONLY fills the gaps from upstream,
+# CACHE_ONLY serves the cache alone, and neither changes the cache.
+NO_WRITE_READS = [
+    Case("finite", JAN_FEB, {"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
+    Case("unbounded", pl.col("date") >= D(2024, 1, 1), {"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
+    Case("unconstrained", None, {"READ_ONLY": [0, 1, 92], "CACHE_ONLY": [0, 1]}),
+    Case("not_equal_date_keeps_enclosing_partition", JAN_FEB & (pl.col("date") != D(2024, 1, 15)), {"READ_ONLY": [0, 92], "CACHE_ONLY": [0]}),
+]
 
 
-@pytest.mark.parametrize(
-    "predicate",
-    [
-        pytest.param(JAN_FEB, id="finite"),
-        pytest.param(pl.col("date") >= D(2024, 1, 1), id="unbounded"),
-        pytest.param(None, id="unconstrained"),
-    ],
-)
-def test_cache_only_serves_cached_partitions_only(jan_cached, predicate):
-    lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.CACHE_ONLY)
-    if predicate is not None:
-        lf = lf.filter(predicate)
-    assert _values(lf) == [0, 1]
-
-
-def test_no_write_modes_not_equal_date_keeps_enclosing_partition(jan_cached):
-    predicate = JAN_FEB & (pl.col("date") != D(2024, 1, 15))
-    read_only = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.READ_ONLY)
-    cache_only = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.CACHE_ONLY)
-    assert _values(read_only.filter(predicate)) == [0, 92]
-    assert _values(cache_only.filter(predicate)) == [0]
+@pytest.mark.parametrize("mode", ["READ_ONLY", "CACHE_ONLY"])
+@pytest.mark.parametrize(("predicate", "expected"), params(NO_WRITE_READS, "pred", "expect"))
+def test_no_write_mode_reads(jan_cached, mode, predicate, expected):
+    before = _snapshot(jan_cached)
+    lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode[mode])
+    assert _values(lf.filter(predicate) if predicate is not None else lf) == expected[mode]
+    assert _snapshot(jan_cached) == before
 
 
 @pytest.mark.parametrize("mode", [CacheMode.READ_ONLY, CacheMode.CACHE_ONLY])
@@ -318,17 +299,13 @@ def test_read_only_null_partition_key_cached(tmp_path):
     assert _values(lf) == [0, 1]
 
 
-def test_read_only_projection_and_limit(jan_cached):
-    lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.READ_ONLY)
-    projected = lf.filter(JAN_FEB).select("value").collect()
+def test_read_only_projection_limit_and_streaming(jan_cached):
+    lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.READ_ONLY).filter(JAN_FEB)
+    projected = lf.select("value").collect()
     assert projected.columns == ["value"]
     assert sorted(projected["value"].to_list()) == [0, 1, 92]
-    assert lf.filter(JAN_FEB).head(2).collect().height == 2
-
-
-def test_read_only_streaming_collect(jan_cached):
-    lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.READ_ONLY)
-    assert sorted(lf.filter(JAN_FEB).collect(engine="streaming")["value"].to_list()) == [0, 1, 92]
+    assert lf.head(2).collect().height == 2
+    assert sorted(lf.collect(engine="streaming")["value"].to_list()) == [0, 1, 92]
 
 
 @pytest.mark.parametrize("name", ["READ_ONLY", "CACHE_ONLY"])

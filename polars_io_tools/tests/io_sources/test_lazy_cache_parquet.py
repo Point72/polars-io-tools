@@ -1,1363 +1,311 @@
+"""cache_parquet: planning helpers as tables, then cache behaviour as (steps -> result, files, upstream calls) tables.
+
+The table-driven tests check results against native Polars with ``assert_cached_matches_native`` and the files left
+behind with ``assert_cache_files``. Tests that patch writers, clocks or locks stay functions.
+"""
+
 import contextlib
 import datetime
 import os
 import pickle
 import shutil
 import time
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
 import cloudpickle
 import numpy as np
 import polars as pl
+import portion
 import pyarrow.parquet as pq
 import pytest
 from polars.exceptions import ComputeError, PanicException
 from polars.testing import assert_frame_equal
+from pydantic import BaseModel
 
-import polars_io_tools as cpl
 from polars_io_tools._compat import POLARS_GE_2
 from polars_io_tools.io_sources import lazy_cache_parquet
-from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, _default_expired, _get_expected_partitions_df, cache_parquet
-from polars_io_tools.tests.helpers.cache_parquet_shared import exercise_daily_cache_parquet
-
-
-class TestGetExpectedPartitionsDFBehavior:
-    """Comprehensive behavioral tests for _get_expected_partitions_df function."""
-
-    @pytest.fixture
-    def comprehensive_schema(self):
-        """Schema with various data types for realistic testing."""
-        return pl.Schema(
-            {
-                "date": pl.Date,
-                "timestamp": pl.Datetime("us"),
-                "region": pl.String,
-                "country": pl.String,
-                "category": pl.String,
-                "value": pl.Float64,
-                "count": pl.Int64,
-                "active": pl.Boolean,
-            }
-        )
-
-    def test_none_predicate_behavior(self, comprehensive_schema):
-        """Test that None predicate always returns empty DataFrame with correct partition schema."""
-        # Test with just date column
-        result = _get_expected_partitions_df(pred=None, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        expected = pl.DataFrame({"date": [None]}, schema={"date": pl.Date})
-        # We fill in null values for unrestricted partitions
-        assert_frame_equal(result, expected)
-
-        # Test with extra columns
-        result_with_extras = _get_expected_partitions_df(
-            pred=None, date_column="date", extra_cols=["region", "country"], time_unit="daily", schema=comprehensive_schema
-        )
-
-        expected_schema = {"region": pl.String, "country": pl.String, "date": pl.Date}
-        expected = pl.DataFrame({"date": [None], "region": [None], "country": [None]}, schema=expected_schema)
-        assert_frame_equal(result_with_extras, expected)
-
-    def test_simple_date_equality_monthly(self, comprehensive_schema):
-        """Test simple date equality creates single monthly partition."""
-        test_date = datetime.date(2024, 3, 15)
-        pred = pl.col("date") == test_date
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        # Should return one partition for March 2024
-        # The exact behavior depends on implementation but should include the target date
-        assert result.height >= 1  # At least one partition
-        assert "date" in result.columns
-
-        # All dates should be within the same month as test_date
-        dates = result["date"].to_list()
-        assert dates == [datetime.date(2024, 3, 1)]
-
-    def test_simple_date_equality_daily(self, comprehensive_schema):
-        """Test simple date equality creates single daily partition."""
-        test_date = datetime.date(2024, 5, 20)
-        pred = pl.col("date") == test_date
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="daily", schema=comprehensive_schema)
-
-        # Should return exactly one partition for the specific day
-        assert result.height >= 1
-        dates = result["date"].to_list()
-        # Should include the exact date or dates that encompass it
-        assert any(d == test_date for d in dates if d is not None)
-
-    def test_date_range_creates_multiple_monthly_partitions(self, comprehensive_schema):
-        """Test date range spanning multiple months creates exactly the expected monthly partitions."""
-        start_date = datetime.date(2024, 1, 15)
-        end_date = datetime.date(2024, 4, 10)
-
-        # Test with is_between - this spans from mid-January to mid-April
-        pred = pl.col("date").is_between(start_date, end_date)
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        # Should create partitions for January, February, March, and April 2024
-        # For monthly partitioning, we expect the first day of each month that contains dates in the range
-        expected = pl.DataFrame(
-            {
-                "date": [
-                    datetime.date(2024, 1, 1),  # January 2024 (contains Jan 15)
-                    datetime.date(2024, 2, 1),  # February 2024 (entire month in range)
-                    datetime.date(2024, 3, 1),  # March 2024 (entire month in range)
-                    datetime.date(2024, 4, 1),  # April 2024 (contains Apr 1-10)
-                ]
-            },
-            schema={"date": pl.Date},
-        )
-
-        # Sort both to ensure consistent ordering for comparison
-        assert_frame_equal(result.sort("date"), expected.sort("date"))
-
-    def test_extra_columns_with_simple_predicates(self, comprehensive_schema):
-        """Test extra partition columns with simple predicates."""
-        test_date = datetime.date(2024, 7, 4)
-
-        # Test with one extra column
-        pred = (pl.col("date") == test_date) & (pl.col("region") == "US")
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=["region"], time_unit="daily", schema=comprehensive_schema)
-
-        assert "date" in result.columns
-        assert "region" in result.columns
-        expected = pl.DataFrame(
-            {"region": ["US"], "date": [test_date]},
-        )
-        assert_frame_equal(result, expected)
-
-    def test_multiple_extra_columns_complex_predicate(self, comprehensive_schema):
-        """Test multiple extra partition columns with is_in predicates create cartesian product of all combinations."""
-        test_date = datetime.date(2024, 8, 12)
-
-        # Fixed HTML encoding: using & instead of &amp;
-        pred = (pl.col("date") == test_date) & (pl.col("region").is_in(["US", "EU", "APAC"])) & (pl.col("category").is_in(["A", "B"]))
-
-        result = _get_expected_partitions_df(
-            pred=pred, date_column="date", extra_cols=["region", "category"], time_unit="daily", schema=comprehensive_schema
-        )
-
-        # Should create cartesian product: 3 regions × 2 categories = 6 combinations
-        # All with the same date since it's a single date equality
-        expected = pl.DataFrame(
-            {
-                "region": ["US", "US", "EU", "EU", "APAC", "APAC"],
-                "category": ["A", "B", "A", "B", "A", "B"],
-                "date": [test_date, test_date, test_date, test_date, test_date, test_date],
-            },
-            schema={"region": pl.String, "category": pl.String, "date": pl.Date},
-        )
-
-        # Sort both for consistent comparison since order might vary
-        assert_frame_equal(result.sort(["region", "category"]), expected.sort(["region", "category"]))
-
-    def test_or_conditions_create_multiple_partitions(self, comprehensive_schema):
-        """Test OR conditions create multiple separate partitions."""
-        date1 = datetime.date(2024, 9, 5)
-        date2 = datetime.date(2024, 10, 15)
-
-        # Two separate dates with OR
-        pred = (pl.col("date") == date1) | (pl.col("date") == date2)
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        dates = set(result["date"].to_list())
-        assert dates == {datetime.date(2024, 9, 1), datetime.date(2024, 10, 1)}
-
-    def test_or_with_extra_columns_creates_all_combinations(self, comprehensive_schema):
-        """Test OR conditions with extra columns create exact cartesian product of all valid combinations."""
-        test_date = datetime.date(2024, 11, 8)
-
-        # Fixed HTML encoding: using & instead of &amp;
-        # This predicate means: date==test_date AND (region==US OR region==EU) AND (category==X OR category==Y)
-        pred = (
-            (pl.col("date") == test_date)
-            & ((pl.col("region") == "US") | (pl.col("region") == "EU"))
-            & ((pl.col("category") == "X") | (pl.col("category") == "Y"))
-        )
-
-        result = _get_expected_partitions_df(
-            pred=pred, date_column="date", extra_cols=["region", "category"], time_unit="daily", schema=comprehensive_schema
-        )
-
-        # Should create exactly 4 combinations: cartesian product of 2 regions × 2 categories
-        # All with the same date since it's a single date equality
-        expected = pl.DataFrame(
-            {
-                "region": ["US", "US", "EU", "EU"],
-                "category": ["X", "Y", "X", "Y"],
-                "date": [test_date, test_date, test_date, test_date],
-            },
-            schema={"region": pl.String, "category": pl.String, "date": pl.Date},
-        )
-
-        # Sort both for consistent comparison since order might vary
-        assert_frame_equal(result.sort(["region", "category"]), expected.sort(["region", "category"]))
-
-    def test_contradictory_predicates(self, comprehensive_schema):
-        """Test contradictory predicates return empty results."""
-        # Impossible condition: date can't be two different values simultaneously
-        pred = (pl.col("date") == datetime.date(2024, 1, 1)) & (pl.col("date") == datetime.date(2024, 2, 1))
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        # Should return empty DataFrame for impossible conditions
-        assert result.height == 0
-        assert "date" in result.columns
-
-    def test_different_time_units_same_predicate(self, comprehensive_schema):
-        """Test same predicate with different time units produces different granularity."""
-        date_range_start = datetime.date(2024, 3, 10)
-        date_range_end = datetime.date(2024, 5, 20)
-        pred = pl.col("date").is_between(date_range_start, date_range_end)
-
-        # Test daily partitioning
-        result_daily = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="daily", schema=comprehensive_schema)
-
-        # Test monthly partitioning
-        result_monthly = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        # Test yearly partitioning
-        result_yearly = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="yearly", schema=comprehensive_schema)
-
-        # Daily should generally have more partitions than monthly
-        # Monthly should have more partitions than yearly (unless range is within one year)
-        # Daily partitioning should create more granular partitions
-        daily_dates = set(result_daily["date"].to_list())
-        monthly_dates = set(result_monthly["date"].to_list())
-
-        assert set(pl.date_range(date_range_start, date_range_end, interval="1d", eager=True)) == set(daily_dates)
-        assert set(pl.date_range(date_range_start.replace(day=1), date_range_end, interval="1mo", eager=True)) == set(monthly_dates)
-        yearly_dates = result_yearly["date"].to_list()
-        assert set(pl.date_range(date_range_start.replace(month=1, day=1), date_range_end, interval="1y", eager=True)) == set(yearly_dates)
-
-    def test_open_ended_lower_bound_only(self, comprehensive_schema):
-        """Lower-bound-only predicate should yield no finite expected partitions."""
-        start_date = datetime.date(2024, 6, 5)
-        pred = pl.col("date") >= start_date
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="daily", schema=comprehensive_schema)
-
-        assert result.is_empty()
-        assert result.columns == ["date"]
-
-    def test_open_ended_upper_bound_only(self, comprehensive_schema):
-        """Upper-bound-only predicate should yield no finite expected partitions."""
-        end_date = datetime.date(2024, 6, 2)
-        pred = pl.col("date") <= end_date
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="daily", schema=comprehensive_schema)
-
-        assert result.is_empty()
-        assert result.columns == ["date"]
-
-    def test_predicate_with_non_partition_columns_ignored(self, comprehensive_schema):
-        """Test that predicates on non-partition columns are handled gracefully."""
-        # Predicate that includes both partition and non-partition columns
-        pred = (
-            (pl.col("date") == datetime.date(2024, 12, 25)) & (pl.col("region") == "US") & (pl.col("value") > 100.0)  # Non-partition column
-        )
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=["region"], time_unit="daily", schema=comprehensive_schema)
-        expected = pl.DataFrame({"region": ["US"], "date": [datetime.date(2024, 12, 25)]}, schema={"region": pl.String, "date": pl.Date})
-        assert_frame_equal(result, expected)
-
-    def test_complex_nested_or_and_conditions(self, comprehensive_schema):
-        """Test complex nested OR and AND conditions create union of partitions from each branch."""
-        # Complex predicate: (date1 AND region1) OR (date2 AND region2)
-        date1 = datetime.date(2024, 6, 1)
-        date2 = datetime.date(2024, 7, 1)
-
-        # Fixed HTML encoding: using & instead of &amp;
-        pred = ((pl.col("date") == date1) & (pl.col("region") == "US")) | ((pl.col("date") == date2) & (pl.col("region") == "EU"))
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=["region"], time_unit="monthly", schema=comprehensive_schema)
-
-        # Should create exactly 2 partitions: one for each OR branch
-        # For monthly partitioning, dates become first day of their respective months
-        expected = pl.DataFrame(
-            {
-                "region": ["US", "EU"],
-                "date": [datetime.date(2024, 6, 1), datetime.date(2024, 7, 1)],
-            },
-            schema={"region": pl.String, "date": pl.Date},
-        )
-
-        assert_frame_equal(result.sort(["date", "region"]), expected.sort(["date", "region"]))
-
-    def test_timestamp_column_as_date_column(self, comprehensive_schema):
-        """Test using timestamp column as the date partition column extracts date portion."""
-        test_timestamp = datetime.datetime(2024, 4, 15, 14, 30, 45)
-        pred = pl.col("timestamp") == test_timestamp
-
-        result = _get_expected_partitions_df(
-            pred=pred,
-            date_column="timestamp",  # Using timestamp as date column
-            extra_cols=[],
-            time_unit="daily",
-            schema=comprehensive_schema,
-        )
-
-        # Should return the date portion of the timestamp for daily partitioning
-        # The timestamp gets converted to just the date part
-        expected = pl.DataFrame({"timestamp": [datetime.date(2024, 4, 15)]}, schema={"timestamp": pl.Datetime("us")})
-
-        assert_frame_equal(result, expected)
-
-    def test_large_date_ranges_yearly_partitioning(self, comprehensive_schema):
-        """Test function with large date ranges using yearly partitioning creates exact yearly partitions."""
-        # Large range spanning multiple years
-        start_date = datetime.date(2020, 1, 1)
-        end_date = datetime.date(2024, 12, 31)
-
-        # Fixed HTML encoding: using & instead of &amp;
-        pred = pl.col("date").is_between(start_date, end_date) & pl.col("region").is_in(["US", "EU"])
-
-        result = _get_expected_partitions_df(
-            pred=pred,
-            date_column="date",
-            extra_cols=["region"],
-            time_unit="yearly",  # Use yearly to keep partition count manageable
-            schema=comprehensive_schema,
-        )
-
-        # Should create partitions for each year (2020-2024) × each region (US, EU) = 10 partitions
-        expected_years = [2020, 2021, 2022, 2023, 2024]
-        expected_regions = ["US", "EU"]
-
-        expected_data = []
-        for year in expected_years:
-            for region in expected_regions:
-                expected_data.append(
-                    {
-                        "region": region,
-                        "date": datetime.date(year, 1, 1),  # First day of year for yearly partitioning
-                    }
-                )
-
-        expected = pl.DataFrame(expected_data, schema={"region": pl.String, "date": pl.Date})
-        assert_frame_equal(result.sort(["date", "region"]), expected.sort(["date", "region"]))
-
-    def test_is_in_predicate_with_multiple_dates(self, comprehensive_schema):
-        """Test is_in predicate with multiple dates creates exact monthly partitions."""
-        target_dates = [datetime.date(2024, 2, 14), datetime.date(2024, 3, 17), datetime.date(2024, 4, 22)]
-
-        pred = pl.col("date").is_in(target_dates)
-
-        result = _get_expected_partitions_df(pred=pred, date_column="date", extra_cols=[], time_unit="monthly", schema=comprehensive_schema)
-
-        # Should create partitions for February, March, and April 2024
-        # For monthly partitioning, use first day of each month
-        expected = pl.DataFrame(
-            {
-                "date": [
-                    datetime.date(2024, 2, 1),  # February 2024
-                    datetime.date(2024, 3, 1),  # March 2024
-                    datetime.date(2024, 4, 1),  # April 2024
-                ]
-            },
-            schema={"date": pl.Date},
-        )
-
-        assert_frame_equal(result.sort("date"), expected.sort("date"))
-
-
-def test_simple(tmp_path):
-    df = pl.DataFrame({"date": [datetime.date(2023, 1, 15)], "value": [42]}).lazy()
-    result = df.piot.cache_parquet(cache_path=tmp_path, date_column="date")
-    assert isinstance(result, pl.LazyFrame)
-    result.collect()
-
-    parquet_file = tmp_path / "monthly" / "2023-01.parquet"
-    assert parquet_file.exists()
-
-    # read back metadata embedded in parquet
-    meta = pq.read_metadata(parquet_file).metadata
-    meta = {k.decode(): v.decode() for k, v in meta.items()}
-    assert meta["__piot__time_unit"] == "monthly"
-    assert meta["__piot__partition_format"] == "$year-$month"
-
-    read_df = result.collect()
-    assert read_df.shape == (1, 2)
-    assert read_df["value"].to_list() == [42]
-
-
-def test_callable_not_invoked_when_cache_satisfies(tmp_path):
-    """If the cache fully satisfies reads, a callable source should not be invoked."""
-    # First, create cache with known data
-    initial_df = pl.DataFrame(
-        {
-            "date": [datetime.date(2023, 1, 1), datetime.date(2023, 1, 2)],
-            "region": ["US", "US"],
-            "value": [10, 20],
-        }
-    ).lazy()
-
-    cached = initial_df.piot.cache_parquet(cache_path=tmp_path, date_column="date", time_unit="daily", extra_partition_cols=["region"])
-    cached.collect()
-
-    # Define a callable that should NOT be called if cache suffices
-    called = {"count": 0}
-
-    def make_source():
-        called["count"] += 1
-        return pl.DataFrame(
-            {
-                "date": [datetime.date(2023, 1, 1), datetime.date(2023, 1, 2)],
-                "region": ["US", "US"],
-                "value": [10, 20],
-            }
-        ).lazy()
-
-    # Query that is fully satisfied by the cache (no write required)
-    lf = cache_parquet(
-        make_source,
-        cache_path=tmp_path,
-        date_column="date",
-        time_unit="daily",
-        extra_partition_cols=["region"],
-    ).filter(pl.col("region") == "US", pl.col("date").is_between(datetime.date(2023, 1, 1), datetime.date(2023, 1, 2)))
-
-    out = lf.collect()
-
-    # Ensure callable was never invoked
-    assert called["count"] == 0
-    # Ensure data was read from cache and matches initial values
-    assert out.shape == (2, 3)
-    assert set(out["value"].to_list()) == {10, 20}
-
-    lf = cache_parquet(
-        make_source,
-        cache_path=tmp_path,
-        date_column="date",
-        time_unit="daily",
-        extra_partition_cols=["region"],
-    ).filter(
-        pl.col("region") == "US",
-    )
-
-    out = lf.collect()
-
-    # No date restriction, so lazyframe IS invoked
-    assert called["count"] == 1
-    # Ensure data was read from cache and matches initial values
-    assert out.shape == (2, 3)
-    assert set(out["value"].to_list()) == {10, 20}
-
-
-def test_complex(tmp_path):
-    lf = pl.LazyFrame(
-        {
-            "date": (
-                x := pl.datetime_range(
-                    # note the use of datetime columns
-                    datetime.datetime(2023, 1, 1),
-                    datetime.datetime(2024, 12, 31),
-                    interval="1d",
-                    eager=True,
-                )
-            ),
-            "feature": np.random.rand(x.shape[0]),
-            "quantity": range(len(x)),
-            "price": 100 + np.arange(x.shape[0]),
-        }
-    )
-
-    result = (
-        lf.piot.cache_parquet(cache_path=str(tmp_path), date_column="date")
-        .filter((pl.col("date") < datetime.datetime(2024, 12, 15)) & (pl.col("date") > datetime.datetime(2024, 10, 15)))
-        .filter(pl.col("quantity") % 2 != 0)
-        .select(["date", "feature", "price"])
-    )
-
-    read_df = result.collect(engine="streaming")
-    assert read_df.shape == (30, 3)
-
-    assert len(os.listdir(tmp_path / "monthly")) == 3
-
-    from_cache = [pl.read_parquet(f"{tmp_path!s}/monthly/2024-{month}.parquet") for month in ["10", "11", "12"]]
-    assert from_cache[0].shape == (31, 4)
-    assert from_cache[1].shape == (30, 4)
-    assert from_cache[2].shape == (31, 4)
-
-
-def test_custom_partition_format(tmp_path):
-    daily_df = pl.DataFrame({"date": [datetime.date(2023, 1, 15)], "value": [1]}).lazy()
-    monthly_df = pl.DataFrame({"date": [datetime.date(2023, 2, 15)], "value": [2]}).lazy()
-    yearly_df = pl.DataFrame({"date": [datetime.date(2023, 3, 15)], "value": [3]}).lazy()
-
-    daily_df.piot.cache_parquet(
-        cache_path=tmp_path / "daily_test",
-        date_column="date",
-        time_unit="daily",
-        partition_format="y=$year/m=$month/d=$day",
-    ).collect()
-    monthly_df.piot.cache_parquet(
-        cache_path=tmp_path / "monthly_test",
-        date_column="date",
-        time_unit="monthly",
-        partition_format="year=$year/month=$month",
-    ).collect()
-    yearly_df.piot.cache_parquet(
-        cache_path=tmp_path / "yearly_test",
-        date_column="date",
-        time_unit="yearly",
-        partition_format="year=$year",
-    ).collect()
-
-    assert (tmp_path / "daily_test" / "daily" / "y=2023/m=01/d=15.parquet").exists()
-    assert (tmp_path / "monthly_test" / "monthly" / "year=2023/month=02.parquet").exists()
-    assert (tmp_path / "yearly_test" / "yearly" / "year=2023.parquet").exists()
-
-    daily_data = pl.scan_parquet(tmp_path / "daily_test" / "daily" / "y=2023/m=01/d=15.parquet").collect()
-    monthly_data = pl.scan_parquet(tmp_path / "monthly_test" / "monthly" / "year=2023/month=02.parquet").collect()
-    yearly_data = pl.scan_parquet(tmp_path / "yearly_test" / "yearly" / "year=2023.parquet").collect()
-
-    assert daily_data["value"].to_list() == [1]
-    assert monthly_data["value"].to_list() == [2]
-    assert yearly_data["value"].to_list() == [3]
-
-
-def test_bad_partition_format(tmp_path):
-    df = pl.DataFrame({"date": [datetime.date(2023, 1, 15)], "value": [42]}).lazy()
-
-    with pytest.raises(ValueError, match="missing"):
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="monthly",
-            partition_format="$year",  # missing $month
-        )
-
-    with pytest.raises(ValueError, match="unexpected"):
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="monthly",
-            partition_format="$year-$month-$day",
-        )
-
-    with pytest.raises(ValueError):
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="monthly",
-            partition_format="$year-${month",
-        )
-
-    with pytest.raises(ValueError, match="Invalid time unit"):
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="occasionally",
-        )
-
-
-def test_custom_partition_format_cache_readback(tmp_path):
-    """Test that custom partition formats work correctly with cache read-back functionality."""
-    # Test data spanning multiple partitions
-    df1 = pl.DataFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2), datetime.date(2024, 6, 3)], "value": [10, 20, 30]}).lazy()
-
-    # Write initial data with custom partition format
-    cache_path = tmp_path / "custom_format_test"
-    result1 = df1.piot.cache_parquet(
-        cache_path=cache_path,
-        date_column="date",
-        time_unit="daily",
-        partition_format="theYear=$year/theMonth=$month/theDay=$day",
-    ).collect()
-
-    # Verify initial data
-    assert result1.sort("date")["value"].to_list() == [10, 20, 30]
-
-    # Verify file structure exists
-    assert (cache_path / "daily" / "theYear=2024/theMonth=06/theDay=01.parquet").exists()
-    assert (cache_path / "daily" / "theYear=2024/theMonth=06/theDay=02.parquet").exists()
-    assert (cache_path / "daily" / "theYear=2024/theMonth=06/theDay=03.parquet").exists()
-
-    # Now try to append new data - this should trigger the existing partition parsing
-    df2 = pl.DataFrame({"date": [datetime.date(2024, 6, 4), datetime.date(2024, 6, 5)], "value": [40, 50]}).lazy()
-
-    result2 = df2.piot.cache_parquet(
-        cache_path=cache_path,
-        date_column="date",
-        time_unit="daily",
-        partition_format="theYear=$year/theMonth=$month/theDay=$day",
-    ).collect()
-
-    # Should return all data (existing + new)
-    expected_values = [10, 20, 30, 40, 50]
-    assert sorted(result2["value"].to_list()) == expected_values
-
-    # Verify new files were created
-    assert (cache_path / "daily" / "theYear=2024/theMonth=06/theDay=04.parquet").exists()
-    assert (cache_path / "daily" / "theYear=2024/theMonth=06/theDay=05.parquet").exists()
-
-
-def test_overwrite(tmp_path):
-    df1 = pl.DataFrame({"date": [datetime.date(2023, 1, 15)], "value": [42]}).lazy()
-    df1.piot.cache_parquet(cache_path=tmp_path, date_column="date").collect()
-
-    partition_path = tmp_path / "monthly" / "2023-01.parquet"
-    first_mtime = os.path.getmtime(partition_path)
-    time.sleep(0.01)
-
-    df2 = pl.DataFrame({"date": [datetime.date(2023, 1, 15)], "value": [99]}).lazy()
-    df2.piot.cache_parquet(cache_path=tmp_path, date_column="date", cache_mode=CacheMode.REBUILD).collect()
-
-    new_data = pl.scan_parquet(partition_path).collect()
-    assert new_data["value"].to_list() == [99]
-    assert first_mtime < os.path.getmtime(partition_path)
-
-
-def test_multiple_partitions(tmp_path):
-    df = pl.DataFrame(
-        {
-            "date": [
-                datetime.date(2023, 1, 15),
-                datetime.date(2023, 2, 20),
-                datetime.date(2023, 3, 25),
-            ],
-            "value": [1, 2, 3],
-        }
-    ).lazy()
-
-    df.piot.cache_parquet(cache_path=tmp_path, date_column="date").collect()
-
-    base = tmp_path / "monthly"
-    for m in ("01", "02", "03"):
-        assert (base / f"2023-{m}.parquet").exists()
-
-    jan = pl.scan_parquet(base / "2023-01.parquet").collect()
-    feb = pl.scan_parquet(base / "2023-02.parquet").collect()
-    mar = pl.scan_parquet(base / "2023-03.parquet").collect()
-    assert jan["value"].to_list() == [1]
-    assert feb["value"].to_list() == [2]
-    assert mar["value"].to_list() == [3]
-
-    # also works for other time units
-    df.piot.cache_parquet(tmp_path / "daily_test", "date", time_unit="daily").collect()
-    df.piot.cache_parquet(tmp_path / "yearly_test", "date", time_unit="yearly").collect()
-
-    assert (tmp_path / "daily_test" / "daily" / "2023-01-15.parquet").exists()
-    assert (tmp_path / "yearly_test" / "yearly" / "2023.parquet").exists()
-
-
-def test_missing_written(tmp_path):
-    """
-    Ensure that partitions for which *no* data exists are still written as
-    empty parquet files.
-    """
-    # only one row in January
-    df = pl.DataFrame({"date": [datetime.date(2023, 1, 15)], "value": [1]}).lazy()
-
-    (
-        df.piot.cache_parquet(cache_path=tmp_path, date_column="date")
-        .filter((pl.col("date") >= datetime.date(2023, 1, 1)) & (pl.col("date") <= datetime.date(2023, 3, 31)))
-        .collect()
-    )
-
-    base = tmp_path / "monthly"
-    # existing data
-    assert (base / "2023-01.parquet").exists()
-
-    # empty partitions must also exist
-    for month in ("02", "03"):
-        part_file = base / f"2023-{month}.parquet"
-        assert part_file.exists(), f"missing empty parquet for 2023-{month}"
-        assert pl.read_parquet(part_file).height == 0
-
-
-def test_contradiction(monkeypatch, tmp_path):
-    """
-    Test that contradiction detection prevents writing twice.
-    """
-
-    dates = pl.date_range(
-        datetime.date(2024, 1, 1),
-        datetime.date(2024, 1, 31),
-        interval="1d",
-        eager=True,
-    )
-    base = pl.LazyFrame({"date": dates, "val": pl.arange(0, len(dates), eager=True)})
-
-    # Predicate that selects a subset (10th .. 20th)
-    pred = (pl.col("date") >= datetime.date(2024, 1, 10)) & (pl.col("date") <= datetime.date(2024, 1, 20))
-
-    call_counter = {"n": 0}
-    original_sink = pl.LazyFrame.sink_parquet
-
-    def _counting_sink(self, *args, **kwargs):
-        call_counter["n"] += 1
-        return original_sink(self, *args, **kwargs)
-
-    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", _counting_sink, raising=True)
-
-    cached = base.piot.cache_parquet(
-        cache_path=tmp_path,
-        date_column="date",
-        time_unit="monthly",
-    )
-
-    cached.filter(pred).collect()
-
-    cached.filter(pred).collect()
-
-    assert call_counter["n"] == 1, f"sink_parquet was called {call_counter['n']} times; contradiction logic failed"
-
-
-def test_extra_partition_columns(tmp_path):
-    """Test that extra partition columns are correctly handled."""
-    df = pl.DataFrame(
-        {
-            "date": [datetime.date(2024, 1, 3), datetime.date(2024, 1, 4)] * 2,
-            "country": ["US", "CA"] * 2,
-            "val": [1, 2, 3, 4],
-        }
-    ).lazy()
-
-    (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="monthly",
-            extra_partition_cols=["country"],
-        ).collect()
-    )
-
-    assert (tmp_path / "monthly" / "US" / "2024-01.parquet").is_file()
-    assert (tmp_path / "monthly" / "CA" / "2024-01.parquet").is_file()
-
-    read_back = pl.scan_parquet(f"{tmp_path}/monthly/**/*.parquet").collect()
-    assert set(read_back["country"]) == {"US", "CA"}
-    assert len(read_back) == 4
-
-
-def test_between_pred_uses_existing_partitions(tmp_path, monkeypatch):
-    """
-    Test that contradiction detection works on an `is_between`
-    call preceded by two individual daily partitions.
-    """
-    import datetime
-
-    import polars as pl
-
-    df = pl.DataFrame(
-        {
-            "date": [datetime.date(2021, 3, 1), datetime.date(2021, 3, 2)],
-            "val": [10, 20],
-        }
-    ).lazy()
-
-    # 1 ─ write 2021-03-01
-    df.piot.cache_parquet(tmp_path, "date", time_unit="daily").filter(pl.col("date") == datetime.date(2021, 3, 1)).collect()
-
-    # 2 ─ write 2021-03-02
-    df.piot.cache_parquet(tmp_path, "date", time_unit="daily").filter(pl.col("date") == datetime.date(2021, 3, 2)).collect()
-
-    # patch sink_parquet; any extra write will increment the counter
-    cnt = {"n": 0}
-    orig_sink = pl.LazyFrame.sink_parquet
-
-    def _count(*a, **k):
-        cnt["n"] += 1
-        return orig_sink(*a, **k)
-
-    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", _count, raising=True)
-
-    between_pred = pl.col("date").is_between(datetime.date(2021, 3, 1), datetime.date(2021, 3, 2), closed="both")
-
-    # 3 ─ query the BETWEEN predicate; should be served from cache
-    out = df.piot.cache_parquet(tmp_path, "date", time_unit="daily").filter(between_pred).collect()
-
-    assert cnt["n"] == 0, "sink_parquet ran again; expected cache hit"
-    assert out["val"].to_list() == [10, 20]
-
-
-def test_empty_partitions_with_extra_cols(tmp_path):
-    """
-    Tests that we correctly write empty partitions for
-    `extra_partition_cols` when a queried combination has no data.
-    """
-    df = pl.DataFrame(
-        {
-            "date": [datetime.date(2024, 5, 10), datetime.date(2024, 5, 10)],
-            "region": ["NA", "EU"],
-            "value": [100, 200],
-        }
-    ).lazy()
-
-    # Query for NA, EU, and APAC. APAC has no data in the source frame.
-    predicate = pl.col("region").is_in(["NA", "EU", "APAC"]) & (pl.col("date") == datetime.date(2024, 5, 10))
-
-    (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(predicate)
-        .collect()
-    )
-
-    # Check that partitions with data were written correctly
-    na_path = tmp_path / "daily" / "NA" / "2024-05-10.parquet"
-    eu_path = tmp_path / "daily" / "EU" / "2024-05-10.parquet"
-    assert na_path.exists()
-    assert eu_path.exists()
-    assert pl.read_parquet(na_path)["value"][0] == 100
-    assert pl.read_parquet(eu_path)["value"][0] == 200
-
-    # Crucially, check that the empty partition for APAC was also created
-    apac_path = tmp_path / "daily" / "APAC" / "2024-05-10.parquet"
-    assert apac_path.exists(), "Empty partition for APAC was not created"
-    assert pl.read_parquet(apac_path).height == 0
-
-
-def test_predicate_pushdown(tmp_path, capsys):
-    """
-    Tests that a simple filter applied AFTER .cache_parquet() is correctly
-    pushed down to the upstream source during the initial discovery phase.
-    """
-
-    df = pl.DataFrame({"d": [datetime.date(2020, 1, 1), datetime.date(2020, 1, 2)], "val": [1, 2]}).lazy().piot.debug()
-
-    result_df = df.piot.cache_parquet(tmp_path, date_column="d", time_unit="daily").filter(pl.col("d") == datetime.date(2020, 1, 1)).collect()
-
-    captured = capsys.readouterr()
-    stdout = captured.out
-
-    expected_predicate_str = 'predicate=[(col("d")) == (2020-01-01)]'
-    other_possibility = 'predicate=col("d").is_between([2020-01-01, 2020-01-02])'
-    assert any(s in stdout for s in (expected_predicate_str, other_possibility)), "The simple predicate was not pushed down to the upstream source."
-    assert result_df.shape == (1, 2)
-    assert result_df["d"][0] == datetime.date(2020, 1, 1)
-
-
-def test_write_uses_widened_predicate(tmp_path, capsys):
-    """
-    Tests that the write operation uses a "widened" predicate to fetch
-    the full partition, not just the slice requested by the user.
-    """
-    from datetime import date
-
-    # Arrange: Source data spans multiple days in a month
-    df = pl.DataFrame(
-        {"date": [date(2024, 5, 1), date(2024, 5, 15), date(2024, 5, 30)], "val": [1, 15, 30], "partition": ["foo", "bar", "baz"]}
-    ).lazy()
-
-    # Act: Chain the debug source, then cache with a filter for a *single day*
-    (df.piot.debug().piot.cache_parquet(tmp_path, date_column="date", time_unit="monthly").filter(pl.col("date") == date(2024, 5, 15)).collect())
-
-    # Assert: Check the output from the debug source
-    captured = capsys.readouterr().out
-
-    # The second call is for writing. It should use the WIDENED predicate
-    # to fetch the entire month of May.
-    # The predicate should be something like: is_between(2024-05-01, 2024-06-01)
-    assert "is_between" in captured
-    assert "2024-05-01" in captured
-    assert "2024-06-01" in captured
-
-    # Assert that the written file contains the full partition's data
-    written_file = tmp_path / "monthly" / "2024-05.parquet"
-    assert written_file.exists()
-    data_in_cache = pl.read_parquet(written_file)
-    assert data_in_cache.shape == (3, 3), "The cached file should contain all 3 rows for the month"
-    assert data_in_cache["val"].to_list() == [1, 15, 30]
-
-
-def test_model_predicate_is_pushed_down(tmp_path, capsys):
-    """
-    Test that pushdown happens for a model predicate
-    even when the filter is applied after the `cache_parquet` call.
-    """
-    df = (
-        pl.DataFrame(
-            {
-                "date": [
-                    datetime.date(2025, 5, 1),
-                    datetime.date(2025, 5, 2),
-                    datetime.date(2025, 5, 3),
-                ],
-                "model": ["USE4S", "OTHER", "USE4S"],
-                "val": [10, 20, 30],
-            }
-        )
-        .lazy()
-        .piot.debug()
-    )
-
-    (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="monthly",
-            extra_partition_cols="model",
-        )
-        .filter(pl.col("model") == "USE4S")
-        .collect()
-    )
-
-    out = capsys.readouterr().out
-    assert 'col("model")' in out and '"USE4S"' in out, "model predicate was not pushed down; helper-column filter still blocks predicate push-down"
-
-
-def test_empty_result_from_cache(tmp_path):
-    """
-    Test that no data doesn't yield an error.
-    """
-    # Upstream frame has only 2024-02-01
-    src = pl.DataFrame({"date": [datetime.date(2024, 2, 1)], "val": [1]}).lazy()
-
-    # Go through cache_parquet, then ask for a date that isn't there
-    lf = src.piot.cache_parquet(
-        cache_path=tmp_path,
-        date_column="date",
-        time_unit="monthly",
-    ).filter(pl.col("date") == datetime.date(2025, 1, 1))
-
-    out = lf.collect()
-
-    assert out.is_empty()
-    assert out.columns == ["date", "val"]
-
-
-def test_sequential_cache_parquet(tmp_path):
-    """Test that sequential `cache_parquet` calls work correctly."""
-    base = pl.LazyFrame({"date": [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2), datetime.date(2024, 2, 1)], "x": [1, 3, 5]})
-
-    sequential = base.piot.cache_parquet(tmp_path, "date", time_unit="monthly").piot.cache_parquet(tmp_path, "date", time_unit="monthly")
-
-    out = sequential.collect()
-    assert out.shape == (3, 2)
-
-
-def test_missing_written_daily_with_extra_cols(tmp_path):
-    """
-    Test that we correctly write empty partitions for daily partitions when
-    extra partition columns are specified.
-    """
-    df = pl.LazyFrame(
-        {
-            "date": [datetime.date(2024, 5, 10), datetime.date(2024, 5, 10)],
-            "region": ["NA", "EU"],
-            "value": [100, 200],
-        }
-    )
-
-    # Predicate selects TWO days and THREE regions (APAC has no rows).
-    pred = (
-        pl.col("region").is_in(["NA", "EU", "APAC"]) & (pl.col("date") >= datetime.date(2024, 5, 10)) & (pl.col("date") <= datetime.date(2024, 5, 11))
-    )
-
-    (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(pred)
-        .collect()
-    )
-
-    base = tmp_path / "daily"
-    # Real data rows exist only for (NA, 2024-05-10) and (EU, 2024-05-10).
-    # The test checks that the *four* missing partitions are still written.
-    expected_empty = [
-        ("NA", "2024-05-11"),
-        ("EU", "2024-05-11"),
-        ("APAC", "2024-05-10"),
-        ("APAC", "2024-05-11"),
-    ]
-    for region, day in expected_empty:
-        f = base / region / f"{day}.parquet"
-        assert f.is_file(), f"missing empty parquet for {region}/{day}"
-        assert pl.read_parquet(f).height == 0
-
-
-def test_missing_written_daily_with_extra_cols_gap(tmp_path):
-    """
-    Test that we correctly write empty partitions for daily partitions when
-    extra partition columns are specified, and there is a gap.
-    """
-    df = pl.LazyFrame(
-        {
-            "date": [datetime.date(2024, 5, 10), datetime.date(2024, 5, 11)],
-            "region": ["NA", "EU"],
-            "value": [100, 200],
-        }
-    )
-
-    # Predicate selects TWO days and THREE regions (APAC has no rows).
-    pred = (
-        pl.col("region").is_in(["NA", "EU", "APAC"])
-        & (pl.col("date") >= datetime.date(2024, 5, 10))
-        & (pl.col("date") <= datetime.date(2024, 5, 14))
-        & (pl.col("date") != datetime.date(2024, 5, 11))
-    )
-
-    (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(pred)
-        .collect()
-    )
-
-    base = tmp_path / "daily"
-    for region in ["NA", "EU", "APAC"]:
-        # Check that the partition for 2024-05-11 exists
-        f = base / region / "2024-05-11.parquet"
-        assert not f.exists(), f"should not generate parquet for {region}/2024-05-11"
-
-
-def test_polars_private_api_still_exists():
-    """Assert the Polars credential provider API contains a method we expect to use."""
-    cred = pl.CredentialProviderAWS(profile_name=None, **({} if POLARS_GE_2 else {"_storage_options_has_endpoint_url": False}))
-    assert hasattr(cred, "_storage_update_options"), "_storage_update_options() removed upstream"
-    out = cred._storage_update_options()
-    assert isinstance(out, dict), "unexpected return type"
-
-
-@pytest.mark.parametrize("run_first", ["collect", "no_collect"])
-def test_intermediate_collect(tmp_path, run_first):
-    """
-    Test an edge case that we discovered: an intermediate collect
-    should not break the caching mechanism.
-    """
-
-    def run(base, do_collect: bool):
-        if base.exists():
-            shutil.rmtree(base)
-        src = pl.DataFrame({"a": [1, 2, 3], "date": [datetime.date(2025, 7, 31)] * 3}).lazy()
-
-        ldf = src.piot.cache_parquet(base / "foo_test", "date", time_unit="daily")
-        if do_collect:
-            ldf.collect()
-
-        ldf1 = ldf.with_columns(pl.lit("foo").alias("foo")).piot.cache_parquet(base / "foo_test1", "date", time_unit="daily")
-        ldf2 = ldf.with_columns(pl.lit("bar").alias("bar")).piot.cache_parquet(base / "foo_test2", "date", time_unit="daily")
-
-        res = ldf1.join(ldf2, on="a").collect()
-
-        cache = {}
-        for p in base.rglob("*.parquet"):
-            key = p.relative_to(base).as_posix()
-            cache[key] = pl.read_parquet(p)
-        return res, cache
-
-    if run_first == "no_collect":
-        # Run without intermediate collect
-        res_no_collect, cache_no_collect = run(tmp_path / "scenario_no_collect", False)
-        res_collect, cache_collect = run(tmp_path / "scenario_with_collect", True)
+from polars_io_tools.io_sources.lazy_cache_parquet import (
+    CacheMode,
+    Enumerability,
+    PartitionInfo,
+    _build_final_scan,
+    _compute_clipped_expected_partitions,
+    _compute_partitions_to_write,
+    _default_expired,
+    _get_expected_partitions_df,
+    _get_fs_path_directory_info,
+    cache_parquet,
+)
+from polars_io_tools.tests.helpers.cache_parquet_shared import (
+    UpstreamSpy,
+    assert_cache_files,
+    assert_cached_matches_native,
+    cache_files,
+    collect_filtered,
+    exercise_daily_cache_parquet,
+)
+from polars_io_tools.tests.helpers.catalogue import DATE_PREDICATES, TEMPORAL_DTYPES, Case, daily_frame, params
+
+D = datetime.date
+DT = datetime.datetime
+UTC = datetime.UTC
+MODES = [CacheMode.CACHE, CacheMode.READ_ONLY, CacheMode.CACHE_ONLY, CacheMode.REBUILD, CacheMode.IGNORE]
+
+
+def _frame(**cols) -> pl.LazyFrame:
+    return pl.LazyFrame(cols)
+
+
+# _get_expected_partitions_df: (predicate, date column, extra columns, time unit) -> the partitions a query covers.
+# Expected frames hold the extra columns, then the date column; an unrestricted column is null.
+
+SCHEMA = pl.Schema(
+    {
+        "date": pl.Date,
+        "timestamp": pl.Datetime("us"),
+        "region": pl.String,
+        "country": pl.String,
+        "category": pl.String,
+        "value": pl.Float64,
+        "count": pl.Int64,
+        "active": pl.Boolean,
+    }
+)
+
+
+def parts(dates, col="date", **extra) -> pl.DataFrame:
+    n = len(dates)
+    cols = {k: v if isinstance(v, list) else [v] * n for k, v in extra.items()}
+    return pl.DataFrame({**cols, col: dates}, schema={**{k: pl.String for k in extra}, col: SCHEMA[col]})
+
+
+def EP(id, pred, expect, time_unit="monthly", extra=(), col="date"):
+    return Case(id, pred, expect, {"extra": list(extra), "time_unit": time_unit, "col": col})
+
+
+def _months(*ms, year=2024):
+    return [D(year, m, 1) for m in ms]
+
+
+_d, _r, _c = pl.col("date"), pl.col("region"), pl.col("category")
+_RANGE = _d.is_between(D(2024, 3, 10), D(2024, 5, 20))
+EXPECTED_PARTITIONS = [
+    EP("none_predicate_behavior-date", None, parts([None])),
+    EP("none_predicate_behavior-extra_cols", None, parts([None], region=None, country=None), "daily", ["region", "country"]),
+    EP("simple_date_equality_monthly", _d == D(2024, 3, 15), parts(_months(3))),
+    EP("simple_date_equality_daily", _d == D(2024, 5, 20), parts([D(2024, 5, 20)]), "daily"),
+    EP("date_range_creates_multiple_monthly_partitions", _d.is_between(D(2024, 1, 15), D(2024, 4, 10)), parts(_months(1, 2, 3, 4))),
+    EP("extra_columns_with_simple_predicates", (_d == D(2024, 7, 4)) & (_r == "US"), parts([D(2024, 7, 4)], region="US"), "daily", ["region"]),
+    EP(
+        "multiple_extra_columns_complex_predicate",
+        (_d == D(2024, 8, 12)) & _r.is_in(["US", "EU", "APAC"]) & _c.is_in(["A", "B"]),
+        parts([D(2024, 8, 12)] * 6, region=["US", "US", "EU", "EU", "APAC", "APAC"], category=["A", "B"] * 3),
+        "daily",
+        ["region", "category"],
+    ),
+    EP("or_conditions_create_multiple_partitions", (_d == D(2024, 9, 5)) | (_d == D(2024, 10, 15)), parts(_months(9, 10))),
+    EP(
+        "or_with_extra_columns_creates_all_combinations",
+        (_d == D(2024, 11, 8)) & ((_r == "US") | (_r == "EU")) & ((_c == "X") | (_c == "Y")),
+        parts([D(2024, 11, 8)] * 4, region=["US", "US", "EU", "EU"], category=["X", "Y"] * 2),
+        "daily",
+        ["region", "category"],
+    ),
+    EP("contradictory_predicates", (_d == D(2024, 1, 1)) & (_d == D(2024, 2, 1)), parts([])),
+    EP("different_time_units_same_predicate-daily", _RANGE, parts(pl.date_range(D(2024, 3, 10), D(2024, 5, 20), eager=True).to_list()), "daily"),
+    EP("different_time_units_same_predicate-monthly", _RANGE, parts(_months(3, 4, 5))),
+    EP("different_time_units_same_predicate-yearly", _RANGE, parts(_months(1)), "yearly"),
+    EP("open_ended_lower_bound_only", _d >= D(2024, 6, 5), parts([]), "daily"),
+    EP("open_ended_upper_bound_only", _d <= D(2024, 6, 2), parts([]), "daily"),
+    EP(
+        "predicate_with_non_partition_columns_ignored",
+        (_d == D(2024, 12, 25)) & (_r == "US") & (pl.col("value") > 100.0),
+        parts([D(2024, 12, 25)], region="US"),
+        "daily",
+        ["region"],
+    ),
+    EP(
+        "complex_nested_or_and_conditions",
+        ((_d == D(2024, 6, 1)) & (_r == "US")) | ((_d == D(2024, 7, 1)) & (_r == "EU")),
+        parts(_months(6, 7), region=["US", "EU"]),
+        extra=["region"],
+    ),
+    EP(
+        "timestamp_column_as_date_column",
+        pl.col("timestamp") == DT(2024, 4, 15, 14, 30, 45),
+        parts([DT(2024, 4, 15)], col="timestamp"),
+        "daily",
+        col="timestamp",
+    ),
+    EP(
+        "large_date_ranges_yearly_partitioning",
+        _d.is_between(D(2020, 1, 1), D(2024, 12, 31)) & _r.is_in(["US", "EU"]),
+        parts([D(y, 1, 1) for y in range(2020, 2025) for _ in "ab"], region=["US", "EU"] * 5),
+        "yearly",
+        ["region"],
+    ),
+    EP("is_in_predicate_with_multiple_dates", _d.is_in([D(2024, 2, 14), D(2024, 3, 17), D(2024, 4, 22)]), parts(_months(2, 3, 4))),
+]
+
+
+@pytest.mark.parametrize(("pred", "expect", "col", "extra", "time_unit"), params(EXPECTED_PARTITIONS, "pred", "expect", "col", "extra", "time_unit"))
+def test_get_expected_partitions_df(pred, expect, col, extra, time_unit):
+    result = _get_expected_partitions_df(pred=pred, date_column=col, extra_cols=extra, time_unit=time_unit, schema=SCHEMA)
+    assert_frame_equal(result, expect, check_row_order=False)
+
+
+# _compute_clipped_expected_partitions: a one-sided interval is clipped to the cached date range, or None.
+
+_inf = portion.inf
+
+
+def CL(id, interval, existing, expect, time_unit="daily", region=None):
+    return Case(id, interval, expect, {"existing": existing, "time_unit": time_unit, "region": region})
+
+
+CLIPPED = [
+    CL("returns_none_for_empty_interval", portion.empty(), [D(2024, 6, 1)], None),
+    CL("returns_none_for_fully_bounded_interval", portion.closed(D(2024, 6, 1), D(2024, 6, 5)), [D(2024, 6, 1), D(2024, 6, 5)], None),
+    CL("returns_none_for_fully_unbounded_interval", portion.open(-_inf, _inf), [D(2024, 6, 1)], None),
+    CL("returns_none_for_empty_existing_partitions", portion.closedopen(D(2024, 6, 1), _inf), [], None),
+    CL("returns_none_for_missing_date_column", portion.closedopen(D(2024, 6, 1), _inf), None, None),
+    CL("returns_none_for_invalid_clipped_range", portion.closedopen(D(2024, 6, 10), _inf), [D(2024, 6, 1)], None),
+    CL("unbounded_above_clips_to_existing_max", portion.closedopen(D(2024, 6, 2), _inf), [D(2024, 6, 1), D(2024, 6, 5)], [2, 3, 4, 5]),
+    CL("unbounded_below_clips_to_existing_min", portion.openclosed(-_inf, D(2024, 6, 4)), [D(2024, 6, 2), D(2024, 6, 5)], [2, 3, 4]),
+    CL("with_extra_cols_cross_product", portion.closedopen(D(2024, 6, 1), _inf), [D(2024, 6, 1), D(2024, 6, 2)], [1, 2], region=["US", "EU"]),
+    CL("with_datetime_in_interval", portion.closedopen(DT(2024, 6, 2, 10, 30), _inf), [D(2024, 6, 1), D(2024, 6, 3)], [2, 3]),
+    CL("monthly_time_unit", portion.closedopen(D(2024, 2, 15), _inf), [D(2024, 1, 15), D(2024, 4, 10)], _months(2, 3, 4), "monthly"),
+    CL(
+        "yearly_time_unit",
+        portion.closedopen(D(2022, 6, 15), _inf),
+        [D(2021, 1, 1), D(2024, 3, 10)],
+        [D(y, 1, 1) for y in (2022, 2023, 2024)],
+        "yearly",
+    ),
+    CL("single_date_existing", portion.closedopen(D(2024, 6, 1), _inf), [D(2024, 6, 1)], [1]),
+]
+
+
+@pytest.mark.parametrize(
+    ("interval", "existing", "expect", "time_unit", "region"), params(CLIPPED, "pred", "existing", "expect", "time_unit", "region")
+)
+def test_compute_clipped_expected_partitions(interval, existing, expect, time_unit, region):
+    if existing is None:
+        existing_df = pl.DataFrame({"other_col": [1, 2, 3]})
     else:
-        res_collect, cache_collect = run(tmp_path / "scenario_with_collect", True)
-        res_no_collect, cache_no_collect = run(tmp_path / "scenario_no_collect", False)
-
-    assert_frame_equal(res_no_collect, res_collect, check_row_order=False)
-    assert set(cache_no_collect) == set(cache_collect)
-    for k in cache_no_collect:
-        assert_frame_equal(cache_no_collect[k], cache_collect[k], check_row_order=False)
-
-
-def test_missing_written_daily_with_extra_cols_gap2(tmp_path):
-    """
-    Test that we correctly write empty partitions for daily partitions when
-    extra partition columns are specified, and there is a gap.
-    """
-    df = pl.LazyFrame(
-        {
-            "date": [datetime.date(2024, 5, 10), datetime.date(2024, 5, 11)],
-            "region": ["NA", "EU"],
-            "value": [100, 200],
-        }
+        existing_df = pl.DataFrame({"date": existing}, schema={"date": pl.Date})
+        if region:
+            existing_df = existing_df.with_columns(region=pl.Series(region))
+    extra = ["region"] if region else []
+    schema = {"date": pl.Date, **({"region": pl.String} if region else {})}
+    result = _compute_clipped_expected_partitions(
+        predicate_interval=interval, existing_parts_df=existing_df, date_column="date", extra_cols=extra, time_unit=time_unit, schema=schema
     )
-    # We include "NA" in the is_in, but exclude it explicitly
-    pred = (pl.col.region.is_in(["EU", "NA"]) & pl.col.region.ne("NA")) & (pl.col.date.eq(datetime.date(2024, 5, 10)))
-    res = (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(pred)
-        .collect()
+    if expect is None:
+        assert result is None
+        return
+    dates = [D(2024, 6, d) if isinstance(d, int) else d for d in expect]
+    want = pl.DataFrame({"date": dates}, schema={"date": pl.Date})
+    if region:
+        want = want.join(pl.DataFrame({"region": region}), how="cross")
+    assert_frame_equal(result, want.select(result.columns), check_row_order=False)
+
+
+# Small helpers
+
+
+@pytest.mark.parametrize(
+    ("expected_days", "existing_days", "remaining_days"),
+    [([1, 2], [], [1, 2]), ([1, 2, 3], [1, 3], [2]), ([1, 2], [1, 2], [])],
+    ids=["empty_existing", "some_existing", "all_existing"],
+)
+def test_compute_partitions_to_write(expected_days, existing_days, remaining_days):
+    def days(ds):
+        return pl.DataFrame({"date": [D(2024, 1, d) for d in ds]}, schema={"date": pl.Date})
+
+    info = PartitionInfo(
+        enumerability=Enumerability.FINITE, expected_parts_df=days(expected_days), existing_parts_df=days(existing_days), join_cols=["date"]
     )
-    assert res.is_empty()
-    base = tmp_path / "daily"
-    f = base / "NA" / "2024-05-10.parquet"
-    if f.exists():
-        # Should not be empty, we have data for "NA" on "2024-05-10"
-        assert not pl.read_parquet(f).is_empty()
+    assert_frame_equal(_compute_partitions_to_write(info), days(remaining_days))
 
 
-def test_push_and_parse_exclusions_to_custom_io_source(tmp_path):
-    from polars.io.plugins import register_io_source
+def test_compute_partitions_to_write_no_join_cols():
+    expected = pl.DataFrame({"val": [1]})
+    info = PartitionInfo(enumerability=Enumerability.FINITE, expected_parts_df=expected, existing_parts_df=expected, join_cols=[])
+    assert_frame_equal(_compute_partitions_to_write(info), expected)
 
-    from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_range
-    from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
 
-    predicate_record = {}
+def test_write_empty_parquet_file(tmp_path):
+    from polars_io_tools.io_sources.lazy_cache_parquet import _write_empty_parquet_file
 
-    def my_io(self: pl.LazyFrame) -> pl.LazyFrame:
-        schema = self.collect_schema()
+    path = str(tmp_path / "nested" / "one.parquet")
+    schema = pl.Schema({"value": pl.Int64})
+    _write_empty_parquet_file(path, schema=schema, metadata={}, storage_options={}, credential_provider=None, write_kwargs={})
+    assert_frame_equal(pl.read_parquet(path), pl.DataFrame(schema=schema))
 
-        def source_generator(with_columns, predicate, n_rows, batch_size):
-            # print("Running my_io\n")
-            ldf = self.clone()
-            if predicate is not None:
-                print("PREDICATE IS NOT NONE\n")
-                predicate_record["predicate"] = predicate
-                ldf = ldf.filter(predicate)
-            else:
-                print("PREDICATE IS NONE\n")
-            if with_columns is not None:
-                ldf = ldf.select(with_columns)
-            if n_rows is not None:
-                ldf = ldf.head(n_rows)
-            print(ldf.explain())
-            yield ldf.collect()
 
-        return register_io_source(source_generator, schema=schema, validate_schema=True)
+def test_build_read_plan_falls_back_to_glob_for_many_paths():
+    from polars_io_tools.io_sources.lazy_cache_parquet import _MAX_ENUMERATED_SCAN_PATHS, _build_read_plan
 
-    df = pl.LazyFrame(
-        {
-            "date": [datetime.date(2024, 5, 10), datetime.date(2024, 5, 11)],
-            "region": ["NA", "EU"],
-            "value": [100, 200],
-        }
+    dates = [D(2024, 1, 1) + timedelta(days=i) for i in range(_MAX_ENUMERATED_SCAN_PATHS + 1)]
+    info = PartitionInfo(
+        enumerability=Enumerability.FINITE,
+        expected_parts_df=pl.DataFrame({"date": dates}),
+        existing_parts_df=pl.DataFrame({"date": dates, "file": [str(d) for d in dates]}),
+        join_cols=["date"],
     )
-    lf = df.clone()
-    pred = pl.col.region.eq("NA") & (pl.col.date.eq(datetime.date(2024, 5, 10)))
-    res = (
-        my_io(df)
-        .piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(pred)
-        .collect()
+    plan = _build_read_plan(
+        partition_info=info,
+        predicate=pl.col("date") >= dates[0],
+        time_unit_dir="file:///tmp/cache/daily",
+        has_cached_files=True,
+        file_key_column="file",
     )
-    assert_frame_equal(res, lf.filter(pred).collect())
-    base = tmp_path / "daily"
-    region, day, exp_df = ("NA", "2024-05-10", df.filter(pred).collect())
-    f = base / region / f"{day}.parquet"
-    assert f.is_file(), f"missing empty parquet for {region}/{day}"
-    assert_frame_equal(pl.read_parquet(f), exp_df)
-    # reset predicate holder
-    predicate_record = {}
-    # call again, wider predicate
-    pred2 = pl.col.region.is_in(["NA", "EU"]) & (pl.col.date.eq(datetime.date(2024, 5, 10)))
-    res = (
-        my_io(df)
-        .piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(pred2)
-        .collect()
-    )
-    assert_frame_equal(res, lf.filter(pred2).collect())
-    pred_recorded = predicate_record.get("predicate")
-    assert pred_recorded is not None, "predicate was not recorded"
-    pred_og_inputs = pred2.meta.pop()
-    new_pred_inputs = pred_recorded.meta.pop()
-    pred_seri = {e.meta.serialize(format="json") for e in pred_og_inputs}
-    pred_recorded_seri = {e.meta.serialize(format="json") for e in new_pred_inputs}
-    assert pred_seri != pred_recorded_seri, "recorded predicate matches original predicate; expected exclusion"
-    raw_date_info = convert_expr_to_datetime_range(pred_recorded, "date", get_enclosure=False)
-    valid_values = convert_expr_to_valid_values(pred_recorded, "region")
-
-    assert raw_date_info.lower == datetime.datetime(2024, 5, 10, 0, 0)
-    assert valid_values == {"EU"}, (
-        f"Received {valid_values = } expected just to have EU since we cached NA for 2024-05-10"
-    )  # we have data for "NA" cached, so shouldnt query
+    assert plan.use_paths is None
 
 
-def test_large_partition_query(tmp_path, monkeypatch):
-    """
-    Test that we correctly write empty partitions for daily partitions when
-    extra partition columns are specified, and there is a gap.
-    """
-    # More partitions than the default open-sink cap (128); raise it so the streaming
-    # sink can keep every partition open at once.
-    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "8192")
-    df = pl.LazyFrame(
-        {
-            "date": pl.date_range(datetime.date(2020, 1, 1), datetime.date(2026, 1, 1), eager=True),
-        }
-    )
-    df = df.with_columns(
-        region=pl.col.date.dt.day().replace_strict({1: "NA", 2: "EU", 3: "CA", 4: "NA", 6: "NA"}, default="US", return_dtype=pl.Utf8),
-        value=pl.lit(100),
-    )
-    small_pred = pl.col.region.eq("US") & pl.col.date.is_between(datetime.date(2020, 1, 1), datetime.date(2020, 6, 1))
-    _res = (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(small_pred)
-        .collect()
-    )
-    big_pred = pl.col.region.is_in(["US", "NA"]) & pl.col.date.is_between(datetime.date(2019, 12, 15), datetime.date(2020, 9, 14))
-    _res2 = (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(big_pred)
-        .collect()
-    )
-    expected = df.filter(big_pred).collect()
-    missing_expected = expected.join(
-        _res2,
-        on=["date", "region"],
-        how="anti",
-    )
-    assert missing_expected.is_empty(), "missing expected rows in the result"
+_SCAN = pl.DataFrame({"x": [1, 2, 3, 4, 5], "y": list("abcde")})
 
 
-def test_huge_partition_query(tmp_path, caplog, monkeypatch):
-    """
-    Test a large partition query that spans multiple years. We have partial data in the cache, and if we submitted each requested partition as a combination of OR's, we would end up with a very large query that could segfault.
-    """
-    # This query writes far more partitions than the default open-sink cap (128). Raise
-    # the cap so the streaming partitioned sink keeps every partition open at once; the
-    # cache adapter refuses to exceed whatever cap is in effect rather than silently
-    # dropping rows.
-    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "8192")
-    df = pl.LazyFrame(
-        {
-            "date": pl.date_range(datetime.date(2020, 1, 1), datetime.date(2026, 1, 1), eager=True),
-        }
-    )
-    df = df.with_columns(
-        region=pl.col.date.dt.day().replace_strict({1: "NA", 2: "EU", 3: "CA", 4: "NA", 6: "NA"}, default="US", return_dtype=pl.Utf8),
-        value=pl.lit(100),
-    )
-    small_pred = pl.col.region.eq("US") & pl.col.date.is_between(datetime.date(2020, 1, 1), datetime.date(2021, 2, 1))
-    res = (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(small_pred)
-        .collect()
-    )
-    expected = df.filter(small_pred).collect()
-    assert_frame_equal(res.sort("date", "region"), expected.sort("date", "region"))
-
-    big_pred = pl.col.region.is_in(["US", "NA"]) & pl.col.date.is_between(datetime.date(2020, 1, 1), datetime.date(2024, 2, 1))
-
-    import logging
-
-    caplog.set_level(logging.DEBUG, logger="polars_io_tools.io_sources.lazy_cache_parquet")
-    res2 = (
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        )
-        .filter(big_pred)
-        .collect()
-    )
-    expected = df.filter(big_pred).collect()
-    missing_expected = expected.join(
-        res2,
-        on=["date", "region"],
-        how="anti",
-    )
-    assert missing_expected.is_empty(), "missing expected rows in the result"
-    assert_frame_equal(res2.sort("date", "region"), expected.sort("date", "region"))
-    # Huge bounded queries avoid very large explicit path lists on Windows.
-    logs = caplog.text
-    assert "Cache scan uses glob" in logs
+@pytest.mark.parametrize(
+    ("pred", "cols", "n_rows", "expected"),
+    [
+        (None, None, None, _SCAN),
+        (pl.col("x") > 1, None, None, _SCAN.filter(pl.col("x") > 1)),
+        (None, ["y"], None, _SCAN.select("y")),
+        (None, None, 2, _SCAN.head(2)),
+    ],
+    ids=["cache_only", "with_predicate", "with_columns", "with_limit"],
+)
+def test_build_final_scan(pred, cols, n_rows, expected):
+    assert_frame_equal(_build_final_scan(_SCAN.lazy(), pred, cols, n_rows).collect(), expected)
 
 
-def test_partition_count_exceeds_open_sinks_raises(tmp_path, monkeypatch):
-    """Writing more partitions than the open-sink cap fails loud instead of dropping rows."""
-    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "4")
-    df = pl.LazyFrame(
-        {
-            "date": pl.date_range(datetime.date(2020, 1, 1), datetime.date(2020, 1, 10), eager=True),
-            "value": range(10),
-        }
-    )
-    pred = pl.col.date.is_between(datetime.date(2020, 1, 1), datetime.date(2020, 1, 10))
-    with pytest.raises(Exception, match="open-sink cap"):
-        df.piot.cache_parquet(cache_path=tmp_path, date_column="date", time_unit="daily").filter(pred).collect()
+@pytest.mark.parametrize(
+    ("root", "time_unit", "prefix", "time_dir"),
+    [
+        ("s3://mybucket/my/prefix/", "daily", "mybucket/my/prefix/daily", "s3://mybucket/my/prefix/daily"),
+        ("s3://mybucket//double/leading/", "monthly", "mybucket//double/leading/monthly", "s3://mybucket//double/leading/monthly"),
+        ("{tmp}", "daily", "{tmp}/daily", "{uri}/daily"),
+        ("{uri}", "daily", "{tmp}/daily", "{uri}/daily"),
+        ("{uri}", "monthly", "{tmp}/monthly", "{uri}/monthly"),
+    ],
+    ids=[
+        "strips_trailing_slash_s3",
+        "preserves_double_leading_slash_s3",
+        "local_path_gets_file_prefix",
+        "file_uri_not_double_prefixed",
+        "local_and_file_uri_equivalent",
+    ],
+)
+def test_get_fs_path_directory_info(tmp_path, root, time_unit, prefix, time_dir):
+    def fill(s):
+        return s.format(tmp=str(tmp_path), uri=tmp_path.as_uri())
 
-
-def test_get_fs_path_directory_info_strips_trailing_slash_s3():
-    from polars_io_tools.io_sources.lazy_cache_parquet import _get_fs_path_directory_info
-
-    fs_prefix, time_dir = _get_fs_path_directory_info("s3://mybucket/my/prefix/", "daily")
-    assert fs_prefix == "mybucket/my/prefix/daily"
-    assert time_dir.startswith("s3://mybucket/my/prefix/daily")
-
-
-def test_get_fs_path_directory_info_preserves_double_leading_slash_s3():
-    from polars_io_tools.io_sources.lazy_cache_parquet import _get_fs_path_directory_info
-
-    fs_prefix, time_dir = _get_fs_path_directory_info("s3://mybucket//double/leading/", "monthly")
-    assert fs_prefix == "mybucket//double/leading/monthly"
-    assert time_dir.startswith("s3://mybucket//double/leading/monthly")
-
-
-def test_get_fs_path_directory_info_local_path_gets_file_prefix(tmp_path):
-    """Test that plain local paths get file:// prefix for atomic writes via object-store."""
-    from polars_io_tools.io_sources.lazy_cache_parquet import _get_fs_path_directory_info
-
-    fs_prefix, time_dir = _get_fs_path_directory_info(str(tmp_path), "daily")
-    assert fs_prefix == str(tmp_path / "daily")
-    assert time_dir == (tmp_path / "daily").as_uri()
-
-
-def test_get_fs_path_directory_info_file_uri_not_double_prefixed(tmp_path):
-    """Test that file:// URIs don't get double-prefixed."""
-    from polars_io_tools.io_sources.lazy_cache_parquet import _get_fs_path_directory_info
-
-    file_uri = tmp_path.as_uri()
-    fs_prefix, time_dir = _get_fs_path_directory_info(file_uri, "daily")
-    assert fs_prefix == str(tmp_path / "daily")
-    assert time_dir == (tmp_path / "daily").as_uri()
-    # Ensure no double file:// prefix
-    assert not time_dir.startswith("file://file://")
-
-
-def test_get_fs_path_directory_info_local_and_file_uri_equivalent(tmp_path):
-    """Test that plain path and file:// URI produce identical results."""
-    from polars_io_tools.io_sources.lazy_cache_parquet import _get_fs_path_directory_info
-
-    plain_prefix, plain_dir = _get_fs_path_directory_info(str(tmp_path), "monthly")
-    file_prefix, file_dir = _get_fs_path_directory_info(tmp_path.as_uri(), "monthly")
-
-    assert plain_prefix == file_prefix
-    assert plain_dir == file_dir
+    assert _get_fs_path_directory_info(fill(root), time_unit) == (str(Path(fill(prefix))) if "{tmp}" in prefix else prefix, fill(time_dir))
 
 
 def test_path_as_file_uri_formats_windows_drive_path():
@@ -1367,1921 +315,902 @@ def test_path_as_file_uri_formats_windows_drive_path():
     assert uri == "file:///C:/Users/runneradmin/AppData/Local/Temp/cache/daily"
 
 
-class TestOptionalDateColumn:
-    """Test suite for optional date column functionality."""
-
-    def test_cache_parquet_no_date_single_extra_col(self, tmp_path):
-        """Test cache_parquet with no date column and single extra partition column."""
-        df = pl.DataFrame(
-            {"region": ["US", "US", "EU", "EU", "APAC"], "value": [100, 200, 150, 250, 180], "category": ["A", "B", "A", "B", "A"]}
-        ).lazy()
-
-        # Cache with region partitioning only
-        cached_df = df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column=None,
-            extra_partition_cols="region",  # Test string input
-        )
-
-        result = cached_df.collect()
-        assert result.shape == (5, 3)
-        assert set(result.columns) == {"region", "value", "category"}
-
-        # Verify cache structure - should create null/US.parquet, null/EU.parquet, null/APAC.parquet
-        cache_files = list(tmp_path.rglob("*.parquet"))
-        assert len(cache_files) == 3  # One for each region
-
-        # Verify all files are in null directory
-        for f in cache_files:
-            assert "null" in str(f)
-
-        # Test reading from cache again
-        cached_df2 = df.piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols="region")
-        result2 = cached_df2.collect()
-        assert result.shape == result2.shape
-        assert result.equals(result2)
-
-    def test_cache_parquet_no_date_multiple_extra_cols(self, tmp_path):
-        """Test cache_parquet with no date column and multiple extra partition columns."""
-        df = pl.DataFrame(
-            {
-                "region": ["US", "US", "EU", "EU", "APAC", "APAC"],
-                "product": ["A", "B", "A", "B", "A", "B"],
-                "value": [100, 200, 150, 250, 180, 220],
-                "score": [1.1, 2.2, 1.5, 2.5, 1.8, 2.8],
-            }
-        ).lazy()
-
-        # Cache with both region and product partitioning
-        cached_df = df.piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols=["region", "product"])
-
-        result = cached_df.collect()
-        assert result.shape == (6, 4)
-
-        # Verify all combinations are cached - should be 3 regions × 2 products = 6 files
-        cache_files = list(tmp_path.rglob("*.parquet"))
-        assert len(cache_files) == 6
-
-        # Verify directory structure: null/region/product.parquet
-        file_paths = [f.relative_to(tmp_path).as_posix() for f in cache_files]
-        expected_patterns = [
-            "null/US/A.parquet",
-            "null/US/B.parquet",
-            "null/EU/A.parquet",
-            "null/EU/B.parquet",
-            "null/APAC/A.parquet",
-            "null/APAC/B.parquet",
-        ]
-        for pattern in expected_patterns:
-            assert any(pattern in path for path in file_paths), f"Missing pattern: {pattern}"
-
-    def test_cache_parquet_no_date_no_extra_cols(self, tmp_path):
-        """Test cache_parquet with no date column and no extra partition columns (single table)."""
-        df = pl.DataFrame({"value": [100, 200, 150], "name": ["Alice", "Bob", "Charlie"], "active": [True, False, True]}).lazy()
-
-        # Cache with no partitioning - should create single file
-        cached_df = df.piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols=None)
-
-        result = cached_df.collect()
-        assert result.shape == (3, 3)
-        assert set(result.columns) == {"value", "name", "active"}
-
-        # Verify single cache file
-        cache_files = list(tmp_path.rglob("*.parquet"))
-        assert len(cache_files) == 1
-
-        # Should be in null/data.parquet
-        cache_file = cache_files[0]
-        assert "null" in str(cache_file)
-        assert "data.parquet" in str(cache_file)
-
-        # Test reading from cache again
-        cached_df2 = df.piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols=None)
-        result2 = cached_df2.collect()
-        assert result.equals(result2)
-
-    def test_cache_parquet_no_date_with_predicate(self, tmp_path):
-        """Test that predicates work with no date column."""
-        df = pl.DataFrame(
-            {"region": ["US", "US", "EU", "EU", "APAC"], "category": ["X", "Y", "X", "Y", "X"], "value": [100, 200, 150, 250, 180]}
-        ).lazy()
-
-        # Cache all data first
-        df.piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols=["region", "category"]).collect()
-
-        # Now read with a predicate
-        filtered_result = (
-            df.filter(pl.col("region") == "US")
-            .piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols=["region", "category"])
-            .collect()
-        )
-
-        # Should return all data (cache scans all files), but we can verify the original filter works
-        original_filtered = df.filter(pl.col("region") == "US").collect()
-        assert filtered_result.shape == (5, 3)  # Cache returns all data
-        assert original_filtered.shape == (2, 3)  # Original filter works
-
-    def test_cache_parquet_no_date_different_cache_modes(self, tmp_path):
-        """Test different cache modes work with no date column."""
-        df = pl.DataFrame({"category": ["A", "B", "A", "B"], "value": [100, 200, 150, 250]}).lazy()
-
-        # Test IGNORE mode
-        result_ignore = df.piot.cache_parquet(
-            cache_path=tmp_path / "ignore", date_column=None, extra_partition_cols=["category"], cache_mode=CacheMode.IGNORE
-        ).collect()
-
-        # Should return original data without caching
-        assert result_ignore.shape == (4, 2)
-        cache_files = list((tmp_path / "ignore").rglob("*.parquet"))
-        assert len(cache_files) == 0
-
-        # Test CACHE mode (normal)
-        result_cache = df.piot.cache_parquet(
-            cache_path=tmp_path / "cache", date_column=None, extra_partition_cols=["category"], cache_mode=CacheMode.CACHE
-        ).collect()
-
-        assert result_cache.shape == (4, 2)
-        cache_files = list((tmp_path / "cache").rglob("*.parquet"))
-        assert len(cache_files) == 2  # A and B partitions
-
-        # Test REBUILD mode
-        result_rebuild = df.piot.cache_parquet(
-            cache_path=tmp_path / "cache",  # Same path
-            date_column=None,
-            extra_partition_cols=["category"],
-            cache_mode=CacheMode.REBUILD,
-        ).collect()
-
-        assert result_rebuild.shape == (4, 2)
-        assert result_cache.equals(result_rebuild)
-
-    def test_cache_parquet_no_date_metadata(self, tmp_path):
-        """Test that metadata is correctly set for no date column cases."""
-        df = pl.DataFrame({"region": ["US", "EU"], "value": [100, 200]}).lazy()
-
-        # Cache with extra columns
-        df.piot.cache_parquet(cache_path=tmp_path / "with_extra", date_column=None, extra_partition_cols=["region"]).collect()
-
-        # Check metadata in the parquet files
-        cache_files = list((tmp_path / "with_extra").rglob("*.parquet"))
-        assert len(cache_files) == 2
-
-        # Read metadata from one file
-        import pyarrow.parquet as pq
-
-        parquet_file = pq.ParquetFile(cache_files[0])
-        metadata = parquet_file.metadata.metadata
-
-        # Should have null time_unit and partitioned_by info
-        assert metadata[b"__piot__time_unit"] == b"null"
-        assert metadata[b"__piot__partitioned_by"] == b"region"
-
-        # Test single partition case
-        df_single = pl.DataFrame({"value": [1, 2, 3]}).lazy()
-        df_single.piot.cache_parquet(cache_path=tmp_path / "single", date_column=None, extra_partition_cols=None).collect()
-
-        cache_files_single = list((tmp_path / "single").rglob("*.parquet"))
-        assert len(cache_files_single) == 1
-
-        parquet_file_single = pq.ParquetFile(cache_files_single[0])
-        metadata_single = parquet_file_single.metadata.metadata
-
-        assert metadata_single[b"__piot__time_unit"] == b"null"
-        assert metadata_single[b"__piot__partitioned_by"] == b""
-
-    def test_cache_parquet_no_date_backward_compatibility(self, tmp_path):
-        """Test that existing functionality still works alongside new features."""
-        import datetime
-
-        # Test with date column (existing functionality)
-        df_with_date = pl.DataFrame(
-            {"date": [datetime.date(2024, 1, 1), datetime.date(2024, 2, 1)], "region": ["US", "EU"], "value": [100, 200]}
-        ).lazy()
-
-        result_with_date = df_with_date.piot.cache_parquet(
-            cache_path=tmp_path / "with_date", date_column="date", time_unit="monthly", extra_partition_cols=["region"]
-        ).collect()
-
-        assert result_with_date.shape == (2, 3)
-        cache_files_date = list((tmp_path / "with_date").rglob("*.parquet"))
-        assert len(cache_files_date) == 2  # One per month-region combination
-
-        # Verify these are in monthly directory, not null
-        for f in cache_files_date:
-            assert "monthly" in str(f)
-            assert "null" not in str(f)
-
-        # Test without date column (new functionality)
-        df_no_date = pl.DataFrame({"region": ["US", "EU", "APAC"], "value": [100, 200, 300]}).lazy()
-
-        result_no_date = df_no_date.piot.cache_parquet(cache_path=tmp_path / "no_date", date_column=None, extra_partition_cols=["region"]).collect()
-
-        assert result_no_date.shape == (3, 2)
-        cache_files_no_date = list((tmp_path / "no_date").rglob("*.parquet"))
-        assert len(cache_files_no_date) == 3
-
-        # Verify these are in null directory
-        for f in cache_files_no_date:
-            assert "null" in str(f)
-            assert "monthly" not in str(f)
-
-
-@pytest.mark.parametrize(
-    "partition_format",
-    [
-        None,  # use default for daily
-        "theYear=$year/theMonth=$month/theDay=$day",  # custom format
-    ],
-)
-def test_open_ended_filters_query_expected_partitions(tmp_path, partition_format):
-    import datetime
-
-    import polars as pl
-
-    from polars_io_tools.io_sources.util import _storage_options_for
-
-    aws_profile = None
-
-    # Local filesystem path (unit test, no S3 dependencies)
-    cache_root = str(tmp_path / "open_ended_cache")
-
-    # Build a small LazyFrame with a date column
-    lf = pl.DataFrame(
-        {
-            "date": pl.date_range(datetime.datetime(2024, 6, 1), datetime.datetime(2024, 6, 3), interval="1d", eager=True),
-            "value": [11, 22, 33],
-        }
-    ).lazy()
-
-    # First write with custom partition template; returned df should match input slice
-    collected = lf.piot.cache_parquet(
-        cache_path=cache_root,
-        date_column="date",
-        time_unit="daily",
-        # partition_format="theYear=$year/theMonth=$month/theDay=$day",
-        aws_profile=aws_profile,
-        cache_mode=cpl.CacheMode.REBUILD,
-    ).collect()
-    assert collected.shape == (3, 2)
-    assert collected["date"].to_list() == [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2), datetime.date(2024, 6, 3)]
-    assert collected["value"].to_list() == [11, 22, 33]
-
-    # Append a row
-    appended = (
-        pl.DataFrame({"date": [datetime.datetime(2024, 6, 5)], "value": [44]})
-        .with_columns(pl.col("date").cast(pl.Date))
-        .lazy()
-        .piot.cache_parquet(
-            cache_path=cache_root,
-            date_column="date",
-            time_unit="daily",
-            # partition_format="theYear=$year/theMonth=$month/theDay=$day",
-            aws_profile=aws_profile,
-        )
-        .filter(pl.col("date") >= datetime.date(2024, 6, 4))
-        .collect()
-    )
-    assert appended.shape == (1, 2)
-    assert appended["date"].to_list() == [datetime.date(2024, 6, 5)]
-    assert appended["value"].to_list() == [44]
-
-    # Verify via scan_parquet
-    polars_opts = _storage_options_for(cache_root, aws_profile=aws_profile).polars
-    pl_cache_root = cache_root + "/**/*.parquet"
-    out = pl.scan_parquet(pl_cache_root, storage_options=polars_opts).sort("date").collect()
-
-    assert out.shape[0] == 4
-    assert out["date"].min() == datetime.date(2024, 6, 1)
-    assert out["date"].max() == datetime.date(2024, 6, 5)
-
-    # Verify filters are handled properly (predicate applied to cached data)
-    filtered = (
-        lf.piot.cache_parquet(
-            cache_path=cache_root,
-            date_column="date",
-            time_unit="daily",
-            # partition_format="theYear=$year/theMonth=$month/theDay=$day",
-            aws_profile=aws_profile,
-        )
-        .filter(pl.col("date") >= datetime.date(2024, 6, 2))
-        .sort("date")
-        .collect()
-    )
-    # One-sided lower bound should read cached partitions and include appended row
-    assert filtered["date"].to_list() == [datetime.date(2024, 6, 2), datetime.date(2024, 6, 3), datetime.date(2024, 6, 5)]
-    assert filtered["value"].to_list() == [22, 33, 44]
-
-
-def test_one_sided_with_extra_cols_no_empty_writes(tmp_path):
-    """
-    One-sided lower bound on date with extra partition filters should:
-    - Read upstream for matching data
-    - Write only the actual partitions with rows
-    - NOT create empty parquet files for partitions with no rows
-    """
-    df = pl.LazyFrame(
-        {
-            "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2), datetime.date(2024, 6, 5)],
-            "region": ["US", "US", "EU"],
-            "value": [10, 20, 50],
-        }
-    )
-
-    # Seed cache
-    base = tmp_path / "one_sided_extra"
-    df.piot.cache_parquet(cache_path=base, date_column="date", time_unit="daily", extra_partition_cols="region").collect()
-
-    # One-sided lower bound with extra column filter
-    lf = df.piot.cache_parquet(cache_path=base, date_column="date", time_unit="daily", extra_partition_cols="region").filter(
-        (pl.col("date") >= datetime.date(2024, 6, 2)) & (pl.col("region").is_in(["US", "EU", "APAC"]))
-    )
-    out = lf.sort(["date", "region"]).collect()
-
-    # Verify only matching rows returned
-    assert out.shape == (2, 3)
-    assert out["date"].to_list() == [datetime.date(2024, 6, 2), datetime.date(2024, 6, 5)]
-    assert out["region"].to_list() == ["US", "EU"]
-
-    # Verify cache contents: only files with rows are present; no empty APAC files
-    base_daily = base / "daily"
-    assert (base_daily / "US" / "2024-06-02.parquet").exists()
-    assert (base_daily / "EU" / "2024-06-05.parquet").exists()
-    assert not (base_daily / "APAC" / "2024-06-02.parquet").exists()
-    assert not (base_daily / "APAC" / "2024-06-05.parquet").exists()
-
-
-def test_one_sided_upper_bound_with_extra_cols(tmp_path):
-    """
-    Upper-bound-only on date with extra partition filters should:
-    - Read upstream for matching data
-    - Write only the actual partitions with rows
-    - NOT create empty parquet files for partitions with no rows
-    """
-    df = pl.LazyFrame(
-        {
-            "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2), datetime.date(2024, 6, 5)],
-            "region": ["US", "US", "EU"],
-            "value": [10, 20, 50],
-        }
-    )
-
-    # Seed cache
-    base = tmp_path / "one_sided_extra_upper"
-    df.piot.cache_parquet(cache_path=base, date_column="date", time_unit="daily", extra_partition_cols="region").collect()
-
-    # One-sided upper bound with extra column filter
-    lf = df.piot.cache_parquet(cache_path=base, date_column="date", time_unit="daily", extra_partition_cols="region").filter(
-        (pl.col("date") <= datetime.date(2024, 6, 2)) & (pl.col("region").is_in(["US", "EU", "APAC"]))
-    )
-    out = lf.sort(["date", "region"]).collect()
-
-    # Verify only matching rows returned
-    assert out.shape == (2, 3)
-    assert out["date"].to_list() == [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2)]
-    assert out["region"].to_list() == ["US", "US"]
-
-    # Verify cache contents: only files with rows are present; no empty APAC files
-    base_daily = base / "daily"
-    assert (base_daily / "US" / "2024-06-01.parquet").exists()
-    assert (base_daily / "US" / "2024-06-02.parquet").exists()
-    assert not (base_daily / "APAC" / "2024-06-01.parquet").exists()
-    assert not (base_daily / "APAC" / "2024-06-02.parquet").exists()
-
-
-def test_one_sided_lower_bound_reads_cache_and_upstream(tmp_path):
-    """
-    For one-sided lower bound queries, ensure we read cached partitions and only
-    fetch upstream for partitions not already in cache.
-    """
-    # Seed cache with early dates
-    df = pl.LazyFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2)], "val": [1, 2]})
-    base = tmp_path / "one_sided_lower"
-    df.piot.cache_parquet(base, "date", time_unit="daily").collect()
-
-    # Upstream has a later date
-    df2 = pl.LazyFrame({"date": [datetime.date(2024, 6, 5)], "val": [5]})
-
-    # Query lower bound >= 2024-06-2 against combined source
-    # Build combined source by concatenation
-    out = (
-        pl.concat([df2, df])
-        .piot.cache_parquet(base, "date", time_unit="daily")
-        .filter(pl.col("date") >= datetime.date(2024, 6, 2))
-        .sort("date")
-        .collect()
-    )
-
-    assert out["date"].to_list() == [datetime.date(2024, 6, 2), datetime.date(2024, 6, 5)]
-    assert out["val"].to_list() == [2, 5]
-
-
-def test_no_date_with_extra_cols_unconstrained_queries_upstream(tmp_path, capsys):
-    """
-    When no date_column but extra_partition_cols are provided, UNCONSTRAINED queries
-    should always query upstream (new partition values might exist), filtering out
-    already-cached partitions. Data is still correctly returned from cache.
-    """
-    df = pl.DataFrame({"region": ["US", "EU", "US"], "value": [1, 2, 3]}).lazy().piot.debug()
-
-    # Cache without a date column but with extra partition cols
-    cached = df.piot.cache_parquet(cache_path=tmp_path, date_column=None, extra_partition_cols="region")
-    # First collect with a lower-bound-like filter on value
-    out1 = cached.filter(pl.col("value") >= 2).sort(["region", "value"]).collect()
-    assert out1.to_dict(as_series=False) == {"region": ["EU", "US"], "value": [2, 3]}
-
-    # Capture debug output to ensure upstream was called
-    first = capsys.readouterr().out
-    assert "predicate=" in first, "expected upstream debug output on first run"
-
-    # Second run: with partition columns, UNCONSTRAINED always queries upstream
-    # (but filters out existing partitions, so no new data is written)
-    out2 = cached.filter(pl.col("value") >= 2).sort(["region", "value"]).collect()
-    assert_frame_equal(out2, out1)
-
-    second = capsys.readouterr().out
-    # With partition columns, upstream IS queried (with not_existing filter)
-    assert "predicate=" in second, "UNCONSTRAINED with partition cols should query upstream"
-
-
 def test_strftime_from_template():
     from polars_io_tools.io_sources.lazy_cache_parquet import _strftime_from_template
 
     assert _strftime_from_template("theYear=$year/theMonth=$month/theDay=$day") == "theYear=%Y/theMonth=%m/theDay=%d"
 
 
-def test_no_date_no_extra_first_writes_second_reads_cache(tmp_path, capsys):
-    """No date, no extra partition columns: first run writes; second run reads cache only."""
-    df = pl.DataFrame({"val": [1, 2, 3]}).lazy().piot.debug()
-
-    cached = df.piot.cache_parquet(cache_path=tmp_path, date_column=None)
-
-    out1 = cached.collect()
-    assert out1.shape == (3, 1)
-
-    first = capsys.readouterr().out
-    assert "debug called" in first, "expected upstream debug on first run"
-
-    out2 = cached.collect()
-    assert_frame_equal(out2, out1)
-
-    second = capsys.readouterr().out
-    assert second.count("debug called") == 0, "second run should read from cache only"
-
-    # Verify cache structure - should create a single file under null
-    cache_files = list(tmp_path.rglob("*.parquet"))
-    assert len(cache_files) == 1
-    for f in cache_files:
-        assert "null" in str(f)
+def test_polars_private_api_still_exists():
+    """The Polars credential provider still has the private method the cache uses."""
+    cred = pl.CredentialProviderAWS(profile_name=None, **({} if POLARS_GE_2 else {"_storage_options_has_endpoint_url": False}))
+    assert isinstance(cred._storage_update_options(), dict)
 
 
-def test_one_sided_lower_bound_upstream_predicate_shape(tmp_path, capsys):
-    from datetime import date
-
-    # Seed cache with early dates
-    base_src = pl.DataFrame({"date": [date(2024, 6, 1), date(2024, 6, 2), date(2024, 6, 3)], "val": [1, 2, 3]}).lazy()
-    cache_root = tmp_path / "one_sided_shape"
-    base_src.piot.cache_parquet(cache_root, "date", time_unit="daily").collect()
-
-    # Upstream with a later date; add debug to inspect upstream predicate
-    upstream = pl.DataFrame({"date": [date(2024, 6, 5)], "val": [5]}).lazy().piot.debug()
-
-    (upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") >= date(2024, 6, 2)).collect())
-
-    out = capsys.readouterr().out
-    # One-sided writes restrict upstream to whole partitions from the bound
-    assert ">= (2024-06-02)" in out or ">= 2024-06-02" in out
-    # And not a bounded is_between for the upstream path
-    assert "is_between" not in out
+# CacheMode as a pydantic field
 
 
-def test_one_sided_upper_bound_upstream_predicate_shape(tmp_path, capsys):
-    from datetime import date
-
-    # Seed cache with later dates
-    base_src = pl.DataFrame({"date": [date(2024, 6, 3), date(2024, 6, 4), date(2024, 6, 5)], "val": [3, 4, 5]}).lazy()
-    cache_root = tmp_path / "one_sided_upper_shape"
-    base_src.piot.cache_parquet(cache_root, "date", time_unit="daily").collect()
-
-    # Upstream with an earlier date; add debug to inspect upstream predicate
-    upstream = pl.DataFrame({"date": [date(2024, 6, 2)], "val": [2]}).lazy().piot.debug()
-
-    (upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") <= date(2024, 6, 4)).collect())
-
-    out = capsys.readouterr().out
-    # One-sided writes restrict upstream to whole partitions up to the bound (exclusive start of the next day)
-    assert "< (2024-06-05)" in out or "< 2024-06-05" in out
-    assert "is_between" not in out
+class _Model(BaseModel):
+    cache_mode: CacheMode = CacheMode.CACHE
 
 
-def test_one_sided_lower_bound_upstream_contains_not_existing_predicate(tmp_path):
-    from datetime import date
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("CACHE", CacheMode.CACHE),
+        ("IGNORE", CacheMode.IGNORE),
+        ("REBUILD", CacheMode.REBUILD),
+        (1, CacheMode.CACHE),
+        (2, CacheMode.IGNORE),
+        (3, CacheMode.REBUILD),
+        (CacheMode.CACHE, CacheMode.CACHE),
+        (CacheMode.REBUILD, CacheMode.REBUILD),
+        ("INVALID", KeyError),
+        (999, ValueError),
+        (3.14, ValueError),
+    ],
+    ids=[
+        "validate_from_string-CACHE",
+        "validate_from_string-IGNORE",
+        "validate_from_string-REBUILD",
+        "validate_from_int-1",
+        "validate_from_int-2",
+        "validate_from_int-3",
+        "validate_from_enum-CACHE",
+        "validate_from_enum-REBUILD",
+        "validate_invalid_string",
+        "validate_invalid_int",
+        "validate_invalid_type",
+    ],
+)
+def test_cachemode_validate(value, expected):
+    if isinstance(expected, type):
+        with pytest.raises(expected, match="Cannot convert value to CacheMode" if isinstance(value, float) else None):
+            CacheMode.validate(value)
+    else:
+        assert CacheMode.validate(value) == expected
 
-    from polars_io_tools.io_sources.util import register_io_source_with_is_pure
 
-    # Seed cache with early dates
-    cache_root = tmp_path / "one_sided_not_pred"
-    base_src = pl.DataFrame({"date": [date(2024, 6, 1), date(2024, 6, 2)], "val": [1, 2]}).lazy()
-    base_src.piot.cache_parquet(cache_root, "date", time_unit="daily").collect()
-
-    # Upstream has a later date; record the predicate pushed down to it
-    upstream_df = pl.DataFrame({"date": [date(2024, 6, 5)], "val": [5]})
-    pushed: list[pl.Expr | None] = []
-
-    def spy(with_columns, predicate, n_rows, batch_size):
-        pushed.append(predicate)
-        yield upstream_df.filter(predicate) if predicate is not None else upstream_df
-
-    upstream = register_io_source_with_is_pure(spy, schema=upstream_df.schema, is_pure=False)
-    upstream.piot.cache_parquet(cache_root, "date", time_unit="daily").filter(pl.col("date") >= date(2024, 6, 2)).collect()
-
-    # The upstream predicate keeps only uncached days at or after the lower bound
-    assert len(pushed) == 1 and pushed[0] is not None
-    probe = pl.DataFrame({"date": pl.date_range(date(2024, 5, 31), date(2024, 6, 4), eager=True)})
-    kept = probe.filter(pushed[0])["date"].to_list()
-    assert kept == [date(2024, 6, 3), date(2024, 6, 4)]
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("REBUILD", CacheMode.REBUILD), ("CACHE", CacheMode.CACHE), (1, CacheMode.CACHE), (3, CacheMode.REBUILD), (CacheMode.IGNORE, CacheMode.IGNORE)],
+    ids=["from_string-REBUILD", "from_string-CACHE", "from_int-1", "from_int-3", "from_enum"],
+)
+def test_cachemode_in_pydantic_model(value, expected):
+    model = _Model(cache_mode=value)
+    assert model.cache_mode == expected
+    assert model.model_dump(mode="python") == {"cache_mode": expected}
+    assert model.model_dump(mode="json") == {"cache_mode": expected.name}
+    assert model.model_dump_json() == f'{{"cache_mode":"{expected.name}"}}'
 
 
-def test_no_date_with_extra_unconstrained_queries_upstream_for_new_partitions(tmp_path):
-    """No date, extra partition columns, unconstrained: queries upstream for new partitions.
+def test_cachemode_pydantic_json_schema_and_default():
+    props = _Model.model_json_schema()["properties"]["cache_mode"]
+    assert "enum" in props or "$ref" in props
+    assert _Model().cache_mode == CacheMode.CACHE
 
-    With partition columns, UNCONSTRAINED always queries upstream (new partition values
-    might exist), filtering out already-cached partitions.
+
+# Layout: the files a write leaves and the metadata in them.
+
+
+def LAY(id, time_unit, fmt, dates, files):
+    return Case(id, None, files, {"time_unit": time_unit, "fmt": fmt, "dates": dates})
+
+
+_JFM = [D(2023, 1, 15), D(2023, 2, 20), D(2023, 3, 25)]
+LAYOUTS = [
+    LAY("simple", "monthly", None, [D(2023, 1, 15)], ["monthly/2023-01.parquet"]),
+    LAY("custom_partition_format-daily", "daily", "y=$year/m=$month/d=$day", [D(2023, 1, 15)], ["daily/y=2023/m=01/d=15.parquet"]),
+    LAY("custom_partition_format-monthly", "monthly", "year=$year/month=$month", [D(2023, 2, 15)], ["monthly/year=2023/month=02.parquet"]),
+    LAY("custom_partition_format-yearly", "yearly", "year=$year", [D(2023, 3, 15)], ["yearly/year=2023.parquet"]),
+    LAY("multiple_partitions-monthly", "monthly", None, _JFM, ["monthly/2023-01.parquet", "monthly/2023-02.parquet", "monthly/2023-03.parquet"]),
+    LAY("multiple_partitions-daily", "daily", None, _JFM, ["daily/2023-01-15.parquet", "daily/2023-02-20.parquet", "daily/2023-03-25.parquet"]),
+    LAY("multiple_partitions-yearly", "yearly", None, _JFM, ["yearly/2023.parquet"]),
+]
+_DEFAULT_FORMAT = {"daily": "$year-$month-$day", "monthly": "$year-$month", "yearly": "$year"}
+
+
+@pytest.mark.parametrize(("time_unit", "fmt", "dates", "files"), params(LAYOUTS, "time_unit", "fmt", "dates", "expect"))
+def test_layout(tmp_path, time_unit, fmt, dates, files):
+    source = _frame(date=dates, value=list(range(1, len(dates) + 1)))
+    result = cache_parquet(source, tmp_path, "date", time_unit=time_unit, partition_format=fmt)
+    assert isinstance(result, pl.LazyFrame)
+    assert_frame_equal(result.collect(), source.collect(), check_row_order=False)
+    written = cache_files(tmp_path)
+    assert sorted(written) == files
+    assert_frame_equal(pl.concat(written.values()), source.collect(), check_row_order=False)
+    for path in files:
+        meta = {k.decode(): v.decode() for k, v in pq.read_metadata(tmp_path / path).metadata.items()}
+        assert meta["__piot__time_unit"] == time_unit
+        assert meta["__piot__partition_format"] == (fmt or _DEFAULT_FORMAT[time_unit])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"partition_format": "$year"}, "missing"),
+        ({"partition_format": "$year-$month-$day"}, "unexpected"),
+        ({"partition_format": "$year-${month"}, None),
+        ({"time_unit": "occasionally"}, "Invalid time unit"),
+    ],
+    ids=["missing", "unexpected", "malformed", "time_unit"],
+)
+def test_bad_partition_format(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _frame(date=[D(2023, 1, 15)], value=[42]).piot.cache_parquet(cache_path=tmp_path, date_column="date", **({"time_unit": "monthly"} | kwargs))
+
+
+def test_complex(tmp_path):
+    x = pl.datetime_range(DT(2023, 1, 1), DT(2024, 12, 31), interval="1d", eager=True)
+    lf = pl.LazyFrame({"date": x, "feature": np.random.rand(x.shape[0]), "quantity": range(len(x)), "price": 100 + np.arange(x.shape[0])})
+    pred = (pl.col("date") < DT(2024, 12, 15)) & (pl.col("date") > DT(2024, 10, 15))
+    query = lf.piot.cache_parquet(cache_path=str(tmp_path), date_column="date").filter(pred).filter(pl.col("quantity") % 2 != 0)
+    assert query.select(["date", "feature", "price"]).collect(engine="streaming").shape == (30, 3)
+    assert {p: f.shape for p, f in cache_files(tmp_path).items()} == {
+        f"monthly/2024-{m}.parquet": (n, 4) for m, n in [("10", 31), ("11", 30), ("12", 31)]
+    }
+
+
+# Steps: a cache is driven by a sequence of reads; then the files it holds are checked.
+
+
+@dataclass(frozen=True)
+class Step:
+    """One read: ``source`` through the cache in ``mode``, filtered by ``pred``.
+
+    ``expect`` is the ``value`` column of the result in any order; ``None`` means what native Polars returns for the
+    same source and predicate.
     """
-    df_cache = pl.DataFrame({"region": ["US"], "val": [1]}).lazy()
-    root = tmp_path / "no_date_extra_unconstrained"
-    df_cache.piot.cache_parquet(root, date_column=None, extra_partition_cols="region").collect()
 
-    # Query with a different upstream - since we have partition cols, it queries upstream
-    # filtering out existing partitions (US). EU is new, so it gets written.
-    df_up = pl.DataFrame({"region": ["EU"], "val": [2]}).lazy()
-    out_first = df_up.piot.cache_parquet(root, date_column=None, extra_partition_cols="region").collect()
-    # Both US (from cache) and EU (newly written from upstream) are returned
-    assert sorted(out_first["val"].to_list()) == [1, 2]
-
-    # Third call with same upstream - EU already cached, so no new writes
-    out_second = df_up.piot.cache_parquet(root, date_column=None, extra_partition_cols="region").collect()
-    assert sorted(out_second["val"].to_list()) == [1, 2]
+    source: Any
+    pred: Any = None
+    mode: CacheMode = CacheMode.CACHE
+    expect: Any = None
+    kw: dict = field(default_factory=dict)
 
 
-def test_local_cache_parquet_daily_shared(tmp_path, caplog):
-    cache_root = str(tmp_path)
+def run_steps(root, steps, column="value", **kwargs):
+    for step in steps:
+        lf = cache_parquet(step.source, root, cache_mode=step.mode, **(kwargs | step.kw))
+        got = collect_filtered(lf, step.pred)
+        if step.expect is None:
+            assert_frame_equal(got, collect_filtered(step.source, step.pred), check_row_order=False)
+        else:
+            assert sorted(got[column].to_list()) == sorted(step.expect)
+
+
+def S(id, steps, files, column="value", exact=False, **kwargs):
+    return Case(id, steps, files, {"column": column, "exact": exact, "kwargs": {"date_column": "date"} | kwargs})
+
+
+def _daily(days, values=None, month=6, **extra):
+    days = [D(2024, month, d) for d in days]
+    return _frame(date=days, value=values if values is not None else list(range(1, len(days) + 1)), **extra)
+
+
+_RG = {"time_unit": "daily", "extra_partition_cols": "region"}
+_MAY10 = _frame(date=[D(2024, 5, 10)] * 2, region=["NA", "EU"], value=[100, 200])
+_MAY_GAP = _frame(date=[D(2024, 5, 10), D(2024, 5, 11)], region=["NA", "EU"], value=[100, 200])
+_ONE_SIDED = _frame(date=[D(2024, 6, 1), D(2024, 6, 2), D(2024, 6, 5)], region=["US", "US", "EU"], value=[10, 20, 50])
+_REGIONS = pl.col("region").is_in(["US", "EU", "APAC"])
+_JAN_MAR = _frame(date=[D(2024, 1, 15), D(2024, 2, 15), D(2024, 3, 15)], value=[100, 200, 300])
+_EMPTY = pl.LazyFrame(schema={"date": pl.Date, "value": pl.Int64})
+
+STEPS = [
+    # empty files mark queried partitions without rows
+    S(
+        "missing_written",
+        [Step(_frame(date=[D(2023, 1, 15)], value=[1]), pl.col("date").is_between(D(2023, 1, 1), D(2023, 3, 31)))],
+        {"monthly/2023-01.parquet": [1], "monthly/2023-02.parquet": [], "monthly/2023-03.parquet": []},
+        exact=True,
+    ),
+    S(
+        "empty_partitions_with_extra_cols",
+        [Step(_MAY10, pl.col("region").is_in(["NA", "EU", "APAC"]) & (pl.col("date") == D(2024, 5, 10)))],
+        {"daily/NA/2024-05-10.parquet": [100], "daily/EU/2024-05-10.parquet": [200], "daily/APAC/2024-05-10.parquet": []},
+        exact=True,
+        **_RG,
+    ),
+    S(
+        "missing_written_daily_with_extra_cols",
+        [Step(_MAY10, pl.col("region").is_in(["NA", "EU", "APAC"]) & pl.col("date").is_between(D(2024, 5, 10), D(2024, 5, 11)))],
+        {
+            f"daily/{r}/2024-05-{d}.parquet": v
+            for r, d, v in [("NA", 10, [100]), ("EU", 10, [200]), ("NA", 11, []), ("EU", 11, []), ("APAC", 10, []), ("APAC", 11, [])]
+        },
+        exact=True,
+        **_RG,
+    ),
+    S(
+        "missing_written_daily_with_extra_cols_gap",
+        [
+            Step(
+                _MAY_GAP,
+                pl.col("region").is_in(["NA", "EU", "APAC"])
+                & pl.col("date").is_between(D(2024, 5, 10), D(2024, 5, 14))
+                & (pl.col("date") != D(2024, 5, 11)),
+            )
+        ],
+        {f"daily/{r}/2024-05-11.parquet": None for r in ["NA", "EU", "APAC"]}
+        | {"daily/NA/2024-05-10.parquet": [100], "daily/APAC/2024-05-14.parquet": []},
+        **_RG,
+    ),
+    S(
+        "missing_written_daily_with_extra_cols_gap2",
+        [Step(_MAY_GAP, pl.col("region").is_in(["EU", "NA"]) & pl.col("region").ne("NA") & pl.col("date").eq(D(2024, 5, 10)))],
+        {"daily/NA/2024-05-10.parquet": None, "daily/EU/2024-05-10.parquet": []},
+        exact=True,
+        **_RG,
+    ),
+    # one-sided reads write whole partitions that have rows, and no empty files beyond the cached range
+    S(
+        "one_sided_with_extra_cols_no_empty_writes",
+        [Step(_ONE_SIDED), Step(_ONE_SIDED, (pl.col("date") >= D(2024, 6, 2)) & _REGIONS)],
+        {
+            "daily/US/2024-06-02.parquet": [20],
+            "daily/EU/2024-06-05.parquet": [50],
+            "daily/APAC/2024-06-02.parquet": None,
+            "daily/APAC/2024-06-05.parquet": None,
+        },
+        **_RG,
+    ),
+    S(
+        "one_sided_upper_bound_with_extra_cols",
+        [Step(_ONE_SIDED), Step(_ONE_SIDED, (pl.col("date") <= D(2024, 6, 2)) & _REGIONS)],
+        {
+            "daily/US/2024-06-01.parquet": [10],
+            "daily/US/2024-06-02.parquet": [20],
+            "daily/APAC/2024-06-01.parquet": None,
+            "daily/APAC/2024-06-02.parquet": None,
+        },
+        **_RG,
+    ),
+    S(
+        "one_sided_lower_bound_reads_cache_and_upstream",
+        [Step(_daily([1, 2])), Step(pl.concat([_daily([5], [5]), _daily([1, 2])]), pl.col("date") >= D(2024, 6, 2))],
+        {"daily/2024-06-01.parquet": [1], "daily/2024-06-02.parquet": [2], "daily/2024-06-05.parquet": [5]},
+        time_unit="daily",
+    ),
+    S(
+        "unbounded_above_fills_gaps_up_to_existing_max",
+        [Step(_daily([1, 3, 5], [1, 3, 5])), Step(_daily([1, 3, 5], [1, 3, 5]), pl.col("date") >= D(2024, 6, 2))],
+        {f"daily/2024-06-0{d}.parquet": v for d, v in [(1, [1]), (2, []), (3, [3]), (4, []), (5, [5]), (6, None), (7, None)]},
+        exact=True,
+        time_unit="daily",
+    ),
+    S(
+        "unbounded_below_fills_gaps_down_to_existing_min",
+        [Step(_daily([3, 5, 7], [3, 5, 7])), Step(_daily([3, 5, 7], [3, 5, 7]), pl.col("date") <= D(2024, 6, 6))],
+        {f"daily/2024-06-0{d}.parquet": v for d, v in [(1, None), (2, None), (3, [3]), (4, []), (5, [5]), (6, []), (7, [7])]},
+        exact=True,
+        time_unit="daily",
+    ),
+    S(
+        "unbounded_with_extra_cols_fills_gaps",
+        [Step(_daily([1, 3], [1, 3], region=["US", "US"])), Step(_daily([1, 3], [1, 3], region=["US", "US"]), pl.col("date") >= D(2024, 6, 1))],
+        {
+            "daily/US/2024-06-01.parquet": [1],
+            "daily/US/2024-06-02.parquet": [],
+            "daily/US/2024-06-03.parquet": [3],
+            "daily/US/2024-06-04.parquet": None,
+        },
+        exact=True,
+        **_RG,
+    ),
+    # REBUILD reads upstream, overwrites the partitions in scope, and keeps the others
+    S(
+        "overwrite",
+        [Step(_frame(date=[D(2023, 1, 15)], value=[42])), Step(_frame(date=[D(2023, 1, 15)], value=[99]), mode=CacheMode.REBUILD)],
+        {"monthly/2023-01.parquet": [99]},
+        exact=True,
+    ),
+    S(
+        "rebuild_preserves_other_partitions",
+        [
+            Step(_JAN_MAR),
+            Step(_frame(date=[D(2024, 2, 20)], value=[999]), pl.col("date").is_between(D(2024, 2, 1), D(2024, 2, 28)), CacheMode.REBUILD),
+        ],
+        {"monthly/2024-01.parquet": [100], "monthly/2024-02.parquet": [999], "monthly/2024-03.parquet": [300]},
+        exact=True,
+        time_unit="monthly",
+    ),
+    S(
+        "rebuild_overwrites_existing_partition",
+        [
+            Step(_frame(date=[D(2024, 5, 10)], region=["US"], value=[100])),
+            Step(
+                _frame(date=[D(2024, 5, 10)], region=["US"], value=[999]),
+                (pl.col("date") == D(2024, 5, 10)) & (pl.col("region") == "US"),
+                CacheMode.REBUILD,
+            ),
+        ],
+        {"daily/US/2024-05-10.parquet": [999]},
+        exact=True,
+        **_RG,
+    ),
+    S(
+        "rebuild_writes_empty_files_for_missing_data",
+        [Step(_daily([1, 3], [10, 30]), pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3)), CacheMode.REBUILD)],
+        {"daily/2024-06-01.parquet": [10], "daily/2024-06-02.parquet": [], "daily/2024-06-03.parquet": [30]},
+        exact=True,
+        time_unit="daily",
+    ),
+    S(
+        "rebuild_overwrites_previously_empty_partition",
+        [
+            Step(_daily([1, 3], [10, 30]), pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3))),
+            Step(_daily([1, 2, 3], [10, 20, 30]), pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 3)), CacheMode.REBUILD),
+        ],
+        {"daily/2024-06-01.parquet": [10], "daily/2024-06-02.parquet": [20], "daily/2024-06-03.parquet": [30]},
+        exact=True,
+        time_unit="daily",
+    ),
+    S(
+        "rebuild_with_extra_cols_preserves_other_regions",
+        [
+            Step(_frame(date=[D(2024, 8, 1)] * 2, region=["US", "EU"], value=[100, 200])),
+            Step(
+                _frame(date=[D(2024, 8, 1)], region=["US"], value=[999]),
+                (pl.col("date") == D(2024, 8, 1)) & (pl.col("region") == "US"),
+                CacheMode.REBUILD,
+            ),
+        ],
+        {"daily/US/2024-08-01.parquet": [999], "daily/EU/2024-08-01.parquet": [200]},
+        exact=True,
+        **_RG,
+    ),
+    S(
+        "rebuild_no_date_column",
+        [Step(_frame(region=["US", "EU"], value=[100, 200])), Step(_frame(region=["US"], value=[999]), pl.col("region") == "US", CacheMode.REBUILD)],
+        {"null/US.parquet": [999], "null/EU.parquet": [200]},
+        exact=True,
+        date_column=None,
+        extra_partition_cols="region",
+    ),
+    S(
+        "rebuild_empty_to_data",
+        [
+            Step(_EMPTY, pl.col("date") == D(2024, 9, 1), CacheMode.REBUILD),
+            Step(_frame(date=[D(2024, 9, 1)], value=[42]), pl.col("date") == D(2024, 9, 1), CacheMode.REBUILD),
+        ],
+        {"daily/2024-09-01.parquet": [42]},
+        exact=True,
+        time_unit="daily",
+    ),
+    S(
+        "rebuild_data_to_empty",
+        [Step(_frame(date=[D(2024, 10, 1)], value=[42])), Step(_EMPTY, pl.col("date") == D(2024, 10, 1), CacheMode.REBUILD)],
+        {"daily/2024-10-01.parquet": []},
+        exact=True,
+        time_unit="daily",
+    ),
+    # reads served from the cache
+    S(
+        "between_pred_uses_existing_partitions",
+        [
+            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[10, 20]), pl.col("date") == D(2021, 3, 1)),
+            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[10, 20]), pl.col("date") == D(2021, 3, 2)),
+            Step(_frame(date=[D(2021, 3, 1), D(2021, 3, 2)], value=[0, 0]), pl.col("date").is_between(D(2021, 3, 1), D(2021, 3, 2)), expect=[10, 20]),
+        ],
+        {"daily/2021-03-01.parquet": [10], "daily/2021-03-02.parquet": [20]},
+        exact=True,
+        time_unit="daily",
+    ),
+    S(
+        "custom_partition_format_cache_readback",
+        [Step(_daily([1, 2, 3], [10, 20, 30])), Step(_daily([4, 5], [40, 50]), expect=[10, 20, 30, 40, 50])],
+        {f"daily/theYear=2024/theMonth=06/theDay=0{d}.parquet": [10 * d] for d in range(1, 6)},
+        exact=True,
+        time_unit="daily",
+        partition_format="theYear=$year/theMonth=$month/theDay=$day",
+    ),
+    S(
+        "empty_result_from_cache",
+        [Step(_frame(date=[D(2024, 2, 1)], value=[1]), pl.col("date") == D(2025, 1, 1))],
+        {"monthly/2025-01.parquet": []},
+        exact=True,
+    ),
+    S(
+        "extra_partition_columns",
+        [Step(_frame(date=[D(2024, 1, 3), D(2024, 1, 4)] * 2, country=["US", "CA"] * 2, value=[1, 2, 3, 4]))],
+        {"monthly/US/2024-01.parquet": [1, 3], "monthly/CA/2024-01.parquet": [2, 4]},
+        exact=True,
+        extra_partition_cols=["country"],
+    ),
+    # no date column: one file per extra-column value under null/, or null/data.parquet
+    S(
+        "cache_parquet_no_date_single_extra_col",
+        [
+            Step(_frame(region=["US", "US", "EU", "EU", "APAC"], value=[100, 200, 150, 250, 180])),
+            Step(_frame(region=["US"], value=[0]), expect=[100, 200, 150, 250, 180]),
+        ],
+        {"null/US.parquet": [100, 200], "null/EU.parquet": [150, 250], "null/APAC.parquet": [180]},
+        exact=True,
+        date_column=None,
+        extra_partition_cols="region",
+    ),
+    S(
+        "cache_parquet_no_date_multiple_extra_cols",
+        [Step(_frame(region=["US", "US", "EU", "EU", "APAC", "APAC"], product=["A", "B"] * 3, value=[100, 200, 150, 250, 180, 220]))],
+        {f"null/{r}/{p}.parquet": [v] for (r, p), v in zip([(r, p) for r in ["US", "EU", "APAC"] for p in "AB"], [100, 200, 150, 250, 180, 220])},
+        exact=True,
+        date_column=None,
+        extra_partition_cols=["region", "product"],
+    ),
+    S(
+        "cache_parquet_no_date_no_extra_cols",
+        [Step(_frame(value=[100, 200, 150], name=["Alice", "Bob", "Charlie"])), Step(_frame(value=[0], name=["x"]), expect=[100, 200, 150])],
+        {"null/data.parquet": [100, 200, 150]},
+        exact=True,
+        date_column=None,
+    ),
+    S(
+        "cache_parquet_no_date_with_predicate",
+        [
+            Step(_frame(region=["US", "US", "EU", "EU", "APAC"], category=list("XYXYX"), value=[100, 200, 150, 250, 180])),
+            Step(
+                _frame(region=["US", "US", "EU", "EU", "APAC"], category=list("XYXYX"), value=[100, 200, 150, 250, 180]).filter(
+                    pl.col("region") == "US"
+                ),
+                expect=[100, 200, 150, 250, 180],
+            ),
+        ],
+        {"null/US/X.parquet": [100], "null/APAC/X.parquet": [180]},
+        date_column=None,
+        extra_partition_cols=["region", "category"],
+    ),
+    S(
+        "cache_parquet_no_date_different_cache_modes",
+        [
+            Step(_frame(category=list("ABAB"), value=[100, 200, 150, 250]), mode=CacheMode.IGNORE),
+            Step(_frame(category=list("ABAB"), value=[100, 200, 150, 250]), mode=CacheMode.CACHE),
+            Step(_frame(category=list("ABAB"), value=[100, 200, 150, 250]), mode=CacheMode.REBUILD),
+        ],
+        {"null/A.parquet": [100, 150], "null/B.parquet": [200, 250]},
+        exact=True,
+        date_column=None,
+        extra_partition_cols=["category"],
+    ),
+    S(
+        "no_date_with_extra_unconstrained_queries_upstream_for_new_partitions",
+        [
+            Step(_frame(region=["US"], value=[1])),
+            Step(_frame(region=["EU"], value=[2]), expect=[1, 2]),
+            Step(_frame(region=["EU"], value=[3]), expect=[1, 2]),
+        ],
+        {"null/US.parquet": [1], "null/EU.parquet": [2]},
+        exact=True,
+        date_column=None,
+        extra_partition_cols="region",
+    ),
+    S(
+        "sequential_cache_parquet",
+        [Step(_frame(date=[D(2024, 1, 1), D(2024, 1, 2), D(2024, 2, 1)], value=[1, 3, 5]))],
+        {"monthly/2024-01.parquet": [1, 3], "monthly/2024-02.parquet": [5]},
+    ),
+]
+
+
+@pytest.mark.parametrize(("steps", "files", "column", "exact", "kwargs"), params(STEPS, "pred", "expect", "column", "exact", "kwargs"))
+def test_steps(tmp_path, steps, files, column, exact, kwargs):
+    run_steps(tmp_path, steps, column, **kwargs)
+    assert_cache_files(tmp_path, files, column, exact=exact)
+
+
+def test_sequential_cache_parquet_chained(tmp_path):
+    base = _frame(date=[D(2024, 1, 1), D(2024, 1, 2), D(2024, 2, 1)], x=[1, 3, 5])
+    assert base.piot.cache_parquet(tmp_path, "date").piot.cache_parquet(tmp_path, "date").collect().shape == (3, 2)
+
+
+def test_no_date_metadata(tmp_path):
+    for name, extra, by in [("with_extra", ["region"], b"region"), ("single", None, b"")]:
+        cache_parquet(_frame(region=["US", "EU"], value=[100, 200]), tmp_path / name, extra_partition_cols=extra).collect()
+        for path in (tmp_path / name).rglob("*.parquet"):
+            meta = pq.ParquetFile(path).metadata.metadata
+            assert (meta[b"__piot__time_unit"], meta[b"__piot__partitioned_by"]) == (b"null", by)
+
+
+# Every cache mode over the catalogue's predicate shapes and temporal dtypes: what a read returns equals native Polars,
+# cold and warm. CACHE_ONLY returns nothing from an empty cache and serves a full one; IGNORE leaves no files.
+
+
+@pytest.mark.parametrize("mode", [m for m in MODES if m != CacheMode.CACHE_ONLY], ids=lambda m: m.name)
+@pytest.mark.parametrize("pred", params(DATE_PREDICATES, "pred"))
+def test_mode_matches_native_by_predicate(tmp_path, mode, pred):
+    assert_cached_matches_native(daily_frame().lazy(), tmp_path, pred, date_column="date", time_unit="daily", cache_mode=mode)
+    if mode == CacheMode.IGNORE:
+        assert not cache_files(tmp_path)
+
+
+@pytest.fixture(scope="module")
+def full_daily_cache(tmp_path_factory):
+    root = tmp_path_factory.mktemp("full_daily_cache")
+    cache_parquet(daily_frame().lazy(), root, "date", time_unit="daily").collect()
+    return root
+
+
+@pytest.mark.parametrize("pred", params(DATE_PREDICATES, "pred"))
+def test_cache_only_matches_native_by_predicate(tmp_path, full_daily_cache, pred):
+    kwargs = {"date_column": "date", "time_unit": "daily", "cache_mode": CacheMode.CACHE_ONLY}
+    assert collect_filtered(cache_parquet(daily_frame().lazy(), tmp_path, **kwargs), pred).is_empty()
+    assert_cached_matches_native(daily_frame().lazy(), full_daily_cache, pred, **kwargs)
+
+
+@pytest.mark.parametrize("dtype", [d for d in TEMPORAL_DTYPES if d != pl.Date], ids=str)
+@pytest.mark.parametrize("pred", params([c for c in DATE_PREDICATES if c.id in ("between", "ne_in_window")], "pred"))
+def test_mode_matches_native_by_dtype(tmp_path, dtype, pred):
+    assert_cached_matches_native(daily_frame(dtype=dtype).lazy(), tmp_path, pred, date_column="date", time_unit="monthly")
+
+
+# Upstream calls: what the cache asks its source for.
+
+
+def test_callable_not_invoked_when_cache_satisfies(tmp_path):
+    source = _frame(date=[D(2023, 1, 1), D(2023, 1, 2)], region=["US", "US"], value=[10, 20])
+    kwargs = {"date_column": "date", "time_unit": "daily", "extra_partition_cols": ["region"]}
+    cache_parquet(source, tmp_path, **kwargs).collect()
+    calls = []
+
+    def make_source():
+        calls.append(1)
+        return source
+
+    covered = (pl.col("region") == "US") & pl.col("date").is_between(D(2023, 1, 1), D(2023, 1, 2))
+    assert_cached_matches_native(source, tmp_path, covered, runs=1, **kwargs)
+    assert sorted(cache_parquet(make_source, tmp_path, **kwargs).filter(covered).collect()["value"]) == [10, 20]
+    assert calls == []
+    # Without a date restriction new dates may exist upstream, so the source is built.
+    assert sorted(cache_parquet(make_source, tmp_path, **kwargs).filter(pl.col("region") == "US").collect()["value"]) == [10, 20]
+    assert calls == [1]
+
+
+_PROBE = pl.DataFrame({"date": pl.date_range(D(2024, 5, 31), D(2024, 6, 6), eager=True)})
+
+
+def UP(id, seed, upstream, pred, calls, kept=None, **kwargs):
+    """``seed`` is cached first; then ``upstream`` is read through the cache with ``pred``.
+
+    ``calls`` is the number of upstream calls; ``kept`` is what the last pushed predicate keeps of ``_PROBE``.
+    """
+    return Case(id, pred, (calls, kept), {"seed": seed, "upstream": upstream, "kwargs": {"date_column": "date", "time_unit": "daily"} | kwargs})
+
+
+_D123 = pl.DataFrame({"date": [D(2024, 6, 1), D(2024, 6, 2), D(2024, 6, 3)], "value": [1, 2, 3]})
+_D345 = pl.DataFrame({"date": [D(2024, 6, 3), D(2024, 6, 4), D(2024, 6, 5)], "value": [3, 4, 5]})
+UPSTREAM = [
+    UP("predicate_pushdown", None, _D123, pl.col("date") == D(2024, 6, 1), 1, [D(2024, 6, 1)]),
+    UP(
+        "write_uses_widened_predicate",
+        None,
+        _D123,
+        pl.col("date") == D(2024, 6, 15),
+        1,
+        pl.date_range(D(2024, 6, 1), D(2024, 6, 6), eager=True).to_list(),
+        time_unit="monthly",
+    ),
+    UP(
+        "one_sided_lower_bound_upstream_predicate_shape",
+        _D123,
+        pl.DataFrame({"date": [D(2024, 6, 5)], "value": [5]}),
+        pl.col("date") >= D(2024, 6, 2),
+        1,
+        [D(2024, 6, 4), D(2024, 6, 5), D(2024, 6, 6)],
+    ),
+    UP(
+        "one_sided_lower_bound_upstream_contains_not_existing_predicate",
+        _D123.head(2),
+        pl.DataFrame({"date": [D(2024, 6, 5)], "value": [5]}),
+        pl.col("date") >= D(2024, 6, 2),
+        1,
+        [D(2024, 6, 3), D(2024, 6, 4), D(2024, 6, 5), D(2024, 6, 6)],
+    ),
+    UP(
+        "one_sided_upper_bound_upstream_predicate_shape",
+        _D345,
+        pl.DataFrame({"date": [D(2024, 6, 2)], "value": [2]}),
+        pl.col("date") <= D(2024, 6, 4),
+        1,
+        [D(2024, 5, 31), D(2024, 6, 1), D(2024, 6, 2)],
+    ),
+    UP(
+        "rebuild_queries_upstream_not_cache",
+        _D123,
+        _D123.with_columns(value=pl.lit(9, pl.Int64)),
+        pl.col("date") == D(2024, 6, 1),
+        1,
+        [D(2024, 6, 1)],
+        cache_mode=CacheMode.REBUILD,
+    ),
+    UP("contradiction", _D123, _D123, pl.col("date").is_between(D(2024, 6, 1), D(2024, 6, 2)), 0),
+    UP("no_date_no_extra_first_writes_second_reads_cache", _D123, _D123, None, 0, date_column=None),
+]
+
+
+@pytest.mark.parametrize(("seed", "upstream", "pred", "expect", "kwargs"), params(UPSTREAM, "seed", "upstream", "pred", "expect", "kwargs"))
+def test_upstream_calls(tmp_path, seed, upstream, pred, expect, kwargs):
+    calls, kept = expect
+    if seed is not None:
+        cache_parquet(seed.lazy(), tmp_path, **kwargs | {"cache_mode": CacheMode.CACHE}).collect()
+    spy = UpstreamSpy(upstream)
+    result = collect_filtered(cache_parquet(spy.lazy, tmp_path, **kwargs), pred)
+    assert spy.calls == calls
+    if kept is not None:
+        assert spy.kept(_PROBE)["date"].to_list() == kept
+    if seed is None or kwargs.get("cache_mode") == CacheMode.REBUILD:
+        assert_frame_equal(result, collect_filtered(upstream.lazy(), pred), check_row_order=False)
+
+
+def test_debug_source_sees_pushed_partition_predicates(tmp_path, capsys):
+    """Through ``piot.debug`` upstream: a model predicate reaches the source, and a second unconstrained read of a
+    no-date cache with partition columns still asks upstream for new partitions."""
+    model = _frame(date=[D(2025, 5, 1), D(2025, 5, 2), D(2025, 5, 3)], model=["USE4S", "OTHER", "USE4S"], val=[10, 20, 30]).piot.debug()
+    model.piot.cache_parquet(cache_path=tmp_path / "m", date_column="date", extra_partition_cols="model").filter(pl.col("model") == "USE4S").collect()
+    out = capsys.readouterr().out
+    assert 'col("model")' in out and '"USE4S"' in out
+
+    cached = (
+        _frame(region=["US", "EU", "US"], value=[1, 2, 3]).piot.debug().piot.cache_parquet(cache_path=tmp_path / "r", extra_partition_cols="region")
+    )
+    first = cached.filter(pl.col("value") >= 2).sort(["region", "value"]).collect()
+    assert first.to_dict(as_series=False) == {"region": ["EU", "US"], "value": [2, 3]}
+    assert "predicate=" in capsys.readouterr().out
+    assert_frame_equal(cached.filter(pl.col("value") >= 2).sort(["region", "value"]).collect(), first)
+    assert "predicate=" in capsys.readouterr().out
+
+    lf = _frame(value=[1, 2, 3]).piot.debug().piot.cache_parquet(cache_path=tmp_path / "n")
+    lf.collect()
+    assert "debug called" in capsys.readouterr().out
+    lf.collect()
+    assert "debug called" not in capsys.readouterr().out
+
+
+def test_push_and_parse_exclusions_to_custom_io_source(tmp_path):
+    """A wider second query asks upstream only for the region it has not cached."""
+    from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_range
+    from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
+
+    spy = UpstreamSpy(_MAY_GAP.collect())
+    kwargs = {"date_column": "date", **_RG}
+    pred = (pl.col("region") == "NA") & (pl.col("date") == D(2024, 5, 10))
+    assert_frame_equal(cache_parquet(spy.lazy, tmp_path, **kwargs).filter(pred).collect(), _MAY_GAP.filter(pred).collect())
+    assert_cache_files(tmp_path, {"daily/NA/2024-05-10.parquet": [100]}, exact=True)
+    wider = pl.col("region").is_in(["NA", "EU"]) & (pl.col("date") == D(2024, 5, 10))
+    assert_frame_equal(cache_parquet(spy.lazy, tmp_path, **kwargs).filter(wider).collect(), _MAY_GAP.filter(wider).collect())
+    pushed = spy.predicates[-1]
+    assert {e.meta.serialize(format="json") for e in wider.meta.pop()} != {e.meta.serialize(format="json") for e in pushed.meta.pop()}
+    assert convert_expr_to_datetime_range(pushed, "date", get_enclosure=False).lower == DT(2024, 5, 10)
+    assert convert_expr_to_valid_values(pushed, "region") == {"EU"}
+
+
+@pytest.mark.parametrize("partition_format", [None, "theYear=$year/theMonth=$month/theDay=$day"])
+def test_open_ended_filters_query_expected_partitions(tmp_path, caplog, partition_format):
     import logging
 
     caplog.set_level(logging.DEBUG, logger="polars_io_tools.io_sources.lazy_cache_parquet")
-    collected, appended, filtered = exercise_daily_cache_parquet(
-        cache_root=cache_root,
-        aws_profile=None,
-        partition_format="theYear=$year/theMonth=$month/theDay=$day",
+    collected, appended, filtered = exercise_daily_cache_parquet(cache_root=str(tmp_path), partition_format=partition_format)
+    assert collected.to_dict(as_series=False) == {"date": [D(2024, 6, 1), D(2024, 6, 2), D(2024, 6, 3)], "value": [11, 22, 33]}
+    assert appended.to_dict(as_series=False) == {"date": [D(2024, 6, 5)], "value": [44]}
+    assert filtered.to_dict(as_series=False) == {"date": [D(2024, 6, 2), D(2024, 6, 3)], "value": [22, 33]}
+    assert pl.concat(cache_files(tmp_path).values())["date"].sort().to_list() == [D(2024, 6, d) for d in (1, 2, 3, 5)]
+    assert "Cache scan uses" in caplog.text and "enumerated" in caplog.text
+    lower = cache_parquet(
+        _frame(date=[D(2024, 6, 1), D(2024, 6, 2), D(2024, 6, 3)], value=[11, 22, 33]),
+        tmp_path,
+        "date",
+        time_unit="daily",
+        partition_format=partition_format,
     )
-    assert collected.shape == (3, 2)
-    assert collected["date"].to_list() == [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2), datetime.date(2024, 6, 3)]
-    assert collected["value"].to_list() == [11, 22, 33]
-
-    assert appended.shape == (1, 2)
-    assert appended["date"].to_list() == [datetime.date(2024, 6, 5)]
-    assert appended["value"].to_list() == [44]
-
-    assert filtered["date"].to_list() == [datetime.date(2024, 6, 2), datetime.date(2024, 6, 3)]
-    assert filtered["value"].to_list() == [22, 33]
-    # The appended query uses a bounded predicate; expect enumerated path selection
-    logs = caplog.text
-    assert "Cache scan uses" in logs and "enumerated" in logs
-
-
-class TestHelperFunctions:
-    """Tests for cache planning and file-writing helpers."""
-
-    @pytest.mark.parametrize(
-        ("expected_days", "existing_days", "remaining_days"),
-        [
-            ([1, 2], [], [1, 2]),
-            ([1, 2, 3], [1, 3], [2]),
-            ([1, 2], [1, 2], []),
-        ],
-        ids=["empty_existing", "some_existing", "all_existing"],
-    )
-    def test_compute_partitions_to_write(self, expected_days, existing_days, remaining_days):
-        from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
-
-        expected = pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in expected_days]})
-        part_info = PartitionInfo(
-            enumerability=Enumerability.FINITE,
-            expected_parts_df=expected,
-            existing_parts_df=pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in existing_days]}, schema=expected.schema),
-            join_cols=["date"],
-        )
-        result = _compute_partitions_to_write(part_info)
-        remaining = pl.DataFrame({"date": [datetime.date(2024, 1, day) for day in remaining_days]}, schema=expected.schema)
-        assert_frame_equal(result, remaining)
-
-    def test_compute_partitions_to_write_no_join_cols(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import Enumerability, PartitionInfo, _compute_partitions_to_write
-
-        expected = pl.DataFrame({"val": [1]})
-        part_info = PartitionInfo(
-            enumerability=Enumerability.FINITE,
-            expected_parts_df=expected,
-            existing_parts_df=pl.DataFrame({"val": [1]}),
-            join_cols=[],
-        )
-        result = _compute_partitions_to_write(part_info)
-        assert_frame_equal(result, expected)
-
-    def test_write_empty_parquet_file(self, tmp_path):
-        from polars_io_tools.io_sources.lazy_cache_parquet import _write_empty_parquet_file
-
-        path = str(tmp_path / "nested" / "one.parquet")
-        schema = pl.Schema({"value": pl.Int64})
-
-        _write_empty_parquet_file(
-            path,
-            schema=schema,
-            metadata={},
-            storage_options={},
-            credential_provider=None,
-            write_kwargs={},
-        )
-
-        assert pl.read_parquet(path).schema == schema
-        assert pl.read_parquet(path).height == 0
-
-    def test_build_read_plan_falls_back_to_glob_for_many_paths(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import (
-            _MAX_ENUMERATED_SCAN_PATHS,
-            Enumerability,
-            PartitionInfo,
-            _build_read_plan,
-        )
-
-        dates = [datetime.date(2024, 1, 1) + datetime.timedelta(days=i) for i in range(_MAX_ENUMERATED_SCAN_PATHS + 1)]
-        part_info = PartitionInfo(
-            enumerability=Enumerability.FINITE,
-            expected_parts_df=pl.DataFrame({"date": dates}),
-            existing_parts_df=pl.DataFrame({"date": dates, "file": [str(d) for d in dates]}),
-            join_cols=["date"],
-        )
-
-        read_plan = _build_read_plan(
-            partition_info=part_info,
-            predicate=pl.col("date") >= dates[0],
-            time_unit_dir="file:///tmp/cache/daily",
-            has_cached_files=True,
-            file_key_column="file",
-        )
-
-        assert read_plan.use_paths is None
-
-    def test_build_final_scan_cache_only(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import _build_final_scan
-
-        cache_df = pl.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]}).lazy()
-        result = _build_final_scan(cache_df, None, None, None).collect()
-        assert result.shape == (3, 2)
-
-    def test_build_final_scan_with_predicate(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import _build_final_scan
-
-        cache_df = pl.DataFrame({"x": [1, 2, 3]}).lazy()
-        result = _build_final_scan(cache_df, pl.col("x") > 1, None, None).collect()
-        assert result["x"].to_list() == [2, 3]
-
-    def test_build_final_scan_with_columns(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import _build_final_scan
-
-        cache_df = pl.DataFrame({"x": [1, 2], "y": ["a", "b"], "z": [10, 20]}).lazy()
-        result = _build_final_scan(cache_df, None, ["x", "y"], None).collect()
-        assert result.columns == ["x", "y"]
-
-    def test_build_final_scan_with_limit(self):
-        from polars_io_tools.io_sources.lazy_cache_parquet import _build_final_scan
-
-        cache_df = pl.DataFrame({"x": [1, 2, 3, 4, 5]}).lazy()
-        result = _build_final_scan(cache_df, None, None, 2).collect()
-        assert len(result) == 2
-
-
-class TestComputeClippedExpectedPartitions:
-    """Tests for _compute_clipped_expected_partitions function."""
-
-    def test_returns_none_for_empty_interval(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.empty(),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is None
-
-    def test_returns_none_for_fully_bounded_interval(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 5)]})
-        # Fully bounded: [2024-06-01, 2024-06-05]
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closed(datetime.date(2024, 6, 1), datetime.date(2024, 6, 5)),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is None
-
-    def test_returns_none_for_fully_unbounded_interval(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1)]})
-        # Fully unbounded: (-inf, +inf)
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.open(-portion.inf, portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is None
-
-    def test_returns_none_for_empty_existing_partitions(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        existing = pl.DataFrame(schema={"date": pl.Date})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 6, 1), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is None
-
-    def test_returns_none_for_missing_date_column(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        existing = pl.DataFrame({"other_col": [1, 2, 3]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 6, 1), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is None
-
-    def test_returns_none_for_invalid_clipped_range(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # existing_max is 2024-06-01, but predicate_min is 2024-06-10
-        # clipped_min (2024-06-10) > clipped_max (2024-06-01) -> invalid
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 6, 10), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is None
-
-    def test_unbounded_above_clips_to_existing_max(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # date >= 2024-06-02, existing max is 2024-06-05
-        # Should enumerate 2024-06-02, 03, 04, 05
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 5)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 6, 2), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is not None
-        dates = sorted(result["date"].to_list())
-        assert dates == [
-            datetime.date(2024, 6, 2),
-            datetime.date(2024, 6, 3),
-            datetime.date(2024, 6, 4),
-            datetime.date(2024, 6, 5),
-        ]
-
-    def test_unbounded_below_clips_to_existing_min(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # date <= 2024-06-04, existing min is 2024-06-02
-        # Should enumerate 2024-06-02, 03, 04
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 2), datetime.date(2024, 6, 5)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.openclosed(-portion.inf, datetime.date(2024, 6, 4)),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is not None
-        dates = sorted(result["date"].to_list())
-        assert dates == [
-            datetime.date(2024, 6, 2),
-            datetime.date(2024, 6, 3),
-            datetime.date(2024, 6, 4),
-        ]
-
-    def test_with_extra_cols_cross_product(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # date >= 2024-06-01 with extra col "region" having values US, EU
-        # existing max is 2024-06-02
-        existing = pl.DataFrame(
-            {
-                "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2)],
-                "region": ["US", "EU"],
-            }
-        )
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 6, 1), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=["region"],
-            time_unit="daily",
-            schema={"date": pl.Date, "region": pl.String},
-        )
-        assert result is not None
-        # Should have 2 dates x 2 regions = 4 rows
-        assert len(result) == 4
-        assert set(result["region"].to_list()) == {"US", "EU"}
-        assert set(result["date"].to_list()) == {datetime.date(2024, 6, 1), datetime.date(2024, 6, 2)}
-
-    def test_with_datetime_in_interval(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # Interval uses datetime, should convert to date
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 3)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.datetime(2024, 6, 2, 10, 30), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is not None
-        dates = sorted(result["date"].to_list())
-        assert dates == [datetime.date(2024, 6, 2), datetime.date(2024, 6, 3)]
-
-    def test_monthly_time_unit(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # date >= 2024-02-15, existing max is 2024-04-10
-        # With monthly widening: 2024-02-01, 2024-03-01, 2024-04-01
-        existing = pl.DataFrame({"date": [datetime.date(2024, 1, 15), datetime.date(2024, 4, 10)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 2, 15), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="monthly",
-            schema={"date": pl.Date},
-        )
-        assert result is not None
-        dates = sorted(result["date"].to_list())
-        assert dates == [
-            datetime.date(2024, 2, 1),
-            datetime.date(2024, 3, 1),
-            datetime.date(2024, 4, 1),
-        ]
-
-    def test_yearly_time_unit(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # date >= 2022-06-15, existing max is 2024-03-10
-        # With yearly widening: 2022-01-01, 2023-01-01, 2024-01-01
-        existing = pl.DataFrame({"date": [datetime.date(2021, 1, 1), datetime.date(2024, 3, 10)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2022, 6, 15), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="yearly",
-            schema={"date": pl.Date},
-        )
-        assert result is not None
-        dates = sorted(result["date"].to_list())
-        assert dates == [
-            datetime.date(2022, 1, 1),
-            datetime.date(2023, 1, 1),
-            datetime.date(2024, 1, 1),
-        ]
-
-    def test_single_date_existing(self):
-        import portion
-
-        from polars_io_tools.io_sources.lazy_cache_parquet import _compute_clipped_expected_partitions
-
-        # Only one existing date, predicate starts at same date
-        existing = pl.DataFrame({"date": [datetime.date(2024, 6, 1)]})
-        result = _compute_clipped_expected_partitions(
-            predicate_interval=portion.closedopen(datetime.date(2024, 6, 1), portion.inf),
-            existing_parts_df=existing,
-            date_column="date",
-            extra_cols=[],
-            time_unit="daily",
-            schema={"date": pl.Date},
-        )
-        assert result is not None
-        assert result["date"].to_list() == [datetime.date(2024, 6, 1)]
-
-
-class TestUnboundedRangeGapFilling:
-    """Tests for the new behavior: filling gaps within existing bounds for unbounded ranges."""
-
-    def test_unbounded_above_fills_gaps_up_to_existing_max(self, tmp_path):
-        """
-        For unbounded above (date >= X): Fill empty partitions from X to max(existing).
-        Beyond max(existing), don't create empty partitions.
-        """
-        # Seed cache with data at dates 1, 3, 5 (gap at 2 and 4)
-        df = pl.LazyFrame(
-            {
-                "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 3), datetime.date(2024, 6, 5)],
-                "val": [1, 3, 5],
-            }
-        )
-        base = tmp_path / "unbounded_above_gaps"
-        df.piot.cache_parquet(base, "date", time_unit="daily").collect()
-
-        # Now query with unbounded above: date >= 2024-06-02
-        # This should fill gaps at 2024-06-02 and 2024-06-04 (within existing range)
-        # But NOT at 2024-06-06 or beyond (outside existing range)
-        df.piot.cache_parquet(base, "date", time_unit="daily").filter(pl.col("date") >= datetime.date(2024, 6, 2)).collect()
-
-        base_daily = base / "daily"
-
-        # Original data partitions should exist
-        assert (base_daily / "2024-06-01.parquet").exists()
-        assert (base_daily / "2024-06-03.parquet").exists()
-        assert (base_daily / "2024-06-05.parquet").exists()
-
-        # Gaps WITHIN existing range (2024-06-01 to 2024-06-05) should be filled with empty files
-        assert (base_daily / "2024-06-02.parquet").exists()
-        assert (base_daily / "2024-06-04.parquet").exists()
-        # Verify they are empty
-        assert pl.read_parquet(base_daily / "2024-06-02.parquet").is_empty()
-        assert pl.read_parquet(base_daily / "2024-06-04.parquet").is_empty()
-
-        # Partitions BEYOND existing max should NOT be created
-        assert not (base_daily / "2024-06-06.parquet").exists()
-        assert not (base_daily / "2024-06-07.parquet").exists()
-
-    def test_unbounded_below_fills_gaps_down_to_existing_min(self, tmp_path):
-        """
-        For unbounded below (date <= Y): Fill empty partitions from min(existing) to Y.
-        Before min(existing), don't create empty partitions.
-        """
-        # Seed cache with data at dates 3, 5, 7 (gap at 4 and 6)
-        df = pl.LazyFrame(
-            {
-                "date": [datetime.date(2024, 6, 3), datetime.date(2024, 6, 5), datetime.date(2024, 6, 7)],
-                "val": [3, 5, 7],
-            }
-        )
-        base = tmp_path / "unbounded_below_gaps"
-        df.piot.cache_parquet(base, "date", time_unit="daily").collect()
-
-        # Now query with unbounded below: date <= 2024-06-06
-        # This should fill gaps at 2024-06-04 (within existing range)
-        # But NOT at 2024-06-01, 2024-06-02 (before existing min)
-        df.piot.cache_parquet(base, "date", time_unit="daily").filter(pl.col("date") <= datetime.date(2024, 6, 6)).collect()
-
-        base_daily = base / "daily"
-
-        # Original data partitions should exist
-        assert (base_daily / "2024-06-03.parquet").exists()
-        assert (base_daily / "2024-06-05.parquet").exists()
-        assert (base_daily / "2024-06-07.parquet").exists()
-
-        # Gaps WITHIN the clipped range (2024-06-03 to 2024-06-06) should be filled
-        assert (base_daily / "2024-06-04.parquet").exists()
-        assert (base_daily / "2024-06-06.parquet").exists()
-        # Verify they are empty
-        assert pl.read_parquet(base_daily / "2024-06-04.parquet").is_empty()
-        assert pl.read_parquet(base_daily / "2024-06-06.parquet").is_empty()
-
-        # Partitions BEFORE existing min should NOT be created
-        assert not (base_daily / "2024-06-01.parquet").exists()
-        assert not (base_daily / "2024-06-02.parquet").exists()
-
-    def test_unbounded_with_extra_cols_fills_gaps(self, tmp_path):
-        """
-        Unbounded queries with extra partition columns should also fill gaps within existing bounds.
-        """
-        # Seed cache with data at dates 1, 3 for region US only
-        df = pl.LazyFrame(
-            {
-                "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 3)],
-                "region": ["US", "US"],
-                "val": [1, 3],
-            }
-        )
-        base = tmp_path / "unbounded_extra_cols"
-        df.piot.cache_parquet(base, "date", time_unit="daily", extra_partition_cols="region").collect()
-
-        # Query with unbounded above: date >= 2024-06-01
-        df.piot.cache_parquet(base, "date", time_unit="daily", extra_partition_cols="region").filter(
-            pl.col("date") >= datetime.date(2024, 6, 1)
-        ).collect()
-
-        base_daily = base / "daily"
-
-        # Original partitions should exist
-        assert (base_daily / "US" / "2024-06-01.parquet").exists()
-        assert (base_daily / "US" / "2024-06-03.parquet").exists()
-
-        # Gap within existing range should be filled
-        assert (base_daily / "US" / "2024-06-02.parquet").exists()
-        assert pl.read_parquet(base_daily / "US" / "2024-06-02.parquet").is_empty()
-
-        # Beyond existing max should NOT be created
-        assert not (base_daily / "US" / "2024-06-04.parquet").exists()
-
-
-class TestRebuildBehavior:
-    """Tests for CacheMode.REBUILD behavior.
-
-    REBUILD should:
-    - Ignore cache on reads (query upstream for all data matching predicate)
-    - Write fresh data to cache (overwriting existing partition files)
-    - Preserve partitions outside the current query scope (no cache deletion)
-    """
-
-    def test_rebuild_preserves_other_partitions(self, tmp_path):
-        """REBUILD should NOT delete partitions outside the queried range."""
-        # First, create cache with data for multiple months
-        df_multi = pl.DataFrame(
-            {
-                "date": [
-                    datetime.date(2024, 1, 15),
-                    datetime.date(2024, 2, 15),
-                    datetime.date(2024, 3, 15),
-                ],
-                "value": [100, 200, 300],
-            }
-        ).lazy()
-        df_multi.piot.cache_parquet(cache_path=tmp_path, date_column="date", time_unit="monthly").collect()
-
-        base = tmp_path / "monthly"
-        assert (base / "2024-01.parquet").exists()
-        assert (base / "2024-02.parquet").exists()
-        assert (base / "2024-03.parquet").exists()
-
-        # Now REBUILD with different data, but only for February
-        df_rebuild = pl.DataFrame({"date": [datetime.date(2024, 2, 20)], "value": [999]}).lazy()
-        df_rebuild.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="monthly",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("date").is_between(datetime.date(2024, 2, 1), datetime.date(2024, 2, 28))).collect()
-
-        # January and March partitions should still exist with original data
-        jan_data = pl.read_parquet(base / "2024-01.parquet")
-        mar_data = pl.read_parquet(base / "2024-03.parquet")
-        assert jan_data["value"].to_list() == [100]
-        assert mar_data["value"].to_list() == [300]
-
-        # February should have the new data
-        feb_data = pl.read_parquet(base / "2024-02.parquet")
-        assert feb_data["value"].to_list() == [999]
-
-    def test_rebuild_overwrites_existing_partition(self, tmp_path):
-        """REBUILD should overwrite existing partition files with fresh upstream data."""
-        # First cache
-        df1 = pl.DataFrame({"date": [datetime.date(2024, 5, 10)], "region": ["US"], "value": [100]}).lazy()
-        df1.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        ).collect()
-
-        base_daily = tmp_path / "daily"
-        assert pl.read_parquet(base_daily / "US" / "2024-05-10.parquet")["value"].to_list() == [100]
-
-        # REBUILD with different data for same partition
-        df2 = pl.DataFrame({"date": [datetime.date(2024, 5, 10)], "region": ["US"], "value": [999]}).lazy()
-        df2.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-            cache_mode=CacheMode.REBUILD,
-        ).filter((pl.col("date") == datetime.date(2024, 5, 10)) & (pl.col("region") == "US")).collect()
-
-        # Should have the new value
-        assert pl.read_parquet(base_daily / "US" / "2024-05-10.parquet")["value"].to_list() == [999]
-
-    def test_rebuild_writes_empty_files_for_missing_data(self, tmp_path):
-        """REBUILD should write empty files for expected partitions with no upstream data."""
-        # Source has data only for some dates
-        df = pl.DataFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 3)], "value": [10, 30]}).lazy()
-
-        # REBUILD with a query that spans more dates than have data
-        df.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("date").is_between(datetime.date(2024, 6, 1), datetime.date(2024, 6, 3))).collect()
-
-        base_daily = tmp_path / "daily"
-
-        # Partitions with data
-        assert not pl.read_parquet(base_daily / "2024-06-01.parquet").is_empty()
-        assert not pl.read_parquet(base_daily / "2024-06-03.parquet").is_empty()
-
-        # Empty partition for date with no data
-        assert (base_daily / "2024-06-02.parquet").exists()
-        assert pl.read_parquet(base_daily / "2024-06-02.parquet").is_empty()
-
-    def test_rebuild_overwrites_previously_empty_partition(self, tmp_path):
-        """REBUILD should overwrite a previously empty partition if data now exists."""
-        # First, create cache where 2024-06-02 is empty
-        df1 = pl.DataFrame({"date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 3)], "value": [10, 30]}).lazy()
-        df1.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-        ).filter(pl.col("date").is_between(datetime.date(2024, 6, 1), datetime.date(2024, 6, 3))).collect()
-
-        base_daily = tmp_path / "daily"
-        assert pl.read_parquet(base_daily / "2024-06-02.parquet").is_empty()
-
-        # REBUILD with data that now includes 2024-06-02
-        df2 = pl.DataFrame(
-            {
-                "date": [datetime.date(2024, 6, 1), datetime.date(2024, 6, 2), datetime.date(2024, 6, 3)],
-                "value": [10, 20, 30],
-            }
-        ).lazy()
-        df2.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("date").is_between(datetime.date(2024, 6, 1), datetime.date(2024, 6, 3))).collect()
-
-        # 2024-06-02 should now have data
-        assert pl.read_parquet(base_daily / "2024-06-02.parquet")["value"].to_list() == [20]
-
-    def test_rebuild_queries_upstream_not_cache(self, tmp_path, capsys):
-        """REBUILD should always query upstream, not read from cache."""
-        # Create initial cache
-        df_cached = pl.DataFrame({"date": [datetime.date(2024, 7, 1)], "value": [100]}).lazy()
-        df_cached.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-        ).collect()
-
-        # REBUILD with debug to verify upstream is called
-        df_upstream = pl.DataFrame({"date": [datetime.date(2024, 7, 1)], "value": [999]}).lazy().piot.debug()
-
-        result = (
-            df_upstream.piot.cache_parquet(
-                cache_path=tmp_path,
-                date_column="date",
-                time_unit="daily",
-                cache_mode=CacheMode.REBUILD,
-            )
-            .filter(pl.col("date") == datetime.date(2024, 7, 1))
-            .collect()
-        )
-
-        captured = capsys.readouterr().out
-        # Debug should have been called, indicating upstream was queried
-        assert "debug called" in captured
-        # Result should have the new value from upstream
-        assert result["value"].to_list() == [999]
-
-    def test_rebuild_with_extra_cols_preserves_other_regions(self, tmp_path):
-        """REBUILD with extra partition cols should preserve partitions for other column values."""
-        # Create cache with multiple regions
-        df_multi = pl.DataFrame(
-            {
-                "date": [datetime.date(2024, 8, 1), datetime.date(2024, 8, 1)],
-                "region": ["US", "EU"],
-                "value": [100, 200],
-            }
-        ).lazy()
-        df_multi.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-        ).collect()
-
-        base_daily = tmp_path / "daily"
-        assert pl.read_parquet(base_daily / "US" / "2024-08-01.parquet")["value"].to_list() == [100]
-        assert pl.read_parquet(base_daily / "EU" / "2024-08-01.parquet")["value"].to_list() == [200]
-
-        # REBUILD only US region
-        df_rebuild = pl.DataFrame({"date": [datetime.date(2024, 8, 1)], "region": ["US"], "value": [999]}).lazy()
-        df_rebuild.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            extra_partition_cols="region",
-            cache_mode=CacheMode.REBUILD,
-        ).filter((pl.col("date") == datetime.date(2024, 8, 1)) & (pl.col("region") == "US")).collect()
-
-        # US should have new value, EU should be unchanged
-        assert pl.read_parquet(base_daily / "US" / "2024-08-01.parquet")["value"].to_list() == [999]
-        assert pl.read_parquet(base_daily / "EU" / "2024-08-01.parquet")["value"].to_list() == [200]
-
-    def test_rebuild_no_date_column(self, tmp_path):
-        """REBUILD should work correctly without a date column."""
-        # Create initial cache
-        df1 = pl.DataFrame({"region": ["US", "EU"], "value": [100, 200]}).lazy()
-        df1.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column=None,
-            extra_partition_cols="region",
-        ).collect()
-
-        base_null = tmp_path / "null"
-        assert pl.read_parquet(base_null / "US.parquet")["value"].to_list() == [100]
-        assert pl.read_parquet(base_null / "EU.parquet")["value"].to_list() == [200]
-
-        # REBUILD US only
-        df2 = pl.DataFrame({"region": ["US"], "value": [999]}).lazy()
-        df2.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column=None,
-            extra_partition_cols="region",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("region") == "US").collect()
-
-        # US should have new value
-        assert pl.read_parquet(base_null / "US.parquet")["value"].to_list() == [999]
-        # EU should be unchanged
-        assert pl.read_parquet(base_null / "EU.parquet")["value"].to_list() == [200]
-
-    def test_rebuild_empty_to_data(self, tmp_path):
-        """REBUILD should correctly overwrite empty partitions when data becomes available."""
-        # First query creates empty partition
-        df1 = pl.DataFrame({"date": [], "value": []}, schema={"date": pl.Date, "value": pl.Int64}).lazy()
-        df1.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("date") == datetime.date(2024, 9, 1)).collect()
-
-        base_daily = tmp_path / "daily"
-        assert (base_daily / "2024-09-01.parquet").exists()
-        assert pl.read_parquet(base_daily / "2024-09-01.parquet").is_empty()
-
-        # REBUILD with actual data
-        df2 = pl.DataFrame({"date": [datetime.date(2024, 9, 1)], "value": [42]}).lazy()
-        df2.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("date") == datetime.date(2024, 9, 1)).collect()
-
-        assert pl.read_parquet(base_daily / "2024-09-01.parquet")["value"].to_list() == [42]
-
-    def test_rebuild_data_to_empty(self, tmp_path):
-        """REBUILD should correctly overwrite non-empty partitions when data disappears."""
-        # First create with data
-        df1 = pl.DataFrame({"date": [datetime.date(2024, 10, 1)], "value": [42]}).lazy()
-        df1.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-        ).collect()
-
-        base_daily = tmp_path / "daily"
-        assert pl.read_parquet(base_daily / "2024-10-01.parquet")["value"].to_list() == [42]
-
-        # REBUILD with empty source for that partition
-        df2 = pl.DataFrame({"date": [], "value": []}, schema={"date": pl.Date, "value": pl.Int64}).lazy()
-        df2.piot.cache_parquet(
-            cache_path=tmp_path,
-            date_column="date",
-            time_unit="daily",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("date") == datetime.date(2024, 10, 1)).collect()
-
-        # Partition should now be empty
-        assert pl.read_parquet(base_daily / "2024-10-01.parquet").is_empty()
-
-
-class TestCacheModePydantic:
-    """Test CacheMode enum pydantic integration for ergonomic model field usage."""
-
-    def test_cachemode_validate_from_string(self):
-        """CacheMode.validate should accept string enum names."""
-        assert CacheMode.validate("CACHE") == CacheMode.CACHE
-        assert CacheMode.validate("IGNORE") == CacheMode.IGNORE
-        assert CacheMode.validate("REBUILD") == CacheMode.REBUILD
-
-    def test_cachemode_validate_from_int(self):
-        """CacheMode.validate should accept integer values."""
-        assert CacheMode.validate(1) == CacheMode.CACHE
-        assert CacheMode.validate(2) == CacheMode.IGNORE
-        assert CacheMode.validate(3) == CacheMode.REBUILD
-
-    def test_cachemode_validate_from_enum(self):
-        """CacheMode.validate should accept CacheMode instances."""
-        assert CacheMode.validate(CacheMode.CACHE) == CacheMode.CACHE
-        assert CacheMode.validate(CacheMode.REBUILD) == CacheMode.REBUILD
-
-    def test_cachemode_validate_invalid_string(self):
-        """CacheMode.validate should raise KeyError for invalid string names."""
-        with pytest.raises(KeyError):
-            CacheMode.validate("INVALID")
-
-    def test_cachemode_validate_invalid_int(self):
-        """CacheMode.validate should raise ValueError for invalid integer values."""
-        with pytest.raises(ValueError):
-            CacheMode.validate(999)
-
-    def test_cachemode_validate_invalid_type(self):
-        """CacheMode.validate should raise ValueError for invalid types."""
-        with pytest.raises(ValueError, match="Cannot convert value to CacheMode"):
-            CacheMode.validate(3.14)
-
-    def test_cachemode_in_pydantic_model_from_string(self):
-        """CacheMode should work in a pydantic model when passed as a string."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode
-
-        # Should accept string
-        model = MyModel(cache_mode="REBUILD")
-        assert model.cache_mode == CacheMode.REBUILD
-
-        model2 = MyModel(cache_mode="CACHE")
-        assert model2.cache_mode == CacheMode.CACHE
-
-    def test_cachemode_in_pydantic_model_from_int(self):
-        """CacheMode should work in a pydantic model when passed as an int."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode
-
-        # Should accept int
-        model = MyModel(cache_mode=1)
-        assert model.cache_mode == CacheMode.CACHE
-
-        model2 = MyModel(cache_mode=3)
-        assert model2.cache_mode == CacheMode.REBUILD
-
-    def test_cachemode_in_pydantic_model_from_enum(self):
-        """CacheMode should work in a pydantic model when passed as an enum."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode
-
-        model = MyModel(cache_mode=CacheMode.IGNORE)
-        assert model.cache_mode == CacheMode.IGNORE
-
-    def test_cachemode_pydantic_json_serialization(self):
-        """CacheMode should serialize to string name in JSON."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode
-
-        model = MyModel(cache_mode=CacheMode.REBUILD)
-        json_output = model.model_dump_json()
-        assert '"cache_mode":"REBUILD"' in json_output
-
-    def test_cachemode_pydantic_model_dump(self):
-        """CacheMode should dump correctly in python and json mode."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode
-
-        model = MyModel(cache_mode="CACHE")
-
-        # Python mode should return the enum
-        python_dump = model.model_dump(mode="python")
-        assert python_dump["cache_mode"] == CacheMode.CACHE
-
-        # JSON mode should return the string name
-        json_dump = model.model_dump(mode="json")
-        assert json_dump["cache_mode"] == "CACHE"
-
-    def test_cachemode_pydantic_json_schema(self):
-        """CacheMode should generate proper JSON schema with string enum values."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode
-
-        schema = MyModel.model_json_schema()
-        # The schema should show CacheMode as a string enum with the member names
-        assert "CacheMode" in str(schema) or "cache_mode" in str(schema)
-        # Check that the enum values are present in schema
-        cache_mode_props = schema.get("properties", {}).get("cache_mode", {})
-        assert "enum" in cache_mode_props or "$ref" in cache_mode_props
-
-    def test_cachemode_with_default_value(self):
-        """CacheMode should work with default values in pydantic models."""
-        from pydantic import BaseModel
-
-        class MyModel(BaseModel):
-            cache_mode: CacheMode = CacheMode.CACHE
-
-        # Default value
-        model = MyModel()
-        assert model.cache_mode == CacheMode.CACHE
-
-        # Override with string
-        model2 = MyModel(cache_mode="REBUILD")
-        assert model2.cache_mode == CacheMode.REBUILD
-
-
-class TestWriteBoundingColumns:
-    """Opt-in ``write_bounding_columns`` kwarg on ``cache_parquet``.
-
-    Small SYNTHETIC LazyFrames (no real data sources). Validates default-off identity,
-    bounded-write restriction, read-back correctness, that the kwarg is permitted in any
-    cache mode, degrade behavior when the predicate cannot be restricted, and the pinned
-    empty-subset case.
-    """
-
-    @staticmethod
-    def _make_source():
-        """Five rows, all in 2023-01 (one monthly partition). ``x`` and ``y`` are NON-partition columns."""
-        return pl.DataFrame(
-            {
-                "date": [datetime.date(2023, 1, 10)] * 5,
-                "x": [1, 2, 3, 4, 5],
-                "y": [100, 200, 300, 400, 500],
-                "value": [10, 20, 30, 40, 50],
-            }
-        ).lazy()
-
-    @staticmethod
-    def _read_partition(root):
-        return pl.read_parquet(os.path.join(root, "monthly", "2023-01.parquet")).sort("x")
-
-    @staticmethod
-    def _walk_partition_frames(root):
-        """Map of relative parquet path -> sorted frame, for content comparison."""
-        out = {}
-        for dirpath, _dirs, files in os.walk(root):
-            for f in files:
-                if f.endswith(".parquet"):
-                    p = os.path.join(dirpath, f)
-                    out[os.path.relpath(p, root)] = pl.read_parquet(p).sort("x")
-        return out
-
-    def test_default_off_is_identical_to_not_passing(self, tmp_path):
-        """write_bounding_columns=None must produce the same files/rows as not passing the kwarg at all."""
-        d_omitted = tmp_path / "omitted"
-        d_none = tmp_path / "none"
-
-        cache_parquet(self._make_source, cache_path=d_omitted, date_column="date").collect()
-        cache_parquet(self._make_source, cache_path=d_none, date_column="date", write_bounding_columns=None).collect()
-
-        frames_omitted = self._walk_partition_frames(d_omitted)
-        frames_none = self._walk_partition_frames(d_none)
-
-        assert set(frames_omitted) == set(frames_none)
-        assert frames_omitted  # sanity: something was written
-        for rel, frame in frames_omitted.items():
-            assert frame.equals(frames_none[rel]), f"mismatch in {rel}"
-
-    def test_bounded_write_restricts_on_disk_rows(self, tmp_path):
-        """With write_bounding_columns=['x'] and a pushed is_in([1,2]), only the subset is written to disk."""
-        subset = [1, 2]
-        d = tmp_path / "bounded"
-        cache_parquet(
-            self._make_source,
-            cache_path=d,
-            date_column="date",
-            cache_mode=CacheMode.REBUILD,
-            write_bounding_columns=["x"],
-        ).filter(pl.col("x").is_in(subset)).collect()
-
-        on_disk = self._read_partition(d)
-        assert on_disk["x"].to_list() == subset
-
-    def test_unbounded_write_keeps_all_rows(self, tmp_path):
-        """Control: without write_bounding_columns, the same query writes the FULL partition to disk."""
-        d = tmp_path / "unbounded"
-        cache_parquet(
-            self._make_source,
-            cache_path=d,
-            date_column="date",
-            cache_mode=CacheMode.REBUILD,
-        ).filter(pl.col("x").is_in([1, 2])).collect()
-
-        on_disk = self._read_partition(d)
-        assert on_disk["x"].to_list() == [1, 2, 3, 4, 5]
-
-    def test_bounded_and_unbounded_readback_identity(self, tmp_path):
-        """Reading either cache back UNDER the same predicate yields identical rows (correctness preserved)."""
-        pred = pl.col("x").is_in([2, 4])
-
-        d_bounded = tmp_path / "b"
-        d_unbounded = tmp_path / "u"
-
-        bounded = (
-            cache_parquet(
-                self._make_source,
-                cache_path=d_bounded,
-                date_column="date",
-                cache_mode=CacheMode.REBUILD,
-                write_bounding_columns=["x"],
-            )
-            .filter(pred)
-            .collect()
-            .sort("x")
-        )
-        unbounded = (
-            cache_parquet(
-                self._make_source,
-                cache_path=d_unbounded,
-                date_column="date",
-                cache_mode=CacheMode.REBUILD,
-            )
-            .filter(pred)
-            .collect()
-            .sort("x")
-        )
-
-        assert bounded.equals(unbounded)
-        assert bounded["x"].to_list() == [2, 4]
-
-    def test_cache_mode_allowed_with_write_bounding_columns(self, tmp_path):
-        """write_bounding_columns is opt-in and permitted in any cache mode.
-
-        Under CacheMode.CACHE the bounded write still applies on a fresh partition; the
-        predicate-scoped semantics are the caller's responsibility (see docstring).
-        """
-        d = tmp_path / "cache_bounded"
-        out = (
-            cache_parquet(
-                self._make_source,
-                cache_path=d,
-                date_column="date",
-                cache_mode=CacheMode.CACHE,
-                write_bounding_columns=["x"],
-            )
-            .filter(pl.col("x").is_in([1, 2]))
-            .collect()
-        )
-        assert out["x"].to_list() == [1, 2]
-        # The freshly written partition is bounded to the predicate.
-        assert self._read_partition(d)["x"].to_list() == [1, 2]
-
-    def test_rebuild_mode_allowed(self, tmp_path):
-        """REBUILD with write_bounding_columns writes the predicate-bounded subset."""
-        out = (
-            cache_parquet(
-                self._make_source,
-                cache_path=tmp_path / "rebuild_ok",
-                date_column="date",
-                cache_mode=CacheMode.REBUILD,
-                write_bounding_columns=["x"],
-            )
-            .filter(pl.col("x").is_in([1]))
-            .collect()
-        )
-        assert out["x"].to_list() == [1]
-
-    def test_ignore_mode_passthrough(self, tmp_path):
-        """IGNORE bypasses the cache entirely; write_bounding_columns is a no-op (no raise, upstream returned)."""
-        out = (
-            cache_parquet(
-                self._make_source,
-                cache_path=tmp_path / "ignore",
-                date_column="date",
-                cache_mode=CacheMode.IGNORE,
-                write_bounding_columns=["x"],
-            )
-            .filter(pl.col("x").is_in([1, 2]))
-            .collect()
-            .sort("x")
-        )
-        # IGNORE returns upstream filtered by the read-side predicate; no cache files written.
-        assert out["x"].to_list() == [1, 2]
-        assert not os.path.exists(os.path.join(tmp_path / "ignore", "monthly"))
-
-    def test_predicate_not_restrictable_degrades_to_unbounded(self, tmp_path):
-        """write_bounding_columns=['x'] but predicate references only 'y' => restrict returns None => write is NOT bounded."""
-        d = tmp_path / "degrade"
-        cache_parquet(
-            self._make_source,
-            cache_path=d,
-            date_column="date",
-            cache_mode=CacheMode.REBUILD,
-            write_bounding_columns=["x"],
-        ).filter(pl.col("y").is_in([100, 200])).collect()
-
-        on_disk = self._read_partition(d)
-        # No bounding column in the predicate -> full partition written (no crash, degrade-safe).
-        assert on_disk["x"].to_list() == [1, 2, 3, 4, 5]
-
-    def test_empty_subset_pins_current_behavior(self, tmp_path):
-        """Degenerate empty subset ``is_in([])`` with a bounded write.
-
-        A bounded write with an empty subset produces ZERO partition files; the subsequent read
-        returns an empty frame with the expected schema, matching the UNBOUNDED equivalent below.
-        """
-        d = tmp_path / "empty"
-        out = (
-            cache_parquet(
-                self._make_source,
-                cache_path=d,
-                date_column="date",
-                cache_mode=CacheMode.REBUILD,
-                write_bounding_columns=["x"],
-            )
-            .filter(pl.col("x").is_in([]))
-            .collect()
-        )
-        assert out.height == 0
-        assert set(out.columns) == {"date", "x", "y", "value"}
-
-    def test_empty_subset_unbounded_is_clean(self, tmp_path):
-        """Contrast control: the UNBOUNDED empty-subset read returns an empty frame with no error."""
-        d = tmp_path / "empty_unbounded"
-        out = (
-            cache_parquet(
-                self._make_source,
-                cache_path=d,
-                date_column="date",
-                cache_mode=CacheMode.REBUILD,
-            )
-            .filter(pl.col("x").is_in([]))
-            .collect()
-        )
-        assert out.height == 0
-        assert set(out.columns) == {"date", "x", "y", "value"}
-
-
-class TestNonEnumerablePredicatesAndWrites:
-    """Read/write correctness for non-enumerable partition predicates (!=, unbounded ranges)
-    and the CACHE-mode invariant that existing partitions are never rewritten.
-
-    Note: null values in partition columns are unsupported (see cache_parquet docstring).
-    """
-
-    def _mk(self, tmp_path, source_calls=None):
-        data = pl.DataFrame(
-            {
-                "date": [datetime.date(2024, 1, 1)] * 5,
-                "symbol": ["s0", "s1", "s2", "s3", "s4"],
-                "region": ["a", "a", "b", "b", "b"],
-                "v": [1, 2, 3, 4, 5],
-            },
-            schema={"date": pl.Date, "symbol": pl.String, "region": pl.String, "v": pl.Int64},
-        )
-
-        def factory():
-            if source_calls is not None:
-                source_calls.append(1)
-            return data.lazy()
-
-        return data, factory
-
-    def _cache(self, factory, tmp_path, schema):
-        return cache_parquet(
-            factory,
-            cache_path=tmp_path,
-            date_column=None,
-            time_unit="daily",
-            extra_partition_cols=["symbol", "region"],
-            schema=schema,
-        )
-
-    def _mtimes(self, root):
-        return {os.path.join(r, f): os.path.getmtime(os.path.join(r, f)) for r, _, fs in os.walk(root) for f in fs}
-
-    @pytest.mark.parametrize(
-        "pred, expected_v",
-        [
-            (pl.col("symbol") != "s0", [2, 3, 4, 5]),
-            (pl.col("symbol").is_in(["s1", "s2", "s3", "s4"]), [2, 3, 4, 5]),  # positive control
-            (pl.col("v") > 2, [3, 4, 5]),  # non-partition predicate (UNCONSTRAINED)
-            ((pl.col("symbol") != "s0") | (pl.col("symbol") == "s0"), [1, 2, 3, 4, 5]),  # always-true OR
-            ((pl.col("symbol") != "s0") & (pl.col("region") == "b"), [3, 4, 5]),  # partial wildcard
-        ],
-    )
-    def test_populated_cache_read_correct(self, tmp_path, pred, expected_v):
-        data, factory = self._mk(tmp_path)
-        schema = data.schema
-        self._cache(factory, tmp_path, schema).collect()  # populate all
-        out = self._cache(factory, tmp_path, schema).filter(pred).collect()
-        assert sorted(out["v"].to_list()) == expected_v
-
-    def test_populated_cache_not_rewritten(self, tmp_path):
-        """CACHE mode must not rewrite existing partition files on a filtered read."""
-        data, factory = self._mk(tmp_path)
-        schema = data.schema
-        self._cache(factory, tmp_path, schema).collect()
-        before = self._mtimes(tmp_path)
-        time.sleep(0.05)
-        for pred in (pl.col("v") > 2, pl.col("symbol") != "s0"):
-            self._cache(factory, tmp_path, schema).filter(pred).collect()
-        after = self._mtimes(tmp_path)
-        rewritten = [p for p in after if p not in before or after[p] != before[p]]
-        assert rewritten == [], f"CACHE mode rewrote existing files: {rewritten}"
-
-    @pytest.mark.parametrize(
-        "pred, expected_v",
-        [
-            (pl.col("symbol") != "s0", [2, 3, 4, 5]),
-            ((pl.col("symbol") != "s0") | (pl.col("symbol") == "s0"), [1, 2, 3, 4, 5]),
-            ((pl.col("symbol") != "s0") & (pl.col("region") == "b"), [3, 4, 5]),
-        ],
-    )
-    def test_incomplete_cache_populates_missing(self, tmp_path, pred, expected_v):
-        """A non-enumerable predicate on an empty cache should populate the matching partitions."""
-        data, factory = self._mk(tmp_path)
-        schema = data.schema
-        # Fresh cache: first read with a negative/wildcard predicate must return correct rows.
-        out = self._cache(factory, tmp_path, schema).filter(pred).collect()
-        assert sorted(out["v"].to_list()) == expected_v
-
-    def test_contradiction_returns_empty(self, tmp_path):
-        data, factory = self._mk(tmp_path)
-        schema = data.schema
-        self._cache(factory, tmp_path, schema).collect()
-        out = self._cache(factory, tmp_path, schema).filter((pl.col("symbol") == "s0") & (pl.col("symbol") == "s1")).collect()
-        assert out.height == 0
-
-
-class TestDateColumnNonEnumerablePreserved:
-    """The read fix is scoped to date_column=None; date-partitioned caches keep prior behavior.
-
-    In particular, a non-enumerable extra-column predicate on a populated date-partitioned cache
-    must still read from cache without re-querying/rewriting from a (possibly changed) upstream.
-    """
-
-    def test_date_partitioned_negative_predicate_reads_cache(self, tmp_path):
-        orig = pl.DataFrame(
-            {"date": [datetime.date(2024, 1, 1)] * 3, "symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]},
-            schema={"date": pl.Date, "symbol": pl.String, "v": pl.Int64},
-        )
-        mutated = orig.with_columns((pl.col("v") + 100).alias("v"))
-        state = {"df": orig}
-
-        def factory():
-            return state["df"].lazy()
-
-        def mk():
-            return cache_parquet(
-                factory,
-                cache_path=tmp_path,
-                date_column="date",
-                time_unit="daily",
-                extra_partition_cols="symbol",
-                schema=orig.schema,
-            )
-
-        mk().collect()  # populate with orig
-        state["df"] = mutated  # upstream changes; CACHE mode must not overwrite
-        out = mk().filter(pl.col("symbol") != "s0").collect().sort("symbol")
-        assert out["v"].to_list() == [2, 3]
-
-
-def test_rebuild_wildcard_predicate_leaves_out_of_scope_partition(tmp_path):
-    """REBUILD with a non-enumerable predicate (date_column=None) refreshes only in-scope
-    partitions; a partition outside the predicate (``s0`` for ``symbol != 's0'``) is untouched."""
-    orig = pl.DataFrame(
-        {"symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]},
-        schema={"symbol": pl.String, "v": pl.Int64},
-    )
-    mutated = orig.with_columns((pl.col("v") + 100).alias("v"))
+    assert lower.filter(pl.col("date") >= D(2024, 6, 2)).sort("date").collect()["value"].to_list() == [22, 33, 44]
+
+
+@pytest.mark.parametrize("run_first", ["collect", "no_collect"])
+def test_intermediate_collect(tmp_path, run_first):
+    """An intermediate collect does not change what chained caches return or write."""
+
+    def run(base, do_collect: bool):
+        if base.exists():
+            shutil.rmtree(base)
+        ldf = _frame(a=[1, 2, 3], date=[D(2025, 7, 31)] * 3).piot.cache_parquet(base / "foo_test", "date", time_unit="daily")
+        if do_collect:
+            ldf.collect()
+        ldf1 = ldf.with_columns(pl.lit("foo").alias("foo")).piot.cache_parquet(base / "foo_test1", "date", time_unit="daily")
+        ldf2 = ldf.with_columns(pl.lit("bar").alias("bar")).piot.cache_parquet(base / "foo_test2", "date", time_unit="daily")
+        return ldf1.join(ldf2, on="a").collect(), cache_files(base)
+
+    order = [False, True] if run_first == "no_collect" else [True, False]
+    (res_a, cache_a), (res_b, cache_b) = (run(tmp_path / f"scenario_{c}", c) for c in order)
+    assert_frame_equal(res_a, res_b, check_row_order=False)
+    assert set(cache_a) == set(cache_b)
+    for k in cache_a:
+        assert_frame_equal(cache_a[k], cache_b[k], check_row_order=False)
+
+
+_REGION_DAYS = pl.LazyFrame({"date": pl.date_range(D(2020, 1, 1), D(2026, 1, 1), eager=True)}).with_columns(
+    region=pl.col.date.dt.day().replace_strict({1: "NA", 2: "EU", 3: "CA", 4: "NA", 6: "NA"}, default="US", return_dtype=pl.Utf8), value=pl.lit(100)
+)
+
+
+@pytest.mark.parametrize(
+    ("small_end", "big", "scan"),
+    [
+        (D(2020, 6, 1), (D(2019, 12, 15), D(2020, 9, 14)), None),
+        (D(2021, 2, 1), (D(2020, 1, 1), D(2024, 2, 1)), "Cache scan uses glob"),
+    ],
+    ids=["large_partition_query", "huge_partition_query"],
+)
+def test_partition_query_over_many_partitions(tmp_path, caplog, monkeypatch, small_end, big, scan):
+    """A partly cached query over many partitions returns every row; a huge one scans the cache by glob."""
+    import logging
+
+    # More partitions than the default open-sink cap (128).
+    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "8192")
+    caplog.set_level(logging.DEBUG, logger="polars_io_tools.io_sources.lazy_cache_parquet")
+    kwargs = {"date_column": "date", **_RG}
+    assert_cached_matches_native(_REGION_DAYS, tmp_path, pl.col.region.eq("US") & pl.col.date.is_between(D(2020, 1, 1), small_end), runs=1, **kwargs)
+    assert_cached_matches_native(_REGION_DAYS, tmp_path, pl.col.region.is_in(["US", "NA"]) & pl.col.date.is_between(*big), runs=1, **kwargs)
+    if scan:
+        assert scan in caplog.text
+
+
+def test_partition_count_exceeds_open_sinks_raises(tmp_path, monkeypatch):
+    """Writing more partitions than the open-sink cap fails loud instead of dropping rows."""
+    monkeypatch.setenv("POLARS_MAX_OPEN_SINKS", "4")
+    df = _frame(date=pl.date_range(D(2020, 1, 1), D(2020, 1, 10), eager=True), value=range(10))
+    with pytest.raises(Exception, match="open-sink cap"):
+        cache_parquet(df, tmp_path, "date", time_unit="daily").filter(pl.col.date.is_between(D(2020, 1, 1), D(2020, 1, 10))).collect()
+
+
+def test_contradiction_writes_once(monkeypatch, tmp_path):
+    """A repeated read of a cached range does not sink again."""
+    base = daily_frame(31, D(2024, 1, 1)).lazy()
+    pred = pl.col("date").is_between(D(2024, 1, 10), D(2024, 1, 20))
+    sinks = []
+    real_sink = pl.LazyFrame.sink_parquet
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", lambda self, *a, **k: sinks.append(1) or real_sink(self, *a, **k))
+    cached = cache_parquet(base, tmp_path, "date", time_unit="monthly")
+    cached.filter(pred).collect()
+    cached.filter(pred).collect()
+    assert sinks == [1]
+
+
+# write_bounding_columns: an opt-in that writes only the rows the predicate keeps on the listed columns.
+
+_BOUNDED_SOURCE = pl.DataFrame({"date": [D(2023, 1, 10)] * 5, "x": [1, 2, 3, 4, 5], "y": [100, 200, 300, 400, 500], "value": [10, 20, 30, 40, 50]})
+
+
+def WB(id, pred, result, on_disk, mode=CacheMode.REBUILD, bounding=("x",)):
+    return Case(id, pred, (result, on_disk), {"mode": mode, "bounding": list(bounding) if bounding else None})
+
+
+WRITE_BOUNDING = [
+    WB("bounded_write_restricts_on_disk_rows", pl.col("x").is_in([1, 2]), [1, 2], [1, 2]),
+    WB("unbounded_write_keeps_all_rows", pl.col("x").is_in([1, 2]), [1, 2], [1, 2, 3, 4, 5], bounding=None),
+    WB("bounded_and_unbounded_readback_identity", pl.col("x").is_in([2, 4]), [2, 4], [2, 4]),
+    WB("cache_mode_allowed_with_write_bounding_columns", pl.col("x").is_in([1, 2]), [1, 2], [1, 2], CacheMode.CACHE),
+    WB("rebuild_mode_allowed", pl.col("x").is_in([1]), [1], [1]),
+    WB("ignore_mode_passthrough", pl.col("x").is_in([1, 2]), [1, 2], None, CacheMode.IGNORE),
+    WB("predicate_not_restrictable_degrades_to_unbounded", pl.col("y").is_in([100, 200]), [1, 2], [1, 2, 3, 4, 5]),
+    WB("empty_subset_pins_current_behavior", pl.col("x").is_in([]), [], None),
+    # Whether an empty file is written depends on the Polars version.
+    WB("empty_subset_unbounded_is_clean", pl.col("x").is_in([]), [], ..., bounding=None),
+]
+
+
+@pytest.mark.parametrize(("pred", "expect", "mode", "bounding"), params(WRITE_BOUNDING, "pred", "expect", "mode", "bounding"))
+def test_write_bounding_columns(tmp_path, pred, expect, mode, bounding):
+    result, on_disk = expect
+    out = cache_parquet(lambda: _BOUNDED_SOURCE.lazy(), tmp_path, "date", cache_mode=mode, write_bounding_columns=bounding).filter(pred).collect()
+    assert_frame_equal(out, _BOUNDED_SOURCE.filter(pl.col("x").is_in(result)), check_row_order=False)
+    files = cache_files(tmp_path)
+    if on_disk is ...:
+        return
+    if on_disk is None:
+        assert not files
+    else:
+        assert sorted(files) == ["monthly/2023-01.parquet"]
+        assert sorted(files["monthly/2023-01.parquet"]["x"]) == on_disk
+
+
+def test_write_bounding_columns_default_off_is_identical_to_not_passing(tmp_path):
+    cache_parquet(lambda: _BOUNDED_SOURCE.lazy(), tmp_path / "omitted", "date").collect()
+    cache_parquet(lambda: _BOUNDED_SOURCE.lazy(), tmp_path / "none", "date", write_bounding_columns=None).collect()
+    omitted, none = cache_files(tmp_path / "omitted"), cache_files(tmp_path / "none")
+    assert omitted and set(omitted) == set(none)
+    for rel, frame in omitted.items():
+        assert_frame_equal(frame, none[rel])
+
+
+# Non-enumerable partition predicates (!=, wildcards) on a no-date cache, and the CACHE-mode rule that existing
+# partitions are never rewritten.
+
+_SYMBOLS = pl.DataFrame(
+    {"date": [D(2024, 1, 1)] * 5, "symbol": ["s0", "s1", "s2", "s3", "s4"], "region": ["a", "a", "b", "b", "b"], "v": [1, 2, 3, 4, 5]},
+    schema={"date": pl.Date, "symbol": pl.String, "region": pl.String, "v": pl.Int64},
+)
+_SYM_KW = {"date_column": None, "time_unit": "daily", "extra_partition_cols": ["symbol", "region"], "schema": _SYMBOLS.schema}
+_s = pl.col("symbol")
+
+
+@pytest.mark.parametrize("populated", [True, False], ids=["populated_cache_read_correct", "incomplete_cache_populates_missing"])
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _s != "s0",
+        _s.is_in(["s1", "s2", "s3", "s4"]),
+        pl.col("v") > 2,
+        (_s != "s0") | (_s == "s0"),
+        (_s != "s0") & (pl.col("region") == "b"),
+        (_s == "s0") & (_s == "s1"),
+    ],
+    ids=["ne", "positive_control", "non_partition", "always_true_or", "partial_wildcard", "contradiction_returns_empty"],
+)
+def test_non_enumerable_predicate(tmp_path, populated, pred):
+    if populated:
+        cache_parquet(lambda: _SYMBOLS.lazy(), tmp_path, **_SYM_KW).collect()
+    assert_cached_matches_native(_SYMBOLS.lazy(), tmp_path, pred, runs=1, **_SYM_KW)
+
+
+def test_populated_cache_not_rewritten(tmp_path):
+    """CACHE mode must not rewrite existing partition files on a filtered read."""
+    cache_parquet(_SYMBOLS.lazy(), tmp_path, **_SYM_KW).collect()
+    before = {p: (tmp_path / p).stat().st_mtime_ns for p in cache_files(tmp_path)}
+    time.sleep(0.05)
+    for pred in (pl.col("v") > 2, _s != "s0"):
+        cache_parquet(_SYMBOLS.lazy(), tmp_path, **_SYM_KW).filter(pred).collect()
+    assert {p: (tmp_path / p).stat().st_mtime_ns for p in cache_files(tmp_path)} == before
+
+
+def test_date_partitioned_negative_predicate_reads_cache(tmp_path):
+    """On a populated date-partitioned cache, a != on an extra column reads the cache and not a changed upstream."""
+    orig = _SYMBOLS.head(3).drop("region")
     state = {"df": orig}
+    kwargs = {"date_column": "date", "time_unit": "daily", "extra_partition_cols": "symbol", "schema": orig.schema}
+    cache_parquet(lambda: state["df"].lazy(), tmp_path, **kwargs).collect()
+    state["df"] = orig.with_columns(pl.col("v") + 100)
+    assert cache_parquet(lambda: state["df"].lazy(), tmp_path, **kwargs).filter(_s != "s0").collect().sort("symbol")["v"].to_list() == [2, 3]
 
-    def factory():
-        return state["df"].lazy()
+
+_SYM3 = pl.DataFrame({"symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]}, schema={"symbol": pl.String, "v": pl.Int64})
+
+
+@pytest.mark.parametrize(
+    ("refreshed", "expected"),
+    [
+        (_SYM3.with_columns(pl.col("v") + 100), {"s0": 1, "s1": 102, "s2": 103}),
+        (pl.DataFrame({"symbol": ["s0", "s1"], "v": [1, 20]}), {"s0": 1, "s1": 20}),
+    ],
+    ids=["rebuild_wildcard_predicate_leaves_out_of_scope_partition", "rebuild_wildcard_removes_partition_that_disappeared_upstream"],
+)
+def test_rebuild_wildcard(tmp_path, refreshed, expected):
+    """REBUILD with ``symbol != 's0'`` refreshes in-scope partitions, drops those upstream lost, and leaves s0 alone."""
+    state = {"df": _SYM3}
 
     def mk(mode):
-        return cache_parquet(
-            factory,
-            cache_path=tmp_path,
-            date_column=None,
-            extra_partition_cols="symbol",
-            schema=orig.schema,
-            cache_mode=mode,
-        )
+        return cache_parquet(lambda: state["df"].lazy(), tmp_path, extra_partition_cols="symbol", schema=_SYM3.schema, cache_mode=mode)
 
-    mk(CacheMode.CACHE).collect()  # populate
-    state["df"] = mutated
-    mk(CacheMode.REBUILD).filter(pl.col("symbol") != "s0").collect()
-    # s0 is out of scope -> original value; s1/s2 refreshed to mutated values.
+    mk(CacheMode.CACHE).collect()
+    state["df"] = refreshed
+    mk(CacheMode.REBUILD).filter(_s != "s0").collect()
     got = mk(CacheMode.CACHE).collect().sort("symbol")
-    assert dict(zip(got["symbol"], got["v"])) == {"s0": 1, "s1": 102, "s2": 103}
+    assert dict(zip(got["symbol"], got["v"])) == expected
 
 
 def test_wildcard_read_matching_no_files_returns_empty(tmp_path):
     """A wildcard predicate that matches no cached files returns an empty frame, not an error."""
-    data = pl.DataFrame({"symbol": ["s0"], "v": [1]}, schema={"symbol": pl.String, "v": pl.Int64})
-
-    def factory():
-        return data.lazy()
-
-    def mk(mode=CacheMode.CACHE):
-        return cache_parquet(factory, cache_path=tmp_path, date_column=None, extra_partition_cols="symbol", schema=data.schema, cache_mode=mode)
-
-    # Fresh cache; upstream only has s0. Filtering != s0 writes/reads nothing -> empty frame.
-    out = mk().filter(pl.col("symbol") != "s0").collect()
-    assert out.height == 0
-    assert set(out.columns) == {"symbol", "v"}
-    # A pure-false predicate likewise returns empty rather than raising.
-    out2 = mk().filter(pl.lit(False)).collect()
-    assert out2.height == 0
-
-
-def test_rebuild_wildcard_removes_partition_that_disappeared_upstream(tmp_path):
-    """REBUILD with a non-enumerable predicate must drop cached in-scope partitions that the
-    refreshed upstream no longer emits, so a later wildcard scan does not return stale data."""
-    first = pl.DataFrame(
-        {"symbol": ["s0", "s1", "s2"], "v": [1, 2, 3]},
-        schema={"symbol": pl.String, "v": pl.Int64},
-    )
-    # Upstream refresh drops s2 entirely (and would change s1).
-    second = pl.DataFrame(
-        {"symbol": ["s0", "s1"], "v": [1, 20]},
-        schema={"symbol": pl.String, "v": pl.Int64},
-    )
-    state = {"df": first}
-
-    def factory():
-        return state["df"].lazy()
-
-    def mk(mode):
-        return cache_parquet(factory, cache_path=tmp_path, date_column=None, extra_partition_cols="symbol", schema=first.schema, cache_mode=mode)
-
-    mk(CacheMode.CACHE).collect()  # populate s0, s1, s2
-    state["df"] = second
-    mk(CacheMode.REBUILD).filter(pl.col("symbol") != "s0").collect()  # refresh in-scope (s1..); s2 gone
-    got = mk(CacheMode.CACHE).collect().sort("symbol")
-    # s0 untouched (out of scope), s1 refreshed, s2 removed (no longer upstream).
-    assert dict(zip(got["symbol"], got["v"])) == {"s0": 1, "s1": 20}
+    data = _SYM3.head(1)
+    lf = cache_parquet(lambda: data.lazy(), tmp_path, extra_partition_cols="symbol", schema=data.schema)
+    for pred in (_s != "s0", pl.lit(False)):
+        assert_frame_equal(lf.filter(pred).collect(), data.clear())
 
 
 def test_rebuild_one_sided_empties_dropped_day_within_bounds(tmp_path):
-    days = [datetime.date(2024, 6, d) for d in (1, 2, 3)]
-    source = pl.LazyFrame({"date": days, "value": [1, 2, 3]})
+    """Unlike a no-date cache, a dropped day inside the cached date bounds is kept as an empty file."""
+    source = _daily([1, 2, 3])
     cache_parquet(source, tmp_path, "date", time_unit="daily").collect()
-
-    # Unlike the no-date case above, a dropped day inside the cached date bounds is kept as an empty file.
-    rebuilt = source.filter(pl.col("date") != days[1])
-    out = cache_parquet(rebuilt, tmp_path, "date", time_unit="daily", cache_mode=CacheMode.REBUILD).filter(pl.col("date") >= days[0]).collect()
+    rebuilt = source.filter(pl.col("date") != D(2024, 6, 2))
+    out = cache_parquet(rebuilt, tmp_path, "date", time_unit="daily", cache_mode=CacheMode.REBUILD).filter(pl.col("date") >= D(2024, 6, 1)).collect()
     assert out.sort("date")["value"].to_list() == [1, 3]
-    assert pl.read_parquet(tmp_path / "daily" / "2024-06-02.parquet").is_empty()
-
-
-D = datetime.date
-UTC = datetime.UTC
+    assert_cache_files(tmp_path, {"daily/2024-06-02.parquet": []})
 
 
 def T(*args) -> datetime.datetime:

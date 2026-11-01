@@ -1,3 +1,9 @@
+"""piot.cache: per-column, per-partition caching against a source that counts the columns it is asked for.
+
+Step tables give a sequence of queries, the source columns each must fetch and the cache size after it; every
+result is compared with the same query on the uncached frame.
+"""
+
 import os
 import pickle
 import subprocess
@@ -14,16 +20,7 @@ from polars.testing import assert_frame_equal
 import polars_io_tools.io_sources  # noqa: F401
 from polars_io_tools.io_sources.lazy_cache import _is_contradiction
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
-
-
-def assert_expr_equal(a: pl.Expr | None, b: pl.Expr | None):
-    """Assert that two polars expressions are equal"""
-    if a is None:
-        assert b is None
-    elif b is None:
-        assert a is None
-    else:
-        assert a.meta.serialize(format="json") == b.meta.serialize(format="json")
+from polars_io_tools.tests.helpers.catalogue import Case, params
 
 
 @dataclass
@@ -37,78 +34,44 @@ class CallRecord:
 
 @dataclass
 class TrackableSource:
-    """
-    A trackable IO source that records column requests.
-
-    This replaces the previous approach of using map_batches with Mocks,
-    which was fundamentally flawed because map_batches requires pure functions
-    and Polars may call them with arbitrary input data.
-    """
+    """An IO source over ``data`` that records the columns and predicate of every call."""
 
     data: pl.DataFrame
     calls: list[CallRecord] = field(default_factory=list)
 
     def reset(self):
-        """Clear all recorded calls."""
         self.calls.clear()
 
     def get_column_counts(self) -> dict[str, int]:
-        """
-        Count how many times each column was requested.
-
-        Returns a dict mapping column name to request count.
-        If with_columns was None (all columns), counts all columns.
-        """
+        """How often each column was requested; a call without a projection requests every column."""
         counts: dict[str, int] = {}
         for call in self.calls:
-            cols = call.with_columns or list(self.data.columns)
-            for col in cols:
+            for col in call.with_columns or list(self.data.columns):
                 counts[col] = counts.get(col, 0) + 1
         return counts
 
     def as_lazy_frame(self) -> pl.LazyFrame:
-        """Create a LazyFrame backed by this trackable source."""
-        schema = self.data.schema
         tracker = self
-        base_data = self.data
 
-        def source_generator(
-            with_columns: list[str] | None,
-            predicate: pl.Expr | None,
-            n_rows: int | None,
-            batch_size: int | None,
-        ) -> Iterator[pl.DataFrame]:
-            # Record the call - use `is not None` to avoid Expr truthiness issues
-            tracker.calls.append(
-                CallRecord(
-                    with_columns=with_columns,
-                    predicate_str=str(predicate) if predicate is not None else None,
-                    n_rows=n_rows,
-                )
-            )
-
-            df = base_data.lazy()
+        def source_generator(with_columns, predicate, n_rows, batch_size) -> Iterator[pl.DataFrame]:
+            tracker.calls.append(CallRecord(with_columns, str(predicate) if predicate is not None else None, n_rows))
+            df = tracker.data.lazy()
             if predicate is not None:
                 df = df.filter(predicate)
             if with_columns is not None:
                 df = df.select(with_columns)
             if n_rows is not None:
                 df = df.head(n_rows)
-
             if batch_size is None:
                 yield df.collect()
             else:
                 yield from df.collect().iter_slices(n_rows=batch_size)
 
-        return register_io_source_with_is_pure(source_generator, schema=schema, validate_schema=False)
+        return register_io_source_with_is_pure(source_generator, schema=self.data.schema, validate_schema=False)
 
 
 @pytest.fixture
 def source():
-    """Create a trackable source with test data.
-
-    The source is automatically reset after each test.
-    """
     data = pl.DataFrame(
         {
             "x": [1, 2, 3, 4, 5, 6],
@@ -126,8 +89,31 @@ def source():
 
 @pytest.fixture
 def df(source):
-    """Build a lazy frame backed by the trackable source."""
     return source.as_lazy_frame()
+
+
+@pytest.mark.parametrize(
+    ("pred", "select", "empty"),
+    [
+        (None, ["x2", "y2"], False),
+        (pl.col("p"), "x2", False),
+        (pl.col("p") & ~pl.col("p"), "x2", True),
+        (pl.col("p2"), "x2", False),
+        (pl.col("p2") & ~pl.col("p2"), "x2", True),
+    ],
+    ids=["source_basic", "filter", "logically_false", "derived_filter", "logically_false_derived"],
+)
+def test_source(source, df, pred, select, empty):
+    """The tracking source is called once per query, sees the projection and pushed predicate, and filters correctly."""
+    out = (df if pred is None else df.filter(pred)).select(select).collect()
+    assert len(source.calls) == 1
+    call = source.calls[0]
+    if pred is None:
+        assert set(call.with_columns) == {"x2", "y2"}
+    else:
+        assert call.predicate_str is not None and pred.meta.root_names()[0] in call.predicate_str
+        assert_frame_equal(out, source.data.filter(pred).select(select))
+        assert out.is_empty() is empty
 
 
 class Scenario(NamedTuple):
@@ -143,64 +129,6 @@ class Scenario(NamedTuple):
     # For partitioned data, we "complete" the cache by collecting the frame for all columns and no filters
     complete_counts: dict[str, int] = {}
     complete_cache_size: int = 0
-
-
-def test_source_basic(source, df):
-    """Test that the trackable source correctly records column requests."""
-    # Select specific columns
-    df.select(["x2", "y2"]).collect()
-    assert len(source.calls) == 1
-    assert set(source.calls[0].with_columns) == {"x2", "y2"}
-
-    source.reset()
-
-    # Filter and select
-    df.filter(pl.col("p")).select("x2").collect()
-    assert len(source.calls) == 1
-    # The predicate should be pushed down
-    assert source.calls[0].predicate_str is not None
-    assert "p" in source.calls[0].predicate_str
-
-
-def test_source_logically_false_and_derived_filters(source, df):
-    # Baseline raw data for logical comparisons
-    raw_df = source.data
-
-    # 1) Simple filter on p, select x2
-    source.reset()
-    out = df.filter(pl.col("p")).select("x2").collect()
-    assert len(source.calls) == 1
-    expected = raw_df.filter(pl.col("p"))["x2"]
-    assert out["x2"].to_list() == expected.to_list()
-
-    # 2) Logically false predicate p & ~p
-    source.reset()
-    out_false = df.filter(pl.col("p") & ~pl.col("p")).select("x2").collect()
-    # Expression is still evaluated once at the IO layer
-    assert len(source.calls) == 1
-    # Result is logically empty
-    assert len(out_false) == 0
-    call = source.calls[0]
-    # Predicate should be present and mention p
-    assert call.predicate_str is not None
-    assert "p" in call.predicate_str
-
-    # 3) Filter on derived column p2, select x2
-    source.reset()
-    out_p2 = df.filter(pl.col("p2")).select("x2").collect()
-    assert len(source.calls) == 1
-    expected_p2 = raw_df.filter(pl.col("p2"))["x2"]
-    assert out_p2["x2"].to_list() == expected_p2.to_list()
-
-    # 4) Logically false predicate on derived column p2 & ~p2
-    source.reset()
-    out_p2_false = df.filter(pl.col("p2") & ~pl.col("p2")).select("x2").collect()
-    # Again, expression evaluated once at IO, result empty
-    assert len(source.calls) == 1
-    assert len(out_p2_false) == 0
-    call = source.calls[0]
-    assert call.predicate_str is not None
-    assert "p2" in call.predicate_str
 
 
 SCENARIOS = [
@@ -273,336 +201,141 @@ SCENARIOS = [
 
 
 @pytest.mark.parametrize("cache_mode", ["cache", "rebuild", "ignore"])
-@pytest.mark.parametrize(
-    "scenario",
-    SCENARIOS,
-)
+@pytest.mark.parametrize("scenario", SCENARIOS)
 def test_scenarios(source, df, cache_mode, scenario):
-    """Check the caching behavior for various scenarios.
-
-    This test verifies:
-    1. First call populates the cache with the expected size
-    2. Second identical call uses cache (no new source calls in cache mode)
-    3. Third call to collect all data completes the cache
-    """
+    """A query populates the cache, a fresh frame over the same cache returns the same, and a full read completes it."""
     cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=scenario.partition_cols, cache_mode=cache_mode)
 
-    # First call
-    out_cached = df_cache.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
-    first_call_count = len(source.calls)
-    assert first_call_count >= 1, "Expected at least one source call"
-    if cache_mode == "ignore":
-        assert len(cache) == 0
-    else:
-        assert len(cache) == scenario.cache_size
+    def run(partition_cols):
+        # The source's call log is part of the serialized plan, and so of the cache key.
+        source.reset()
+        lf = df.piot.cache(cache, order_by="x", partition_cols=partition_cols, cache_mode=cache_mode)
+        return lf, lf.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
 
-    # Verify results match direct query
-    source.reset()
+    df_cache, out_cached = run(scenario.partition_cols)
+    assert len(source.calls) >= 1
+    assert len(cache) == (0 if cache_mode == "ignore" else scenario.cache_size)
     out = df.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
     assert_frame_equal(out_cached, out, check_row_order=not scenario.partition_cols)
 
-    # Second call - reset source to track new calls
-    source.reset()
-
-    # Re-create df_cache (but using the same `cache`) to prove there is no state in df_cache that's not captured by `cache`
-    # We also reverse the partition cols here to make sure that doesn't impact things
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=list(reversed(scenario.partition_cols)), cache_mode=cache_mode)
-    out_cached2 = df_cache.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
-
-    if cache_mode == "cache":
-        # In cache mode, second call should not need new source data (or minimal calls for partitioned)
-        assert len(cache) == scenario.cache_size
-    else:
-        # In rebuild/ignore mode, source is called again
-        if cache_mode == "ignore":
-            assert len(cache) == 0
-        else:
-            assert len(cache) == scenario.cache_size
+    # A new frame over the same cache, with the partition columns reversed, holds no state of its own.
+    df_cache, out_cached2 = run(list(reversed(scenario.partition_cols)))
+    assert len(cache) == (0 if cache_mode == "ignore" else scenario.cache_size)
     assert_frame_equal(out_cached2, out_cached)
 
-    # Third Call - "Complete" the cache by selecting all the data
-    source.reset()
-
     out_cached3 = df_cache.collect()
-    if cache_mode == "cache":
-        assert len(cache) == scenario.complete_cache_size
-    else:
-        if cache_mode == "ignore":
-            assert len(cache) == 0
-        else:
-            assert len(cache) == scenario.complete_cache_size
-
+    assert len(cache) == (0 if cache_mode == "ignore" else scenario.complete_cache_size)
     assert_frame_equal(out_cached3, df.collect(), check_row_order=not scenario.partition_cols)
 
 
-def test_df_partitioned(source, df):
-    """Test partitioning scenarios with single partition column."""
+# Steps: each query on one cache, the columns it must fetch from the source, and the cache size after it.
+
+ANY = range(99)
+SOME = range(1, 99)
+
+
+@dataclass(frozen=True)
+class Q:
+    """A query; ``counts`` maps a source column to how often it is fetched (``None``: the source is not called)."""
+
+    filter: pl.Expr | None = None
+    select: object = None
+    counts: dict | None = None
+    cache_size: int | None = None
+    ordered: bool = True
+
+
+_y, _p = pl.col("y"), pl.col("p")
+_ya, _yb = _y == "a", _y == "b"
+_y_ab = _y.is_in(["a", "b"])
+_ALL6 = {c: 1 for c in ("x", "y", "p", "x2", "y2", "p2")}
+_ALL5 = {c: 1 for c in ("x", "p", "x2", "y2", "p2")}
+
+
+def STEPS(id, queries, partition_cols=(), column_granularity=True):
+    return Case(id, queries, None, {"partition_cols": partition_cols, "column_granularity": column_granularity})
+
+
+CACHE_STEPS = [
+    STEPS(
+        "df_partitioned",
+        [
+            # x2, plus y (partition) and x (order_by), for y=a
+            Q(_ya, "x2", {"x2": 1, "y2": 0, "p2": 0}, 3),
+            Q(_ya, "p2", {"x2": 0, "y2": 0, "p2": 1}),
+            Q(_yb, "y2", {"x2": 0, "y2": 1, "p2": 0}),
+            Q(_yb, ["x2", "y2"], {"x2": 1, "y2": 0, "p2": 0}),
+            # only y2 for y=a and p2 for y=b are missing
+            Q(_y_ab, None, {"x2": 0, "y2": 1, "p2": 1}, ordered=False),
+        ],
+        ("y",),
+    ),
+    STEPS(
+        "df_multi_partitioned",
+        [
+            # x2, y, p and x for y=a/p=True and y=a/p=False
+            Q(_ya, "x2", {"x2": 1, "y2": 0, "p2": 0}, 8),
+            Q(_ya, "x2", {"x2": ANY}, 8),
+            Q(_ya, "p2", {"x2": 0, "y2": 0, "p2": SOME}),
+            Q(_yb, "y2", {"x2": 0, "y2": 1, "p2": 0}),
+            Q(_yb, ["x2", "y2"], {"x2": SOME, "p2": 0}),
+            Q(_y_ab, None, {}, ordered=False),
+        ],
+        ("y", "p"),
+    ),
+    STEPS(
+        "df_multi_partitioned_contradiction",
+        [
+            Q([_ya, _p == pl.lit(True)], "x2", {"x2": 1, "y2": 0, "p2": 0}, 4),
+            Q([_ya, _p == pl.lit(True)], "x2", {"x2": 0}, 4),
+            Q([_yb, _p == pl.lit(False)], "x2", {"x2": 1, "y2": 0, "p2": 0}, 8),
+            Q([_yb, _p == pl.lit(True)], "x2", {"x2": 1, "y2": 0, "p2": 0}, 12),
+            Q([_yb, _p.eq(True)], "x2", {"x2": 0}, 12),
+            # needs y=c/p=True
+            Q(_p.eq(True), "x2", {"x2": 1, "y2": 0, "p2": 0}, 16),
+            Q(_y_ab & _p.eq(True), "x2", {"x2": 0}, 16),
+            # needs y=a/p=False
+            Q(_y_ab & _p.is_in([False, True]), "x2", {"x2": 1, "y2": 0, "p2": 0}, 20, ordered=False),
+            Q(_y_ab & _p.is_in([False, True]), "x2", {"x2": 0}, 20, ordered=False),
+        ],
+        ("y", "p"),
+    ),
+    # With column_granularity=False the first touch of a block fetches its whole schema.
+    STEPS("column_granularity_false_fills_all_columns", [Q(None, "x2", _ALL6, 6), Q(None, ["y2", "p2"], None)], column_granularity=False),
+    STEPS(
+        "column_granularity_false_preserves_partitioning",
+        [Q(_ya, "x2", _ALL5), Q(_ya, "p2", None), Q(_yb, "x2", _ALL5)],
+        ("y",),
+        column_granularity=False,
+    ),
+]
+
+
+@pytest.mark.parametrize(("queries", "partition_cols", "column_granularity"), params(CACHE_STEPS, "pred", "partition_cols", "column_granularity"))
+def test_cache_steps(source, df, queries, partition_cols, column_granularity):
     cache = {}
-    # Get x2 on y=a
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",))
-    out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # x2 fetched once
-    assert counts.get("y2", 0) == 0  # y2 not fetched
-    assert counts.get("p2", 0) == 0  # p2 not fetched
-    assert len(cache) == 3  # x2, y (partition col), x (order_by) for partition y=a
+    df_cache = df.piot.cache(cache, order_by="x", partition_cols=partition_cols, column_granularity=column_granularity)
+    for q in queries:
+        source.reset()
 
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("x2").collect()
-    assert_frame_equal(out_cached, out)
+        def query(lf, q=q):
+            lf = lf if q.filter is None else lf.filter(*q.filter) if isinstance(q.filter, list) else lf.filter(q.filter)
+            return (lf if q.select is None else lf.select(q.select)).collect()
 
-    source.reset()
-
-    # Get p2 on y=a (x2 should be cached, need to fetch p2)
-    out_cached = df_cache.filter(pl.col("y") == "a").select("p2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 already cached
-    assert counts.get("y2", 0) == 0  # y2 not needed
-    assert counts.get("p2", 0) == 1  # p2 fetched
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("p2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get y2 on y=b (different partition)
-    out_cached = df_cache.filter(pl.col("y") == "b").select("y2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 not needed
-    assert counts.get("y2", 0) == 1  # y2 fetched for new partition
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select("y2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get x2 and y2 on y=b (y2 already cached for y=b, need x2)
-    out_cached = df_cache.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # x2 fetched for y=b partition
-    assert counts.get("y2", 0) == 0  # y2 already cached for y=b
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get all columns on y=a and y=b (only need y2 for y=a, p2 for y=b)
-    out_cached = df_cache.filter(pl.col("y").is_in(["a", "b"])).collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 cached for both partitions
-    assert counts.get("y2", 0) == 1  # y2 needed for y=a
-    assert counts.get("p2", 0) == 1  # p2 needed for y=b
-
-    source.reset()
-    out = df.filter(pl.col("y").is_in(["a", "b"])).collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
-
-
-def test_df_multi_partitioned(source, df):
-    """Test partitioning scenarios with multiple partition columns."""
-    cache = {}
-    # Get x2 on y=a (covers 2 partitions: y=a/p=True and y=a/p=False)
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y", "p"))
-    out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 8  # x2, y, p, x (order_by) for 2 partitions (y=a, p=True) and (y=a, p=False)
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Repeat query - with multi-partition, may still need to query due to partition key ambiguity
-    out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) >= 0  # May or may not need to query depending on cache state
-    assert len(cache) == 8
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get p2 on y=a - need to fetch p2 for y=a partitions
-    out_cached = df_cache.filter(pl.col("y") == "a").select("p2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 not needed
-    assert counts.get("y2", 0) == 0  # y2 not needed
-    assert counts.get("p2", 0) >= 1  # p2 fetched
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("p2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get y2 on y=b (different partition)
-    out_cached = df_cache.filter(pl.col("y") == "b").select("y2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 not needed
-    assert counts.get("y2", 0) == 1  # y2 fetched
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select("y2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get x2 and y2 on y=b (y2 cached, need x2)
-    out_cached = df_cache.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) >= 1  # x2 fetched for y=b partitions
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get all columns on y=a and y=b
-    out_cached = df_cache.filter(pl.col("y").is_in(["a", "b"])).collect()
-    counts = source.get_column_counts()
-    # Some columns may need to be fetched for missing partitions
-
-    source.reset()
-    out = df.filter(pl.col("y").is_in(["a", "b"])).collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
-
-
-def test_df_multi_partitioned_contradiction(source, df):
-    """Test partitioning with multiple partition columns and contradiction detection."""
-    cache = {}
-    # Get x2 on y=a, p=True (single partition)
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y", "p"))
-    out_cached = df_cache.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 4  # x2, y, p, x (order_by) for single partition (y=a, p=True)
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Repeat - should hit cache (no new source calls)
-    out_cached = df_cache.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # Cache hit
-    assert len(cache) == 4
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Different partition (y=b, p=False)
-    out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(False)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # New partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 8
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b", pl.col("p") == pl.lit(False)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Another partition (y=b, p=True)
-    out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # New partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 12
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Repeat - should hit cache
-    out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # Cache hit
-    assert len(cache) == 12
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b", pl.col("p").eq(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Filter only on p=True (needs to query for y=c partition)
-    out_cached = df_cache.filter(pl.col("p").eq(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # Need y=c/p=True partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 16
-
-    source.reset()
-    out = df.filter(pl.col("p").eq(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Combined filter that should hit cache
-    filter_expr = pl.col("y").is_in(["a", "b"]) & pl.col("p").eq(True)
-    out_cached = df_cache.filter(filter_expr).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # All needed partitions cached
-    assert len(cache) == 16
-
-    source.reset()
-    out = df.filter(filter_expr).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Filter that needs additional partitions (y=a/p=False missing)
-    filter_expr = pl.col("y").is_in(["a", "b"]) & pl.col("p").is_in([False, True])
-    out_cached = df_cache.filter(filter_expr).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # Need y=a/p=False partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 20
-
-    source.reset()
-    out = df.filter(filter_expr).select("x2").collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
-
-    source.reset()
-    # Repeat - should hit cache
-    filter_expr = pl.col("y").is_in(["a", "b"]) & pl.col("p").is_in([False, True])
-    out_cached = df_cache.filter(filter_expr).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # All partitions cached
-    assert len(cache) == 20
-
-    source.reset()
-    out = df.filter(filter_expr).select("x2").collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
+        out = query(df_cache)
+        counts = source.get_column_counts()
+        if q.counts is None:
+            assert source.calls == []
+        for col, want in q.counts.items() if q.counts else ():
+            assert counts.get(col, 0) in (want if isinstance(want, range) else (want,)), (col, counts)
+        if q.cache_size is not None:
+            assert len(cache) == q.cache_size
+        assert_frame_equal(out, query(df), check_row_order=q.ordered)
 
 
 def test_streaming(df):
-    cache = {}
-    df_cache = df.piot.cache(cache, order_by="x")
+    df_cache = df.piot.cache({}, order_by="x")
     assert_frame_equal(df.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
-
     with pl.Config() as cfg:
         cfg.set_streaming_chunk_size(2)
         assert_frame_equal(df.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
@@ -610,320 +343,91 @@ def test_streaming(df):
 
 @pytest.mark.parametrize("cache_arg", [None, {}, "diskcache"])
 def test_cache_types(cache_arg, source, df, tmp_path):
-    """Test that both default and provided caches work on a simple example"""
+    """The default cache, a dict and a diskcache each serve a repeated query without calling the source."""
     cache = cache_arg
     if cache_arg == "diskcache":
         diskcache = pytest.importorskip("diskcache")
         cache = diskcache.Cache(tmp_path / "cache")
-
     df_cache = df.piot.cache(cache, order_by="x")
-    df_cache.select("x2").collect()
-    first_call_count = len(source.calls)
-    assert first_call_count == 1
-
+    for expected_calls in (1, 0):
+        source.reset()
+        df_cache.select("x2").collect()
+        assert len(source.calls) == expected_calls
     source.reset()
-
-    # Second call - should hit cache
-    df_cache.select("x2").collect()
-    assert len(source.calls) == 0  # No new source calls
-
-    source.reset()
-
-    # Re-create df_cache with same cache - should still hit cache
-    df_cache = df.piot.cache(cache, order_by="x")
-    df_cache.select("x2").collect()
-    assert len(source.calls) == 0  # No new source calls
-
+    df.piot.cache(cache, order_by="x").select("x2").collect()
+    assert len(source.calls) == 0
     if cache is not None:
         assert len(cache)
 
 
 def test_docstring():
-    """Test that the docstring is accessible"""
     assert len(pl.LazyFrame.piot.cache.__doc__.split("\n")) > 10
 
 
-# Test cases for _is_contradiction from lazy_cache.py
-# Each case is a tuple: (description, polars_expression, expected_is_contradiction)
-lazy_cache_contradiction_test_cases = [
-    (
-        "Single DNF clause, is a contradiction",
-        (pl.col("a") == 5) & (pl.col("a") == 6),
-        True,
-    ),
-    (
-        "Single DNF clause, not a contradiction",
-        (pl.col("a") == 5) & (pl.col("a") > 0),
-        False,
-    ),
-    (
-        "Single DNF clause, contradiction a == 5 & a > 5",
-        (pl.col("a") == 5) & (pl.col("a") > 5),
-        True,
-    ),
-    (
-        "Multiple DNF clauses, all are contradictions",
-        ((pl.col("a") == 5) & (pl.col("a") == 6)) | ((pl.col("b") < 0) & (pl.col("b") > 10)),
-        True,
-    ),
-    (
-        "Multiple DNF clauses, one is not a contradiction",
-        ((pl.col("a") == 5) & (pl.col("a") == 6)) | ((pl.col("b") > 0) & (pl.col("b") < 10)),
-        False,
-    ),
-    (
-        "Multiple DNF clauses, none are contradictions",
-        ((pl.col("a") == 5) & (pl.col("a") > 0)) | ((pl.col("b") > 0) & (pl.col("b") < 10)),
-        False,
-    ),
-    (
-        "Literal True expression",
-        pl.lit(True),
-        False,
-    ),
-    (
-        "Literal False expression",
-        pl.lit(False),
-        True,
-    ),
-    (
-        "Complex nested: ((C1 or C2) and C3) -> (C1 and C3) or (C2 and C3) -- all contradictions",
-        (
-            ((pl.col("a") == 1) & (pl.col("a") == 2))  # C1
-            | ((pl.col("b") == 3) & (pl.col("b") == 4))  # C2
-        )
-        & (
-            (pl.col("c") > 5) & (pl.col("c") < 0)  # C3
-        ),
-        True,
-    ),
-    (
-        "Complex nested: ((NC1 or C2) and NC3) -> (NC1 and NC3) or (C2 and NC3) -- one path not contradiction",
-        (
-            ((pl.col("a") == 1) & (pl.col("a") > 0))  # NC1 (Not Contradiction)
-            | ((pl.col("b") == 3) & (pl.col("b") == 4))  # C2  (Contradiction)
-        )
-        & (
-            (pl.col("c") > 0) & (pl.col("c") < 10)  # NC3 (Not Contradiction)
-        ),
-        False,
-    ),
-    ("Contradiction involving IS NULL", (pl.col("x").is_null()) & (pl.col("x") == 5), True),
-    (
-        "Not a contradiction with IS NULL",
-        (pl.col("x").is_null()) | (pl.col("x") == 5),  # x can be NULL or x can be 5
-        False,
-    ),
-    ("Contradiction with IS NOT NULL", (pl.col("x").is_not_null()) & (pl.col("x").is_null()), True),
-    ("Not a contradiction with IS NOT NULL", (pl.col("x").is_not_null()) & (pl.col("x") == 5), False),
-    (
-        "Expression that becomes empty DNF (e.g. not (lit(False))) -> should not be contradiction",
-        ~pl.lit(False),  # equivalent to pl.lit(True)
-        False,
-    ),
-    (
-        "Expression that becomes DNF with empty clause (e.g. from complex True OR True)",
-        (pl.col("a") > 0) | (pl.col("a") <= 0),  # This is always true
-        False,  # An always true statement is not a contradiction
-    ),
-    # Tests for is_between
-    (
-        "is_between: Contradiction (disjoint ranges)",
-        (pl.col("x").is_between(1, 5)) & (pl.col("x").is_between(10, 15)),
-        True,
-    ),
-    (
-        "is_between: No contradiction (disjoint ranges and exclusive of one)",
-        (pl.col("x").is_between(1, 5)) & ~(pl.col("x").is_between(10, 15)),
-        False,
-    ),
-    (
-        "is_between: Contradiction (same range negated)",
-        (pl.col("x").is_between(1, 5)) & ~(pl.col("x").is_between(1, 5)),
-        True,
-    ),
-    (
-        "is_between: Not a contradiction (overlapping ranges)",
-        (pl.col("x").is_between(1, 10)) & (pl.col("x").is_between(5, 15)),
-        False,
-    ),
-    (
-        "is_between: Contradiction with exact value (value outside range)",
-        (pl.col("x").is_between(1, 5)) & (pl.col("x") == 10),
-        True,
-    ),
-    (
-        "is_between: Not a contradiction with exact value (value inside range)",
-        (pl.col("x").is_between(1, 5)) & (pl.col("x") == 3),
-        False,
-    ),
-    (
-        "is_between: Contradiction (upper bound less than lower bound in one expr)",
-        (pl.col("x").is_between(5, 1)) & (pl.col("x") == 3),  # is_between(5,1) is always false
-        True,
-    ),
-    (
-        "is_between: Not a contradiction (inclusive bounds)",
-        (pl.col("x").is_between(1, 5, closed="both")) & (pl.col("x") == 5),
-        False,
-    ),
-    (
-        "is_between: Contradiction (exclusive upper bound)",
-        (pl.col("x").is_between(1, 5, closed="left")) & (pl.col("x") == 5),  # x >= 1 and x < 5
-        True,
-    ),
-    (
-        "is_between: Contradiction, we exclude both bounds and can equal either one.",
-        (
-            (pl.col("x").is_between(5, 6, closed="none"))
-            & ((pl.col("x") == 5) | (pl.col("x") == 6))  # x == 5 or x == 6
-            & (pl.col("x").is_between(4, 7, closed="none"))
-        ),
-        True,
-    ),
-    # Tests for is_in
-    (
-        "is_in: Contradiction (disjoint sets)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([4, 5, 6]),
-        True,
-    ),
-    (
-        "is_in: Not a contradiction (overlapping sets)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([3, 4, 5]),
-        False,
-    ),
-    (
-        "is_in: Contradiction with exact value (value not in set)",
-        pl.col("x").is_in([1, 2, 3]) & (pl.col("x") == 4),
-        True,
-    ),
-    (
-        "is_in: Not a contradiction with exact value (value in set)",
-        pl.col("x").is_in([1, 2, 3]) & (pl.col("x") == 2),
-        False,
-    ),
-    (
-        "is_in: Contradiction with is_not_in (same sets)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([1, 2, 3]).not_(),
-        True,
-    ),
-    (
-        "is_in: Not a contradiction with is_not_in (different sets, but compatible)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([4, 5, 6]).not_(),  # e.g. x can be 1
-        False,
-    ),
-    (
-        "is_in: Contradiction with is_not_in (value from is_in is excluded by is_not_in)",
-        # x in [1,2,3] AND x not in [3,4,5] -> x can be 1 or 2
-        # (x in [1,2,3] AND x not in [3,4,5]) AND x == 3 -> contradiction
-        (pl.col("x").is_in([1, 2, 3])) & (~pl.col("x").is_in([3, 4, 5])) & (pl.col("x") == 3),
-        True,
-    ),
-    (
-        "is_in: A contradiction (empty list in is_in means always false for that part)",
-        # (pl.col("x").is_in([])) is effectively False. So (False & True) is False.
-        # The DNF for (A & B) is [(A,B)]. If A is False, then (False, B) is a contradiction.
-        # So the whole expression is a contradiction.
-        (pl.col("x").is_in([])) & (pl.col("x") == 5),
-        True,
-    ),
-    (
-        "is_in: A contradiction (is_in contains the minimum value, exclusive)",
-        # (pl.col("x").is_in([])) is effectively False. So (False & True) is False.
-        # The DNF for (A & B) is [(A,B)]. If A is False, then (False, B) is a contradiction.
-        # So the whole expression is a contradiction.
-        (pl.col("x").is_in([5])) & (pl.col("x") > 5),
-        True,
-    ),
-    (
-        "is_in: A contradiction (is_in contains the minimum value, inclusive)",
-        # (pl.col("x").is_in([])) is effectively False. So (False & True) is False.
-        # The DNF for (A & B) is [(A,B)]. If A is False, then (False, B) is a contradiction.
-        # So the whole expression is a contradiction.
-        (pl.col("x").is_in([5])) & (pl.col("x") == 5),
-        False,
-    ),
-    # Tests for edge cases
-    (
-        "Contradiction for int but not float (so we say False)",
-        (
-            (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
-        ),
-        False,
-    ),
+# _is_contradiction: (predicate, schema) -> whether no row can match
+
+
+def C(id, expr, expected, schema=None):
+    return Case(id, expr, expected, {"schema": schema})
+
+
+x, a, b, c = pl.col("x"), pl.col("a"), pl.col("b"), pl.col("c")
+_x_5_6_excl = x.is_between(5, 6, closed="both") & x.ne(5) & x.ne(6)
+_dt_excl = x.is_between(datetime(2024, 1, 1), datetime(2024, 1, 2), closed="both") & x.ne(datetime(2024, 1, 1)) & x.ne(datetime(2024, 1, 2))
+_d_excl = x.is_between(date(2024, 1, 1), date(2024, 1, 2), closed="both") & x.ne(date(2024, 1, 1)) & x.ne(date(2024, 1, 2))
+_d3 = x.ne(date(2024, 1, 1)) & x.ne(date(2024, 1, 2)) & x.ne(date(2024, 1, 3))
+
+CONTRADICTIONS = [
+    C("single_clause_contradiction", (a == 5) & (a == 6), True),
+    C("single_clause_not_contradiction", (a == 5) & (a > 0), False),
+    C("single_clause_eq_and_gt", (a == 5) & (a > 5), True),
+    C("all_clauses_contradictions", ((a == 5) & (a == 6)) | ((b < 0) & (b > 10)), True),
+    C("one_clause_not_contradiction", ((a == 5) & (a == 6)) | ((b > 0) & (b < 10)), False),
+    C("no_clause_contradiction", ((a == 5) & (a > 0)) | ((b > 0) & (b < 10)), False),
+    C("literal_true", pl.lit(True), False),
+    C("literal_false", pl.lit(False), True),
+    C("nested_all_contradictions", (((a == 1) & (a == 2)) | ((b == 3) & (b == 4))) & ((c > 5) & (c < 0)), True),
+    C("nested_one_path_not_contradiction", (((a == 1) & (a > 0)) | ((b == 3) & (b == 4))) & ((c > 0) & (c < 10)), False),
+    C("is_null_and_value", x.is_null() & (x == 5), True),
+    C("is_null_or_value", x.is_null() | (x == 5), False),
+    C("is_not_null_and_is_null", x.is_not_null() & x.is_null(), True),
+    C("is_not_null_and_value", x.is_not_null() & (x == 5), False),
+    C("not_literal_false", ~pl.lit(False), False),
+    C("always_true_or", (a > 0) | (a <= 0), False),
+    C("is_between_disjoint", x.is_between(1, 5) & x.is_between(10, 15), True),
+    C("is_between_and_not_disjoint", x.is_between(1, 5) & ~x.is_between(10, 15), False),
+    C("is_between_and_not_same", x.is_between(1, 5) & ~x.is_between(1, 5), True),
+    C("is_between_overlapping", x.is_between(1, 10) & x.is_between(5, 15), False),
+    C("is_between_value_outside", x.is_between(1, 5) & (x == 10), True),
+    C("is_between_value_inside", x.is_between(1, 5) & (x == 3), False),
+    C("is_between_reversed_bounds", x.is_between(5, 1) & (x == 3), True),
+    C("is_between_inclusive_bound", x.is_between(1, 5, closed="both") & (x == 5), False),
+    C("is_between_exclusive_upper_bound", x.is_between(1, 5, closed="left") & (x == 5), True),
+    C("is_between_open_bounds_or_either_bound", x.is_between(5, 6, closed="none") & ((x == 5) | (x == 6)) & x.is_between(4, 7, closed="none"), True),
+    C("is_in_disjoint", x.is_in([1, 2, 3]) & x.is_in([4, 5, 6]), True),
+    C("is_in_overlapping", x.is_in([1, 2, 3]) & x.is_in([3, 4, 5]), False),
+    C("is_in_value_outside", x.is_in([1, 2, 3]) & (x == 4), True),
+    C("is_in_value_inside", x.is_in([1, 2, 3]) & (x == 2), False),
+    C("is_in_and_not_same", x.is_in([1, 2, 3]) & x.is_in([1, 2, 3]).not_(), True),
+    C("is_in_and_not_other", x.is_in([1, 2, 3]) & x.is_in([4, 5, 6]).not_(), False),
+    C("is_in_excluded_value", x.is_in([1, 2, 3]) & ~x.is_in([3, 4, 5]) & (x == 3), True),
+    C("is_in_empty", x.is_in([]) & (x == 5), True),
+    C("is_in_value_gt_exclusive", x.is_in([5]) & (x > 5), True),
+    C("is_in_value_eq", x.is_in([5]) & (x == 5), False),
+    # Without a schema the bounds cannot be enumerated.
+    C("excluded_bounds_no_schema", _x_5_6_excl, False),
+    C("excluded_bounds_int", _x_5_6_excl, True, pl.Schema({"x": pl.Int32})),
+    C("excluded_bounds_float", _x_5_6_excl, False, pl.Schema({"x": pl.Float64})),
+    C("excluded_bounds_datetime", _dt_excl, False, pl.Schema({"x": pl.Datetime()})),
+    C("excluded_bounds_date", _d_excl, True, pl.Schema({"x": pl.Date()})),
+    C("excluded_dates_closed_left", x.is_between(date(2024, 1, 1), date(2024, 1, 4), closed="left") & _d3, True, pl.Schema({"x": pl.Date()})),
+    C("excluded_dates_closed_right", x.is_between(date(2024, 1, 1), date(2024, 1, 4), closed="right") & _d3, False, pl.Schema({"x": pl.Date()})),
 ]
 
 
-@pytest.mark.parametrize("description, expr, expected", lazy_cache_contradiction_test_cases)
-def test_lazy_cache_is_contradiction(description: str, expr: pl.Expr, expected: bool):
-    assert _is_contradiction(expr) == expected, f"Test failed for: {description}"
-
-
-expr_with_schema = [
-    (
-        "Contradiction for int but not float (so we say True)",
-        (
-            (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Int32}),
-        True,  # we can iterate through the bounds because we have an int type.
-    ),
-    (
-        "Contradiction for int but not float (so we say False)",
-        (
-            (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Float64}),
-        False,  # we cannot iterate through the bounds with a float.
-    ),
-    (
-        "Contradiction for date but not datetime (so we say False)",
-        (
-            (pl.col("x").is_between(datetime(2024, 1, 1), datetime(2024, 1, 2), closed="both"))
-            & pl.col.x.ne(datetime(2024, 1, 1))
-            & pl.col.x.ne(datetime(2024, 1, 2))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Datetime()}),
-        False,  # we cannot iterate through the bounds with a Datetime.
-    ),
-    (
-        "Contradiction for date but not datetime (so we say False)",
-        (
-            (pl.col("x").is_between(date(2024, 1, 1), date(2024, 1, 2), closed="both"))
-            & pl.col.x.ne(date(2024, 1, 1))
-            & pl.col.x.ne(date(2024, 1, 2))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Date()}),
-        True,  # we can iterate through the bounds with a Date.
-    ),
-    (
-        "Contradiction for date across larger range.",
-        (
-            (pl.col("x").is_between(date(2024, 1, 1), date(2024, 1, 4), closed="left"))
-            & pl.col.x.ne(date(2024, 1, 1))
-            & pl.col.x.ne(date(2024, 1, 2))
-            & pl.col.x.ne(date(2024, 1, 3))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Date()}),
-        True,  # we can iterate through the bounds with a Date.
-    ),
-    (
-        "No contradiction for date across larger range.",
-        (
-            (pl.col("x").is_between(date(2024, 1, 1), date(2024, 1, 4), closed="right"))
-            & pl.col.x.ne(date(2024, 1, 1))
-            & pl.col.x.ne(date(2024, 1, 2))
-            & pl.col.x.ne(date(2024, 1, 3))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Date()}),
-        False,  # we can iterate through the bounds with a Date, but 2024-01-04 is included in the filter so we don't have a contradiction.
-    ),
-]
-
-
-@pytest.mark.parametrize("description, expr, schema, expected", expr_with_schema)
-def test_lazy_cache_is_contradiction_with_schema(description: str, expr: pl.Expr, schema: pl.Schema, expected: bool):
-    assert _is_contradiction(expr, schema) == expected, f"Test failed for: {description}"
+@pytest.mark.parametrize(("expr", "schema", "expected"), params(CONTRADICTIONS, "pred", "schema", "expect"))
+def test_lazy_cache_is_contradiction(expr, schema, expected):
+    assert (_is_contradiction(expr) if schema is None else _is_contradiction(expr, schema)) == expected
 
 
 def test_pickle(df):
@@ -1103,53 +607,6 @@ def test_null_partition_unfiltered_incremental_fetch():
         out.sort(["g", "x"], nulls_last=True),
         data.collect().sort(["g", "x"], nulls_last=True),
     )
-
-
-def test_column_granularity_false_fills_all_columns(source, df):
-    """With column_granularity=False, the first touch pulls the whole schema."""
-    cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", column_granularity=False)
-
-    out = df_cache.select("x2").collect()
-    counts = source.get_column_counts()
-    # Every column was fetched even though only x2 was requested.
-    for col in ("x", "y", "p", "x2", "y2", "p2"):
-        assert counts.get(col, 0) == 1, col
-    # One key per column of the (single, unpartitioned) block.
-    assert len(cache) == 6
-
-    source.reset()
-    # A later select of different columns is a pure cache hit: no source query.
-    out2 = df_cache.select(["y2", "p2"]).collect()
-    assert source.calls == []
-    assert_frame_equal(out, df.select("x2").collect())
-    assert_frame_equal(out2, df.select(["y2", "p2"]).collect())
-
-
-def test_column_granularity_false_preserves_partitioning(source, df):
-    """Row partitioning is preserved; each partition fills its full schema once."""
-    cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",), column_granularity=False)
-
-    out_a = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    for col in ("x", "p", "x2", "y2", "p2"):
-        assert counts.get(col, 0) == 1, col
-
-    source.reset()
-    # Same partition, different column -> served from cache, no query.
-    out_a2 = df_cache.filter(pl.col("y") == "a").select("p2").collect()
-    assert source.calls == []
-
-    source.reset()
-    # A different partition triggers exactly one more full-schema fill.
-    df_cache.filter(pl.col("y") == "b").select("x2").collect()
-    counts = source.get_column_counts()
-    for col in ("x", "p", "x2", "y2", "p2"):
-        assert counts.get(col, 0) == 1, col
-
-    assert_frame_equal(out_a, df.filter(pl.col("y") == "a").select("x2").collect())
-    assert_frame_equal(out_a2, df.filter(pl.col("y") == "a").select("p2").collect())
 
 
 def test_column_granularity_false_and_true_share_cache(source, df):
