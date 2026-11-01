@@ -843,6 +843,11 @@ def _check_cache_keeps_filtered_rows(lf: pl.LazyFrame, frame: pl.DataFrame, pred
     ),
     time_unit="monthly",
 )
+# A one-sided date query on a cache that holds only the null-date partition.
+@example(
+    case=(pl.DataFrame({"date": [None], "x": [1], "i": [0]}, schema_overrides={"date": pl.Date}), [pl.col("date") >= date(2024, 2, 1)]),
+    time_unit="daily",
+)
 def test_cache_parquet_keeps_the_rows_a_filter_keeps(tmp_path_factory, case, time_unit):
     frame, predicates = case
     root = tmp_path_factory.mktemp("cache")
