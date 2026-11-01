@@ -15,6 +15,7 @@ from .dnf_visitor import convert_expr_to_dnf
 from .enum import DataType
 from .translated_source import mapping_to_metadata, metadata_to_mapping, translate_polars_predicate
 from .util import (
+    _as_filter,
     _storage_options_for,
     collect_lf_in_io_source,
     extract_description_block,
@@ -768,7 +769,7 @@ def scan_delta(
             pred_rewritten = translate_polars_predicate(predicate, mapping)
             if pred_rewritten is not None:
                 log.debug(f"Applying translated predicate: {pred_rewritten!s}")
-                lf = lf.filter(pred_rewritten)
+                lf = lf.filter(_as_filter(pred_rewritten))
 
             # Projection and casting of mapped columns
             output_cols = with_columns if with_columns is not None else list(exposed_schema.keys())
@@ -777,7 +778,7 @@ def scan_delta(
         # We apply the original predicate in either case
         # to ensure we don't accidentally drop a filter
         if predicate is not None:
-            lf = lf.filter(predicate)
+            lf = lf.filter(_as_filter(predicate))
 
         if n_rows is not None:
             lf = lf.limit(n_rows)

@@ -32,7 +32,7 @@ import polars as pl
 
 from .restrict_visitor import restrict_expr_to_columns
 from .set_visitor import convert_expr_to_valid_values
-from .util import register_io_source_with_is_pure
+from .util import _as_filter, register_io_source_with_is_pure
 
 __all__ = ("pushdown_unpivot",)
 
@@ -177,7 +177,7 @@ def pushdown_unpivot(
             result_lf = pl.concat(parts, how="vertical").lazy() if parts else pl.DataFrame(schema=declared_schema).lazy()
 
         if predicate is not None:
-            result_lf = result_lf.filter(predicate)
+            result_lf = result_lf.filter(_as_filter(predicate))
 
         if with_columns is not None:
             result_lf = result_lf.select(with_columns)

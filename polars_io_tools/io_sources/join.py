@@ -17,7 +17,7 @@ from .range_visitor import (
     convert_expr_to_datetime_range,
 )
 from .restrict_visitor import restrict_expr_to_columns
-from .util import collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import _as_filter, collect_lf_in_io_source, register_io_source_with_is_pure
 
 __all__ = ("filtered_join", "filtered_join_asof", "join_between")
 
@@ -185,7 +185,7 @@ def filtered_join(
             # lazyframe alone, polars will handle the filtering there for us
             # Since no columns in the left lazyframe are renamed after a join, we don't have to worry about column renames
             left_predicate = restrict_expr_to_columns(predicate, left_columns)
-        left_lf = lf1.filter(left_predicate) if left_predicate is not None else lf1
+        left_lf = lf1.filter(_as_filter(left_predicate)) if left_predicate is not None else lf1
 
         # If polars told us to only return a subset of columns, we don't
         # need to request them all. We can just request the columns polars
@@ -247,7 +247,7 @@ def filtered_join(
         if predicate is not None:
             # This filter application will push the filter down to the right lazyframe for us
             # NOTE: This will re-run the filter on the left dataframe, but it should be fast since we already have the filtered dataframe
-            df = df.filter(predicate)
+            df = df.filter(_as_filter(predicate))
 
         if with_columns_set is not None:
             df = df.select([col for col in schema if col in with_columns_set])
@@ -418,7 +418,7 @@ def filtered_join_asof(
                 if full_left_predicate is not None:
                     # If we have a predicate, we can push it down to the left lazyframe
                     # We only do so if polars does not
-                    left_lf = left_lf.filter(full_left_predicate)
+                    left_lf = left_lf.filter(_as_filter(full_left_predicate))
 
                 if by_left is not None and by_right is not None:
                     # If we have set by_left and by_right, then we can, additionally, push down filters
@@ -512,7 +512,7 @@ def filtered_join_asof(
         )
 
         if predicate is not None:
-            lf_joined = lf_joined.filter(predicate)
+            lf_joined = lf_joined.filter(_as_filter(predicate))
 
         # TODO: Remove when this does not interfere with parquet. Should be
         # release >1.30.0

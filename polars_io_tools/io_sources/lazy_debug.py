@@ -3,7 +3,7 @@ from collections.abc import Iterator
 
 import polars as pl
 
-from .util import collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import _as_filter, collect_lf_in_io_source, register_io_source_with_is_pure
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def debug(
 
         df = self
         if predicate is not None:
-            df = df.filter(predicate)
+            df = df.filter(_as_filter(predicate))
         if with_columns is not None:
             df = df.select(with_columns)
         if n_rows is not None:

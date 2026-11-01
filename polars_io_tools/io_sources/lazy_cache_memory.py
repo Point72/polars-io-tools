@@ -56,6 +56,7 @@ from .._compat import POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
 from .restrict_visitor import restrict_expr_to_columns
 from .util import (
     PartitionKey,
+    _as_filter,
     _lossy_python_key,
     collect_lf_in_io_source,
     partition_exclusion_predicate,
@@ -263,7 +264,7 @@ def cache_memory(
             lf = build_frame()
             if todo is not None:
                 # Restricted build: filter the builder to just the demanded (not-yet-built) partitions.
-                lf = lf.filter(todo)
+                lf = lf.filter(_as_filter(todo))
             # Streaming avoids in-memory build work-stealing deadlocks on verified runtimes.
             # Older engines can deadlock on nested streaming IO-source collection.
             built = lf.collect(engine="streaming") if POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN else lf.collect()
@@ -348,7 +349,7 @@ def cache_memory(
             buf = pl.DataFrame(schema=get_schema())
         lf = buf.lazy()
         if predicate is not None:
-            lf = lf.filter(predicate)
+            lf = lf.filter(_as_filter(predicate))
 
         # Project after the filter so predicate columns are still available to it. Without this the
         # wrapped source would be asked for every column, which is strictly worse than the un-proxied

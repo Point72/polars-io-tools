@@ -17,6 +17,8 @@ import portion
 from packaging import version
 
 from .._compat import POLARS_GE_2, POLARS_HAS_COLLECT_BATCHES, POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN
+from .base import BinaryExprNode, CastNode, get_parsed_expr
+from .enum import OperatorType
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,28 @@ def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     regardless of insertion order, making the result usable as a dict key or set member.
     """
     return tuple(sorted((col, _NAN if isinstance(value, float) and math.isnan(value) else value) for col, value in partition_values.items()))
+
+
+def _as_filter(predicate: pl.Expr) -> pl.Expr:
+    """``predicate``, as Polars passed it to an IO source, made safe to filter by.
+
+    Polars passes ``all_horizontal(i8, i8 > 0).cast(Boolean)`` as ``i8 && (i8 > 0).cast(Int8)``, which a lazy filter
+    splits into conjuncts that are not Boolean. Only a predicate with such a logical operand is wrapped, in a
+    ``fill_null(False)`` that keeps it whole and keeps the rows it keeps.
+    """
+    try:
+        nodes = [get_parsed_expr(predicate)]
+    except Exception:  # noqa: BLE001 -- an unparsable predicate is used as passed
+        return predicate
+    while nodes:
+        node = nodes.pop()
+        if node is None:
+            continue
+        logical = isinstance(node, BinaryExprNode) and node.op in (OperatorType.LOGICAL_AND, OperatorType.LOGICAL_OR)
+        if logical and any(isinstance(n, CastNode) and n.dtype != pl.Boolean for n in (node.left, node.right)):
+            return predicate.fill_null(False)
+        nodes.extend(node.get_children())
+    return predicate
 
 
 def _lossy_python_key(dtype: pl.DataType) -> bool:

@@ -35,7 +35,7 @@ from typing import Any, Literal
 import polars as pl
 
 from .restrict_visitor import restrict_expr_to_columns
-from .util import _is_in_collection, register_io_source_with_is_pure
+from .util import _as_filter, _is_in_collection, register_io_source_with_is_pure
 
 __all__ = ("pushdown_pivot",)
 
@@ -244,7 +244,7 @@ def pushdown_pivot(
 
         result_lf = result_df.lazy()
         if predicate is not None:
-            result_lf = result_lf.filter(predicate)
+            result_lf = result_lf.filter(_as_filter(predicate))
         if with_columns is not None:
             result_lf = result_lf.select(with_columns)
         if n_rows is not None:

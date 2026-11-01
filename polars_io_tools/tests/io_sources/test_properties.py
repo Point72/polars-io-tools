@@ -7,26 +7,32 @@ For value extractions, every kept row's value is covered. An adapter that report
 
 import functools
 import itertools
+import logging
 import math
 import operator
 import time
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import narwhals as nw
 import polars as pl
 import portion
 import pytest
-from hypothesis import HealthCheck, assume, given, note, settings, strategies as st
+from hypothesis import HealthCheck, assume, example, given, note, settings, strategies as st
 from polars.io.plugins import register_io_source
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import get_parsed_expr
+from polars_io_tools.io_sources.concat_named import concat_named
 from polars_io_tools.io_sources.delta_io import scan_delta, sink_delta
 from polars_io_tools.io_sources.dnf_visitor import MAX_DNF_TUPLES, _is_contradiction, convert_expr_to_dnf
 from polars_io_tools.io_sources.lazy_cache_memory import cache_memory
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, cache_parquet
+from polars_io_tools.io_sources.lazy_narwhals_reader import scan_narwhals
 from polars_io_tools.io_sources.partitions import by_range, by_time, by_value
 from polars_io_tools.io_sources.pushdown_combine import FilterSpec, IntervalFilterSpec, pushdown_combine
+from polars_io_tools.io_sources.pushdown_pivot import pushdown_pivot
+from polars_io_tools.io_sources.pushdown_unpivot import pushdown_unpivot
 from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_range, convert_expr_to_range
 from polars_io_tools.io_sources.restrict_visitor import restrict_expr_to_columns
 from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
@@ -858,6 +864,10 @@ def test_cache_keeps_the_rows_a_filter_keeps(case, partition_cols, column_granul
 
 @SETTINGS
 @given(case=frames_and_predicates(max_columns=2, depth=2))
+# Polars delivers this predicate as ``c0 && (c0 > 0).cast(Int8)``, whose conjunct ``c0`` is not Boolean.
+@example(
+    case=(pl.DataFrame({"c0": pl.Series([0, 1, 2, 3, -1, None], dtype=pl.Int8)}), pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean))
+)
 def test_cache_memory_keeps_the_rows_of_random_predicates(case):
     """Partitioned on every column of a wide dtype mix."""
     frame, pred = case
@@ -905,6 +915,38 @@ def test_cache_memory_on_a_nan_partition_key():
     # A literal the predicate analysis cannot read, so the query names no partition.
     for pred in [pl.lit(True), pl.col("x") == pl.lit(pl.Series([0.0])).first(), pl.lit(True)]:
         assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
+
+
+def _via_delta(lf, path):
+    sink_delta(lf, str(path / "delta"))
+    return scan_delta(str(path / "delta"), credential_provider=None)
+
+
+_UNPIVOTED = {"index": ["date", "i"], "on": ["c0"]}
+_ENTRY_POINTS = {
+    "cache_memory": lambda lf, path: cache_memory(lf, schema=lf.collect_schema(), partition_cols="c0"),
+    "cache": lambda lf, path: lf.piot.cache({}, order_by="i", partition_cols=("c0",)),
+    "cache_parquet": lambda lf, path: cache_parquet(lf, path, "date", extra_partition_cols="c0"),
+    "probe": lambda lf, path: lf.piot.probe(),
+    "debug": lambda lf, path: lf.piot.debug(log_level=logging.DEBUG),
+    "concat_named": lambda lf, path: concat_named({("a",): lf}, ["name"]).drop("name"),
+    "pushdown_combine": lambda lf, path: pushdown_combine({"s": (lf, {"c0": FilterSpec()})}, lambda s: s["s"]),
+    "filtered_join": lambda lf, path: lf.piot.filtered_join(lf.select("i"), on="i"),
+    "filtered_join_asof": lambda lf, path: lf.piot.filtered_join_asof(lf.select("i"), on="i"),
+    "pushdown_pivot": lambda lf, path: pushdown_pivot(lf.unpivot(**_UNPIVOTED), "variable", ["c0"], index=["date", "i"], values="value"),
+    "pushdown_unpivot": lambda lf, path: pushdown_unpivot(lf, **_UNPIVOTED).drop("variable").rename({"value": "c0"}),
+    "scan_narwhals": lambda lf, path: scan_narwhals(nw.from_native(lf), fetch_size=10),
+    "scan_delta": _via_delta,
+}
+
+
+@pytest.mark.parametrize("entry_point", sorted(_ENTRY_POINTS))
+def test_an_integer_operand_of_all_horizontal_is_filtered(entry_point, tmp_path):
+    """Polars passes this predicate to an IO source as ``c0 && (c0 > 0).cast(Int8)``, whose conjunct ``c0`` is not Boolean."""
+    frame = pl.DataFrame({"date": [date(2024, 1, 1)] * 6, "i": range(6), "c0": pl.Series([0, 1, 2, 3, -1, None], dtype=pl.Int8)})
+    pred = pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean)
+    lf = _ENTRY_POINTS[entry_point](frame.lazy(), tmp_path)
+    assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False, check_column_order=False)
 
 
 # ---------------------------------------------------------------------------

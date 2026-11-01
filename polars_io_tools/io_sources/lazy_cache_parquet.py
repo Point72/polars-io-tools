@@ -33,7 +33,14 @@ from .._compat import POLARS_HAS_PARTITION_BY, POLARS_STREAMING_SUPPORTS_NESTED_
 from .dnf_visitor import ColumnConstraintAnalyzer, DNFClause, convert_expr_to_dnf
 from .range_visitor import _convert_atomic_interval_to_polars_expr, convert_expr_to_datetime_range
 from .restrict_visitor import restrict_expr_to_columns
-from .util import _is_in_collection, _storage_options_for, collect_lf_in_io_source, partition_exclusion_predicate, register_io_source_with_is_pure
+from .util import (
+    _as_filter,
+    _is_in_collection,
+    _storage_options_for,
+    collect_lf_in_io_source,
+    partition_exclusion_predicate,
+    register_io_source_with_is_pure,
+)
 
 
 @dataclass(frozen=True)
@@ -1250,7 +1257,7 @@ def _build_final_scan(
     """Build the final scan LazyFrame from cache."""
     scan = cache_scan
     if predicate is not None:
-        scan = scan.filter(predicate)
+        scan = scan.filter(_as_filter(predicate))
     if with_columns is not None:
         scan = scan.select(with_columns)
     if n_rows is not None:
@@ -2124,9 +2131,9 @@ def cache_parquet(
                         partitions, part_info, write_plan, plan_mode, predicate, date_column, effective_time_unit, schema
                     )
                     if write_filter is not None:
-                        lf = lf.filter(write_filter)
+                        lf = lf.filter(_as_filter(write_filter))
                     if bounding_pred is not None:
-                        lf = lf.filter(bounding_pred)
+                        lf = lf.filter(_as_filter(bounding_pred))
                     return lf
 
                 upstream_lf = upstream_for(partitions_to_write_df)
