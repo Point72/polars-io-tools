@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import math
 import os
 import socket
 from collections.abc import Hashable, Iterator, Sequence
@@ -36,13 +37,28 @@ __all__ = (
 PartitionKey = tuple[tuple[str, Any], ...]
 
 
+class _NaNKey(float):
+    """The NaN of every partition key; NaN is unequal to itself and hashes by identity, so keys share one object."""
+
+    def __reduce__(self):
+        return _nan_key, ()
+
+
+def _nan_key() -> float:
+    """The shared NaN key, also on unpickling."""
+    return _NAN
+
+
+_NAN = _NaNKey("nan")
+
+
 def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     """Build a :data:`PartitionKey` from a mapping of partition column to value.
 
     The pairs are sorted by column name so keys built from the same values are equal
     regardless of insertion order, making the result usable as a dict key or set member.
     """
-    return tuple(sorted(partition_values.items()))
+    return tuple(sorted((col, _NAN if isinstance(value, float) and math.isnan(value) else value) for col, value in partition_values.items()))
 
 
 def _lossy_python_key(dtype: pl.DataType) -> bool:

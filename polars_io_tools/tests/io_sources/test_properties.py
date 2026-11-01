@@ -842,7 +842,6 @@ def test_cache_parquet_keeps_the_rows_a_filter_keeps(tmp_path_factory, case, tim
 @given(case=_partitioned_cases(), partition_cols=st.sampled_from([("x",), ("date", "x"), ()]))
 def test_cache_memory_keeps_the_rows_a_filter_keeps(case, partition_cols):
     frame, predicates = case
-    assume(not (frame["x"].dtype.is_float() and frame["x"].is_nan().any()))  # known bug, see test_cache_memory_on_a_nan_partition_key
     _check_cache_keeps_filtered_rows(cache_memory(frame.lazy(), schema=frame.schema, partition_cols=partition_cols), frame, predicates)
 
 
@@ -850,8 +849,6 @@ def test_cache_memory_keeps_the_rows_a_filter_keeps(case, partition_cols):
 @given(case=_partitioned_cases(), partition_cols=st.sampled_from([("x",), ("date", "x"), ()]), column_granularity=st.booleans())
 def test_cache_keeps_the_rows_a_filter_keeps(case, partition_cols, column_granularity):
     frame, predicates = case
-    # Known bug, see test_cache_on_a_nan_partition_key.
-    assume("x" not in partition_cols or not (frame["x"].dtype.is_float() and frame["x"].is_nan().any()))
     _check_cache_keeps_filtered_rows(
         frame.lazy().piot.cache({}, order_by="i", partition_cols=partition_cols, column_granularity=column_granularity),
         frame,
@@ -864,7 +861,6 @@ def test_cache_keeps_the_rows_a_filter_keeps(case, partition_cols, column_granul
 def test_cache_memory_keeps_the_rows_of_random_predicates(case):
     """Partitioned on every column of a wide dtype mix."""
     frame, pred = case
-    assume(not any(frame[c].dtype.is_float() and frame[c].is_nan().any() for c in frame.columns))  # see test_cache_memory_on_a_nan_partition_key
     frame = frame.with_row_index("i")
     _check_cache_keeps_filtered_rows(cache_memory(frame.lazy(), schema=frame.schema, partition_cols=frame.columns[1:]), frame, [pred])
 
@@ -884,7 +880,6 @@ def test_cache_parquet_on_sub_second_time_keys(tmp_path):
         assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
 
 
-@pytest.mark.xfail(strict=True, raises=pl.exceptions.ComputeError, reason="a NaN partition key is not found again in the cache")
 @pytest.mark.parametrize("column_granularity", [True, False])
 def test_cache_on_a_nan_partition_key(column_granularity):
     frame = pl.DataFrame({"x": [float("nan")], "i": [0]})
@@ -904,7 +899,6 @@ def test_cache_on_a_partition_key_beyond_python_datetime(wrap):
     assert_frame_equal(lf.filter(pl.col("i") >= 0).collect(), frame, check_row_order=False)
 
 
-@pytest.mark.xfail(strict=True, reason="a NaN partition is built again and its rows repeat")
 def test_cache_memory_on_a_nan_partition_key():
     frame = pl.DataFrame({"x": [0.0, float("nan")], "i": [0, 1]})
     lf = cache_memory(frame.lazy(), schema=frame.schema, partition_cols="x")
