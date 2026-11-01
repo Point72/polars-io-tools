@@ -431,7 +431,11 @@ def _partition_keys(
     exprs = []
     for c in extra_cols:
         values = parts_df[c].drop_nulls().unique()
-        expr = pl.col(c).replace_strict(values, _serialize_key_values(values), return_dtype=pl.String)
+        if values.is_empty():
+            # Polars ignores ``return_dtype`` for an empty mapping, and the column holds only nulls.
+            expr = pl.col(c).cast(pl.String)
+        else:
+            expr = pl.col(c).replace_strict(values, _serialize_key_values(values), return_dtype=pl.String)
         exprs.append(expr.fill_null(null_key_token) if null_key_token is not None else expr)
     if date_column is not None and date_fmt is not None:
         expr = _stored_key_date_expr(date_column, parts_df.schema[date_column]).dt.strftime(date_fmt)

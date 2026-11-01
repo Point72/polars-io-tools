@@ -869,7 +869,6 @@ def test_cache_memory_keeps_the_rows_of_random_predicates(case):
     _check_cache_keeps_filtered_rows(cache_memory(frame.lazy(), schema=frame.schema, partition_cols=frame.columns[1:]), frame, [pred])
 
 
-@pytest.mark.xfail(strict=True, raises=pl.exceptions.PanicException, reason="partition keys cached as only nulls are read back as String")
 def test_cache_parquet_after_caching_only_null_partition_keys(tmp_path):
     frame = pl.DataFrame({"date": [date(2024, 1, 31), date(2024, 2, 1)], "x": [None, 1], "i": [0, 1]})
     lf = cache_parquet(frame.lazy(), tmp_path, "date", extra_partition_cols="x")
