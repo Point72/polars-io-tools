@@ -11,6 +11,7 @@ including:
 - Edge cases (empty filters, empty results, schema inference)
 """
 
+import sys
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -2707,6 +2708,33 @@ class TestPushdownCombineCastSafety:
         pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
         # 257 wraps to 1 under Int8, so both 1 and 257 match; pushdown must keep them.
         assert lf.filter(pred).collect().height == src.filter(pred).collect().height == 2
+
+    @pytest.mark.parametrize(
+        ("pred", "dtype"),
+        [
+            (pl.col("x") == 16777216.0, pl.Float32),
+            ((pl.col("x") == 16777216.0) | (pl.col("x") == 5.0), pl.Float32),
+            (pl.col("x") == 1e300, pl.Float32),
+            (pl.col("x") == 16777216.0, pl.Float64),
+            (pl.col("x") == 1e300, pl.Float64),
+            (pl.col("x") == sys.float_info.max, pl.Float32),
+            (pl.col("x") == sys.float_info.max, pl.Float64),
+            ((pl.col("x") == 16777216.0) | (pl.col("x") == 5.0), pl.Float64),
+        ],
+    )
+    def test_float_cast_in_combine_keeps_rounded_rows(self, pred, dtype):
+        # 16777217 rounds to 16777216.0 under Float32, so the cast row matches.
+        src = pl.LazyFrame({"x": [16777217, 5, None]})
+        combine = lambda s: s["s"].with_columns(pl.col("x").cast(dtype))
+        lf = pushdown_combine({"s": (src, {"x": FilterSpec()})}, combine)
+        assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect(), check_row_order=False)
+
+    def test_integral_float_without_float32_consumer_pushes_equality(self):
+        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
+
+        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {16777216.0}}, pl.Int64)
+        # Neither the integer next to the value nor nulls are kept.
+        assert pl.DataFrame({"x": [16777216, 16777217, None]}).filter(expr)["x"].to_list() == [16777216]
 
 
 @pytest.mark.parametrize(

@@ -30,7 +30,9 @@ Example usage::
 
 from __future__ import annotations
 
+import functools
 import logging
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -217,6 +219,7 @@ def _union_discrete_filter(
     members: list[tuple[str, FilterSpec]],
     extracted_values: dict[str, set[Any] | None],
     dtype: pl.DataType,
+    float32_outputs: Callable[[], frozenset[str]] = frozenset,
 ) -> pl.Expr | None:
     """Build a single discrete predicate for the output columns mapped to ``source_col``.
 
@@ -234,8 +237,10 @@ def _union_discrete_filter(
 
     Otherwise returns a filter keeping rows whose ``source_col`` is in the union (a ``None`` value keeps null
     rows). Each member's values are mapped through that member's own ``spec.value_mapping`` before unioning.
+    A large integral float requested through an output column in ``float32_outputs`` is pushed as the integers rounding to it.
     """
     union: dict[Any, Any] = {}
+    widened: set[Any] = set()
     for output_col, spec in members:
         discrete_values = extracted_values.get(output_col)
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
@@ -250,21 +255,44 @@ def _union_discrete_filter(
             return None
         for value in mapped_values:
             union.setdefault(_value_key(value), value)
+            if output_col in float32_outputs() and _float32_preimage(value, dtype) is not None:
+                widened.add(_value_key(value))
 
     col = pl.col(source_col)
     # A value_mapping may map to None. Do not sort: the values may be unorderable (e.g. mixed types).
     non_null = [v for v in union.values() if v is not None]
     if not non_null:
         return col.is_null()
+    keeps_null = len(non_null) < len(union)
+    bounds = [_float32_preimage(union[key], dtype) for key in widened]
+    exprs = [col.is_between(lo, hi) for lo, hi in bounds if lo <= hi]
+    non_null = [v for key, v in union.items() if v is not None and key not in widened]
     if len(non_null) == 1:
-        expr = col == non_null[0]
-    else:
+        exprs.append(col == non_null[0])
+    elif dtype.is_integer() and any(isinstance(v, float) for v in non_null):
+        # Polars 2 rejects an is_in of floats on an integer column.
+        exprs.append(pl.any_horizontal([col == v for v in non_null]))
+    elif non_null:
         if not _membership_supported(non_null, dtype):
             log.debug(f"Values for source col '{source_col}' cannot form a membership on {dtype}; pushing nothing")
             return None
-        expr = col.is_in(_is_in_collection(non_null, dtype))
+        exprs.append(col.is_in(_is_in_collection(non_null, dtype)))
+    expr = exprs[0].or_(*exprs[1:]) if exprs else pl.lit(False)
     # ``== None`` and ``is_in`` never match null rows.
-    return expr | col.is_null() if len(non_null) < len(union) else expr
+    return expr | col.is_null() if keeps_null else expr
+
+
+def _float32_preimage(value: Any, dtype: pl.DataType) -> tuple[int, int] | None:
+    """Integers of ``dtype`` around an integral float ``value`` that a Float32 cast may round to it, or None if no other can.
+
+    The bounds are clipped to ``dtype``, so the range is empty when no value of ``dtype`` is near ``value``.
+    """
+    if not (dtype.is_integer() and isinstance(value, float) and value.is_integer() and abs(value) >= 2**24):
+        return None
+    # Integer arithmetic: the float sum overflows to infinity near the largest float.
+    ulp = 2 ** (math.frexp(value)[1] - 24)
+    lo, hi = pl.select(dtype.min().alias("lo"), dtype.max().alias("hi")).row(0)
+    return max(int(value) - ulp, lo), min(int(value) + ulp, hi)
 
 
 def _value_key(value: Any) -> Any:
@@ -859,6 +887,10 @@ def pushdown_combine(
         # need it.
         source_schemas: dict[str, dict[str, pl.DataType]] = {name: lf.collect_schema() for name, (lf, _) in sources.items()}
 
+        @functools.cache
+        def float32_outputs() -> frozenset[str]:
+            return frozenset(name for name, dtype in output_schema().items() if dtype == pl.Float32)
+
         # Apply transformed filters to each source
         # IMPORTANT: For temporal columns with lookback/lookahead, we apply the EXPANDED
         # filter here (e.g., date >= Jan 2 for a lookback of 3 days when user filters >= Jan 5).
@@ -976,7 +1008,7 @@ def pushdown_combine(
             for source_col, members in by_source_col.items():
                 # Output columns sharing a source column push the UNION of their value sets, or nothing if any
                 # sharer is unconstrained/unmappable (see _union_discrete_filter).
-                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col])
+                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col], float32_outputs)
                 if union_filter is not None:
                     filtered_lf = filtered_lf.filter(union_filter)
                     log.debug(f"Applied discrete filter to {source_name}.{source_col}: {union_filter}")
