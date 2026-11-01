@@ -1,4 +1,16 @@
+import os
+
 import pytest
+
+try:
+    from hypothesis import settings
+except ImportError:
+    pass
+else:
+    # A quick default; select a longer run with ``HYPOTHESIS_PROFILE=hunt`` or ``--hypothesis-profile=hunt``.
+    settings.register_profile("quick", max_examples=50)
+    settings.register_profile("hunt", max_examples=2000)
+    settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "quick"))
 
 
 def pytest_addoption(parser):
