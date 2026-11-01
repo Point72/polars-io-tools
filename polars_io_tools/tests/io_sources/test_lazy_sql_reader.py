@@ -9,6 +9,8 @@ import concurrent.futures
 import logging
 import sqlite3
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -597,43 +599,63 @@ def test_sqlite_where_on_text_timestamps(pred, want, exact):
     assert rows == want if exact else set(want) <= set(rows)
 
 
-# Reader query -> the result equals what the database returns for the query, put through the same Polars steps.
-def Q(
-    id,
-    query,
-    op=lambda lf: lf,
-    *,
-    both=False,
-    tables=(),
-    where=None,
-    text=None,
-    ordered=False,
-    ref=None,
-    scan=None,
-    calls=None,
-    log=None,
-    height=None,
-):
-    """A query row; ``both`` also runs it through scan_clickhouse.
+def _identity(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
 
-    ``op`` is applied to the reader and to the database's result (``ref`` first transforms the latter). ``where``
-    is ``(sql, op)``: the query with that WHERE clause, put through ``op``, gives the same frame. ``text`` maps a part
-    of the one data query (``sql``, or ``inner``/``outer`` around the subquery wrapper) to ``assert_text``
-    arguments. ``calls`` is the number of queries collecting may send; ``log`` is ``(level, message)``.
+
+@dataclass(frozen=True)
+class QueryCase:
+    """A reader query and the Polars steps ``op`` run on it; the result equals the database's answer put through ``op``.
+
+    The ``expected_sql*`` fields check the one data query the reader sends, or its part before (inner) or after (outer)
+    the ``__cpl_subq`` subquery wrapper, case-insensitively. A tuple item of a ``contains`` field is satisfied by any of
+    its alternatives.
     """
-    kw = {
-        "op": op,
-        "tables": tables,
-        "where": where,
-        "text": text,
-        "ordered": ordered,
-        "ref": ref,
-        "scan": scan or {},
-        "calls": calls,
-        "log": log,
-        "height": height,
-    }
-    return [pytest.param(e, query, kw, id=f"{id}-{e}" if both else id) for e in (["scan_db", "scan_clickhouse"] if both else ["scan_db"])]
+
+    id: str
+    query: str
+    op: Callable[[pl.LazyFrame], pl.LazyFrame] = _identity
+    also_clickhouse: bool = False
+    # names in TABLES to create first
+    tables: tuple[str, ...] = ()
+    # reader keyword arguments; a callable value is called for each test
+    scan_kwargs: dict = field(default_factory=dict)
+    # applied to the database's answer before ``op``
+    native_transform: Callable[[pl.DataFrame], pl.DataFrame] | None = None
+    check_row_order: bool = False
+    expected_height: int | None = None
+    expected_query_count: int | None = None
+    expected_log: str | None = None
+    log_level: int = logging.WARNING
+    # the query with this WHERE clause, then selecting ``expected_where_columns``, gives the same frame
+    expected_where: str | None = None
+    expected_where_columns: list[str] | None = None
+    expected_sql_contains: tuple = ()
+    expected_sql_omits: tuple = ()
+    expected_sql_startswith: str | None = None
+    expected_inner_sql_contains: tuple = ()
+    expected_outer_sql_contains: tuple = ()
+    expected_outer_sql_omits: tuple = ()
+
+    @property
+    def checks_sql(self) -> bool:
+        return bool(
+            self.expected_sql_contains
+            or self.expected_sql_omits
+            or self.expected_sql_startswith
+            or self.expected_inner_sql_contains
+            or self.expected_outer_sql_contains
+            or self.expected_outer_sql_omits
+        )
+
+
+def _query_params(cases: list[QueryCase]) -> list:
+    """One ``(entry, tables, case)`` param per reader the case runs on."""
+    return [
+        pytest.param(entry, case.tables, case, id=f"{case.id}-{entry}" if case.also_clickhouse else case.id)
+        for case in cases
+        for entry in (["scan_db", "scan_clickhouse"] if case.also_clickhouse else ["scan_db"])
+    ]
 
 
 def _filter(*preds, select=None, after=None):
@@ -659,7 +681,6 @@ _CB_ALL = ["CenterID", "CentreCode", "ISOCountryCode", "Centre", "EventYear", "E
 _DAY = pl.col("EventName").str.contains("Day")
 _COMPLEX = pl.col("EventYear").is_between(2015, 2050) & ((pl.col("EventDayOfWeek") == "Fri") | (pl.col("EventDayOfWeek") == "Sat")) & _DAY
 _UDF = pl.col("score").map_elements(lambda v: v > 80, return_dtype=pl.Boolean)
-_SUBQ, _WHERE, _CAST = X("__cpl_subq"), X("WHERE"), X("CAST")
 _JOIN_STAR = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
 _JOIN_CAST = "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
 _MULTI_STAR = "SELECT o.*, p.*, c.cust_name FROM Orders o CROSS JOIN Products p LEFT JOIN Customers c ON o.customer_id = c.customer_id"
@@ -682,75 +703,78 @@ _NESTED_STAR = "SELECT * FROM (SELECT CAST(EventDate AS DATE) AS EventDateAsDate
 
 QUERIES = [
     # filters with an equivalent SQL WHERE, shared by scan_db and scan_clickhouse
-    *Q(
+    QueryCase(
         "basic_query",
         "SELECT CenterID, Centre, EventYear FROM CC_Bond",
         _filter(pl.col("EventYear") > 2015),
-        both=True,
-        where=("EventYear > 2015", None),
-        ordered=True,
+        also_clickhouse=True,
+        expected_where="EventYear > 2015",
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "column_selection",
         "SELECT * FROM CC_Bond",
         _filter(pl.col("Centre").str.contains("Da"), select=["CenterID", "Centre", "EventDate"]),
-        both=True,
-        where=("Centre LIKE '%Da%'", _select(["CenterID", "Centre", "EventDate"])),
+        also_clickhouse=True,
+        expected_where="Centre LIKE '%Da%'",
+        expected_where_columns=["CenterID", "Centre", "EventDate"],
     ),
-    *Q(
+    QueryCase(
         "complex_query",
         f"SELECT {', '.join(_CB_ALL)} FROM CC_Bond",
         _filter(_COMPLEX, select=_CB_ALL),
-        both=True,
-        where=("EventYear BETWEEN 2015 AND 2050 AND (EventDayOfWeek = 'Fri' OR EventDayOfWeek = 'Sat') AND EventName LIKE '%Day%'", _select(_CB_ALL)),
+        also_clickhouse=True,
+        expected_where="EventYear BETWEEN 2015 AND 2050 AND (EventDayOfWeek = 'Fri' OR EventDayOfWeek = 'Sat') AND EventName LIKE '%Day%'",
+        expected_where_columns=_CB_ALL,
     ),
-    *Q(
+    QueryCase(
         "not_null",
         "SELECT CenterID, Centre, EventDate FROM CC_Bond",
         _filter(pl.col("EventDate").is_not_null()),
-        both=True,
-        where=("EventDate IS NOT NULL", None),
-        ordered=True,
+        also_clickhouse=True,
+        expected_where="EventDate IS NOT NULL",
+        check_row_order=True,
     ),
     # filter on a column the selection drops
-    *Q(
+    QueryCase(
         "empty_df",
         "SELECT CenterID, Centre, EventDate, EventYear FROM CC_Bond",
         _filter(pl.col("EventYear") < 1900, after=["CenterID", "Centre", "EventDate"]),
-        both=True,
-        where=("EventYear < 1900", _select(["CenterID", "Centre", "EventDate"])),
-        ordered=True,
-        height=0,
+        also_clickhouse=True,
+        expected_where="EventYear < 1900",
+        expected_where_columns=["CenterID", "Centre", "EventDate"],
+        check_row_order=True,
+        expected_height=0,
     ),
-    *Q(
+    QueryCase(
         "in_operator",
         "SELECT CenterID, Centre, EventYear, EventDate, EventDayOfWeek FROM CC_Bond",
         _filter(pl.col("EventDayOfWeek").is_in(["Fri", "Sat", "Sun"])),
-        both=True,
-        where=("EventDayOfWeek IN ('Fri', 'Sat', 'Sun')", None),
+        also_clickhouse=True,
+        expected_where="EventDayOfWeek IN ('Fri', 'Sat', 'Sun')",
     ),
-    *Q(
+    QueryCase(
         "not_like",
         "SELECT CenterID, Centre, EventYear, EventName FROM CC_Bond",
         _filter(~_DAY),
-        both=True,
-        where=("EventName NOT LIKE '%Day%'", None),
+        also_clickhouse=True,
+        expected_where="EventName NOT LIKE '%Day%'",
     ),
-    *Q(
+    QueryCase(
         "implicit_cast_query",
         "SELECT CenterID, Centre, EventYear FROM CC_Bond",
         _filter(pl.col("EventYear") > 2015.1),
-        where=("EventYear > 2015", None),
-        ordered=True,
+        expected_where="EventYear > 2015",
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "join",
         "SELECT cb.CenterID, cb.Centre, ec.Country, ec.ElectFor FROM CC_Bond AS cb, ElectionCalendar AS ec",
         _filter(pl.col("Country").str.contains("a")),
-        where=("ec.Country LIKE '%a%'", None),
+        expected_where="ec.Country LIKE '%a%'",
     ),
     *[
-        row
+        QueryCase(f"str_contains-{i}", "SELECT * FROM CC_Bond", _filter(p))
         for i, p in enumerate(
             [
                 pl.col("Centre").str.contains("^(Dh|Ph)"),
@@ -761,395 +785,491 @@ QUERIES = [
                 ~pl.col("Centre").str.contains("Da"),
             ]
         )
-        for row in Q(f"str_contains-{i}", "SELECT * FROM CC_Bond", _filter(p))
     ],
     # dt.date() pushes down as a DATE cast (issue #51); Polars re-filters, so only the SQL shows it
-    *Q(
+    QueryCase(
         "dt_date_filter_pushdown-eq",
         "SELECT CenterID, Centre, EventDate FROM CC_Bond",
         _filter(pl.col("EventDate").dt.date() == date(2013, 10, 24)),
-        text={"sql": X('CAST("EventDate" AS DATE)')},
+        expected_sql_contains=('CAST("EventDate" AS DATE)',),
     ),
-    *Q(
+    QueryCase(
         "dt_date_filter_pushdown-ge",
         "SELECT CenterID, Centre, EventDate FROM CC_Bond",
         _filter(pl.col("EventDate").dt.date() >= date(2013, 10, 24)),
-        text={"sql": X('CAST("EventDate" AS DATE)')},
+        expected_sql_contains=('CAST("EventDate" AS DATE)',),
     ),
     # equality on a nanosecond column is an is_between whose upper bound keeps sub-microsecond digits
-    *Q("nanosecond_equality_is_not_truncated", "SELECT id, ts FROM ns_tbl", _filter(ts == datetime(2024, 1, 1)), tables=("ns_tbl",), height=2),
+    QueryCase(
+        "nanosecond_equality_is_not_truncated",
+        "SELECT id, ts FROM ns_tbl",
+        _filter(ts == datetime(2024, 1, 1)),
+        tables=("ns_tbl",),
+        expected_height=2,
+    ),
     # aliases and casts in the query
-    *Q(
+    QueryCase(
         "rename_with_filter_integration",
         "SELECT CenterID, EventYear FROM CC_Bond",
         lambda lf: lf.select(pl.col("CenterID").alias("center_id"), pl.col("EventYear").alias("event_year")).filter(
             pl.col("event_year").is_not_null()
         ),
     ),
-    *Q(
+    QueryCase(
         "select_alias_predicate_pushdown_simple",
         "SELECT EventYear AS event_year, CenterID AS center_id FROM CC_Bond",
         _filter(pl.col("event_year") > 2016, after=["event_year", "center_id"]),
     ),
-    *Q("select_alias_cast_datetime_to_date_types", "SELECT CAST(EventDate AS DATE) AS BusDate, CenterID FROM CC_Bond"),
-    *Q("select_original_and_cast_same_column", "SELECT EventDate, CAST(EventDate AS DATE) AS BusDate, CenterID FROM CC_Bond"),
-    *Q(
+    QueryCase("select_alias_cast_datetime_to_date_types", "SELECT CAST(EventDate AS DATE) AS BusDate, CenterID FROM CC_Bond"),
+    QueryCase("select_original_and_cast_same_column", "SELECT EventDate, CAST(EventDate AS DATE) AS BusDate, CenterID FROM CC_Bond"),
+    QueryCase(
         "nested_select_star_with_cast_alias",
         _NESTED_STAR,
-        ordered=True,
-        log=(logging.DEBUG, "Executing SQL with pushdown: " + parse_one(_NESTED_STAR, dialect="duckdb").sql(dialect="duckdb")),
+        check_row_order=True,
+        log_level=logging.DEBUG,
+        expected_log="Executing SQL with pushdown: " + parse_one(_NESTED_STAR, dialect="duckdb").sql(dialect="duckdb"),
     ),
     # cloudpickle round trip (needed by Ray)
-    *Q("scan_db_pickle_basic", "SELECT * FROM CC_Bond", _pickled(), ordered=True),
-    *Q("scan_db_pickle_with_filter", "SELECT * FROM CC_Bond", _pickled(_filter(pl.col("EventYear") > 2020)), ordered=True),
-    *Q("scan_db_pickle_with_select", "SELECT CenterID, Centre, EventYear FROM CC_Bond", _pickled(), ordered=True),
+    QueryCase("scan_db_pickle_basic", "SELECT * FROM CC_Bond", _pickled(), check_row_order=True),
+    QueryCase("scan_db_pickle_with_filter", "SELECT * FROM CC_Bond", _pickled(_filter(pl.col("EventYear") > 2020)), check_row_order=True),
+    QueryCase("scan_db_pickle_with_select", "SELECT CenterID, Centre, EventYear FROM CC_Bond", _pickled(), check_row_order=True),
     # head: Polars pushes n_rows only without a predicate; head(n).filter(p) reads n rows before filtering
-    *Q(
+    QueryCase(
         "polars_does_not_push_n_rows_with_predicate",
         "SELECT * FROM EmployeeTbl",
         lambda lf: lf.filter(pl.col("score") > 80).head(5),
-        text={"sql": X("WHERE", omits="LIMIT")},
-        ordered=True,
+        expected_sql_contains=("WHERE",),
+        expected_sql_omits=("LIMIT",),
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "polars_pushes_n_rows_without_predicate",
         "SELECT * FROM EmployeeTbl",
         lambda lf: lf.head(5),
-        both=True,
-        text={"sql": X("LIMIT")},
-        ordered=True,
+        also_clickhouse=True,
+        expected_sql_contains=("LIMIT",),
+        check_row_order=True,
     ),
-    *Q("head_with_non_sql_filter_returns_correct_count", "SELECT * FROM EmployeeTbl", lambda lf: lf.filter(_UDF).head(10), ordered=True),
-    *Q("head_then_filter-sql", "SELECT * FROM EmployeeTbl", lambda lf: lf.head(10).filter(pl.col("score") > 80), ordered=True),
-    *Q("head_then_filter-udf", "SELECT * FROM EmployeeTbl", lambda lf: lf.head(10).filter(_UDF), ordered=True),
-    *Q("workaround_collect_then_head", "SELECT * FROM EmployeeTbl", lambda lf: lf.filter(_UDF).collect().head(10).lazy(), ordered=True),
-    *Q("head_zero_skips_query", "SELECT CenterID, Centre, EventYear FROM CC_Bond", lambda lf: lf.head(0), both=True, calls=0),
-    *Q(
+    QueryCase(
+        "head_with_non_sql_filter_returns_correct_count", "SELECT * FROM EmployeeTbl", lambda lf: lf.filter(_UDF).head(10), check_row_order=True
+    ),
+    QueryCase("head_then_filter-sql", "SELECT * FROM EmployeeTbl", lambda lf: lf.head(10).filter(pl.col("score") > 80), check_row_order=True),
+    QueryCase("head_then_filter-udf", "SELECT * FROM EmployeeTbl", lambda lf: lf.head(10).filter(_UDF), check_row_order=True),
+    QueryCase(
+        "workaround_collect_then_head", "SELECT * FROM EmployeeTbl", lambda lf: lf.filter(_UDF).collect().head(10).lazy(), check_row_order=True
+    ),
+    QueryCase(
+        "head_zero_skips_query",
+        "SELECT CenterID, Centre, EventYear FROM CC_Bond",
+        lambda lf: lf.head(0),
+        also_clickhouse=True,
+        expected_query_count=0,
+    ),
+    QueryCase(
         "head_zero_with_column_selection",
         "SELECT CenterID, Centre, EventYear FROM CC_Bond",
         lambda lf: lf.select(["CenterID", "Centre"]).head(0),
-        both=True,
-        calls=0,
+        also_clickhouse=True,
+        expected_query_count=0,
     ),
     # joins: rebuilt projections keep the table qualifier, or the query is wrapped as a subquery
-    *Q(
+    QueryCase(
         "with_columns_preserves_qualification_on_join",
         "SELECT a.shared, a.aval, b.bval FROM A AS a LEFT JOIN B AS b ON a.shared = b.shared",
         _select(["shared", "aval"]),
         tables=("A", "B"),
-        text={"sql": X(("SELECT a.shared, a.aval", 'SELECT "a"."shared", "a"."aval"', "SELECT [a].[shared], [a].[aval]"))},
+        expected_sql_contains=(("SELECT a.shared, a.aval", 'SELECT "a"."shared", "a"."aval"', "SELECT [a].[shared], [a].[aval]"),),
     ),
-    *Q("select_shared_column_is_qualified", _JOIN_STAR, _select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]), tables=_STAR_TABLES, text={"sql": _SUBQ}),
-    *Q("select_non_shared_column_is_qualified", _JOIN_STAR, _select(["ID", "CNTRY"]), tables=_STAR_TABLES, text={"sql": _SUBQ}),
-    *Q(
+    QueryCase(
+        "select_shared_column_is_qualified",
+        _JOIN_STAR,
+        _select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]),
+        tables=_STAR_TABLES,
+        expected_sql_contains=("__cpl_subq",),
+    ),
+    QueryCase(
+        "select_non_shared_column_is_qualified", _JOIN_STAR, _select(["ID", "CNTRY"]), tables=_STAR_TABLES, expected_sql_contains=("__cpl_subq",)
+    ),
+    QueryCase(
         "select_all_star_expanded_columns",
         _JOIN_STAR,
         _select(["ID", "ID_BB_COMPANY", "CNTRY", "SOME_DATE"]),
         tables=_STAR_TABLES,
-        text={"sql": _SUBQ},
+        expected_sql_contains=("__cpl_subq",),
     ),
-    *Q("predicate_pushdown_works_with_star_join", _JOIN_STAR, _filter(pl.col("CNTRY") == "US"), tables=_STAR_TABLES, text={"sql": _WHERE}),
+    QueryCase(
+        "predicate_pushdown_works_with_star_join", _JOIN_STAR, _filter(pl.col("CNTRY") == "US"), tables=_STAR_TABLES, expected_sql_contains=("WHERE",)
+    ),
     # columns only on the cr side resolve without a qualifier
-    *Q(
+    QueryCase(
         "predicate_with_multiple_filters",
         _JOIN_STAR,
         _filter((pl.col("SOME_DATE") == date(2024, 1, 15)) & (pl.col("PointID") == 100000)),
         tables=(*_STAR_TABLES, "PointID"),
-        text={"sql": _WHERE},
-        height=1,
+        expected_sql_contains=("WHERE",),
+        expected_height=1,
     ),
-    *Q(
+    QueryCase(
         "combined_select_qualified_and_predicate_unqualified",
         _JOIN_STAR,
         _filter(pl.col("CNTRY") == "US", after=["ID_BB_COMPANY", "CNTRY_OF_RISK"]),
         tables=_STAR_TABLES,
-        text={"sql": X("__cpl_subq", "WHERE")},
+        expected_sql_contains=(
+            "__cpl_subq",
+            "WHERE",
+        ),
     ),
-    *Q(
+    QueryCase(
         "alias_predicate_rewrites_to_underlying_expression",
         _JOIN_CAST,
         _filter(pl.col("bus_date") >= date(2024, 2, 1)),
         tables=_STAR_TABLES,
-        text={"sql": X("WHERE", "CAST")},
+        expected_sql_contains=(
+            "WHERE",
+            "CAST",
+        ),
     ),
-    *Q(
+    QueryCase(
         "select_alias_column_alongside_star_expanded",
         _JOIN_CAST,
         _select(["bus_date", "ID_BB_COMPANY"]),
         tables=_STAR_TABLES,
-        text={"sql": X("__cpl_subq", "CAST", "bus_date")},
+        expected_sql_contains=(
+            "__cpl_subq",
+            "CAST",
+            "bus_date",
+        ),
     ),
-    *Q(
+    QueryCase(
         "bare_star_join_does_not_qualify",
         "SELECT * FROM StarA a LEFT JOIN StarB b ON a.joinkey = b.bkey",
         _select(["aid", "bval"]),
         tables=("StarA", "StarB"),
-        text={"sql": X(omits=["a.aid", '"a"."aid"'])},
+        expected_sql_omits=("a.aid", '"a"."aid"'),
     ),
     # a redundant full-schema select leaves the SQL unchanged
-    *Q(
+    QueryCase(
         "explicit_columns_with_join_uses_subquery",
         "SELECT a.shared, b.bval FROM JoinA a LEFT JOIN JoinB b ON a.shared = b.shared",
         _select(["shared", "bval"]),
         tables=("JoinA", "JoinB"),
-        text={"sql": X(("a.shared", '"a"."shared"', "[a].[shared]"), ("b.bval", '"b"."bval"', "[b].[bval]"), omits="__cpl_subq")},
+        expected_sql_contains=(
+            ("a.shared", '"a"."shared"', "[a].[shared]"),
+            ("b.bval", '"b"."bval"', "[b].[bval]"),
+        ),
+        expected_sql_omits=("__cpl_subq",),
     ),
-    *Q(
+    QueryCase(
         "no_expansion_when_no_joins",
         "SELECT * FROM CreditRef",
         _select(["ID", "CNTRY"]),
         tables=_STAR_TABLES,
-        text={"sql": X(omits=["cr.ID", '"cr"."ID"'])},
+        expected_sql_omits=("cr.ID", '"cr"."ID"'),
     ),
-    *Q("no_modification_without_pushdown", _JOIN_STAR, tables=_STAR_TABLES, text={"sql": X(("cr.*", '"cr".*'))}),
-    *Q("multi_star_select_shared_uses_subquery", _MULTI_STAR, _select(["customer_id", "cust_name"]), tables=_MULTI_TABLES, text={"sql": _SUBQ}),
-    *Q("multi_star_select_non_shared_uses_subquery", _MULTI_STAR, _select(["order_id", "product_name"]), tables=_MULTI_TABLES, text={"sql": _SUBQ}),
-    *Q(
+    QueryCase("no_modification_without_pushdown", _JOIN_STAR, tables=_STAR_TABLES, expected_sql_contains=(("cr.*", '"cr".*'),)),
+    QueryCase(
+        "multi_star_select_shared_uses_subquery",
+        _MULTI_STAR,
+        _select(["customer_id", "cust_name"]),
+        tables=_MULTI_TABLES,
+        expected_sql_contains=("__cpl_subq",),
+    ),
+    QueryCase(
+        "multi_star_select_non_shared_uses_subquery",
+        _MULTI_STAR,
+        _select(["order_id", "product_name"]),
+        tables=_MULTI_TABLES,
+        expected_sql_contains=("__cpl_subq",),
+    ),
+    QueryCase(
         "multi_star_filter_with_subquery",
         _MULTI_STAR,
         _filter(pl.col("cust_name") == "Alice", after=["order_id", "cust_name", "product_name"]),
         tables=_MULTI_TABLES,
-        text={"sql": X("__cpl_subq", "WHERE")},
-        height=6,
+        expected_sql_contains=(
+            "__cpl_subq",
+            "WHERE",
+        ),
+        expected_height=6,
     ),
-    *Q("multi_star_no_subquery_without_pushdown", _MULTI_STAR, tables=_MULTI_TABLES, text={"sql": X(omits="__cpl_subq")}),
+    QueryCase("multi_star_no_subquery_without_pushdown", _MULTI_STAR, tables=_MULTI_TABLES, expected_sql_omits=("__cpl_subq",)),
     # comma-separated tables are implicit cross joins
-    *Q(
+    QueryCase(
         "comma_join_with_qualified_star_uses_subquery",
         "SELECT a.*, b.bval FROM CommaA a, CommaB b WHERE a.shared_key = b.shared_key",
         _select(["shared_key", "bval"]),
         tables=("CommaA", "CommaB"),
-        text={"sql": _SUBQ},
+        expected_sql_contains=("__cpl_subq",),
     ),
     # subquery wrapping: ORDER BY without TOP/OFFSET would move out (MSSQL only); others stay inside
-    *Q(
+    QueryCase(
         "order_by_stays_in_inner_for_non_mssql",
         "SELECT region, amount FROM Sales ORDER BY amount DESC",
         _select(["region", "amount"]),
         tables=("Sales",),
-        text={"sql": X("ORDER BY", omits="__cpl_subq")},
-        ordered=True,
+        expected_sql_contains=("ORDER BY",),
+        expected_sql_omits=("__cpl_subq",),
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "order_by_with_limit_stays_in_inner",
         "SELECT region, amount FROM Sales ORDER BY amount DESC LIMIT 2",
         _select(["region"]),
         tables=("Sales",),
-        text={"sql": _SUBQ, "inner": X("ORDER BY")},
-        ordered=True,
+        expected_sql_contains=("__cpl_subq",),
+        expected_inner_sql_contains=("ORDER BY",),
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "no_wrapping_without_pushdown",
         "SELECT region, amount FROM Sales ORDER BY amount",
         tables=("Sales",),
-        text={"sql": X("ORDER BY", omits="__cpl_subq")},
-        ordered=True,
+        expected_sql_contains=("ORDER BY",),
+        expected_sql_omits=("__cpl_subq",),
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "alias_predicate_works_without_rewriting",
         "SELECT region, CAST(sale_date AS DATE) AS sale_date FROM Sales",
         _filter(pl.col("sale_date") >= date(2024, 2, 1)),
         tables=("Sales",),
-        text={"sql": _SUBQ, "outer": X("WHERE", omits="CAST")},
+        expected_sql_contains=("__cpl_subq",),
+        expected_outer_sql_contains=("WHERE",),
+        expected_outer_sql_omits=("CAST",),
     ),
     # a predicate on a UNION filters every branch
-    *Q(
+    QueryCase(
         "union_predicate_filters_all_branches",
         "SELECT region, amount FROM SalesQ1 UNION ALL SELECT region, amount FROM SalesQ2",
         _filter(pl.col("region") == "East"),
         tables=("SalesQ1", "SalesQ2"),
-        text={"sql": _SUBQ},
-        height=2,
+        expected_sql_contains=("__cpl_subq",),
+        expected_height=2,
     ),
-    *Q(
+    QueryCase(
         "union_column_selection",
         "SELECT id, name, val FROM UnionA UNION ALL SELECT id, name, val FROM UnionB",
         _select(["id", "name"]),
         tables=("UnionA", "UnionB"),
-        text={"sql": _SUBQ},
+        expected_sql_contains=("__cpl_subq",),
     ),
-    *Q(
+    QueryCase(
         "group_by_with_predicate_pushdown",
         "SELECT region, SUM(amount) AS total FROM Sales GROUP BY region",
         _filter(pl.col("total") >= 250),
         tables=("Sales",),
-        text={"sql": _SUBQ, "inner": X("GROUP BY")},
+        expected_sql_contains=("__cpl_subq",),
+        expected_inner_sql_contains=("GROUP BY",),
     ),
-    *Q(
+    QueryCase(
         "cte_query_with_column_selection",
         "WITH cte AS (SELECT region, amount FROM Sales) SELECT region, amount FROM cte",
         _select(["region"]),
         tables=("Sales",),
-        text={"sql": _SUBQ},
+        expected_sql_contains=("__cpl_subq",),
     ),
-    *Q(
+    QueryCase(
         "order_by_with_offset_stays_in_inner",
         "SELECT region, amount FROM Sales ORDER BY amount LIMIT 2 OFFSET 1",
         _select(["region"]),
         tables=("Sales",),
-        text={"sql": _SUBQ, "inner": X("ORDER BY")},
-        ordered=True,
+        expected_sql_contains=("__cpl_subq",),
+        expected_inner_sql_contains=("ORDER BY",),
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "order_by_qualified_stays_in_inner_for_non_mssql",
         "SELECT a.id, a.event_date FROM OrderQualA a ORDER BY a.event_date",
         _select(["id", "event_date"]),
         tables=("OrderQualA",),
-        text={"sql": X("ORDER BY", omits="__cpl_subq")},
-        ordered=True,
+        expected_sql_contains=("ORDER BY",),
+        expected_sql_omits=("__cpl_subq",),
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "predicate_only_pushdown",
         "SELECT region, amount, sale_date FROM Sales",
         _filter(pl.col("region") == "East"),
         tables=("Sales",),
-        text={"sql": _SUBQ, "outer": _WHERE},
+        expected_sql_contains=("__cpl_subq",),
+        expected_outer_sql_contains=("WHERE",),
     ),
-    *Q(
+    QueryCase(
         "nested_subquery_wrapping",
         "SELECT region, amount FROM (SELECT region, amount FROM Sales) AS inner_q",
         _select(["region"]),
         tables=("Sales",),
-        text={"sql": _SUBQ},
+        expected_sql_contains=("__cpl_subq",),
     ),
     # metadata-derived reserved and special-character names stay selectable
-    *Q(
+    QueryCase(
         "column_selection_quotes_metadata_names",
         "SELECT * FROM QuotedMetadataColumns",
         _select(["group", "value with space"]),
         tables=("QuotedMetadataColumns",),
-        scan={"krb5": False},
+        scan_kwargs={"krb5": False},
     ),
     # cast_map narrows a column server side
-    *Q(
+    QueryCase(
         "cast_map_narrows_column_server_side",
         "SELECT * FROM RecordTbl",
         lambda lf: lf.sort("PointID"),
         tables=("RecordTbl",),
-        scan=_RECORD,
-        ref=_record_dates,
-        ordered=True,
+        scan_kwargs=_RECORD,
+        native_transform=_record_dates,
+        check_row_order=True,
     ),
-    *Q(
+    QueryCase(
         "cast_map_pushes_date_predicate_to_sql",
         "SELECT * FROM RecordTbl",
         lambda lf: lf.filter(pl.col("RecordDate") == date(2025, 5, 30)).sort("PointID"),
         tables=("RecordTbl",),
-        scan=_RECORD,
-        ref=_record_dates,
-        ordered=True,
-        text={"sql": X("CAST", "DATE", "RecordDate", "WHERE")},
-        height=2,
+        scan_kwargs=_RECORD,
+        native_transform=_record_dates,
+        check_row_order=True,
+        expected_sql_contains=(
+            "CAST",
+            "DATE",
+            "RecordDate",
+            "WHERE",
+        ),
+        expected_height=2,
     ),
     # the inner cast layer lists every column; the outer select prunes
-    *Q(
+    QueryCase(
         "cast_map_projection_pushdown_still_prunes",
         "SELECT * FROM RecordTbl",
         lambda lf: lf.select(["RecordDate", "PointID"]).sort("PointID"),
         tables=("RecordTbl",),
-        scan=_RECORD,
-        ref=_record_dates,
-        ordered=True,
-        text={"sql": {"startswith": 'SELECT "RECORDDATE", "POINTID" FROM'}},
+        scan_kwargs=_RECORD,
+        native_transform=_record_dates,
+        check_row_order=True,
+        expected_sql_startswith='SELECT "RECORDDATE", "POINTID" FROM',
     ),
     # partitioned reads return the unpartitioned rows
     *[
-        row
-        for every in ["1y", "1mo", "6mo", 90, "1q"]
-        for row in Q(
+        QueryCase(
             f"by_time_matches_unpartitioned-{every}",
             "SELECT * FROM CC_Bond",
             _filter(_DATE_FILTER),
-            scan={"partitions": lambda every=every: cpl.by_time("EventDate", every)},
+            scan_kwargs={"partitions": lambda every=every: cpl.by_time("EventDate", every)},
         )
+        for every in ["1y", "1mo", "6mo", 90, "1q"]
     ],
     # [2013-01-01, 2017-01-01) split yearly is four windows (exclusive upper bound)
-    *Q(
+    QueryCase(
         "by_time_partition_count",
         "SELECT * FROM CC_Bond",
         _filter(_DATE_FILTER),
-        scan={"partitions": lambda: cpl.by_time("EventDate", "1y")},
-        log=(logging.DEBUG, "running 4 partition(s)"),
+        scan_kwargs={"partitions": lambda: cpl.by_time("EventDate", "1y")},
+        log_level=logging.DEBUG,
+        expected_log="running 4 partition(s)",
     ),
-    *Q("by_value_derived_from_predicate", "SELECT * FROM CC_Bond", _filter(_COUNTRIES), scan={"partitions": lambda: cpl.by_value("ISOCountryCode")}),
-    *Q(
+    QueryCase(
+        "by_value_derived_from_predicate",
+        "SELECT * FROM CC_Bond",
+        _filter(_COUNTRIES),
+        scan_kwargs={"partitions": lambda: cpl.by_value("ISOCountryCode")},
+    ),
+    QueryCase(
         "by_value_explicit_groups",
         "SELECT * FROM CC_Bond",
         _filter(_COUNTRIES),
-        scan={"partitions": lambda: cpl.by_value("ISOCountryCode", [["GT", "BD"], "RO"])},
+        scan_kwargs={"partitions": lambda: cpl.by_value("ISOCountryCode", [["GT", "BD"], "RO"])},
     ),
-    *Q(
+    QueryCase(
         "by_range_numeric",
         "SELECT * FROM CC_Bond",
         _filter((pl.col("EventYear") >= 2013) & (pl.col("EventYear") < 2055)),
-        scan={"partitions": lambda: cpl.by_range("EventYear", every=10)},
+        scan_kwargs={"partitions": lambda: cpl.by_range("EventYear", every=10)},
     ),
     # every CC_Bond row has FileType 'G'
-    *Q("explicit_read_partition_list", "SELECT * FROM CC_Bond", scan={"partitions": lambda: [cpl.ReadPartition(pl.col("FileType") == "G", key="G")]}),
+    QueryCase(
+        "explicit_read_partition_list",
+        "SELECT * FROM CC_Bond",
+        scan_kwargs={"partitions": lambda: [cpl.ReadPartition(pl.col("FileType") == "G", key="G")]},
+    ),
     # a one-shot generator of slices, and a projection without the partition column the client-side filter needs
-    *Q(
+    QueryCase(
         "generator_partitions_retain_columns_under_projection",
         "SELECT * FROM CC_Bond",
         _filter(_COUNTRIES, after="CentreCode"),
-        scan={"partitions": _parts("GT", "BD", "RO")},
+        scan_kwargs={"partitions": _parts("GT", "BD", "RO")},
     ),
-    *Q(
+    QueryCase(
         "max_concurrency_matches_unpartitioned",
         "SELECT * FROM CC_Bond",
         _filter(_DATE_FILTER),
-        scan={"partitions": lambda: cpl.by_time("EventDate", "1mo"), "max_concurrency": 1},
+        scan_kwargs={"partitions": lambda: cpl.by_time("EventDate", "1mo"), "max_concurrency": 1},
     ),
     # a slice predicate SQL cannot express is applied client side
-    *Q(
+    QueryCase(
         "untranslatable_predicate_filters_client_side",
         "SELECT * FROM CC_Bond",
-        scan={"partitions": lambda: [cpl.ReadPartition(pl.col("EventName").map_elements(lambda v: "Day" in v, return_dtype=pl.Boolean), key=0)]},
-        ref=lambda df: df.filter(_DAY),
+        scan_kwargs={
+            "partitions": lambda: [cpl.ReadPartition(pl.col("EventName").map_elements(lambda v: "Day" in v, return_dtype=pl.Boolean), key=0)]
+        },
+        native_transform=lambda df: df.filter(_DAY),
     ),
-    *Q(
+    QueryCase(
         "unbounded_predicate_falls_back_to_single_query",
         "SELECT * FROM CC_Bond",
-        scan={"partitions": lambda: cpl.by_time("EventDate")},
-        log=(logging.DEBUG, "running 1 partition(s)"),
+        scan_kwargs={"partitions": lambda: cpl.by_time("EventDate")},
+        log_level=logging.DEBUG,
+        expected_log="running 1 partition(s)",
     ),
     # a top-level ORDER BY only loses global order under partitioning: warn, don't raise
-    *Q(
+    QueryCase(
         "partitioned_query_with_order_by_warns_not_raises",
         "SELECT * FROM CC_Bond ORDER BY EventDate DESC",
         _filter(_DATE_FILTER),
-        scan={"partitions": lambda: cpl.by_time("EventDate", "1y")},
-        log=(logging.WARNING, "ORDER BY"),
+        scan_kwargs={"partitions": lambda: cpl.by_time("EventDate", "1y")},
+        expected_log="ORDER BY",
     ),
 ]
 
 
-@pytest.mark.parametrize(("entry", "query", "kw"), QUERIES)
-def test_scan_matches_native(db, caplog, entry, query, kw):
-    for name in kw["tables"]:
+@pytest.fixture
+def tables(request, db):
+    """Creates the TABLES entries named by the parameter inside the test's transaction."""
+    for name in request.param:
         db.conn.execute(TABLES[name])
-    op, ref = kw["op"], kw["ref"] or (lambda df: df)
-    lf = ENTRY_POINTS[entry](query, **{k: v() if callable(v) else v for k, v in kw["scan"].items()})
+
+
+def _native(db, case: QueryCase) -> pl.LazyFrame:
+    df = db.native(case.query)
+    return case.op((case.native_transform(df) if case.native_transform else df).lazy())
+
+
+@pytest.mark.parametrize(("entry", "tables", "case"), _query_params(QUERIES), indirect=["tables"])
+def test_scan_matches_native(db, tables, caplog, entry, case):
+    lf = ENTRY_POINTS[entry](case.query, **{k: v() if callable(v) else v for k, v in case.scan_kwargs.items()})
     start = len(db.calls)
-    level, message = kw["log"] or (logging.WARNING, None)
-    with caplog.at_level(level):
-        got = assert_matches_native(op(lf), op(ref(db.native(query)).lazy()), None, check_row_order=kw["ordered"])
-    assert got.columns == op(ref(db.native(query)).lazy()).collect_schema().names()
-    assert op(lf).collect_schema() == got.schema
-    if message is not None:
-        assert any(message in r.message for r in caplog.records), [r.message for r in caplog.records]
-    if kw["height"] is not None:
-        assert got.height == kw["height"]
-    if kw["calls"] is not None:
-        assert len(db.calls) - start == kw["calls"], db.calls[start:]
-    if kw["text"]:
-        (sql,) = db.queries(start)
-        parts = {"sql": sql, "inner": sql.split("__cpl_subq")[0], "outer": sql.split("__cpl_subq")[-1]}
-        for part, expect in kw["text"].items():
-            assert_text(parts[part], ignore_case=True, **expect)
-    if kw["where"]:
-        where, after = kw["where"]
-        filtered = ENTRY_POINTS[entry](f"{query} WHERE {where}").pipe(after or (lambda lf: lf)).collect()
-        assert_frame_equal(filtered, got, check_row_order=kw["ordered"])
+    with caplog.at_level(case.log_level):
+        got = assert_matches_native(case.op(lf), _native(db, case), None, check_row_order=case.check_row_order)
+    sent = db.queries(start)
+    calls = len(db.calls) - start
+
+    assert got.columns == _native(db, case).collect_schema().names()
+    assert case.op(lf).collect_schema() == got.schema
+    if case.expected_height is not None:
+        assert got.height == case.expected_height
+    if case.expected_where is not None:
+        filtered = ENTRY_POINTS[entry](f"{case.query} WHERE {case.expected_where}")
+        if case.expected_where_columns is not None:
+            filtered = filtered.select(case.expected_where_columns)
+        assert_frame_equal(filtered.collect(), got, check_row_order=case.check_row_order)
+
+    if case.expected_log is not None:
+        assert any(case.expected_log in r.message for r in caplog.records), [r.message for r in caplog.records]
+    if case.expected_query_count is not None:
+        assert calls == case.expected_query_count, db.calls[start:]
+    if case.checks_sql:
+        (sql,) = sent
+        inner, outer = sql.split("__cpl_subq")[0], sql.split("__cpl_subq")[-1]
+        assert_text(sql, case.expected_sql_contains, case.expected_sql_omits, startswith=case.expected_sql_startswith, ignore_case=True)
+        assert_text(inner, case.expected_inner_sql_contains, ignore_case=True)
+        assert_text(outer, case.expected_outer_sql_contains, case.expected_outer_sql_omits, ignore_case=True)
 
 
 def _identity_schema(schema):
