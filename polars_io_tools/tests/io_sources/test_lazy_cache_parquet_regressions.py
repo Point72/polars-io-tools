@@ -1,6 +1,6 @@
 """Regressions for cache_parquet planning bugs (re-writes, lost rows, key parsing), as named rows.
 
-``REGRESSIONS`` rows drive a cache with a seed and a list of queries and check every query against native Polars
+``REGRESSIONS`` rows drive a cache with a seed and a list of reads and check every read against native Polars
 cold and warm; rows can also require that the seed's files are not rewritten. Bugs that need a patched platform,
 pre-written legacy files or a changing upstream stay functions.
 """
@@ -9,7 +9,7 @@ import datetime
 import importlib
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -58,24 +58,35 @@ _JAN = pl.col("date").is_between(D(2024, 1, 1), D(2024, 1, 31))
 
 
 @dataclass(frozen=True)
-class Reg:
-    """A regression row.
+class Read:
+    """A cached read of ``predicate`` (``None`` reads everything) in cache ``mode``."""
 
-    ``seed`` predicates are read through the cache first (``None`` reads everything); with ``kept`` the files they
-    leave are aged and must be neither rewritten nor removed by the queries, and ``n_files`` is their count.
-    Each query is a predicate, or a (predicate, cache mode) pair, read ``runs`` times and compared with ``src``.
+    predicate: pl.Expr | None
+    mode: CacheMode = CACHE
+
+
+@dataclass(frozen=True)
+class Regression:
+    """A cache seeded by reading ``seed`` from ``seed_src`` (default ``src``), then ``reads`` of ``src``.
+
+    Each read runs ``runs`` times and must match native Polars. With ``keep_seed_files`` the seed's files are aged and
+    no read may rewrite or remove them.
     """
 
     id: str
     src: Any
-    queries: list
+    _: KW_ONLY
+    reads: list[Read]
     seed: list = field(default_factory=list)
-    kept: bool = False
-    n_files: int | None = None
-    runs: int = 1
     seed_src: Any = None
-    files: tuple = ()
-    kw: dict = field(default_factory=dict)
+    keep_seed_files: bool = False
+    seed_file_count: int | None = None
+    final_file_count: int | None = None
+    # paths relative to the cache root, checked after the reads
+    expected_files: tuple[str, ...] = ()
+    absent_files: tuple[str, ...] = ()
+    runs: int = 1
+    cache_kwargs: dict = field(default_factory=dict)
 
 
 def _ts(values, dtype):
@@ -100,66 +111,67 @@ _DT_TYPES = {"Date": pl.Date, "Datetime(us)": pl.Datetime("us"), "Datetime(us, N
 
 REGRESSIONS = [
     *(
-        Reg(f"one_sided_date_predicate_on_empty_cache-{k}", MONTHLY_SRC, [p])
+        Regression(f"one_sided_date_predicate_on_empty_cache-{k}", MONTHLY_SRC, reads=[Read(p)])
         for k, p in [("le", pl.col("date") <= D(2024, 1, 31)), ("ge", pl.col("date") >= D(2024, 1, 1))]
     ),
     *(
-        Reg(
+        Regression(
             f"not_equal_date_does_not_drop_enclosing_partition-{tu}",
             MONTHLY_SRC.with_columns(pl.col("date").cast(dt)),
-            [pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29)) & (pl.col("date") != ex)],
+            reads=[Read(pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29)) & (pl.col("date") != ex))],
             runs=2,
-            kw={"time_unit": tu},
+            cache_kwargs={"time_unit": tu},
         )
         for tu, dt, ex in [("monthly", pl.Date, D(2024, 1, 15)), ("daily", pl.Datetime("us"), DT(2024, 1, 15, 12))]
     ),
     *(
-        Reg(
+        Regression(
             f"cached_partitions_not_rewritten_by_open_queries-{tu}-{k}",
             MONTHLY_SRC,
-            [p],
-            [_JAN],
-            kept=True,
-            files=("monthly/2024-02.parquet",) if tu == "monthly" else (),
-            kw={"time_unit": tu},
+            reads=[Read(p)],
+            seed=[_JAN],
+            keep_seed_files=True,
+            expected_files=("monthly/2024-02.parquet",) if tu == "monthly" else (),
+            cache_kwargs={"time_unit": tu},
         )
         for tu in ["monthly", "yearly"]
         for k, p in [("unbounded", pl.col("date") >= D(2024, 1, 1)), ("unconstrained", None)]
     ),
-    Reg(
+    Regression(
         "daily_datetime_column_partitions_not_rewritten",
         pl.LazyFrame({"date": [DT(2024, 1, 1, 9), DT(2024, 1, 1, 15), DT(2024, 1, 2, 9)], "value": [0, 1, 2]}),
-        [pl.col("date") >= DT(2024, 1, 1)],
-        [pl.col("date").is_between(DT(2024, 1, 1), DT(2024, 1, 1, 23, 59))],
-        kept=True,
-        kw={"time_unit": "daily"},
+        reads=[Read(pl.col("date") >= DT(2024, 1, 1))],
+        seed=[pl.col("date").is_between(DT(2024, 1, 1), DT(2024, 1, 1, 23, 59))],
+        keep_seed_files=True,
+        cache_kwargs={"time_unit": "daily"},
     ),
-    Reg(
+    Regression(
         "finite_query_does_not_rewrite_cached_partitions_between_missing_ones",
         _SYM,
-        [pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29)) & pl.col("sym").is_in(["A", "B"])],
-        [(pl.col("date") == D(2024, 1, 10)) & (pl.col("sym") == "B"), (pl.col("date") == D(2024, 2, 10)) & (pl.col("sym") == "A")],
-        kept=True,
-        kw=_MSYM,
+        reads=[Read(pl.col("date").is_between(D(2024, 1, 1), D(2024, 2, 29)) & pl.col("sym").is_in(["A", "B"]))],
+        seed=[(pl.col("date") == D(2024, 1, 10)) & (pl.col("sym") == "B"), (pl.col("date") == D(2024, 2, 10)) & (pl.col("sym") == "A")],
+        keep_seed_files=True,
+        cache_kwargs=_MSYM,
     ),
-    Reg(
+    Regression(
         "extra_col_only_predicate_does_not_rewrite_cached_dates",
         _SYM,
-        [pl.col("sym") == "A"],
-        [_JAN],
-        kept=True,
-        files=("monthly/A/2024-02.parquet", "!monthly/B/2024-02.parquet"),
-        kw=_MSYM,
+        reads=[Read(pl.col("sym") == "A")],
+        seed=[_JAN],
+        keep_seed_files=True,
+        expected_files=("monthly/A/2024-02.parquet",),
+        absent_files=("monthly/B/2024-02.parquet",),
+        cache_kwargs=_MSYM,
     ),
     *(
-        Reg(
+        Regression(
             f"custom_partition_format_cache_hit-{fmt}",
             MONTHLY_SRC,
-            [_JAN],
-            [_JAN],
-            kept=True,
-            files=(f"monthly/{jan}",),
-            kw={"partition_format": fmt},
+            reads=[Read(_JAN)],
+            seed=[_JAN],
+            keep_seed_files=True,
+            expected_files=(f"monthly/{jan}",),
+            cache_kwargs={"partition_format": fmt},
         )
         for fmt, jan in [
             ("$year/$month", "2024/01.parquet"),
@@ -168,7 +180,13 @@ REGRESSIONS = [
         ]
     ),
     *(
-        Reg(f"null_or_value_predicate_keeps_null_rows-{k}-{'warm' if warm else 'cold'}", src, [p], [None] if warm else [], kw=_MX)
+        Regression(
+            f"null_or_value_predicate_keeps_null_rows-{k}-{'warm' if warm else 'cold'}",
+            src,
+            reads=[Read(p)],
+            seed=[None] if warm else [],
+            cache_kwargs=_MX,
+        )
         for k, src, p in [
             ("date_null_or_value", _NULLABLE_DATES, pl.col("date").is_null() | (pl.col("date") == D(2024, 1, 10))),
             ("date_null_or_range", _NULLABLE_DATES, pl.col("date").is_null() | _JAN),
@@ -179,33 +197,33 @@ REGRESSIONS = [
         for warm in (False, True)
     ),
     *(
-        Reg(
+        Regression(
             f"null_date_partition_is_cached-{fmt}",
             pl.LazyFrame({"date": [D(2024, 1, 10), None], "value": [0, 1]}),
-            [None],
-            [None],
-            kept=True,
-            n_files=2,
-            kw={"partition_format": fmt},
+            reads=[Read(None)],
+            seed=[None],
+            keep_seed_files=True,
+            seed_file_count=2,
+            cache_kwargs={"partition_format": fmt},
         )
         for fmt in [None, "$year/$month"]
     ),
-    Reg(
+    Regression(
         "decimal_partition_exclusion_without_date_column",
         pl.LazyFrame({"x": pl.Series(["1.23", "-2.50", "4.00"]).cast(pl.Decimal(10, 2)), "value": [0, 1, 2]}),
-        [None],
-        [pl.col("x") < 4],
-        kept=True,
-        kw={"date_column": None, "extra_partition_cols": "x"},
+        reads=[Read(None)],
+        seed=[pl.col("x") < 4],
+        keep_seed_files=True,
+        cache_kwargs={"date_column": None, "extra_partition_cols": "x"},
     ),
-    Reg(
+    Regression(
         "decimal_partition_finite_query_with_several_values",
         pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 1, 11)], "x": pl.Series(["1.23", "2.34"]).cast(pl.Decimal(10, 2)), "value": [0, 1]}),
-        [_JAN & pl.col("x").is_in(pl.Series(["1.23", "2.34"]).cast(pl.Decimal(10, 2)))],
-        kw={"extra_partition_cols": "x"},
+        reads=[Read(_JAN & pl.col("x").is_in(pl.Series(["1.23", "2.34"]).cast(pl.Decimal(10, 2))))],
+        cache_kwargs={"extra_partition_cols": "x"},
     ),
     *(
-        Reg(
+        Regression(
             f"timezone_aware_finite_query_uses_local_partition_bounds-{tu}-{tz}",
             pl.LazyFrame(
                 {
@@ -215,83 +233,90 @@ REGRESSIONS = [
                     "value": [0, 1, 2, 3],
                 }
             ),
-            [pl.col("ts").is_between(DT(2024, 1, 1, tzinfo=ZoneInfo(tz)), DT(2024, 1, 31, 23, 59, tzinfo=ZoneInfo(tz)))],
+            reads=[Read(pl.col("ts").is_between(DT(2024, 1, 1, tzinfo=ZoneInfo(tz)), DT(2024, 1, 31, 23, 59, tzinfo=ZoneInfo(tz))))],
             runs=2,
-            kw={"date_column": "ts", "time_unit": tu},
+            cache_kwargs={"date_column": "ts", "time_unit": tu},
         )
         for tu in ["daily", "monthly"]
         for tz in ["America/New_York", "Asia/Tokyo"]
     ),
     *(
-        Reg(
+        Regression(
             f"exclusive_datetime_bounds_keep_rest_of_bound_date-{tu}",
             pl.LazyFrame({"ts": [DT(2024, 1, 31, 13), DT(2024, 2, 1, 13), DT(2024, 2, 2, 11)], "value": [0, 1, 2]}),
-            [(pl.col("ts") > DT(2024, 1, 31, 12)) & (pl.col("ts") < DT(2024, 2, 2, 12))],
+            reads=[Read((pl.col("ts") > DT(2024, 1, 31, 12)) & (pl.col("ts") < DT(2024, 2, 2, 12)))],
             runs=2,
-            kw={"date_column": "ts", "time_unit": tu},
+            cache_kwargs={"date_column": "ts", "time_unit": tu},
         )
         for tu in ["daily", "monthly"]
     ),
     *(
-        Reg(
+        Regression(
             f"one_sided_query_caches_whole_partitions-{op}-{k}",
             pl.LazyFrame({"ts": _ts([DT(2024, 1, 5), DT(2024, 1, 20), DT(2024, 2, 5)], dt), "value": [0, 1, 2]}),
-            [pl.col("ts") >= pl.lit(DT(2024, 1, 10)).cast(dt) if op == "ge" else pl.col("ts") <= pl.lit(DT(2024, 1, 10)).cast(dt), None],
-            kw={"date_column": "ts"},
+            reads=[
+                Read(pl.col("ts") >= pl.lit(DT(2024, 1, 10)).cast(dt) if op == "ge" else pl.col("ts") <= pl.lit(DT(2024, 1, 10)).cast(dt)),
+                Read(None),
+            ],
+            cache_kwargs={"date_column": "ts"},
         )
         for op in ["ge", "le"]
         for k, dt in _DT_TYPES.items()
     ),
-    Reg(
+    Regression(
         "one_sided_query_writes_empty_files_only_for_queried_extra_values",
         pl.LazyFrame({"ts": [DT(2024, 1, 10, 9), DT(2024, 1, 21, 17)], "k": ["a", "a"], "value": [0, 1]}),
-        [pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23)), (pl.col("ts") > DT(2024, 1, 1)) & (pl.col("k") == "b"), None],
-        kw={"date_column": "ts", "time_unit": "daily", "extra_partition_cols": "k"},
+        reads=[
+            Read(pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23))),
+            Read((pl.col("ts") > DT(2024, 1, 1)) & (pl.col("k") == "b")),
+            Read(None),
+        ],
+        cache_kwargs={"date_column": "ts", "time_unit": "daily", "extra_partition_cols": "k"},
     ),
-    Reg(
+    Regression(
         "one_sided_exclusive_midnight_bound_does_not_mark_bound_date_cached",
         pl.LazyFrame({"ts": [DT(2024, 1, 21, 17), DT(2024, 2, 20, 6)], "value": [0, 1]}),
-        [pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23)), pl.col("ts") < DT(2024, 2, 20), None],
-        kw={"date_column": "ts", "time_unit": "daily"},
+        reads=[Read(pl.col("ts").is_between(DT(2024, 1, 21), DT(2024, 1, 21, 23))), Read(pl.col("ts") < DT(2024, 2, 20)), Read(None)],
+        cache_kwargs={"date_column": "ts", "time_unit": "daily"},
     ),
-    Reg(
+    Regression(
         "or_with_one_sided_date_clause_reads_every_cached_match",
         pl.LazyFrame({"date": [D(2024, 1, 10), D(2024, 2, 10), D(2024, 3, 10)], "value": [1, 2, 3]}),
-        [(pl.col("date") == D(2024, 3, 10)) | (pl.col("date") < D(2024, 2, 15))],
-        [None],
+        reads=[Read((pl.col("date") == D(2024, 3, 10)) | (pl.col("date") < D(2024, 2, 15)))],
+        seed=[None],
     ),
     *(
-        Reg(
+        Regression(
             f"last_representable_date_partition-{mode.name}-{tu}",
             pl.LazyFrame({"date": [D.max, D(9999, 1, 5)], "value": [0, 1]}),
-            [(pl.col("date") == D.max, mode)],
+            reads=[Read(pl.col("date") == D.max, mode=mode)],
             runs=2,
-            kw={"time_unit": tu, "ttl": datetime.timedelta(days=1)},
+            cache_kwargs={"time_unit": tu, "ttl": datetime.timedelta(days=1)},
         )
         for mode in [READ_ONLY, CACHE]
         for tu in ["daily", "monthly", "yearly"]
     ),
     # REBUILD refreshes the partitions in scope from the current upstream
     *(
-        Reg(
+        Regression(
             f"rebuild_missing_aware_predicate_refreshes_null_partition-{dc}-{k}",
             _MISSING_SRC.with_columns(pl.col("value") + 100),
-            [(p, REBUILD)],
-            [None],
+            reads=[Read(p, mode=REBUILD)],
+            seed=[None],
             seed_src=_MISSING_SRC,
-            kw={"date_column": dc, "extra_partition_cols": "x"},
+            cache_kwargs={"date_column": dc, "extra_partition_cols": "x"},
         )
         for dc in [None, "date"]
         for k, p in _MISSING_AWARE.items()
     ),
     *(
-        Reg(
+        Regression(
             f"rebuild_unbounded_query_drops_rows_upstream_no_longer_has-{k}",
             _DROPPED.clear(),
-            [(p, REBUILD)],
-            [None],
+            reads=[Read(p, mode=REBUILD)],
+            seed=[None],
             seed_src=_DROPPED,
-            kw={"extra_partition_cols": "sym"},
+            cache_kwargs={"extra_partition_cols": "sym"},
         )
         for k, p in [
             ("unbounded", pl.col("date") >= D(2024, 1, 1)),
@@ -300,32 +325,31 @@ REGRESSIONS = [
         ]
     ),
     *(
-        Reg(
+        Regression(
             f"rebuild_datetime_scope_caches_whole_partition-{tz}",
             pl.LazyFrame({"ts": pl.Series([DT(2024, 1, 5), DT(2024, 1, 15), DT(2024, 2, 5)], dtype=pl.Datetime("us", tz)), "value": [0, 1, 2]}),
-            [
-                (
+            reads=[
+                Read(
                     pl.col("ts").is_between(
                         DT(2024, 1, 10, tzinfo=ZoneInfo(tz) if tz else None), DT(2024, 1, 20, tzinfo=ZoneInfo(tz) if tz else None)
                     ),
-                    REBUILD,
+                    mode=REBUILD,
                 ),
-                None,
+                Read(None),
             ],
-            kw={"date_column": "ts"},
+            cache_kwargs={"date_column": "ts"},
         )
         for tz in [None, "America/New_York"]
     ),
     *(
-        Reg(
+        Regression(
             f"rebuild_removes_stale_null_partition-{nc}",
             src.filter(pl.col("value") == 0),
-            [(None, REBUILD)],
-            [None],
-            n_files=None,
+            reads=[Read(None, mode=REBUILD)],
+            seed=[None],
             seed_src=src,
-            files=("#1",),
-            kw={"extra_partition_cols": "x"},
+            final_file_count=1,
+            cache_kwargs={"extra_partition_cols": "x"},
         )
         for nc, src in [
             ("date", pl.LazyFrame({"date": [D(2024, 1, 10), None], "x": ["a", "a"], "value": [0, 1]})),
@@ -337,26 +361,24 @@ REGRESSIONS = [
 
 @pytest.mark.parametrize("reg", [pytest.param(r, id=r.id) for r in REGRESSIONS])
 def test_regression(tmp_path, reg):
-    kwargs = {"date_column": "date"} | reg.kw
+    kwargs = {"date_column": "date"} | reg.cache_kwargs
     seed_src = reg.src if reg.seed_src is None else reg.seed_src
     for pred in reg.seed:
         collect_filtered(cache_parquet(seed_src, tmp_path, **kwargs), pred)
-    snapshot = _age_files(tmp_path) if reg.kept else None
-    if reg.n_files is not None:
-        assert len(snapshot) == reg.n_files
-    for query in reg.queries:
-        pred, mode = query if isinstance(query, tuple) else (query, CACHE)
-        assert_cached_matches_native(reg.src, tmp_path, pred, runs=reg.runs, **kwargs | {"cache_mode": mode})
-    if reg.kept:
+    if reg.seed_file_count is not None:
+        assert len(list(tmp_path.rglob("*.parquet"))) == reg.seed_file_count
+    snapshot = _age_files(tmp_path) if reg.keep_seed_files else None
+    for read in reg.reads:
+        assert_cached_matches_native(reg.src, tmp_path, read.predicate, runs=reg.runs, **kwargs | {"cache_mode": read.mode})
+    if reg.keep_seed_files:
         assert _rewritten(snapshot) == []
         assert all(path.exists() for path in snapshot)
-    for path in reg.files:
-        if path.startswith("#"):
-            assert len(list(tmp_path.rglob("*.parquet"))) == int(path[1:])
-        elif path.startswith("!"):
-            assert not (tmp_path / path[1:]).exists()
-        else:
-            assert (tmp_path / path).exists()
+    if reg.final_file_count is not None:
+        assert len(list(tmp_path.rglob("*.parquet"))) == reg.final_file_count
+    for path in reg.expected_files:
+        assert (tmp_path / path).exists(), path
+    for path in reg.absent_files:
+        assert not (tmp_path / path).exists(), path
 
 
 # Key parsing
