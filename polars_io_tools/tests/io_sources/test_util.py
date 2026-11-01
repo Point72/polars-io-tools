@@ -19,7 +19,9 @@ from polars_io_tools.io_sources.util import (
     with_columns_topo,
     wrap_io_source_with_error_catching,
 )
+from polars_io_tools.testing import PredicateTracker
 from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
 from polars_io_tools.tests.helpers.quirks import quirk
 
 from .conftest import io_source_assert
@@ -27,229 +29,108 @@ from .conftest import io_source_assert
 c = pl.col
 
 
-def _sample_lf() -> pl.LazyFrame:
-    return pl.LazyFrame(
-        {
-            "a": [1, 2, 3, 4, 5],
-            "b": [10, 20, 30, 40, 50],
-            "c": ["x", "y", "x", "y", "x"],
-        }
-    )
+_SAMPLE = pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30, 40, 50], "c": ["x", "y", "x", "y", "x"]})
+_UTC, _EST = UTC, timezone(timedelta(hours=-5))
+_COMPLEX = pl.DataFrame(
+    {
+        "int_col": [1, 2, 3, 4, 5],
+        "float_col": [1.1, 2.2, 3.3, 4.4, 5.5],
+        "str_col": ["a", "b", "c", "d", "e"],
+        "bool_col": [True, False, True, False, True],
+        "date_col": [date(2023, m, 1) for m in range(1, 6)],
+        "datetime_col": [datetime(2023, m, 1, 9 + m) for m in range(1, 6)],
+        "datetime_utc": [datetime(2023, m, 1, 9 + m, tzinfo=_UTC) for m in range(1, 6)],
+        "datetime_est": [datetime(2023, m, 1, 9 + m, tzinfo=_EST) for m in range(1, 6)],
+        "nullable_int": [1, None, 3, None, 5],
+        "list_col": [[1, 2], [3, 4, 5], [6], [7, 8, 9, 10], []],
+    }
+)
 
 
-def _complex_sample_lf() -> pl.LazyFrame:
-    """Sample LazyFrame with various data types for comprehensive testing."""
-    # Create timezone-aware datetimes
-    utc = UTC
-    est = timezone(timedelta(hours=-5))
-
-    return pl.LazyFrame(
-        {
-            "int_col": [1, 2, 3, 4, 5],
-            "float_col": [1.1, 2.2, 3.3, 4.4, 5.5],
-            "str_col": ["a", "b", "c", "d", "e"],
-            "bool_col": [True, False, True, False, True],
-            "date_col": [
-                date(2023, 1, 1),
-                date(2023, 2, 1),
-                date(2023, 3, 1),
-                date(2023, 4, 1),
-                date(2023, 5, 1),
-            ],
-            "datetime_col": [
-                datetime(2023, 1, 1, 10, 0),
-                datetime(2023, 2, 1, 11, 0),
-                datetime(2023, 3, 1, 12, 0),
-                datetime(2023, 4, 1, 13, 0),
-                datetime(2023, 5, 1, 14, 0),
-            ],
-            # Timezone-aware datetimes
-            "datetime_utc": [
-                datetime(2023, 1, 1, 10, 0, tzinfo=utc),
-                datetime(2023, 2, 1, 11, 0, tzinfo=utc),
-                datetime(2023, 3, 1, 12, 0, tzinfo=utc),
-                datetime(2023, 4, 1, 13, 0, tzinfo=utc),
-                datetime(2023, 5, 1, 14, 0, tzinfo=utc),
-            ],
-            "datetime_est": [
-                datetime(2023, 1, 1, 10, 0, tzinfo=est),
-                datetime(2023, 2, 1, 11, 0, tzinfo=est),
-                datetime(2023, 3, 1, 12, 0, tzinfo=est),
-                datetime(2023, 4, 1, 13, 0, tzinfo=est),
-                datetime(2023, 5, 1, 14, 0, tzinfo=est),
-            ],
-            "nullable_int": [1, None, 3, None, 5],
-            # Varying length lists for more complex testing
-            "list_col": [[1, 2], [3, 4, 5], [6], [7, 8, 9, 10], []],
-        }
-    )
+def F(id, df, expr, pushed_plans=False):
+    """``pushed_plans``: also check the plans: a normal filter and the disabled variant push into the source
+    (SELECTION, no FILTER); filter_no_pushdown keeps a FILTER and pushes nothing."""
+    return Case(id, expr, kw={"df": df, "pushed_plans": pushed_plans})
 
 
-def _verify_filter_no_pushdown(lf: pl.LazyFrame, expr: list[pl.Expr]) -> None:
-    """Helper to verify filter_no_pushdown behavior matches normal filter."""
-    normal_filter = lf.clone().filter(expr)
-    no_pushdown_filter = lf.clone().piot.filter_no_pushdown(expr)
-    no_pushdown_filter_disabled = lf.clone().piot.filter_no_pushdown(expr, _disable_optimizations=True)
-
-    # Verify plan differences - no_pushdown should use FILTER, not SELECTION
-    no_pushdown_explain = no_pushdown_filter.explain()
-    assert "FILTER" in no_pushdown_explain
-
-    # Verify results are identical
-    normal_df = normal_filter.collect()
-    no_pushdown_df = no_pushdown_filter.collect()
-    disabled_df = no_pushdown_filter_disabled.collect()
-
-    assert_frame_equal(normal_df, no_pushdown_df)
-    assert_frame_equal(normal_df, disabled_df)
-
-
-_EXPRS = [[pl.col("c") == "x", pl.col("a") > 2], [pl.col("c") == "x"]]
-
-
-@pytest.mark.parametrize("expr", _EXPRS)
-def test_filter_no_pushdown_via_pipe_print_explain(expr):
-    lf = _sample_lf()
-    lf = io_source_assert(lf.collect(), lambda _: True)
-    normal_filter = lf.filter(expr)
-    no_pushdown_filter = lf.piot.filter_no_pushdown(expr)
-    no_pushdown_filter_disabled = lf.piot.filter_no_pushdown(expr, _disable_optimizations=True)
-
-    # Print the plan so we can visually confirm no pushdown
-    expected_pushed = [normal_filter, no_pushdown_filter_disabled]
-    for lf in expected_pushed:
-        explain = lf.explain()
-        assert "SELECTION: " in explain
-        assert "FILTER" not in explain
-    no_pushdown_filter_explain = no_pushdown_filter.explain()
-    assert "SELECTION" not in no_pushdown_filter_explain
-    assert "FILTER" in no_pushdown_filter_explain
-
-    # Basic sanity: only rows with c == 'x'
-    normal_filter_df = normal_filter.collect()
-    no_pushdown_filter_df = no_pushdown_filter.collect()
-    no_pushdown_filter_disabled_df = no_pushdown_filter_disabled.collect()
-
-    assert_frame_equal(normal_filter_df, no_pushdown_filter_df)
-    assert_frame_equal(normal_filter_df, no_pushdown_filter_disabled_df)
-
-
-# Focused test expressions covering key scenarios
-_COMPREHENSIVE_EXPRS = [
-    # Basic data type tests
-    pl.col("int_col").cast(pl.Float64) > 2.5,
-    pl.col("str_col").alias("renamed_str") == "c",
-    pl.col("nullable_int").is_not_null(),
-    # Timezone-aware datetime operations
-    pl.col("datetime_utc").dt.hour().alias("utc_hour") >= 12,
-    pl.col("datetime_utc").dt.convert_time_zone("US/Eastern").alias("utc_to_est").dt.hour() >= 5,
-    # Complex ternary/conditional expressions
-    pl.when(pl.col("int_col") > 3).then(pl.col("str_col")).otherwise(pl.lit("default")).alias("conditional") == "d",
-    pl.when(pl.col("list_col").list.len() == 0)
-    .then(pl.lit("empty"))
-    .when(pl.col("list_col").list.len() == 1)
-    .then(pl.lit("single"))
-    .otherwise(pl.lit("multiple"))
-    .alias("list_category")
-    == "multiple",
-    # Variable length list operations
-    pl.col("list_col").list.len() > 2,
-    pl.col("list_col").list.len() == 0,  # Test empty lists
-    pl.col("list_col").list.sum().alias("list_sum").fill_null(0) > 10,
-    # Multiple expressions (tests the AND combination optimization)
-    [pl.col("int_col") > 2, pl.col("str_col") != "b"],
-    [pl.col("bool_col"), pl.col("nullable_int").is_not_null(), pl.col("date_col").dt.year() == 2023],
-    [
-        pl.col("bool_col") | pl.col("nullable_int").is_not_null(),
-        pl.col("date_col").dt.year() == 2023,
-        pl.any_horizontal(pl.col("int_col") > 3, pl.col("float_col") < 5.0),
+_LIST_LEN = pl.col("list_col").list.len()
+NO_PUSHDOWN = [
+    *[
+        F(f"filter_no_pushdown_via_pipe_print_explain-{i}", _SAMPLE, e, True)
+        for i, e in enumerate([[pl.col("c") == "x", pl.col("a") > 2], [pl.col("c") == "x"]])
     ],
+    *[
+        F(f"filter_no_pushdown_comprehensive-{i}", _COMPLEX, e)
+        for i, e in enumerate(
+            [
+                pl.col("int_col").cast(pl.Float64) > 2.5,
+                pl.col("str_col").alias("renamed_str") == "c",
+                pl.col("nullable_int").is_not_null(),
+                pl.col("datetime_utc").dt.hour().alias("utc_hour") >= 12,
+                pl.col("datetime_utc").dt.convert_time_zone("US/Eastern").alias("utc_to_est").dt.hour() >= 5,
+                pl.when(pl.col("int_col") > 3).then(pl.col("str_col")).otherwise(pl.lit("default")).alias("conditional") == "d",
+                pl.when(_LIST_LEN == 0)
+                .then(pl.lit("empty"))
+                .when(_LIST_LEN == 1)
+                .then(pl.lit("single"))
+                .otherwise(pl.lit("multiple"))
+                .alias("list_category")
+                == "multiple",
+                _LIST_LEN > 2,
+                _LIST_LEN == 0,
+                pl.col("list_col").list.sum().alias("list_sum").fill_null(0) > 10,
+                # several expressions are ANDed into one temporary column
+                [pl.col("int_col") > 2, pl.col("str_col") != "b"],
+                [pl.col("bool_col"), pl.col("nullable_int").is_not_null(), pl.col("date_col").dt.year() == 2023],
+                [
+                    pl.col("bool_col") | pl.col("nullable_int").is_not_null(),
+                    pl.col("date_col").dt.year() == 2023,
+                    pl.any_horizontal(pl.col("int_col") > 3, pl.col("float_col") < 5.0),
+                ],
+            ]
+        )
+    ],
+    F("filter_no_pushdown_edge_cases-empty", _COMPLEX, []),
+    F(
+        "filter_no_pushdown_edge_cases-mixed",
+        _COMPLEX,
+        [
+            (pl.col("int_col").cast(pl.Float64) > 2.0)
+            & (pl.col("str_col").alias("renamed") != "x")
+            & pl.col("nullable_int").is_not_null()
+            & (pl.col("date_col").dt.year() == 2023)
+            & (pl.col("datetime_utc").dt.hour().alias("utc_hour") >= 10)
+        ],
+    ),
 ]
 
 
-@pytest.mark.parametrize("expr", _COMPREHENSIVE_EXPRS)
-def test_filter_no_pushdown_comprehensive(expr):
-    """Test filter_no_pushdown with focused scenarios:
-    - Basic casts and aliases
-    - Timezone-aware datetime operations
-    - Complex ternary/conditional expressions (pl.when chains)
-    - Variable length list operations
-    - Multiple expressions (tests single AND'ed temporary column optimization)
-    """
-    lf = _complex_sample_lf()
-    lf = io_source_assert(lf.collect(), lambda _: True)
-    _verify_filter_no_pushdown(lf, expr)
-
-
-def test_filter_no_pushdown_edge_cases():
-    """Test edge cases and complex multi-type expressions."""
-    lf = _complex_sample_lf()
-    lf = io_source_assert(lf.collect(), lambda _: True)
-
-    # Empty filter list
-    result = lf.piot.filter_no_pushdown([])
-    assert_frame_equal(result.collect(), lf.collect())
-
-    # Complex expression combining multiple data types, casts, aliases, and timezone operations
-    complex_expr = [
-        (pl.col("int_col").cast(pl.Float64) > 2.0)
-        & (pl.col("str_col").alias("renamed") != "x")
-        & (pl.col("nullable_int").is_not_null())
-        & (pl.col("date_col").dt.year() == 2023)
-        & (pl.col("datetime_utc").dt.hour().alias("utc_hour") >= 10)
-    ]
-
-    _verify_filter_no_pushdown(lf, complex_expr)
+@pytest.mark.parametrize(("expr", "df", "pushed_plans"), params(NO_PUSHDOWN, "pred", "df", "pushed_plans"))
+def test_filter_no_pushdown(expr, df, pushed_plans):
+    """filter_no_pushdown gives the rows a normal filter gives, without pushing the filter into the source."""
+    lf = io_source_assert(df, lambda _: True)
+    empty = isinstance(expr, list) and not expr
+    normal = lf if empty else lf.filter(expr)
+    # an empty list is only accepted with optimizations on
+    variants = [lf.piot.filter_no_pushdown(expr)] + ([] if empty else [lf.piot.filter_no_pushdown(expr, _disable_optimizations=True)])
+    for variant in variants:
+        assert_frame_equal(variant.collect(), normal.collect())
+    if not empty:
+        assert_text(variants[0].explain(), "FILTER", omits="SELECTION" if pushed_plans else ())
+    if pushed_plans:
+        for pushed in (normal, variants[1]):
+            assert_text(pushed.explain(), "SELECTION: ", omits="FILTER")
 
 
 class TestRegisterIoSourceWithIsPure:
-    """Test the register_io_source_with_is_pure utility function."""
-
     def test_cse_optimization_with_is_pure(self):
-        """Test that is_pure=True enables CSE optimization in self-joins."""
-        # Shared counter and lock to track how many times the io_source is called
-        counter = 0
-        lock = threading.Lock()
-
-        def counting_io_source(
-            with_columns: list[str] | None,
-            predicate: pl.Expr | None,
-            n_rows: int | None,
-            batch_size: int | None,
-        ) -> Iterator[pl.DataFrame]:
-            nonlocal counter
-            with lock:
-                counter += 1
-
-            # Return a simple DataFrame
-            df = pl.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]})
-
-            # Apply any filters/selections that were pushed down
-            if predicate is not None:
-                df = df.filter(predicate)
-            if with_columns is not None:
-                df = df.select(with_columns)
-            if n_rows is not None:
-                df = df.head(n_rows)
-
-            yield df
-
-        schema = {"id": pl.Int64, "value": pl.Int64}
-
-        # Create LazyFrame using our helper function
-        lf = register_io_source_with_is_pure(counting_io_source, schema=schema)
-
-        # Perform a self-join - this should trigger CSE if is_pure=True is working
+        """is_pure=True lets a self-join read the source once."""
+        tracker = PredicateTracker(pl.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]}))
+        lf = register_io_source_with_is_pure(_tracking_source(tracker), schema=tracker.df.schema)
         result = lf.join(lf, on="id", how="inner").collect(engine="in-memory" if POLARS_GE_2 else "auto")
-
-        # Verify the result is correct
-        expected = pl.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30], "value_right": [10, 20, 30]})
-        assert_frame_equal(result, expected, check_row_order=False)
-
-        # Check if CSE is working based on Polars version
+        assert_frame_equal(result, pl.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30], "value_right": [10, 20, 30]}), check_row_order=False)
         if quirk("pure_udf_cse"):
-            # With is_pure=True, CSE should work and counter should be 1
-            assert counter == 1, f"Expected counter=1 (CSE working), but got counter={counter}"
+            assert tracker.call_count == 1
 
     @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
     @pytest.mark.parametrize(
@@ -274,255 +155,161 @@ class TestRegisterIoSourceWithIsPure:
     @pytest.mark.parametrize("project", [False, True])
     def test_head_then_filter(self, project):
         df = pl.DataFrame({"a": range(10), "b": range(10, 20)})
-
-        def source(with_columns, predicate, n_rows, batch_size):
-            out = df if predicate is None else df.filter(predicate)
-            out = out if n_rows is None else out.head(n_rows)
-            yield out if with_columns is None else out.select(with_columns)
+        lf = register_io_source_with_is_pure(_tracking_source(PredicateTracker(df)), schema=df.schema)
 
         def query(lf):
             lf = lf.head(5).filter(pl.col("a") > 2)
             return lf.select("b") if project else lf
 
-        lf = register_io_source_with_is_pure(source, schema=df.schema)
-        assert_frame_equal(query(lf).collect(), query(df.lazy()).collect())
+        assert_matches_native(query(lf), query(df.lazy()), None, check_row_order=True)
 
     def test_kwargs_passthrough(self):
-        """Test that additional kwargs are passed through correctly."""
+        """validate_schema reaches register_io_source and rejects a frame with another schema."""
 
-        def dummy_io_source(with_columns, predicate, n_rows, batch_size):
-            # incorrect schema
+        def wrong_schema(with_columns, predicate, n_rows, batch_size):
             yield pl.DataFrame({"y": [1, 2, 3]})
 
-        schema = {"x": pl.Int64}
-
-        # Test with additional kwargs
-        result = register_io_source_with_is_pure(dummy_io_source, schema=schema, validate_schema=True)
-
+        result = register_io_source_with_is_pure(wrong_schema, schema={"x": pl.Int64}, validate_schema=True)
         assert isinstance(result, pl.LazyFrame)
-
-        # This should error if validate_schema=True was passed correctly
         with pytest.raises(SchemaError):
             result.collect()
 
 
-class TestWrapIoSourceWithErrorCatching:
-    """Test the wrap_io_source_with_error_catching utility function."""
+_COUNT_LOCK = threading.Lock()
 
-    def test_error_catching_preserves_function_metadata(self):
-        """Test that functools.wraps preserves original function metadata."""
 
-        def original_io_source(with_columns, predicate, n_rows, batch_size):
-            """Original docstring for testing."""
-            yield pl.DataFrame({"x": [1, 2, 3]})
+def _tracking_source(tracker: PredicateTracker):
+    """An IO source callable over ``tracker.df`` that counts its calls; it filters before taking n_rows."""
 
-        # Add some custom attributes for testing
-        original_io_source.custom_attr = "test_value"
+    def source(with_columns, predicate, n_rows, batch_size) -> Iterator[pl.DataFrame]:
+        with _COUNT_LOCK:
+            tracker.call_count += 1
+        df = tracker.df if predicate is None else tracker.df.filter(predicate)
+        df = df if with_columns is None else df.select(with_columns)
+        yield df if n_rows is None else df.head(n_rows)
 
-        wrapped = wrap_io_source_with_error_catching(original_io_source, identifier="test")
+    return source
 
-        # Check that metadata is preserved
-        assert wrapped.__name__ == "original_io_source"
-        assert wrapped.__doc__ == "Original docstring for testing."
-        assert hasattr(wrapped, "__wrapped__")
-        assert wrapped.__wrapped__ is original_io_source
 
-    def test_error_catching_normal_operation(self):
-        """Test that error catching doesn't interfere with normal operation."""
+def test_error_catching_preserves_function_metadata():
+    def original_io_source(with_columns, predicate, n_rows, batch_size):
+        """Original docstring for testing."""
+        yield pl.DataFrame({"x": [1, 2, 3]})
 
-        def working_io_source(with_columns, predicate, n_rows, batch_size):
-            """A working IO source."""
-            df = pl.DataFrame({"x": [1, 2, 3], "y": [10, 20, 30]})
+    wrapped = wrap_io_source_with_error_catching(original_io_source, identifier="test")
+    assert (wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__) == ("original_io_source", "Original docstring for testing.", original_io_source)
 
-            # Apply filters/selections
-            if predicate is not None:
-                df = df.filter(predicate)
-            if with_columns is not None:
-                df = df.select(with_columns)
-            if n_rows is not None:
-                df = df.head(n_rows)
 
-            yield df
+def test_error_catching_normal_operation():
+    df = pl.DataFrame({"x": [1, 2, 3], "y": [10, 20, 30]})
+    wrapped = wrap_io_source_with_error_catching(_tracking_source(PredicateTracker(df)), identifier="test")
+    (result,) = wrapped(with_columns=["x"], predicate=pl.col("x") > 1, n_rows=None, batch_size=None)
+    assert_frame_equal(result, pl.DataFrame({"x": [2, 3]}))
 
-        wrapped = wrap_io_source_with_error_catching(working_io_source, identifier="test")
 
-        # Test normal operation
-        results = list(wrapped(with_columns=["x"], predicate=pl.col("x") > 1, n_rows=2, batch_size=None))
+class CustomError(Exception):
+    pass
 
-        assert len(results) == 1
-        df = results[0]
-        expected = pl.DataFrame({"x": [2, 3]})
-        assert_frame_equal(df, expected)
 
-    def test_error_catching_catches_exceptions(self, caplog):
-        """Test that error catching re-raises with detailed context, without logging."""
+def _raises(error, yields_first=False):
+    def failing_io_source(*args, **kwargs):
+        if yields_first:
+            yield pl.DataFrame({"x": [1]})
+        raise error
 
-        class CustomError(Exception):
-            pass
+    return failing_io_source
 
-        def failing_io_source(with_columns, predicate, n_rows, batch_size):
-            """An IO source that always fails."""
-            raise CustomError("Something went wrong!")
-            yield  # This line is never reached
 
-        wrapped = wrap_io_source_with_error_catching(failing_io_source, identifier="test_failing")
+_PRED = (pl.col("x") > 5) & (pl.col("y") < 11)
+_LONG = pl.col("data_date").is_between(pl.lit("2024-01-01"), pl.lit("2024-12-31")) & (pl.col("region") == "US") & (pl.col("value") > 100)
+_STD = {"with_columns": None, "predicate": None, "n_rows": None, "batch_size": None}
 
-        # Test that the exception is caught and re-raised with context
-        with pytest.raises(RuntimeError) as exc_info:
-            list(wrapped(with_columns=None, predicate=None, n_rows=None, batch_size=None))
 
-        # Check the exception message contains our context
-        assert "IO Source 'failing_io_source' failed" in str(exc_info.value)
-        assert "Something went wrong!" in str(exc_info.value)
+def X(*contains, omits=()):
+    return {"contains": contains, "omits": omits}
 
-        # Check that the original exception is chained
-        assert exc_info.value.__cause__ is not None
-        assert isinstance(exc_info.value.__cause__, CustomError)
 
-        # Check that detailed error information is included in the exception message
-        msg = str(exc_info.value)
-        assert "=== IO SOURCE ERROR ===" in msg
-        assert "Function: failing_io_source" in msg
-        assert "Identifier: test_failing" in msg
-        assert "Error Type: CustomError" in msg
-        assert "Error Message: Something went wrong!" in msg
+# (failing source, call args) -> the batches before the error, and the RuntimeError: its cause and message
+ERRORS = [
+    Case(
+        "error_catching_catches_exceptions",
+        (_raises(CustomError("Something went wrong!")), (), _STD),
+        (
+            [],
+            CustomError,
+            X(
+                "IO Source 'failing_io_source' failed",
+                "=== IO SOURCE ERROR ===",
+                "Function: failing_io_source",
+                "Identifier: test",
+                "Error Type: CustomError",
+                "Error Message: Something went wrong!",
+            ),
+        ),
+    ),
+    # the first batch comes through; the error surfaces on the next
+    Case(
+        "error_catching_with_generator_exception",
+        (_raises(ValueError("Generator failed"), yields_first=True), (), _STD),
+        ([{"x": [1]}], ValueError, X("IO Source 'failing_io_source' failed", "Generator failed")),
+    ),
+    Case(
+        "error_catching_preserves_arguments_in_error",
+        (_raises(Exception("Test error")), (), {"with_columns": ["x", "y"], "predicate": _PRED, "n_rows": 10, "batch_size": 100}),
+        ([], Exception, X("Call Arguments:", "with_columns", "predicate", "n_rows", "batch_size", str(_PRED))),
+    ),
+    # expressions in arguments appear in full, not as a truncated repr
+    Case(
+        "error_catching_converts_expr_in_args_to_string",
+        (_raises(Exception("e")), (None, _LONG, None, 100000), {}),
+        ([], Exception, X("data_date", "is_between", "region", "value", omits="<Expr [")),
+    ),
+    Case(
+        "error_catching_handles_mixed_args_and_kwargs",
+        (
+            _raises(Exception("e")),
+            (pl.col("x").cast(pl.Float64) + pl.col("y"), "normal_arg"),
+            {"predicate": pl.col("z").is_in([1, 2, 3]), "other": "value"},
+        ),
+        ([], Exception, X(("cast", "Float64"), "is_in", omits="<Expr [")),
+    ),
+]
 
-    def test_error_catching_with_generator_exception(self, caplog):
-        """Test error catching when exception occurs during generator execution."""
 
-        def failing_generator_io_source(with_columns, predicate, n_rows, batch_size):
-            """An IO source that fails during iteration."""
-            yield pl.DataFrame({"x": [1]})  # First yield succeeds
-            raise ValueError("Generator failed on second iteration")
-            yield pl.DataFrame({"x": [2]})  # This is never reached
+@pytest.mark.parametrize(("call", "expect"), params(ERRORS, "pred", "expect"))
+def test_error_catching_raises_with_context(call, expect):
+    source, args, kwargs = call
+    batches = wrap_io_source_with_error_catching(source, identifier="test")(*args, **kwargs)
+    first, cause, text = expect
+    got = []
+    with pytest.raises(RuntimeError) as exc_info:
+        got.extend(b.to_dict(as_series=False) for b in batches)
+    assert got == first
+    assert type(exc_info.value.__cause__) is cause
+    assert_text(str(exc_info.value), **text)
 
-        wrapped = wrap_io_source_with_error_catching(failing_generator_io_source, identifier="generator_test")
 
-        generator = wrapped(with_columns=None, predicate=None, n_rows=None, batch_size=None)
+def test_catching_then_debug_logging_no_error(caplog):
+    """The wrapper logs nothing itself; a caller's debug log of the error carries the full context."""
+    import logging
 
-        # First iteration should work
-        first_result = next(generator)
-        expected_first = pl.DataFrame({"x": [1]})
-        assert_frame_equal(first_result, expected_first)
-
-        # Second iteration should raise our wrapped exception
-        with pytest.raises(RuntimeError) as exc_info:
-            next(generator)
-
-        assert "IO Source 'failing_generator_io_source' failed" in str(exc_info.value)
-        assert "Generator failed on second iteration" in str(exc_info.value)
-        assert isinstance(exc_info.value.__cause__, ValueError)
-
-    def test_error_catching_preserves_arguments_in_error(self, caplog):
-        """Test that error messages include the arguments passed to the function (no logging)."""
-
-        def failing_io_source(with_columns, predicate, n_rows, batch_size):
-            raise Exception("Test error")
-            yield
-
-        wrapped = wrap_io_source_with_error_catching(failing_io_source, identifier="args_test")
-
-        test_predicate = (pl.col("x") > 5) & (pl.col("y") < 11)
-        test_columns = ["x", "y"]
-
-        with pytest.raises(RuntimeError) as exc_info:
-            list(wrapped(with_columns=test_columns, predicate=test_predicate, n_rows=10, batch_size=100))
-
-        # Check that arguments are included in the exception message (not logs)
-        msg = str(exc_info.value)
-        assert "Call Arguments:" in msg
-        assert "with_columns" in msg
-        assert "predicate" in msg
-        assert "n_rows" in msg
-        assert "batch_size" in msg
-        # Check full string representation of predicate is included
-        assert str(test_predicate) in msg
-
-    def test_error_catching_converts_expr_in_args_to_string(self, caplog):
-        """Test that pl.Expr instances in positional args are converted to full string representation."""
-
-        def failing_io_source_with_args(arg1, arg2, arg3, arg4):
-            """IO source that takes positional args."""
-            raise Exception("Test error with args")
-            yield
-
-        wrapped = wrap_io_source_with_error_catching(failing_io_source_with_args, identifier="args_expr_test")
-
-        # Create a complex expression that would be truncated in repr but not in str
-        complex_expr = (
-            pl.col("data_date").is_between(pl.lit("2024-01-01"), pl.lit("2024-12-31")) & (pl.col("region") == "US") & (pl.col("value") > 100)
-        )
-
-        with pytest.raises(RuntimeError) as exc_info:
-            list(wrapped(None, complex_expr, None, 100000))
-
-        msg = str(exc_info.value)
-        # The full expression should be in the error message as a string,
-        # not truncated like the repr would be
-        assert "data_date" in msg
-        assert "is_between" in msg
-        assert "region" in msg
-        assert "value" in msg
-        # Should NOT have the truncated repr format like "<Expr [...] at 0x...>"
-        assert "<Expr [" not in msg
-
-    def test_error_catching_handles_mixed_args_and_kwargs(self, caplog):
-        """Test that both args and kwargs with pl.Expr are properly converted."""
-
-        def failing_io_source_mixed(arg1, arg2, **kwargs):
-            """IO source with mixed positional and keyword args."""
-            raise Exception("Mixed args error")
-            yield
-
-        wrapped = wrap_io_source_with_error_catching(failing_io_source_mixed, identifier="mixed_test")
-
-        expr_in_args = pl.col("x").cast(pl.Float64) + pl.col("y")
-        expr_in_kwargs = pl.col("z").is_in([1, 2, 3])
-
-        with pytest.raises(RuntimeError) as exc_info:
-            list(wrapped(expr_in_args, "normal_arg", predicate=expr_in_kwargs, other="value"))
-
-        msg = str(exc_info.value)
-        # Both expressions should be fully represented
-        assert "cast" in msg or "Float64" in msg  # from args
-        assert "is_in" in msg  # from kwargs
-        # Should NOT have truncated repr
-        assert "<Expr [" not in msg
-
-    def test_catching_then_debug_logging_no_error(self, caplog):
-        """Catching the error and logging debug with exc_info should emit no error logs,
-        and debug logs should contain the full enhanced error info."""
-
-        import logging
-
-        class Boom(Exception):
-            pass
-
-        def failing_io_source(with_columns, predicate, n_rows, batch_size):
-            raise Boom("kaboom!")
-            yield  # unreachable
-
-        wrapped = wrap_io_source_with_error_catching(failing_io_source, identifier="debug_logging_test")
-
-        caplog.clear()
-        caplog.set_level(logging.DEBUG)
-
-        # Trigger and catch the error, then log at debug with exc_info
-        try:
-            list(wrapped(with_columns=None, predicate=None, n_rows=None, batch_size=None))
-        except RuntimeError:
-            logging.debug("Captured wrapped IO error", exc_info=True)
-
-        # Ensure no error-level log was emitted by our wrapper
-        assert all(record.levelno < logging.ERROR for record in caplog.records), "Unexpected error logs present"
-
-        # Ensure our debug log contains the enhanced error info (from exception formatting)
-        text = caplog.text
-        assert "=== IO SOURCE ERROR ===" in text
-        assert "Function: failing_io_source" in text
-        assert "Identifier: debug_logging_test" in text
-        assert "Error Type: Boom" in text
-        assert "Error Message: kaboom!" in text
+    wrapped = wrap_io_source_with_error_catching(_raises(CustomError("kaboom!")), identifier="debug_logging_test")
+    caplog.set_level(logging.DEBUG)
+    try:
+        list(wrapped(**_STD))
+    except RuntimeError:
+        logging.debug("Captured wrapped IO error", exc_info=True)
+    assert all(record.levelno < logging.ERROR for record in caplog.records)
+    assert_text(
+        caplog.text,
+        [
+            "=== IO SOURCE ERROR ===",
+            "Function: failing_io_source",
+            "Identifier: debug_logging_test",
+            "Error Type: CustomError",
+            "Error Message: kaboom!",
+        ],
+    )
 
 
 def _topo(lf, exprs):
@@ -578,7 +365,7 @@ TOPO_CASES = [
         {"b3": [2, 3], "b4": [3, 4]},
         call=_topo_accessor,
     ),
-    T("empty_exprs_returns_original", _sample_lf().collect().to_dict(as_series=False), [], None, call=_topo_accessor),
+    T("empty_exprs_returns_original", _SAMPLE.to_dict(as_series=False), [], None, call=_topo_accessor),
 ]
 
 
@@ -743,315 +530,143 @@ def test_with_columns_topo_with_implicit_selector_and_dependency():
     assert_frame_equal(df.select(expected.columns), expected)
 
 
-class TestStorageOptionsFor:
-    """Tests for `_storage_options_for` with thorough boto3/session mocking."""
-
-    def test_non_s3_uri_returns_empty(self):
-        opts = _storage_options_for("file:///tmp/cache")
-        assert opts.pyarrow == {}
-        assert opts.polars == {}
-
-        opts2 = _storage_options_for("/local/path/cache")
-        assert opts2.pyarrow == {}
-        assert opts2.polars == {}
-
-        opts3 = _storage_options_for("http://example.com/cache")
-        assert opts3.pyarrow == {}
-        assert opts3.polars == {}
-
-    def test_s3_with_credentials_and_token(self, monkeypatch):
-        class FakeCreds:
-            def __init__(self, access_key: str, secret_key: str, token: str | None):
-                self.access_key = access_key
-                self.secret_key = secret_key
-                self.token = token
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                # capture profile_name for later assertions if needed
-                self.profile_name = profile_name
-                self.region_name = "us-west-2"
-                self._creds = FakeCreds("AKIA_TEST", "SECRET_TEST", "TOKEN_TEST")
-
-            def get_credentials(self):
-                return self._creds
-
-        # Patch boto3.Session directly (boto3 is imported inside _storage_options_for)
-        monkeypatch.setattr("boto3.Session", FakeSession)
-
-        # Explicit endpoint via query should win over env
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "https://env-endpoint")
-        monkeypatch.setenv("AWS_S3_ENDPOINT", "https://env-s3-endpoint")
-
-        uri = "s3://bucket/path?endpoint_override=https://query-endpoint"
-        opts = _storage_options_for(uri, aws_profile="test-profile")
-
-        # pyarrow-style keys
-        assert opts.pyarrow["access_key"] == "AKIA_TEST"
-        assert opts.pyarrow["secret_key"] == "SECRET_TEST"
-        assert opts.pyarrow["session_token"] == "TOKEN_TEST"
-        assert opts.pyarrow["region"] == "us-west-2"
-        assert opts.pyarrow["endpoint_override"] == "https://query-endpoint"
-
-        # polars/deltalake-style keys
-        assert opts.polars["aws_access_key_id"] == "AKIA_TEST"
-        assert opts.polars["aws_secret_access_key"] == "SECRET_TEST"
-        assert opts.polars["aws_session_token"] == "TOKEN_TEST"
-        assert opts.polars["endpoint_url"] == "https://query-endpoint"
-
-    def test_s3_with_credentials_no_token(self, monkeypatch):
-        class FakeCreds:
-            def __init__(self, access_key: str, secret_key: str, token: str | None):
-                self.access_key = access_key
-                self.secret_key = secret_key
-                self.token = token
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                self.profile_name = profile_name
-                self.region_name = "eu-central-1"
-                self._creds = FakeCreds("AKIA_NO_TOKEN", "SECRET_NO_TOKEN", None)
-
-            def get_credentials(self):
-                return self._creds
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-
-        # No endpoint in query; env should set endpoint
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "https://env-only-endpoint")
-        monkeypatch.delenv("AWS_S3_ENDPOINT", raising=False)
-
-        opts = _storage_options_for("s3://bucket/path")
-
-        # Token keys should not be present
-        assert "session_token" not in opts.pyarrow
-        assert "aws_session_token" not in opts.polars
-
-        # Region is present only in pyarrow opts
-        assert opts.pyarrow["region"] == "eu-central-1"
-        assert "region" not in opts.polars
-
-        # Endpoint derived from env
-        assert opts.pyarrow["endpoint_override"] == "https://env-only-endpoint"
-        assert opts.polars["endpoint_url"] == "https://env-only-endpoint"
-
-    def test_s3a_scheme_supported(self, monkeypatch):
-        class FakeCreds:
-            def __init__(self, access_key: str, secret_key: str, token: str | None):
-                self.access_key = access_key
-                self.secret_key = secret_key
-                self.token = token
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                self.profile_name = profile_name
-                self.region_name = None
-                self._creds = FakeCreds("AKIA_S3A", "SECRET_S3A", None)
-
-            def get_credentials(self):
-                return self._creds
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        # Ensure neither env var is set
-        monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-        monkeypatch.delenv("AWS_S3_ENDPOINT", raising=False)
-
-        opts = _storage_options_for("s3a://bucket/path")
-
-        assert opts.pyarrow["access_key"] == "AKIA_S3A"
-        assert opts.pyarrow["secret_key"] == "SECRET_S3A"
-        assert "session_token" not in opts.pyarrow
-        # No region key when region_name is None
-        assert "region" not in opts.pyarrow
-        # No endpoint keys when none provided
-        assert "endpoint_override" not in opts.pyarrow
-        assert "endpoint_url" not in opts.polars
-        assert opts.polars["aws_access_key_id"] == "AKIA_S3A"
-        assert opts.polars["aws_secret_access_key"] == "SECRET_S3A"
-        assert "aws_session_token" not in opts.polars
-
-    def test_endpoint_env_precedence(self, monkeypatch):
-        class FakeCreds:
-            def __init__(self, access_key: str, secret_key: str, token: str | None):
-                self.access_key = access_key
-                self.secret_key = secret_key
-                self.token = token
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                self.profile_name = profile_name
-                self.region_name = "ap-southeast-1"
-                self._creds = FakeCreds("AKIA_ENV", "SECRET_ENV", None)
-
-            def get_credentials(self):
-                return self._creds
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-
-        # Both env vars set; AWS_ENDPOINT_URL should win when no query param
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "https://endpoint-url")
-        monkeypatch.setenv("AWS_S3_ENDPOINT", "https://s3-endpoint")
-
-        opts = _storage_options_for("s3://bucket/path")
-        assert opts.pyarrow["endpoint_override"] == "https://endpoint-url"
-        assert opts.polars["endpoint_url"] == "https://endpoint-url"
-
-        # If query param provided, it should override env
-        opts2 = _storage_options_for("s3://bucket/path?endpoint_override=https://query")
-        assert opts2.pyarrow["endpoint_override"] == "https://query"
-        assert opts2.polars["endpoint_url"] == "https://query"
-
-    def test_no_credentials_only_region_and_endpoint(self, monkeypatch):
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                self.profile_name = profile_name
-                self.region_name = "us-east-1"
-
-            def get_credentials(self):
-                return None
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setenv("AWS_S3_ENDPOINT", "https://only-env-endpoint")
-        monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-
-        opts = _storage_options_for("s3://bucket/path")
-
-        # No access keys when creds is None
-        assert "access_key" not in opts.pyarrow
-        assert "secret_key" not in opts.pyarrow
-        assert "session_token" not in opts.pyarrow
-        assert "aws_access_key_id" not in opts.polars
-        assert "aws_secret_access_key" not in opts.polars
-        assert "aws_session_token" not in opts.polars
-
-        # Region still present for pyarrow
-        assert opts.pyarrow["region"] == "us-east-1"
-        # Endpoint present in both
-        assert opts.pyarrow["endpoint_override"] == "https://only-env-endpoint"
-        assert opts.polars["endpoint_url"] == "https://only-env-endpoint"
-
-    def test_profile_name_forwarded_to_boto3_session(self, monkeypatch):
-        captured = {"profile": None}
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                captured["profile"] = profile_name
-                self.region_name = None
-
-            def get_credentials(self):
-                class C:
-                    access_key = "AKIA_PROFILE"
-                    secret_key = "SECRET_PROFILE"
-                    token = None
-
-                return C()
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-
-        _ = _storage_options_for("s3://bucket/path", aws_profile="dev-profile")
-
-        assert captured["profile"] == "dev-profile"
-
-    def test_tuple_decomposition_non_s3(self):
-        pa_opts, pl_opts, cred_provider = _storage_options_for("file:///tmp/cache")
-        assert pa_opts == {}
-        assert pl_opts == {}
-        assert cred_provider is None
-
-    def test_tuple_decomposition_s3_with_token(self, monkeypatch):
-        class FakeCreds:
-            def __init__(self, access_key: str, secret_key: str, token: str | None):
-                self.access_key = access_key
-                self.secret_key = secret_key
-                self.token = token
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                self.profile_name = profile_name
-                self.region_name = "us-west-1"
-                self._creds = FakeCreds("AKIA_TUPLE", "SECRET_TUPLE", "TOKEN_TUPLE")
-
-            def get_credentials(self):
-                return self._creds
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        monkeypatch.setenv("AWS_ENDPOINT_URL", "https://tuple-endpoint")
-
-        uri = "s3://bucket/path?endpoint_override=https://query-endpoint"
-        pa_opts, pl_opts, cred_provider = _storage_options_for(uri, aws_profile="tuple-profile")
-
-        assert pa_opts["access_key"] == "AKIA_TUPLE"
-        assert pa_opts["secret_key"] == "SECRET_TUPLE"
-        assert pa_opts["session_token"] == "TOKEN_TUPLE"
-        assert pa_opts["region"] == "us-west-1"
-        assert pa_opts["endpoint_override"] == "https://query-endpoint"
-
-        assert pl_opts["aws_access_key_id"] == "AKIA_TUPLE"
-        assert pl_opts["aws_secret_access_key"] == "SECRET_TUPLE"
-        assert pl_opts["aws_session_token"] == "TOKEN_TUPLE"
-        assert pl_opts["endpoint_url"] == "https://query-endpoint"
-        assert cred_provider is not None
-
-    def test_tuple_decomposition_s3_no_token(self, monkeypatch):
-        class FakeCreds:
-            def __init__(self, access_key: str, secret_key: str, token: str | None):
-                self.access_key = access_key
-                self.secret_key = secret_key
-                self.token = token
-
-        class FakeSession:
-            def __init__(self, profile_name: str | None = None):
-                self.profile_name = profile_name
-                self.region_name = "eu-west-3"
-                self._creds = FakeCreds("AKIA_TUPLE_NO", "SECRET_TUPLE_NO", None)
-
-            def get_credentials(self):
-                return self._creds
-
-        class FakeCredentialProvider:
-            def __init__(self, **kwargs):
-                pass
-
-            def _storage_update_options(self):
-                return {}
-
-        monkeypatch.setattr("boto3.Session", FakeSession)
-        monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-        monkeypatch.setenv("AWS_S3_ENDPOINT", "https://tuple-env-endpoint")
-        monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-
-        pa_opts, pl_opts, cred_provider = _storage_options_for("s3://bucket/path")
-
-        assert "session_token" not in pa_opts
-        assert "aws_session_token" not in pl_opts
-        assert pa_opts["region"] == "eu-west-3"
-        assert pa_opts["endpoint_override"] == "https://tuple-env-endpoint"
-        assert pl_opts["endpoint_url"] == "https://tuple-env-endpoint"
-        assert cred_provider is not None
+def S(id, uri, pyarrow, polars, *, region=None, creds=None, env=None, profile=None, log=None):
+    """A ``_storage_options_for`` row: boto3 has ``region`` and ``creds`` (access key, secret, token) and the
+    environment holds ``env``; the expected option dicts follow."""
+    return Case(id, uri, (pyarrow, polars), {"region": region, "creds": creds, "env": env or {}, "profile": profile, "log": log})
+
+
+_ENV_BOTH = {"AWS_ENDPOINT_URL": "https://endpoint-url", "AWS_S3_ENDPOINT": "https://s3-endpoint"}
+
+
+def _keys(access, secret, token=None, region=None, endpoint=None):
+    pyarrow = {"access_key": access, "secret_key": secret} if access else {}
+    polars = {"aws_access_key_id": access, "aws_secret_access_key": secret} if access else {}
+    if token:
+        pyarrow["session_token"], polars["aws_session_token"] = token, token
+    if region:
+        pyarrow["region"] = region
+    if endpoint:
+        pyarrow["endpoint_override"], polars["endpoint_url"] = endpoint, endpoint
+        if endpoint.startswith("http://"):
+            polars["allow_http"] = "true"
+    return pyarrow, polars
+
+
+STORAGE_OPTIONS = [
+    *[
+        S(f"non_s3_uri_returns_empty-{n}", uri, {}, {})
+        for n, uri in [("file", "file:///tmp/cache"), ("local", "/local/path/cache"), ("http", "http://example.com/cache")]
+    ],
+    # an endpoint in the query wins over the environment
+    S(
+        "s3_with_credentials_and_token",
+        "s3://bucket/path?endpoint_override=https://query-endpoint",
+        *_keys("AKIA_TEST", "SECRET_TEST", "TOKEN_TEST", "us-west-2", "https://query-endpoint"),
+        region="us-west-2",
+        creds=("AKIA_TEST", "SECRET_TEST", "TOKEN_TEST"),
+        env={"AWS_ENDPOINT_URL": "https://env-endpoint", "AWS_S3_ENDPOINT": "https://env-s3-endpoint"},
+        profile="test-profile",
+    ),
+    # region is a pyarrow option only
+    S(
+        "s3_with_credentials_no_token",
+        "s3://bucket/path",
+        *_keys("AKIA_NO_TOKEN", "SECRET_NO_TOKEN", None, "eu-central-1", "https://env-only-endpoint"),
+        region="eu-central-1",
+        creds=("AKIA_NO_TOKEN", "SECRET_NO_TOKEN", None),
+        env={"AWS_ENDPOINT_URL": "https://env-only-endpoint"},
+    ),
+    S("s3a_scheme_supported", "s3a://bucket/path", *_keys("AKIA_S3A", "SECRET_S3A"), creds=("AKIA_S3A", "SECRET_S3A", None)),
+    # AWS_ENDPOINT_URL wins over AWS_S3_ENDPOINT, a query endpoint over both
+    S(
+        "endpoint_env_precedence-env",
+        "s3://bucket/path",
+        *_keys("AKIA_ENV", "SECRET_ENV", None, "ap-southeast-1", "https://endpoint-url"),
+        region="ap-southeast-1",
+        creds=("AKIA_ENV", "SECRET_ENV", None),
+        env=_ENV_BOTH,
+    ),
+    S(
+        "endpoint_env_precedence-query",
+        "s3://bucket/path?endpoint_override=https://query",
+        *_keys("AKIA_ENV", "SECRET_ENV", None, "ap-southeast-1", "https://query"),
+        region="ap-southeast-1",
+        creds=("AKIA_ENV", "SECRET_ENV", None),
+        env=_ENV_BOTH,
+    ),
+    S(
+        "no_credentials_only_region_and_endpoint",
+        "s3://bucket/path",
+        *_keys(None, None, None, "us-east-1", "https://only-env-endpoint"),
+        region="us-east-1",
+        env={"AWS_S3_ENDPOINT": "https://only-env-endpoint"},
+    ),
+    S(
+        "profile_name_forwarded_to_boto3_session",
+        "s3://bucket/path",
+        *_keys("AKIA_PROFILE", "SECRET_PROFILE"),
+        creds=("AKIA_PROFILE", "SECRET_PROFILE", None),
+        profile="dev-profile",
+    ),
+    # an unresolvable endpoint host is kept as configured
+    S(
+        "storage_options_resolution_failure_keeps_original",
+        "s3://bucket/path",
+        *_keys("AKIA_TEST", "SECRET_TEST", None, "us-east-1", "http://grid:9020"),
+        region="us-east-1",
+        creds=("AKIA_TEST", "SECRET_TEST", None),
+        env={"AWS_ENDPOINT_URL": "http://grid:9020"},
+        log="Failed to resolve hostname",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("uri", "expect", "region", "creds", "env", "profile", "log"),
+    params(STORAGE_OPTIONS, "pred", "expect", "region", "creds", "env", "profile", "log"),
+)
+def test_storage_options_for(monkeypatch, caplog, uri, expect, region, creds, env, profile, log):
+    import socket
+    from types import SimpleNamespace
+
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, profile_name=None):
+            sessions.append(profile_name)
+            self.region_name = region
+
+        def get_credentials(self):
+            return None if creds is None else SimpleNamespace(access_key=creds[0], secret_key=creds[1], token=creds[2])
+
+    class FakeCredentialProvider:
+        def __init__(self, **kwargs):
+            pass
+
+        def _storage_update_options(self):
+            return {}
+
+    def unresolvable(hostname):
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr("boto3.Session", FakeSession)
+    monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
+    monkeypatch.setattr("socket.gethostbyname", unresolvable)
+    for name in ("AWS_ENDPOINT_URL", "AWS_S3_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    _resolve_endpoint_hostname.cache_clear()
+    try:
+        pyarrow, polars, provider = opts = _storage_options_for(uri, aws_profile=profile)
+    finally:
+        _resolve_endpoint_hostname.cache_clear()
+    assert (opts.pyarrow, opts.polars) == (pyarrow, polars) == expect
+    s3 = uri.startswith("s3")
+    assert (provider is not None) == s3
+    assert sessions == ([profile] if s3 else [])
+    assert log is None or log in caplog.text
 
 
 class _Lookups(list):
@@ -1100,45 +715,6 @@ def test_resolve_failure_returns_original(monkeypatch, caplog):
     _resolve_endpoint_hostname.cache_clear()
     monkeypatch.setattr("socket.gethostbyname", failing_gethostbyname)
     assert _resolve_endpoint_hostname("http://nonexistent.host:9020") == "http://nonexistent.host:9020"
-    assert "Failed to resolve hostname" in caplog.text
-    _resolve_endpoint_hostname.cache_clear()
-
-
-def test_storage_options_resolution_failure_keeps_original(monkeypatch, caplog):
-    """A failed lookup in ``_storage_options_for`` keeps the configured endpoint."""
-    import socket as socket_module
-
-    class FakeCreds:
-        access_key = "AKIA_TEST"
-        secret_key = "SECRET_TEST"
-        token = None
-
-    class FakeSession:
-        def __init__(self, profile_name=None):
-            self.region_name = "us-east-1"
-
-        def get_credentials(self):
-            return FakeCreds()
-
-    class FakeCredentialProvider:
-        def __init__(self, **kwargs):
-            pass
-
-        def _storage_update_options(self):
-            return {}
-
-    def failing_gethostbyname(hostname):
-        raise socket_module.gaierror("Name or service not known")
-
-    _resolve_endpoint_hostname.cache_clear()
-    monkeypatch.setattr("boto3.Session", FakeSession)
-    monkeypatch.setattr("polars_io_tools.io_sources.util.pl.CredentialProviderAWS", FakeCredentialProvider, raising=False)
-    monkeypatch.setattr("socket.gethostbyname", failing_gethostbyname)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://grid:9020")
-
-    opts = _storage_options_for("s3://bucket/path")
-    assert opts.pyarrow["endpoint_override"] == "http://grid:9020"
-    assert opts.polars["endpoint_url"] == "http://grid:9020"
     assert "Failed to resolve hostname" in caplog.text
     _resolve_endpoint_hostname.cache_clear()
 
