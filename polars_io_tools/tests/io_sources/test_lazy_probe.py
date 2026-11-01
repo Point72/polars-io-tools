@@ -1,3 +1,5 @@
+"""LazyFrame.piot.probe: a pass-through that emits a profiling span."""
+
 import polars as pl
 import pytest
 from opentelemetry import trace
@@ -33,16 +35,42 @@ def _probe_spans():
     return [s for s in _EXPORTER.get_finished_spans() if s.name.startswith("io_source.execute[probe]")]
 
 
-def test_probe_is_result_preserving_passthrough():
-    df = pl.DataFrame({"id": [1, 2, 3], "v": [10, 20, 30]})
-    out = df.lazy().piot.probe().collect(engine="streaming")
-    assert_frame_equal(out, df)
-
-
-def test_probe_forwards_n_rows_pushdown():
-    out = pl.LazyFrame({"id": list(range(100))}).piot.probe().head(5).collect(engine="streaming")
-    assert out["id"].to_list() == [0, 1, 2, 3, 4]
-    assert _probe_spans()[-1].attributes["polars_io_tools.total_rows"] == 5
+@pytest.mark.parametrize(
+    ("df", "kw", "op", "attrs"),
+    [
+        pytest.param(
+            pl.DataFrame({"id": [1, 2, 3], "v": [10, 20, 30]}),
+            {},
+            lambda lf: lf,
+            {"polars_io_tools.total_rows": 3},
+            id="probe_is_result_preserving_passthrough",
+        ),
+        pytest.param(
+            pl.DataFrame({"id": list(range(100))}), {}, lambda lf: lf.head(5), {"polars_io_tools.total_rows": 5}, id="probe_forwards_n_rows_pushdown"
+        ),
+        # a pushed predicate reaches the probe, so only matching rows flow through it
+        pytest.param(
+            pl.DataFrame({"id": [1, 2, 3, 4], "grp": [0, 1, 0, 1]}),
+            {},
+            lambda lf: lf.filter(pl.col("grp") == 1),
+            {"polars_io_tools.total_rows": 2},
+            id="probe_forwards_predicate_pushdown",
+        ),
+        pytest.param(
+            pl.DataFrame({"id": [1, 2, 3]}),
+            {"description": "stage1"},
+            lambda lf: lf,
+            {"polars_io_tools.explain_name": "probe", "polars_io_tools.explain_detail": "stage1", "polars_io_tools.total_rows": 3},
+            id="probe_emits_one_span_with_description",
+        ),
+    ],
+)
+def test_probe(df, kw, op, attrs):
+    """A probe passes the rows through, Polars' pushdowns included, and emits one span counting them."""
+    got = op(df.lazy().piot.probe(**kw)).collect(engine="streaming")
+    assert_frame_equal(got, op(df.lazy()).collect(), check_row_order=False)
+    (span,) = _probe_spans()
+    assert {k: span.attributes[k] for k in attrs} == attrs
 
 
 def test_probe_does_not_dedupe_impure_input():
@@ -56,27 +84,6 @@ def test_probe_does_not_dedupe_impure_input():
     probe = register_io_source_with_is_pure(impure, schema=pl.Schema({"run": pl.Int64}), is_pure=False).piot.probe()
     out = pl.concat([probe, probe]).collect(engine="streaming")
     assert sorted(out["run"].to_list()) == [1, 2]
-
-
-def test_probe_emits_one_span_with_description():
-    df = pl.DataFrame({"id": [1, 2, 3]})
-    df.lazy().piot.probe(description="stage1").collect(engine="streaming")
-
-    spans = _probe_spans()
-    assert len(spans) == 1
-    span = spans[0]
-    assert span.attributes["polars_io_tools.explain_name"] == "probe"
-    assert span.attributes["polars_io_tools.explain_detail"] == "stage1"
-    assert span.attributes["polars_io_tools.total_rows"] == 3
-
-
-def test_probe_forwards_predicate_pushdown():
-    # A pushed predicate reaches the probe, so only matching rows flow through it (and are counted).
-    df = pl.DataFrame({"id": [1, 2, 3, 4], "grp": [0, 1, 0, 1]})
-    out = df.lazy().piot.probe().filter(pl.col("grp") == 1).collect(engine="streaming")
-
-    assert out.sort("id")["id"].to_list() == [2, 4]
-    assert _probe_spans()[-1].attributes["polars_io_tools.total_rows"] == 2
 
 
 def test_probe_forwards_is_pure(monkeypatch):

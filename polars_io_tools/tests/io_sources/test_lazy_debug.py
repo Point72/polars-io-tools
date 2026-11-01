@@ -1,54 +1,59 @@
+"""LazyFrame.piot.debug: a pass-through that prints or logs the arguments Polars pushes to it."""
+
 import logging
 
 import polars as pl
-from polars.testing import assert_frame_equal
 
 import polars_io_tools.io_sources  # noqa: F401
+from polars_io_tools.tests.helpers.oracles import assert_matches_native, assert_text
+
+DF = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+NONE_PUSHED = "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`"
 
 
-def test_debug_print(capsys):
-    df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).lazy()
-    df_debug = df.piot.debug()
-    assert_frame_equal(df_debug.collect(), df.collect())
-    assert "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`" in capsys.readouterr().out
-
-
-def test_debug_info(caplog):
-    df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).lazy()
-    df_debug = df.piot.debug(log_level=logging.INFO)
+def _debug(caplog, capsys, op, log_level, *fragments):
+    """``op`` through debug gives what it gives on the frame, and the debug output holds ``fragments``."""
     caplog.set_level(logging.INFO)
-    assert_frame_equal(df_debug.collect(), df.collect())
-    assert "debug called with `with_columns=None`, `predicate=None`, `n_rows=None`" in caplog.text
+    kw = {} if log_level is None else {"log_level": log_level}
+    assert_matches_native(op(DF.lazy().piot.debug(**kw)), op(DF.lazy()), None, check_row_order=True)
+    assert_text(capsys.readouterr().out if log_level is None else caplog.text, fragments)
 
 
-def test_debug_head(caplog):
-    df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).lazy()
-    df_debug = df.piot.debug(log_level=logging.INFO)
-    caplog.set_level(logging.INFO)
-    df2 = df.head(5).filter(pl.col("a") > 1).select(["a", "b"])
-    df_debug2 = df_debug.head(5).filter(pl.col("a") > 1).select(["a", "b"])
-    assert_frame_equal(df_debug2.collect(), df2.collect())
-    assert "debug called with" in caplog.text
-    assert "`with_columns=None`" in caplog.text
-    assert "`n_rows=5`" in caplog.text
+def test_debug_print(caplog, capsys):
+    _debug(caplog, capsys, lambda lf: lf, None, NONE_PUSHED)
 
 
-def test_debug_filter(caplog):
-    df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).lazy()
-    df_debug = df.piot.debug(log_level=logging.INFO)
-    caplog.set_level(logging.INFO)
-    df2 = df.filter(pl.col("a") > 1).select(["a", "b"])
-    df_debug2 = df_debug.filter(pl.col("a") > 1).select(["a", "b"])
-    assert_frame_equal(df_debug2.collect(), df2.collect())
-    assert "debug called with" in caplog.text
-    assert "`with_columns=None`" in caplog.text
-    assert '`predicate=[(col("a")) > (1)]`' in caplog.text
+def test_debug_info(caplog, capsys):
+    _debug(caplog, capsys, lambda lf: lf, logging.INFO, NONE_PUSHED)
+
+
+def test_debug_head(caplog, capsys):
+    _debug(
+        caplog,
+        capsys,
+        lambda lf: lf.head(5).filter(pl.col("a") > 1).select(["a", "b"]),
+        logging.INFO,
+        "debug called with",
+        "`with_columns=None`",
+        "`n_rows=5`",
+    )
+
+
+def test_debug_filter(caplog, capsys):
+    _debug(
+        caplog,
+        capsys,
+        lambda lf: lf.filter(pl.col("a") > 1).select(["a", "b"]),
+        logging.INFO,
+        "debug called with",
+        "`with_columns=None`",
+        '`predicate=[(col("a")) > (1)]`',
+    )
 
 
 def test_debug_logs_per_use_by_default(caplog):
-    # is_pure defaults to False, so reusing the same debug is not deduplicated: its log-side-effect runs per occurrence.
-    df = pl.DataFrame({"a": [1]}).lazy()
-    debug = df.piot.debug(log_level=logging.INFO)
+    """is_pure defaults to False, so a reused debug logs once per use."""
+    debug = pl.DataFrame({"a": [1]}).lazy().piot.debug(log_level=logging.INFO)
     caplog.set_level(logging.INFO)
     pl.concat([debug, debug]).collect(engine="streaming")
     assert caplog.text.count("debug called with") == 2
