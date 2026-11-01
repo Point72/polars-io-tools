@@ -1,4 +1,10 @@
-from datetime import datetime, timedelta
+"""Translating a predicate on logical dtypes into one on the stored physical values.
+
+One table: stored data, the mapping to logical dtypes, a predicate on the logical columns, and what filtering the stored
+data by the translated predicate must keep, compared with Polars filtering the data cast to its logical dtypes.
+"""
+
+from datetime import datetime, time, timedelta
 
 import polars as pl
 import pytest
@@ -10,386 +16,155 @@ from polars_io_tools.io_sources.translated_source import (
     metadata_to_mapping,
     translate_polars_predicate,
 )
+from polars_io_tools.tests.helpers.catalogue import Case, params
 
 
-def _ns_epoch(dt: datetime) -> int:
-    s = pl.Series([dt]).cast(pl.Datetime("ns"), strict=False)
-    return s.dt.timestamp("ns").cast(pl.Int64).to_list()[0]
+def _ns(dt: datetime) -> int:
+    return pl.Series([dt]).cast(pl.Datetime("ns")).dt.timestamp("ns").item()
 
 
-def test_translated_visitor_eq_datetime_ns():
-    # Underlying ints for two timestamps
-    t0 = datetime(2025, 1, 1, 0, 0, 0)
-    t1 = datetime(2025, 1, 1, 0, 0, 1)
-    df = pl.DataFrame(
-        {
-            "ts": [
-                _ns_epoch(t0),
-                _ns_epoch(t1),
+def _time_ns(*ts: time) -> list[int]:
+    return pl.Series(ts, dtype=pl.Time).cast(pl.Int64).to_list()
+
+
+T0, T1, T2, T3 = (datetime(2025, 1, 1, 0, 0, s) for s in range(4))
+NOON = [time(12, 0, s) for s in range(3)]
+NS = {"ts": pl.Datetime("ns")}
+MS = {"dur": pl.Duration("ms")}
+TIME = {"t": pl.Time}
+_TS3 = {"ts": [_ns(T0), _ns(T1), _ns(T2)]}
+_TS4 = {"ts": [_ns(t) for t in (T0, T1, T2, T3)]}
+_DUR = {"dur": [0, 500, 1500, 2500]}
+_TIMES = {"t": _time_ns(*NOON)}
+ts, dur, t = pl.col("ts"), pl.col("dur"), pl.col("t")
+_IS_IN_ISSUE = pytest.mark.xfail(
+    reason="Polars handles is_in differently than equality here, see this issue: https://github.com/pola-rs/polars/issues/22824"
+)
+
+
+def V(id, stored, mapping, pred, expect="exact", via="visitor", marks=()):
+    """``expect``: "exact" keeps the rows the logical filter keeps, "superset" at least those ("nonempty": and there are some), a list the
+    given row numbers, None means nothing is translated. ``pred`` may be a function, for one that fails to build."""
+    return Case(id, pred, expect, {"stored": stored, "mapping": mapping, "via": via}, marks=marks)
+
+
+CASES = [
+    V("translated_visitor_eq_datetime_ns", {"ts": [_ns(T0), _ns(T1)]}, NS, ts == pl.lit(T1)),
+    V("translated_visitor_in_datetime_ns", _TS3, NS, ts.is_in([T0, T2]), [0, 2], marks=_IS_IN_ISSUE),
+    V("translated_visitor_eq_datetime_literal_cast", {"ts": [_ns(T0), _ns(T1)]}, NS, ts == pl.lit(T1).cast(pl.Datetime("ns"), strict=False)),
+    # the cast gives the integer its time unit, so it must stay when comparing against a ms column
+    V(
+        "translated_visitor_keeps_cast_on_integer_literal",
+        {"ts": [_ns(T1) // 10**6]},
+        {"ts": pl.Datetime("ms")},
+        ts == pl.lit(_ns(T1)).cast(pl.Datetime("ns")),
+        via="translate",
+    ),
+    V(
+        "translate_predicate_drops_only_untranslatable_conjunct",
+        {"ts": [_ns(datetime(2025, 1, 1, h)) for h in (1, 2, 3)], "x": [1, 2, 3]},
+        NS,
+        (ts.dt.hour() == 2) & (pl.col("x") > 1),
+        [1, 2],
+        via="translate",
+    ),
+    V(
+        "translate_predicate_drops_only_untranslatable_conjunct-negated",
+        {"ts": [0], "x": [1]},
+        NS,
+        ~((ts.dt.hour() == 2) & (pl.col("x") > 1)),
+        None,
+        via="translate",
+    ),
+    V("translated_visitor_between_datetime_ns", _TS4, NS, ts.is_between(pl.lit(T1), pl.lit(T2), closed="both")),
+    *[V(f"translated_visitor_between_closed_variants-{c}", _TS4, NS, ts.is_between(T1, T2, closed=c)) for c in ("left", "right", "none")],
+    V("translated_visitor_duration_ms_gt", _DUR, MS, dur > pl.lit(timedelta(milliseconds=1000))),
+    V("translated_visitor_time_eq", {"t": _time_ns(*NOON[:2])}, TIME, t == pl.lit(NOON[1])),
+    V("translated_visitor_time_is_in", _TIMES, TIME, t.is_in([NOON[0], NOON[2]])),
+    V("translated_visitor_time_neq_value", _TIMES, TIME, t != NOON[0]),
+    V("translated_visitor_duration_neq_values", _DUR, MS, dur != timedelta(milliseconds=500)),
+    V(
+        "translated_visitor_duration_is_in",
+        _DUR,
+        MS,
+        lambda: dur.is_in([pl.lit(timedelta(milliseconds=v), dtype=pl.Duration("ms")) for v in (500, 2500)]),
+        marks=pytest.mark.xfail(reason="Polars does not support nested object types so the predicate is_in cannot be created."),
+    ),
+    # the mapping applies first, then the user's cast
+    V("translated_visitor_user_cast_layering", {"ts": [_ns(T0), _ns(T1)]}, NS, ts.cast(pl.Datetime("ns"), strict=False) == T1),
+    V("translated_visitor_datetime_not_in_values", _TS3, NS, (ts != T0) & (ts != T2)),
+    V("translated_visitor_duration_not_in_values", _DUR, MS, (dur != timedelta(milliseconds=500)) & (dur != timedelta(milliseconds=2500))),
+    V("translated_visitor_unmapped_not_in_values", {"x": [1, 2, 3]}, {}, ~pl.col("x").is_in([1, 3])),
+    V("translated_visitor_datetime_not_in_unary", _TS3, NS, ~ts.is_in([T0, T2]), [1], marks=_IS_IN_ISSUE),
+    *[
+        V(
+            f"translated_visitor_in_datetime_ns_matches_polars-{n}",
+            {"ts": [_ns(datetime(2025, 1, d)) for d in (1, 2)]},
+            NS,
+            p,
+            "superset",
+            via="translate",
+        )
+        for n, p in [("in", ts.is_in([datetime(2025, 1, 1)])), ("not_in", ~ts.is_in([datetime(2025, 1, 1)]))]
+    ],
+    *[
+        V(f"translated_predicate_matches_logical_filter-{i}", stored, mapping, p, "nonempty", via="translate")
+        for i, (stored, mapping, p) in enumerate(
+            [
+                ({"x": [257, 1], "ts": [0, 1]}, NS, pl.col("x").cast(pl.UInt8, wrap_numerical=True) == 1),
+                ({"x": ["z", "a"]}, {"x": pl.Enum(["z", "a"])}, pl.col("x") < "a"),
+                ({"x": [0, 1]}, {"x": pl.Date}, pl.col("x").cast(pl.String) == "1970-01-02"),
+                ({"x": [2, 0]}, {"x": pl.Boolean}, pl.col("x") == True),
             ]
-        }
-    )
-    # Mapping declares logical dtype for ts
-    mapping = {"ts": pl.Datetime("ns")}
-    # Predicate comparing against a datetime literal
-    pred = pl.col("ts") == pl.lit(t1)
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten)
-    assert out.shape == (1, 1)
-    assert out["ts"].to_list() == [_ns_epoch(t1)]
+        )
+    ],
+]
 
 
-@pytest.mark.xfail(reason="Polars handles is_in differently than equality here, see this issue: https://github.com/pola-rs/polars/issues/22824")
-def test_translated_visitor_in_datetime_ns():
-    t0 = datetime(2025, 1, 1, 0, 0, 0)
-    t1 = datetime(2025, 1, 1, 0, 0, 1)
-    t2 = datetime(2025, 1, 1, 0, 0, 2)
-    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1), _ns_epoch(t2)]})
-    mapping = {"ts": pl.Datetime("ns")}
-    pred = pl.col("ts").is_in([t0, t2])
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten).sort("ts")
-    assert out.shape == (2, 1)
-    assert out["ts"].to_list() == [_ns_epoch(t0), _ns_epoch(t2)]
+def _translate(pred: pl.Expr, mapping: dict, via: str) -> pl.Expr | None:
+    if via == "translate":
+        return translate_polars_predicate(pred, mapping)
+    visitor = TranslatedPredicateVisitor(mapping)
+    get_parsed_expr(pred).accept(visitor)
+    return visitor.process_results()
 
 
-def test_translated_visitor_eq_datetime_literal_cast():
-    # Column mapped to Datetime(ns); literal has an explicit cast
-    t0 = datetime(2025, 1, 1, 0, 0, 0)
-    t1 = datetime(2025, 1, 1, 0, 0, 1)
-    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1)]})
-    mapping = {"ts": pl.Datetime("ns")}
-    lit_cast = pl.lit(t1).cast(pl.Datetime("ns"), strict=False)
-    pred = pl.col("ts") == lit_cast
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten)
-    assert out["ts"].to_list() == [_ns_epoch(t1)]
-
-
-def test_translated_visitor_keeps_cast_on_integer_literal():
-    # The cast gives the integer its time unit, so it must not be dropped when comparing against a ms column
-    t1 = datetime(2025, 1, 1, 0, 0, 1)
-    df = pl.DataFrame({"ts": [_ns_epoch(t1) // 10**6]})
-    pred = pl.col("ts") == pl.lit(_ns_epoch(t1)).cast(pl.Datetime("ns"))
-    rewritten = translate_polars_predicate(pred, {"ts": pl.Datetime("ms")})
-    assert df.filter(rewritten).height == 1
-
-
-def test_translate_predicate_drops_only_untranslatable_conjunct():
-    df = pl.DataFrame({"ts": [_ns_epoch(datetime(2025, 1, 1, h)) for h in (1, 2, 3)], "x": [1, 2, 3]})
-    pred = (pl.col("ts").dt.hour() == 2) & (pl.col("x") > 1)
-    rewritten = translate_polars_predicate(pred, {"ts": pl.Datetime("ns")})
-    assert df.filter(rewritten)["x"].to_list() == [2, 3]
-    assert translate_polars_predicate(~pred, {"ts": pl.Datetime("ns")}) is None
-
-
-def test_translated_visitor_between_datetime_ns():
-    base = datetime(2025, 1, 1, 0, 0, 0)
-    ts = [base, base.replace(second=1), base.replace(second=2), base.replace(second=3)]
-    df = pl.DataFrame({"ts": [_ns_epoch(t) for t in ts]})
-    mapping = {"ts": pl.Datetime("ns")}
-    lower = base.replace(second=1)
-    upper = base.replace(second=2)
-    pred = pl.col("ts").is_between(pl.lit(lower), pl.lit(upper), closed="both")
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten).sort("ts")
-    assert out["ts"].to_list() == [_ns_epoch(lower), _ns_epoch(upper)]
-
-
-def test_translated_visitor_between_closed_variants():
-    base = datetime(2025, 1, 1, 0, 0, 0)
-    ts = [base, base.replace(second=1), base.replace(second=2), base.replace(second=3)]
-    df = pl.DataFrame({"ts": [_ns_epoch(t) for t in ts]})
-    mapping = {"ts": pl.Datetime("ns")}
-    lower = base.replace(second=1)
-    upper = base.replace(second=2)
-    # left-closed: include lower, exclude upper
-    pred_left = pl.col("ts").is_between(lower, upper, closed="left")
-    node_left = get_parsed_expr(pred_left)
-    vis_left = TranslatedPredicateVisitor(mapping)
-    node_left.accept(vis_left)
-    out_left = df.filter(vis_left.process_results()).sort("ts")
-    assert out_left["ts"].to_list() == [_ns_epoch(lower)]
-    # right-closed: exclude lower, include upper
-    pred_right = pl.col("ts").is_between(lower, upper, closed="right")
-    node_right = get_parsed_expr(pred_right)
-    vis_right = TranslatedPredicateVisitor(mapping)
-    node_right.accept(vis_right)
-    out_right = df.filter(vis_right.process_results()).sort("ts")
-    assert out_right["ts"].to_list() == [_ns_epoch(upper)]
-    # none: exclude both bounds
-    pred_none = pl.col("ts").is_between(lower, upper, closed="none")
-    node_none = get_parsed_expr(pred_none)
-    vis_none = TranslatedPredicateVisitor(mapping)
-    node_none.accept(vis_none)
-    out_none = df.filter(vis_none.process_results()).sort("ts")
-    assert out_none["ts"].to_list() == []
-
-
-def test_translated_visitor_duration_ms_gt():
-    # Underlying duration counts in milliseconds
-    df = pl.DataFrame({"dur": [0, 500, 1500, 2500]})
-    mapping = {"dur": pl.Duration("ms")}
-    pred = pl.col("dur") > pl.lit(timedelta(milliseconds=1000))
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten).sort("dur")
-    assert out["dur"].to_list() == [1500, 2500]
-
-
-def test_translated_visitor_time_eq():
-    # Underlying time stored as nanoseconds since midnight
-    times = [
-        datetime(2025, 1, 1, 12, 0, 0).time(),
-        datetime(2025, 1, 1, 12, 0, 1).time(),
-    ]
-    # Build underlying ints via Polars cast
-    ns_counts = pl.Series(times, dtype=pl.Time).cast(pl.Int64).to_list()
-    df = pl.DataFrame({"t": ns_counts})
-    mapping = {"t": pl.Time}
-    pred = pl.col("t") == pl.lit(times[1])
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten)
-    assert out.shape == (1, 1)
-
-
-def test_translated_visitor_time_is_in():
-    # Mapped time column; check is_in with Python time objects
-    t0 = datetime(2025, 1, 1, 12, 0, 0).time()
-    t1 = datetime(2025, 1, 1, 12, 0, 1).time()
-    t2 = datetime(2025, 1, 1, 12, 0, 2).time()
-    ns_counts = pl.Series([t0, t1, t2], dtype=pl.Time).cast(pl.Int64).to_list()
-    df = pl.DataFrame({"t": ns_counts})
-    mapping = {"t": pl.Time}
-    pred = pl.col("t").is_in([t0, t2])
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    out = df.filter(vis.process_results()).sort("t")
-    expected = pl.Series([t0, t2], dtype=pl.Time).cast(pl.Int64).to_list()
-    assert out["t"].to_list() == expected
-
-
-def test_translated_visitor_time_neq_value():
-    # Times and underlying ns counts
-    t0 = datetime(2025, 1, 1, 12, 0, 0).time()
-    t1 = datetime(2025, 1, 1, 12, 0, 1).time()
-    t2 = datetime(2025, 1, 1, 12, 0, 2).time()
-    ns_counts = pl.Series([t0, t1, t2], dtype=pl.Time).cast(pl.Int64).to_list()
-    df = pl.DataFrame({"t": ns_counts})
-    mapping = {"t": pl.Time}
-    pred = pl.col("t") != t0
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten).sort("t")
-    expected = pl.Series([t1, t2], dtype=pl.Time).cast(pl.Int64).to_list()
-    assert out["t"].to_list() == expected
-
-
-def test_translated_visitor_duration_neq_values():
-    # Underlying duration counts in ms; exclude a specific timedelta
-    vals = [0, 500, 1500, 2500]
-    df = pl.DataFrame({"dur": vals})
-    mapping = {"dur": pl.Duration("ms")}
-    pred = pl.col("dur") != timedelta(milliseconds=500)
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten).sort("dur")
-    assert out["dur"].to_list() == [0, 1500, 2500]
-
-
-@pytest.mark.xfail(reason="Polars does not support nested object types so the predicate is_in cannot be created.")
-def test_translated_visitor_duration_is_in():
-    vals = [0, 500, 1500, 2500]
-    df = pl.DataFrame({"dur": vals})
-    mapping = {"dur": pl.Duration("ms")}
-    lit1 = pl.lit(timedelta(milliseconds=500), dtype=pl.Duration(time_unit="ms"))
-    lit2 = pl.lit(timedelta(milliseconds=2500), dtype=pl.Duration(time_unit="ms"))
-    pred = pl.col("dur").is_in([lit1, lit2])
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    out = df.filter(vis.process_results()).sort("dur")
-    assert out["dur"].to_list() == [500, 2500]
-
-
-def test_translated_visitor_user_cast_layering():
-    # User casts the column; visitor should apply mapping then user cast
-    base = datetime(2025, 1, 1, 0, 0, 0)
-    t0 = base
-    t1 = base.replace(second=1)
-    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1)]})
-    mapping = {"ts": pl.Datetime("ns")}
-    pred = pl.col("ts").cast(pl.Datetime("ns"), strict=False) == t1
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    out = df.filter(vis.process_results())
-    assert out["ts"].to_list() == [_ns_epoch(t1)]
-
-
-def test_translated_visitor_datetime_not_in_values():
-    base = datetime(2025, 1, 1, 0, 0, 0)
-    t0 = base
-    t1 = base.replace(second=1)
-    t2 = base.replace(second=2)
-    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1), _ns_epoch(t2)]})
-    mapping = {"ts": pl.Datetime("ns")}
-    pred = (pl.col("ts") != t0) & (pl.col("ts") != t2)
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten)
-    assert out["ts"].to_list() == [_ns_epoch(t1)]
-
-
-def test_translated_visitor_duration_not_in_values():
-    vals = [0, 500, 1500, 2500]
-    df = pl.DataFrame({"dur": vals})
-    mapping = {"dur": pl.Duration("ms")}
-    pred = (pl.col("dur") != timedelta(milliseconds=500)) & (pl.col("dur") != timedelta(milliseconds=2500))
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten).sort("dur")
-    assert out["dur"].to_list() == [0, 1500]
-
-
-def test_translated_visitor_unmapped_not_in_values():
-    # Unmapped Int64 column; NOT IN via unary negation of is_in
-    df = pl.DataFrame({"x": [1, 2, 3]})
-    mapping = {}  # unmapped
-    pred = ~pl.col("x").is_in([1, 3])
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    out = df.filter(rewritten)
-    assert out["x"].to_list() == [2]
-
-
-@pytest.mark.xfail(reason="Polars handles is_in differently than equality here, see this issue: https://github.com/pola-rs/polars/issues/22824")
-def test_translated_visitor_datetime_not_in_unary():
-    # Mapped datetime column; verify ~is_in form works via visitor
-    base = datetime(2025, 1, 1, 0, 0, 0)
-    t0 = base
-    t1 = base.replace(second=1)
-    t2 = base.replace(second=2)
-    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1), _ns_epoch(t2)]})
-    mapping = {"ts": pl.Datetime("ns")}
-    pred = ~pl.col("ts").is_in([t0, t2])
-    node = get_parsed_expr(pred)
-    vis = TranslatedPredicateVisitor(mapping)
-    node.accept(vis)
-    rewritten = vis.process_results()
-    # Evaluate against underlying ints; expect to keep only t1
-    out = df.filter(rewritten)
-    assert out["ts"].to_list() == [_ns_epoch(t1)]
-
-
-@pytest.mark.parametrize("negate", [False, True])
-def test_translated_visitor_in_datetime_ns_matches_polars(negate):
-    """Membership on a mapped column keeps every row that Polars keeps on the mapped frame."""
-    t0, t1 = datetime(2025, 1, 1), datetime(2025, 1, 2)
-    df = pl.DataFrame({"ts": [_ns_epoch(t0), _ns_epoch(t1)]})
-    mapping = {"ts": pl.Datetime("ns")}
-    pred = pl.col("ts").is_in([t0])
-    pred = ~pred if negate else pred
-    rewritten = translate_polars_predicate(pred, mapping)
-    expected = df.cast(mapping).filter(pred)["ts"].dt.timestamp("ns").to_list()
-    assert set(expected) <= set(df.filter(rewritten)["ts"].to_list())
-
-
-def test_metadata_roundtrip_datetime_with_timezone():
-    """Test that metadata_to_mapping correctly handles time_zone field.
-
-    This test ensures the fix for the spec.timezone -> spec.time_zone typo
-    is working correctly. Without this fix, timezones would be silently lost.
-    """
-    # Create a mapping with timezone-aware datetime
-    original_mapping = {
-        "ts_utc": pl.Datetime("ns", time_zone="UTC"),
-        "ts_ny": pl.Datetime("us", time_zone="America/New_York"),
-        "ts_no_tz": pl.Datetime("ms"),  # No timezone
-    }
-
-    # Roundtrip through metadata
-    meta_bytes = mapping_to_metadata(original_mapping)
-    recovered_mapping = metadata_to_mapping(meta_bytes)
-
-    # Verify timezone is preserved
-    assert recovered_mapping["ts_utc"].time_zone == "UTC"
-    assert recovered_mapping["ts_ny"].time_zone == "America/New_York"
-    assert recovered_mapping["ts_no_tz"].time_zone is None
-
-    # Verify time units are preserved
-    assert recovered_mapping["ts_utc"].time_unit == "ns"
-    assert recovered_mapping["ts_ny"].time_unit == "us"
-    assert recovered_mapping["ts_no_tz"].time_unit == "ms"
-
-
-def test_metadata_roundtrip_duration():
-    """Test that metadata_to_mapping correctly handles Duration types with various units."""
-    original_mapping = {
-        "dur_ns": pl.Duration("ns"),
-        "dur_us": pl.Duration("us"),
-        "dur_ms": pl.Duration("ms"),
-    }
-
-    # Roundtrip through metadata
-    meta_bytes = mapping_to_metadata(original_mapping)
-    recovered_mapping = metadata_to_mapping(meta_bytes)
-
-    # Verify duration types are preserved
-    assert isinstance(recovered_mapping["dur_ns"], pl.Duration)
-    assert isinstance(recovered_mapping["dur_us"], pl.Duration)
-    assert isinstance(recovered_mapping["dur_ms"], pl.Duration)
-
-    # Verify time units are preserved
-    assert recovered_mapping["dur_ns"].time_unit == "ns"
-    assert recovered_mapping["dur_us"].time_unit == "us"
-    assert recovered_mapping["dur_ms"].time_unit == "ms"
+@pytest.mark.parametrize(("pred", "stored", "mapping", "via", "expect"), params(CASES, "pred", "stored", "mapping", "via", "expect"))
+def test_translated_predicate_keeps_logical_rows(pred, stored, mapping, via, expect):
+    pred = pred() if callable(pred) else pred
+    df = pl.DataFrame(stored).with_row_index("__row")
+    rewritten = _translate(pred, mapping, via)
+    if expect is None:
+        assert rewritten is None, rewritten
+        return
+    got = df["__row"].to_list() if rewritten is None else df.filter(rewritten)["__row"].to_list()
+    if isinstance(expect, list):
+        assert got == expect
+        return
+    want = df.cast(mapping).filter(pred)["__row"].to_list()
+    if expect == "exact":
+        assert got == want
+    else:
+        assert set(want) <= set(got)
+        assert want or expect == "superset"
 
 
 @pytest.mark.parametrize(
-    ("stored", "mapping", "pred"),
+    "mapping",
     [
-        ({"x": [257, 1], "ts": [0, 1]}, {"ts": pl.Datetime("ns")}, pl.col("x").cast(pl.UInt8, wrap_numerical=True) == 1),
-        ({"x": ["z", "a"]}, {"x": pl.Enum(["z", "a"])}, pl.col("x") < "a"),
-        ({"x": [0, 1]}, {"x": pl.Date}, pl.col("x").cast(pl.String) == "1970-01-02"),
-        ({"x": [2, 0]}, {"x": pl.Boolean}, pl.col("x") == True),
+        pytest.param(
+            {"ts_utc": pl.Datetime("ns", time_zone="UTC"), "ts_ny": pl.Datetime("us", time_zone="America/New_York"), "ts_no_tz": pl.Datetime("ms")},
+            id="metadata_roundtrip_datetime_with_timezone",
+        ),
+        pytest.param({"dur_ns": pl.Duration("ns"), "dur_us": pl.Duration("us"), "dur_ms": pl.Duration("ms")}, id="metadata_roundtrip_duration"),
     ],
 )
-def test_translated_predicate_matches_logical_filter(stored, mapping, pred):
-    df = pl.DataFrame(stored)
-    expected = df.cast(mapping).filter(pred)
-    rewritten = translate_polars_predicate(pred, mapping)
-    result = df if rewritten is None else df.filter(rewritten)
-    assert result.cast(mapping).filter(pred).equals(expected)
-    assert result.height >= expected.height and expected.height > 0
+def test_metadata_roundtrip(mapping):
+    """Time zones and time units survive the metadata round trip."""
+    recovered = metadata_to_mapping(mapping_to_metadata(mapping))
+    assert {k: (v, getattr(v, "time_zone", None), v.time_unit) for k, v in recovered.items()} == {
+        k: (v, getattr(v, "time_zone", None), v.time_unit) for k, v in mapping.items()
+    }
 
 
 @pytest.mark.parametrize("dtype", [pl.Date, pl.Decimal(10, 2), pl.Categorical, pl.Enum(["a"]), pl.Int8])
