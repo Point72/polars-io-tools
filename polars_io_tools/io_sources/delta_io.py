@@ -234,6 +234,9 @@ def _restrict_and_normalize_partition_filters(
                 # Ensure we only keep supported ops to avoid over-pruning
                 if op2 in supported_ops:
                     out_clause.append((col, op2, out_val))
+                if op2 == "!=" and isinstance(val2, str) and val2 not in null_tokens:
+                    # delta-rs reads an empty string partition as null, which "!=" prunes
+                    normalized.extend([(col, "=", tok)] for tok in null_tokens)
                 # else: skip this tuple
         if len(out_clause) > 0:
             normalized.append(out_clause)
