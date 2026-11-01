@@ -1,3 +1,10 @@
+"""filtered_join, filtered_join_asof and join_between.
+
+filtered_join and filtered_join_asof must return what the plain Polars join returns. A filtered_join row may also pin
+the predicate the right source receives: per column, the keys of an ``is_in``, the value of an ``==``, or ``True`` for
+a bare Boolean column. join_between rows compare the joined columns with an expected frame.
+"""
+
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -5,11 +12,16 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
-from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, LiteralNode, get_literal_value, get_parsed_expr
+from polars_io_tools import join_between
+from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, FunctionNode, LiteralNode, get_literal_value, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
+from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.oracles import assert_matches_native
 from polars_io_tools.tests.helpers.quirks import quirk
 
 from .conftest import io_source_assert
+
+c = pl.col
 
 
 def _flatten_conjuncts(node):
@@ -21,560 +33,210 @@ def _flatten_conjuncts(node):
         yield node
 
 
-def test_filtered_join_basic():
-    """Test basic functionality of filtered_join with single join column."""
-    df = pl.DataFrame(
-        {
-            "foo": [1, 2, 3],
-            "bar": [6.0, 7.0, 8.0],
-            "ham": ["a", "b", "c"],
-        }
-    )
-    other_df = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "c"], "foo2": [1, 2, 3]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("ham")
-        assert sorted(get_literal_value(parsed_expr.inputs[1].expr)) == ["a", "b", "c"]
-
-    other_lf = io_source_assert(other_df, assert_func)
-    res = df.lazy().piot.filtered_join(other_lf, on="ham", maintain_order="left").collect()
-
-    expected = pl.DataFrame(
-        {
-            "foo": [1, 2],
-            "bar": [6.0, 7.0],
-            "ham": ["a", "b"],
-            "apple": ["x", "y"],
-            "bar_right": ["a", "b"],
-            "foo2": [1, 2],
-        }
-    )
-    assert_frame_equal(res, expected)
+def _constraint(atom) -> tuple[str, object] | None:
+    """``(column, keys)`` for ``col.is_in(keys)``, ``(column, ("==", value))`` for ``col == value``, ``(column, True)`` for a bare column."""
+    if isinstance(atom, FunctionNode) and atom.function_type == BooleanFunctionType.IS_IN:
+        return atom.inputs[0].expr.meta.output_name(), sorted(get_literal_value(atom.inputs[1].expr))
+    if isinstance(atom, BinaryExprNode) and atom.op == OperatorType.EQ and isinstance(atom.right, LiteralNode):
+        return atom.left.expr.meta.output_name(), ("==", get_literal_value(atom.right.expr))
+    if isinstance(atom, ColumnNode):
+        return atom.name, True
+    return None
 
 
-@pytest.mark.parametrize("how", ["inner", "left"])
-def test_filtered_join_basic_no_results_left_side(how):
-    """Test basic functionality of filtered_join with single join column when no results are found on the left side."""
-    if quirk("pushes_join_filters"):
-        # Here, polars pushes down filters for us, so they will be pushed down.
-        pytest.skip("Test not applicable for polars > 1.31.0 due to automatic filter pushdown")
-    df = pl.DataFrame(
-        {
-            "foo": [1, 2, 3],
-            "bar": [6.0, 7.0, 8.0],
-            "ham": ["a", "b", "c"],
-        }
-    )
-    other_df = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "d"], "foo2": [1, 2, 3]})
-
-    def assert_func(predicate):
-        assert False, "This should not be called since the left side is empty"
-
-    other_lf = io_source_assert(other_df, assert_func)
-    res = df.lazy().piot.filtered_join(other_lf, on="ham", how=how, maintain_order="left").filter(pl.col.ham == "d").collect()
-
-    expected = pl.DataFrame({}, schema=df.join(other_df, on="ham", maintain_order="left").schema)
-    assert_frame_equal(res, expected)
+def assert_right_receives(predicates: list, expect: dict, exact: bool) -> None:
+    """Every predicate the right source received has the ``expect`` constraints; ``exact`` allows no other conjunct."""
+    for predicate in predicates:
+        found = [_constraint(atom) for atom in _flatten_conjuncts(get_parsed_expr(predicate))]
+        for col, want in expect.items():
+            assert (col, want) in found, f"{col}: {want!r} not in {predicate}"
+        if exact:
+            assert len(found) == len(expect), predicate
 
 
-def test_filtered_join_single_filter_value():
-    """Test basic functionality of filtered_join with single join column."""
-    df = pl.DataFrame(
-        {
-            "foo": [
-                1,
-            ],
-            "bar": [
-                6.0,
-            ],
-            "ham": [
-                "a",
-            ],
-        }
-    )
-    other_df = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "c"], "foo2": [1, 2, 3]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.op == OperatorType.EQ
-        assert parsed_expr.left.expr.meta == pl.col("ham")
-        assert parsed_expr.right.value == "a"
-
-    other_lf = io_source_assert(other_df, assert_func)
-    res = df.lazy().piot.filtered_join(other_lf, on="ham", maintain_order="left").collect()
-
-    expected = pl.DataFrame(
-        {
-            "foo": [1],
-            "bar": [6.0],
-            "ham": ["a"],
-            "apple": ["x"],
-            "bar_right": ["a"],
-            "foo2": [1],
-        }
-    )
-    assert_frame_equal(res, expected)
+ABC = pl.DataFrame({"foo": [1, 2, 3], "bar": [6.0, 7.0, 8.0], "ham": ["a", "b", "c"]})
+ABD = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "c"], "foo2": [1, 2, 3]})
+IDS = pl.DataFrame({"id": [1, 2, 3, 4], "value": ["a", "b", "c", "d"]})
+COMMON = (pl.DataFrame({"id": [1, 2, 3], "common": ["a", "b", "c"]}), pl.DataFrame({"id": [1, 2, 4], "common": ["x", "y", "z"]}))
+NEVER = "never scanned"
 
 
-def test_filtered_join_column_selection():
-    """Test filtered_join with projection pushdown."""
-    df = pl.DataFrame(
-        {
-            "foo": [1, 2, 3],
-            "bar": [6.0, 7.0, 8.0],
-            "ham": ["a", "b", "c"],
-        }
-    )
-    other_df = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "c"], "foo2": [1, 2, 3]})
+def J(id, left, right, kwargs, expect=None, exact=True, query=None, marks=()):
+    """A filtered_join row: ``expect`` maps right columns to their constraint, or is NEVER; ``query`` runs on the result."""
+    return Case(id, query, expect, {"left": left, "right": right, "join": kwargs, "exact": exact}, marks)
 
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("ham")
-        assert sorted(get_literal_value(parsed_expr.inputs[1].expr)) == ["a", "b", "c"]
 
-    res = (
-        df.lazy()
-        .piot.filtered_join(
-            io_source_assert(other_df, assert_func),
-            on="ham",
-            maintain_order="left",
+FILTERED_JOINS = [
+    J("filtered_join_basic", ABC, ABD, {"on": "ham", "maintain_order": "left"}, {"ham": ["a", "b", "c"]}),
+    *[
+        J(
+            f"filtered_join_basic_no_results_left_side-{how}",
+            ABC,
+            ABD.with_columns(bar=pl.Series(["a", "b", "d"])),
+            {"on": "ham", "how": how, "maintain_order": "left"},
+            NEVER,
+            query=lambda lf: lf.filter(c("ham") == "d"),
+            marks=pytest.mark.skipif(quirk("pushes_join_filters"), reason="Polars pushes the filter to the right source itself"),
         )
-        .select("foo", "bar")
-        .collect()
-    )
-    expected = pl.DataFrame(
-        {
-            "foo": [1, 2],
-            "bar": [6.0, 7.0],
-        }
-    )
-    assert_frame_equal(res, expected)
-
-
-def test_filtered_join_multiple_columns():
-    """Test filtered_join with multiple join columns."""
-    df = pl.DataFrame(
-        {
-            "foo": [1, 2, 3],
-            "bar": [6.0, 7.0, 8.0],
-            "ham": ["a", "b", "c"],
-        }
-    )
-    other_df = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "c"], "foo2": [1, 2, 3]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.op == OperatorType.AND
-
-        for input_expr in [parsed_expr.left, parsed_expr.right]:
-            assert input_expr.function_type == BooleanFunctionType.IS_IN
-            col_expr = input_expr.inputs[0].expr
-            if col_expr.meta == pl.col("ham"):
-                assert sorted(get_literal_value(input_expr.inputs[1].expr)) == ["a", "b", "c"]
-            elif col_expr.meta == pl.col("foo2"):
-                assert sorted(get_literal_value(input_expr.inputs[1].expr)) == [1, 2, 3]
-            else:
-                assert False, f"Unexpected column: {col_expr!s}"
-
-    res = (
-        df.lazy()
-        .piot.filtered_join(
-            io_source_assert(other_df, assert_func),
-            left_on=["ham", "foo"],
-            right_on=["ham", "foo2"],
-            maintain_order="left",
+        for how in ("inner", "left")
+    ],
+    J("filtered_join_single_filter_value", ABC.head(1), ABD, {"on": "ham", "maintain_order": "left"}, {"ham": ("==", "a")}),
+    J(
+        "filtered_join_column_selection",
+        ABC,
+        ABD,
+        {"on": "ham", "maintain_order": "left"},
+        {"ham": ["a", "b", "c"]},
+        query=lambda lf: lf.select("foo", "bar"),
+    ),
+    J(
+        "filtered_join_multiple_columns",
+        ABC,
+        ABD,
+        {"left_on": ["ham", "foo"], "right_on": ["ham", "foo2"], "maintain_order": "left"},
+        {"ham": ["a", "b", "c"], "foo2": [1, 2, 3]},
+    ),
+    # The join keys and the user's filter all reach the source; Polars >= 2.1 lowers ``active == True`` to ``active``.
+    J(
+        "filtered_join_multiple_columns_with_extra_filter",
+        pl.DataFrame({"id": [1, 2, 3, 4], "category": ["A", "B", "A", "C"], "value": [10, 20, 30, 40]}),
+        pl.DataFrame({"id": [1, 2, 3, 5], "category": ["A", "B", "A", "D"], "score": [15, 25, 35, 55], "active": [True, False, True, False]}),
+        {"on": ["id", "category"], "maintain_order": "left_right"},
+        {"id": [1, 2, 3, 4], "category": ["A", "B", "C"], "active": ("==", True) if not quirk("pushes_asof_filter") else True},
+        exact=False,
+        query=lambda lf: lf.filter(c("active") == pl.lit(True)),
+    ),
+    J(
+        "filtered_join_different_join_types",
+        IDS,
+        pl.DataFrame({"id": [1, 2, 5, 6], "desc": ["x", "y", "p", "q"]}),
+        {"on": "id", "how": "inner", "maintain_order": "left"},
+        {"id": [1, 2, 3, 4]},
+    ),
+    # Null keys never match, so they are not pushed.
+    J(
+        "filtered_join_with_nulls",
+        IDS.with_columns(id=pl.Series([1, 2, None, 4])),
+        pl.DataFrame({"id": [1, None, 3, 5], "desc": ["x", "y", "z", "p"]}),
+        {"on": "id", "maintain_order": "left"},
+        {"id": [1, 2, 4]},
+    ),
+    J(
+        "filtered_join_with_various_data_types",
+        pl.DataFrame({"id": [1, 2, 3], "date": [date(2023, 1, d) for d in (1, 2, 3)], "flag": [True, False, True]}),
+        pl.DataFrame({"id": [1, 2, 4], "date": [date(2023, 1, d) for d in (1, 2, 4)], "desc": ["x", "y", "z"]}),
+        {"on": ["id", "date"], "maintain_order": "left"},
+        {"id": [1, 2, 3], "date": [date(2023, 1, d) for d in (1, 2, 3)]},
+    ),
+    J(
+        "filtered_join_empty_dataframe",
+        pl.DataFrame(schema={"id": pl.Int64, "value": pl.Float64}),
+        pl.DataFrame({"id": [1, 2, 3], "desc": ["x", "y", "z"]}),
+        {"on": "id", "maintain_order": "left"},
+        {"id": []},
+    ),
+    J("filtered_join_suffix-default", *COMMON, {"on": "id", "maintain_order": "left"}, {"id": [1, 2, 3]}),
+    J("filtered_join_suffix-custom", *COMMON, {"on": "id", "suffix": "_custom", "maintain_order": "left"}, {"id": [1, 2, 3]}),
+    # Projection pushdown must keep a left column that makes the right one take the suffix the query reads.
+    J(
+        "filtered_join_suffixed_column_in_derived_expression",
+        pl.DataFrame(
+            {
+                "data_date": [date(2024, 1, d) for d in (2, 3, 4)],
+                "data_date_previous": [date(2024, 1, d) for d in (1, 2, 3)],
+                "id": [1, 2, 3],
+                "quantity": [100, 200, 300],
+                "price": [10.0, 20.0, 30.0],
+            }
+        ),
+        pl.DataFrame({"data_date": [date(2024, 1, d) for d in (1, 2, 3)], "id": [1, 2, 3], "quantity": [90, 190, 290], "price": [9.0, 19.0, 29.0]}),
+        {"left_on": ["id", "data_date_previous"], "right_on": ["id", "data_date"], "how": "left", "suffix": "_previous", "maintain_order": "left"},
+        query=lambda lf: lf.with_columns(((c("price") - c("price_previous")) * c("quantity_previous")).alias("value_change")).select(
+            "data_date", "id", "value_change"
+        ),
+    ),
+    J(
+        "filtered_join_suffixed_column_multiple_conflicts",
+        pl.DataFrame({"key": [1, 2], "a": [10, 20], "b": [100, 200], "c": [1000, 2000]}),
+        pl.DataFrame({"key": [1, 2], "a": [11, 21], "b": [110, 210], "c": [1100, 2100]}),
+        {"on": "key", "suffix": "_right", "maintain_order": "left"},
+        query=lambda lf: lf.with_columns((c("a_right") + c("b_right") + c("c_right")).alias("sum_right")).select("key", "sum_right"),
+    ),
+    # Keys must not lose precision through Python values.
+    *[
+        J(
+            f"filtered_join_keys_keep_dtype-{name}",
+            pl.DataFrame({"k": keys, "v": range(len(keys))}),
+            pl.DataFrame({"k": keys, "w": range(len(keys))}),
+            {"on": "k"},
         )
-        .collect()
-    )
-    expected = pl.DataFrame(
-        {
-            "foo": [1, 2],
-            "bar": [6.0, 7.0],
-            "ham": ["a", "b"],
-            "apple": ["x", "y"],
-            "bar_right": ["a", "b"],
-        }
-    )
-    assert_frame_equal(res, expected)
+        for name, keys in [
+            ("datetime_ns", pl.Series([1001, 2002]).cast(pl.Datetime("ns"))),
+            ("duration_ns", pl.Series([1001, 2002]).cast(pl.Duration("ns"))),
+            ("time", pl.Series([1001]).cast(pl.Time)),
+            ("decimal", pl.Series([Decimal("1.25"), Decimal("2.50")], dtype=pl.Decimal(10, 2))),
+        ]
+    ],
+    # Keys a Python list holds exactly are pushed as a list, so the pushed predicate shows the values.
+    J(
+        "filtered_join_pushes_integer_keys_as_a_list",
+        pl.DataFrame({"k": [2, 3], "v": [0, 1]}),
+        pl.DataFrame({"k": [1, 2, 3, 4], "w": [10, 20, 30, 40]}),
+        {"on": "k"},
+        {"k": [2, 3]},
+    ),
+    J(
+        "filtered_join_keys_beyond_python_datetime_range",
+        *[pl.Series("k", [253402318799999998, 253402318799999999], dtype=pl.Datetime("us", "UTC")).to_frame()] * 2,
+        {"on": "k"},
+    ),
+]
 
 
-def test_filtered_join_multiple_columns_with_extra_filter():
-    """Test filtered_join with multiple join columns and an extra filter condition."""
-    # Create test dataframes with columns for joining and filtering
-    df = pl.DataFrame({"id": [1, 2, 3, 4], "category": ["A", "B", "A", "C"], "value": [10, 20, 30, 40]})
-
-    other_df = pl.DataFrame({"id": [1, 2, 3, 5], "category": ["A", "B", "A", "D"], "score": [15, 25, 35, 55], "active": [True, False, True, False]})
-
-    # This is the key part - we need to verify that both join conditions AND
-    # the filter condition are pushed down to the source
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-
-        # For a complex expression tree with multiple AND conditions,
-        # we need to collect all leaf conditions
-        conditions = []
-
-        def collect_conditions(expr):
-            # Recursively traverse the expression tree to find all conditions
-            if hasattr(expr, "op") and expr.op == OperatorType.AND:
-                collect_conditions(expr.left)
-                collect_conditions(expr.right)
-            else:
-                conditions.append(expr)
-
-        collect_conditions(parsed_expr)
-
-        # Track which conditions we've found
-        found = {"id_is_in": False, "category_is_in": False, "active_eq": False}
-
-        # Check each condition
-        for cond in conditions:
-            if hasattr(cond, "function_type") and cond.function_type == BooleanFunctionType.IS_IN:
-                col_expr = cond.inputs[0].expr
-                if col_expr.meta == pl.col("id"):
-                    # Verify the id column contains all expected values from left df
-                    assert sorted(get_literal_value(cond.inputs[1].expr)) == [1, 2, 3, 4]
-                    found["id_is_in"] = True
-                elif col_expr.meta == pl.col("category"):
-                    # Verify the category column contains all expected values from left df
-                    assert sorted(get_literal_value(cond.inputs[1].expr)) == ["A", "B", "C"]
-                    found["category_is_in"] = True
-            elif hasattr(cond, "op") and cond.op == OperatorType.EQ:
-                # Check for the extra filter condition (active == True)
-                if cond.left.expr.meta == pl.col("active"):
-                    assert get_literal_value(cond.right.expr) is True
-                    found["active_eq"] = True
-            elif isinstance(cond, ColumnNode) and cond.name == "active":
-                # Polars >= 2.1 lowers ``active == True`` on a Boolean column to a bare column reference.
-                found["active_eq"] = True
-
-        # Ensure we found all expected conditions
-        for condition_name, was_found in found.items():
-            assert was_found, f"Missing condition: {condition_name}"
-
-    # Join with multiple columns using the filtered right dataframe
-    res = (
-        df.lazy()
-        .piot.filtered_join(
-            io_source_assert(other_df, assert_func), left_on=["id", "category"], right_on=["id", "category"], maintain_order="left_right"
-        )
-        .filter(pl.col("active") == pl.lit(True))
-        .collect()
-    )
-
-    # Expected result - only rows that match BOTH join conditions AND the filter
-    expected = pl.DataFrame({"id": [1, 3], "category": ["A", "A"], "value": [10, 30], "score": [15, 35], "active": [True, True]})
-    assert_frame_equal(res, expected)
-
-
-def test_filtered_join_different_join_types():
-    """Test filtered_join with different join types (inner, left, right, outer)."""
-    df = pl.DataFrame({"id": [1, 2, 3, 4], "value": ["a", "b", "c", "d"]})
-    other_df = pl.DataFrame({"id": [1, 2, 5, 6], "desc": ["x", "y", "p", "q"]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("id")
-        assert sorted(get_literal_value(parsed_expr.inputs[1].expr)) == [1, 2, 3, 4]
-
-    # Inner join (default)
-    other_lf = io_source_assert(other_df, assert_func)
-    res = df.lazy().piot.filtered_join(other_lf, on="id", how="inner", maintain_order="left").collect()
-    expected = pl.DataFrame({"id": [1, 2], "value": ["a", "b"], "desc": ["x", "y"]})
-    assert_frame_equal(res, expected)
-
-
-def test_filtered_join_with_nulls():
-    """Test filtered_join handling of null values."""
-    df = pl.DataFrame({"id": [1, 2, None, 4], "value": ["a", "b", "c", "d"]})
-    other_df = pl.DataFrame({"id": [1, None, 3, 5], "desc": ["x", "y", "z", "p"]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("id")
-        # Should only include non-null values in the filter
-        assert sorted(get_literal_value(parsed_expr.inputs[1].expr)) == [1, 2, 4]
-
-    res = df.lazy().piot.filtered_join(io_source_assert(other_df, assert_func), on="id", maintain_order="left").collect()
-
-    # Only the row with id=1 should match
-    expected = pl.DataFrame({"id": [1], "value": ["a"], "desc": ["x"]})
-    assert_frame_equal(res, expected)
-
-
-def test_filtered_join_with_various_data_types():
-    """Test filtered_join with various data types including dates and booleans."""
-    df = pl.DataFrame({"id": [1, 2, 3], "date": [date(2023, 1, 1), date(2023, 1, 2), date(2023, 1, 3)], "flag": [True, False, True]})
-    other_df = pl.DataFrame({"id": [1, 2, 4], "date": [date(2023, 1, 1), date(2023, 1, 2), date(2023, 1, 4)], "desc": ["x", "y", "z"]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.op == OperatorType.AND
-
-        for input_expr in [parsed_expr.left, parsed_expr.right]:
-            assert input_expr.function_type == BooleanFunctionType.IS_IN
-            col_expr = input_expr.inputs[0].expr
-            if col_expr.meta == pl.col("id"):
-                assert sorted(get_literal_value(input_expr.inputs[1].expr)) == [1, 2, 3]
-            elif col_expr.meta == pl.col("date"):
-                dates = get_literal_value(input_expr.inputs[1].expr)
-                assert len(dates) == 3
-                assert all(isinstance(d, date) for d in dates)
-            else:
-                assert False, f"Unexpected column: {col_expr!s}"
-
-    res = (
-        df.lazy()
-        .piot.filtered_join(
-            io_source_assert(other_df, assert_func),
-            left_on=["id", "date"],
-            right_on=["id", "date"],
-            maintain_order="left",
-        )
-        .collect()
-    )
-
-    expected = pl.DataFrame({"id": [1, 2], "date": [date(2023, 1, 1), date(2023, 1, 2)], "flag": [True, False], "desc": ["x", "y"]})
-    assert_frame_equal(res, expected)
-
-
-def test_filtered_join_empty_dataframe():
-    """Test filtered_join behavior with empty DataFrames."""
-    # Empty left DataFrame
-    df_empty = pl.DataFrame({"id": [], "value": []}, schema={"id": pl.Int64, "value": pl.Float64})
-    other_df = pl.DataFrame({"id": [1, 2, 3], "desc": ["x", "y", "z"]})
-
-    def assert_func_empty(predicate):
-        # Since left DataFrame is empty, the filter should contain an empty list
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("id")
-        assert get_literal_value(parsed_expr.inputs[1].expr) == []
-
-    res = df_empty.lazy().piot.filtered_join(io_source_assert(other_df, assert_func_empty), on="id", maintain_order="left").collect()
-
-    # Result should be empty with correct schema
-    assert res.is_empty()
-    assert "id" in res.columns and "value" in res.columns and "desc" in res.columns
-
-
-def test_filtered_join_suffix():
-    """Test filtered_join with custom suffix for duplicate column names."""
-    df = pl.DataFrame({"id": [1, 2, 3], "common": ["a", "b", "c"]})
-    other_df = pl.DataFrame({"id": [1, 2, 4], "common": ["x", "y", "z"]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("id")
-        assert sorted(get_literal_value(parsed_expr.inputs[1].expr)) == [1, 2, 3]
-
-    # With default suffix
-    res = df.lazy().piot.filtered_join(io_source_assert(other_df, assert_func), on="id", maintain_order="left").collect()
-
-    expected = pl.DataFrame({"id": [1, 2], "common": ["a", "b"], "common_right": ["x", "y"]})
-    assert_frame_equal(res, expected)
-
-    # With custom suffix
-    res = df.lazy().piot.filtered_join(io_source_assert(other_df, assert_func), on="id", suffix="_custom", maintain_order="left").collect()
-
-    expected_custom = pl.DataFrame({"id": [1, 2], "common": ["a", "b"], "common_custom": ["x", "y"]})
-    assert_frame_equal(res, expected_custom)
-
-
-def test_filtered_join_suffixed_column_in_derived_expression():
-    """Test filtered_join when suffixed columns are used in derived expressions but not directly selected.
-
-    This tests a subtle bug where projection pushdown could break suffix handling:
-    - If with_columns includes "quantity_previous" (suffixed name from right side)
-    - But the base column "quantity" exists in both left and right schemas
-    - We must keep "quantity" in the left side to create a name conflict
-    - Otherwise "quantity" from the right side won't get the suffix applied
-
-    The symptom was: ColumnNotFoundError for "quantity_previous" because
-    without the conflict, the right side's "quantity" stayed as "quantity".
-    """
-    # Left dataframe with a date column for joining and columns that will conflict
-    left_df = pl.DataFrame(
-        {
-            "data_date": [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)],
-            "data_date_previous": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
-            "id": [1, 2, 3],
-            "quantity": [100, 200, 300],
-            "price": [10.0, 20.0, 30.0],
-        }
-    )
-
-    # Right dataframe - same structure, will be joined to get "previous" values
-    right_df = pl.DataFrame(
-        {
-            "data_date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
-            "id": [1, 2, 3],
-            "quantity": [90, 190, 290],
-            "price": [9.0, 19.0, 29.0],
-        }
-    )
-
-    # Perform the filtered join - this creates quantity_previous and price_previous
-    result = (
-        left_df.lazy()
-        .piot.filtered_join(
-            right_df.lazy(),
-            left_on=["id", "data_date_previous"],
-            right_on=["id", "data_date"],
-            how="left",
-            suffix="_previous",
-            maintain_order="left",
-        )
-        # Use suffixed columns in a derived expression
-        .with_columns(((pl.col("price") - pl.col("price_previous")) * pl.col("quantity_previous")).alias("value_change"))
-        # Only select derived column and identifiers - NOT the suffixed columns directly
-        # This triggers projection pushdown that requests suffixed columns
-        .select("data_date", "id", "value_change")
-        .collect()
-    )
-
-    # Expected: the value_change should be computed correctly
-    # Row 1: (10.0 - 9.0) * 90 = 90.0
-    # Row 2: (20.0 - 19.0) * 190 = 190.0
-    # Row 3: (30.0 - 29.0) * 290 = 290.0
-    expected = pl.DataFrame(
-        {
-            "data_date": [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)],
-            "id": [1, 2, 3],
-            "value_change": [90.0, 190.0, 290.0],
-        }
-    )
-
-    assert_frame_equal(result, expected)
-
-
-def test_filtered_join_suffixed_column_multiple_conflicts():
-    """Test that multiple suffixed columns are handled correctly with projection pushdown."""
-    left_df = pl.DataFrame(
-        {
-            "key": [1, 2],
-            "a": [10, 20],
-            "b": [100, 200],
-            "c": [1000, 2000],
-        }
-    )
-
-    right_df = pl.DataFrame(
-        {
-            "key": [1, 2],
-            "a": [11, 21],
-            "b": [110, 210],
-            "c": [1100, 2100],
-        }
-    )
-
-    # Use all three suffixed columns in a computation, but don't select them directly
-    result = (
-        left_df.lazy()
-        .piot.filtered_join(right_df.lazy(), on="key", suffix="_right", maintain_order="left")
-        .with_columns((pl.col("a_right") + pl.col("b_right") + pl.col("c_right")).alias("sum_right"))
-        .select("key", "sum_right")
-        .collect()
-    )
-
-    # Row 1: 11 + 110 + 1100 = 1221
-    # Row 2: 21 + 210 + 2100 = 2331
-    expected = pl.DataFrame({"key": [1, 2], "sum_right": [1221, 2331]})
-
-    assert_frame_equal(result, expected)
+@pytest.mark.parametrize(("query", "expect", "kw"), params(FILTERED_JOINS, "pred", "expect", "kw"))
+def test_filtered_join(query, expect, kw):
+    seen = []
+    right = io_source_assert(kw["right"], seen.append)
+    query = query or (lambda lf: lf)
+    row_order = "maintain_order" in kw["join"]
+    reference = query(kw["left"].lazy().join(kw["right"].lazy(), **kw["join"]))
+    assert_matches_native(query(kw["left"].lazy().piot.filtered_join(right, **kw["join"])), reference, None, check_row_order=row_order)
+    if expect is NEVER:
+        assert not seen, seen
+    elif expect is not None:
+        assert_right_receives(seen, expect, kw["exact"])
 
 
 @pytest.mark.parametrize("how", ["inner", "left"])
 def test_filtered_join_complex_workflow(how):
-    """Test filtered_join in a more complex data workflow with multiple operations."""
-    df = pl.DataFrame({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]})
-    other_df = pl.DataFrame({"id": [1, 2, 3, 5], "multiplier": [2, 3, 4, 5]})
+    """Only the join keys and the filter on the right column reach the right source, not the filters on derived columns."""
+    if how == "left" and not quirk("pushes_join_filters"):
+        pytest.skip("Polars before 1.32 does not rewrite this left join as an inner join, so only the keys are pushed")
+    left, right_df = pl.DataFrame({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}), pl.DataFrame({"id": [1, 2, 3, 5], "multiplier": [2, 3, 4, 5]})
+    seen = []
 
-    def assert_func(predicate):
-        def assert_is_in(expr):
-            assert expr.function_type == BooleanFunctionType.IS_IN
-            assert expr.inputs[0].expr.meta == pl.col("id")
-            assert sorted(get_literal_value(expr.inputs[1].expr)) == [1, 2, 3, 4]
-            # only the filter from the join gets pushed down
+    def downstream(joined):
+        product = joined.with_columns((c("value") * c("multiplier")).alias("product")).filter(c("product") > 50)
+        return product.group_by("multiplier").agg(pl.sum("product").alias("sum_product")).sort("multiplier").filter(c("multiplier") < 4)
 
-        parsed_expr = get_parsed_expr(predicate)
-        # In polars >1.31.0, joins can be rewritten, and here the "left" join
-        # becomes an inner join.
-        if how == "left" and not quirk("pushes_join_filters"):
-            # We only pass the filter generated from the join
-            assert_is_in(parsed_expr)
-            pytest.skip("Test behavior differs for left joins in polars <= 1.31.0")
-        assert parsed_expr.op == OperatorType.AND
-        for input_expr in [parsed_expr.left, parsed_expr.right]:
-            if getattr(input_expr, "function_type", None) == BooleanFunctionType.IS_IN:
-                assert_is_in(input_expr)
-            elif input_expr.op == OperatorType.LT:
-                assert input_expr.left.expr.meta == pl.col("multiplier")
-                assert get_literal_value(input_expr.right.expr) == 4
-            else:
-                assert False, f"Unexpected expr: {predicate!s}"
-
-    # Complex workflow: join, calculate, filter, aggregate
-    res = (
-        df.lazy()
-        .piot.filtered_join(io_source_assert(other_df, assert_func), on="id", how=how, maintain_order="left")
-        .with_columns((pl.col("value") * pl.col("multiplier")).alias("product"))
-        .filter(pl.col("product") > 50)
-        .group_by("multiplier")
-        .agg(pl.sum("product").alias("sum_product"))
-        .sort("multiplier")
-        .filter(pl.col("multiplier") < 4)
-        .collect()
-    )
-
-    expected = pl.DataFrame({"multiplier": [3], "sum_product": [60]})
-    assert_frame_equal(res, expected)
+    result = downstream(left.lazy().piot.filtered_join(io_source_assert(right_df, seen.append), on="id", how=how, maintain_order="left"))
+    assert_matches_native(result, downstream(left.lazy().join(right_df.lazy(), on="id", how=how, maintain_order="left")), None, check_row_order=True)
+    for predicate in seen:
+        atoms = list(_flatten_conjuncts(get_parsed_expr(predicate)))
+        assert len(atoms) == 2 and ("id", [1, 2, 3, 4]) in [_constraint(a) for a in atoms], predicate
+        (lt,) = [a for a in atoms if isinstance(a, BinaryExprNode)]
+        assert lt.op == OperatorType.LT and lt.left.expr.meta == c("multiplier") and get_literal_value(lt.right.expr) == 4, predicate
 
 
 def test_filtered_join_sink_parquet(tmp_path):
-    """Test filtered_join with projection pushdown."""
-    # Create a temporary directory for the parquet file
-    tmp_path.mkdir(exist_ok=True)
-    file_path = tmp_path / "join_data.parquet"
-
-    df = pl.DataFrame(
-        {
-            "foo": [1, 2, 3],
-            "bar": [6.0, 7.0, 8.0],
-            "ham": ["a", "b", "c"],
-        }
-    )
-    other_df = pl.DataFrame({"apple": ["x", "y", "z"], "ham": ["a", "b", "d"], "bar": ["a", "b", "c"], "foo2": [1, 2, 3]})
-
-    def assert_func(predicate):
-        parsed_expr = get_parsed_expr(predicate)
-        assert parsed_expr.function_type == BooleanFunctionType.IS_IN
-        assert parsed_expr.inputs[0].expr.meta == pl.col("ham")
-        assert sorted(get_literal_value(parsed_expr.inputs[1].expr)) == ["a", "b", "c"]
-
-    df.lazy().piot.filtered_join(
-        io_source_assert(other_df, assert_func),
-        on="ham",
-        maintain_order="left",
-    ).select("bar", "foo").sink_parquet(file_path)
-
-    result = pl.read_parquet(file_path)
-    expected = pl.DataFrame(
-        {
-            "bar": [6.0, 7.0],
-            "foo": [1, 2],
-        }
-    )
-    assert_frame_equal(result, expected)
+    seen = []
+    path = tmp_path / "join_data.parquet"
+    ABC.lazy().piot.filtered_join(io_source_assert(ABD, seen.append), on="ham", maintain_order="left").select("bar", "foo").sink_parquet(path)
+    assert_frame_equal(pl.read_parquet(path), pl.DataFrame({"bar": [6.0, 7.0], "foo": [1, 2]}))
+    assert_right_receives(seen, {"ham": ["a", "b", "c"]}, exact=True)
 
 
-########### Filtered Join AsOf Tests ###########
+# filtered_join_asof: the tolerance bound pushed to the right source, across strategies, keys and filters.
 @pytest.mark.parametrize("include_id", [True, False])
 @pytest.mark.parametrize(
     "filters",
@@ -732,63 +394,6 @@ def test_filtered_join_asof_basic_backward(include_id, filters, on_same_column, 
     assert_frame_equal(result, expected)
 
 
-def test_filtered_join_asof_collects_do_not_retain_previous_filters():
-    left = pl.LazyFrame({"d": [date(2025, 1, 2), date(2025, 1, 11)]}).set_sorted("d")
-    right = pl.LazyFrame({"d": [date(2025, 1, 1), date(2025, 1, 10)], "value": [10, 20]}).set_sorted("d")
-    kwargs = {"on": "d", "tolerance": timedelta(days=2)}
-    joined = left.piot.filtered_join_asof(right, **kwargs)
-    expected = left.join_asof(right, **kwargs)
-
-    for predicate in (pl.col("d") >= date(2025, 1, 10), pl.col("d") <= date(2025, 1, 2)):
-        assert_frame_equal(joined.filter(predicate).collect(), expected.filter(predicate).collect())
-    assert_frame_equal(joined.collect(), expected.collect())
-
-
-def test_filtered_join_asof_empty_left_dataframe():
-    """Test filtered_join_asof with empty left DataFrame."""
-    df_left_empty = pl.DataFrame({"timestamp": [], "value": []}, schema={"timestamp": pl.Datetime, "value": pl.Float64}).with_columns(
-        pl.col("timestamp").set_sorted()
-    )
-
-    df_right = pl.DataFrame(
-        {
-            "timestamp": [datetime(2023, 1, 1, 9, 0, 0), datetime(2023, 1, 1, 9, 5, 0)],
-            "data": ["a", "b"],
-        }
-    ).with_columns(pl.col("timestamp").set_sorted())
-
-    # Test both should produce empty results with same schema
-    result = df_left_empty.lazy().piot.filtered_join_asof(df_right.lazy(), on="timestamp", strategy="backward").collect()
-
-    expected = df_left_empty.lazy().join_asof(df_right.lazy(), on="timestamp", strategy="backward").collect()
-
-    assert_frame_equal(result, expected)
-    assert result.is_empty()
-
-
-def test_filtered_join_asof_empty_right_dataframe():
-    """Test filtered_join_asof with empty right DataFrame."""
-    df_left = pl.DataFrame(
-        {
-            "timestamp": [datetime(2023, 1, 1, 9, 0, 0)],
-            "value": [1],
-        }
-    ).with_columns(pl.col("timestamp").set_sorted())
-
-    df_right_empty = pl.LazyFrame({"timestamp": [], "data": []}, schema={"timestamp": pl.Datetime, "data": pl.Utf8}).with_columns(
-        pl.col("timestamp").set_sorted()
-    )
-
-    result = df_left.lazy().piot.filtered_join_asof(df_right_empty, on="timestamp", strategy="backward").collect()
-
-    expected = df_left.lazy().join_asof(df_right_empty, on="timestamp", strategy="backward").collect()
-
-    assert_frame_equal(result, expected)
-    # Should have left row but no right match (null values)
-    assert len(result) == 1
-    assert result["data"][0] is None
-
-
 @pytest.mark.parametrize("strategy", ["backward", "forward", "nearest"])
 def test_filtered_join_asof_no_tolerance(strategy):
     """Test filtered_join_asof without tolerance parameter."""
@@ -845,458 +450,206 @@ def test_filtered_join_asof_no_tolerance(strategy):
     assert_frame_equal(result, expected)
 
 
-class TestJoinBetween:
-    """Test join_between function for range joins with equi-join support."""
-
-    def test_basic_range_join_no_by(self):
-        """Test basic range join without by columns."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3],
-                "trade_date": [date(2024, 1, 15), date(2024, 2, 15), date(2024, 3, 15)],
-                "amount": [100.0, 200.0, 300.0],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "valid_from": [date(2024, 1, 1), date(2024, 2, 1), date(2024, 3, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 31)],
-                "price": [10.0, 20.0, 30.0],
-            }
-        ).lazy()
-
-        result = join_between(left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to").collect()
-
-        assert len(result) == 3
-        assert result.filter(pl.col("trade_id") == 1)["price"][0] == 10.0
-        assert result.filter(pl.col("trade_id") == 2)["price"][0] == 20.0
-        assert result.filter(pl.col("trade_id") == 3)["price"][0] == 30.0
-
-    def test_equi_join_with_by_column(self):
-        """Test join with by column for equi-join on common column."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3, 4],
-                "security_id": ["AAPL", "AAPL", "GOOG", "GOOG"],
-                "trade_date": [date(2024, 1, 15), date(2024, 2, 15), date(2024, 1, 15), date(2024, 2, 15)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL", "AAPL", "GOOG", "GOOG"],
-                "valid_from": [date(2024, 1, 1), date(2024, 2, 1), date(2024, 1, 1), date(2024, 2, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 2, 29), date(2024, 1, 31), date(2024, 2, 29)],
-                "price": [150.0, 155.0, 140.0, 145.0],
-            }
-        ).lazy()
-
-        result = join_between(left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id").collect()
-
-        assert len(result) == 4
-        assert result.filter(pl.col("trade_id") == 1)["price"][0] == 150.0
-        assert result.filter(pl.col("trade_id") == 2)["price"][0] == 155.0
-        assert result.filter(pl.col("trade_id") == 3)["price"][0] == 140.0
-        assert result.filter(pl.col("trade_id") == 4)["price"][0] == 145.0
-
-    def test_left_join_preserves_rows_when_by_not_in_right(self):
-        """Test that left join preserves rows when by value doesn't exist in right table."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3],
-                "security_id": ["AAPL", "MSFT", "GOOG"],
-                "trade_date": [date(2024, 1, 15), date(2024, 1, 15), date(2024, 1, 15)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL", "GOOG"],
-                "valid_from": [date(2024, 1, 1), date(2024, 1, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 1, 31)],
-                "price": [150.0, 140.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="left"
-        ).collect()
-
-        assert len(result) == 3
-        assert result.filter(pl.col("trade_id") == 1)["price"][0] == 150.0
-        assert result.filter(pl.col("trade_id") == 2)["price"][0] is None
-        assert result.filter(pl.col("trade_id") == 3)["price"][0] == 140.0
-
-    def test_inner_join_drops_rows_when_by_not_in_right(self):
-        """Test that inner join drops rows when by value doesn't exist in right table."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3],
-                "security_id": ["AAPL", "MSFT", "GOOG"],
-                "trade_date": [date(2024, 1, 15), date(2024, 1, 15), date(2024, 1, 15)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL", "GOOG"],
-                "valid_from": [date(2024, 1, 1), date(2024, 1, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 1, 31)],
-                "price": [150.0, 140.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="inner"
-        ).collect()
-
-        assert len(result) == 2
-        trade_ids = result["trade_id"].to_list()
-        assert 1 in trade_ids
-        assert 3 in trade_ids
-        assert 2 not in trade_ids
-
-    def test_equi_join_with_composite_key(self):
-        """Test join between with multiple by columns (composite key)."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2],
-                "security_id": ["ABC", "ABC"],
-                "source": ["Bloomberg", "Reuters"],
-                "trade_date": [date(2024, 1, 15), date(2024, 1, 15)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["ABC", "ABC"],
-                "source": ["Bloomberg", "Reuters"],
-                "valid_from": [date(2024, 1, 1), date(2024, 1, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 1, 31)],
-                "price": [100.0, 101.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by=["security_id", "source"]
-        ).collect()
-
-        assert len(result) == 2
-        assert result.filter(pl.col("trade_id") == 1)["price"][0] == 100.0
-        assert result.filter(pl.col("trade_id") == 2)["price"][0] == 101.0
-
-    def test_left_join_preserves_unmatched_range(self):
-        """Test that left join preserves rows with no matching range."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3],
-                "security_id": ["AAPL", "AAPL", "AAPL"],
-                "trade_date": [date(2024, 1, 15), date(2024, 6, 15), date(2024, 3, 15)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL", "AAPL"],
-                "valid_from": [date(2024, 1, 1), date(2024, 3, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 3, 31)],
-                "price": [10.0, 30.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="left"
-        ).collect()
-
-        assert len(result) == 3
-        assert result.filter(pl.col("trade_id") == 2)["price"][0] is None
-        assert result.filter(pl.col("trade_id") == 1)["price"][0] is not None
-        assert result.filter(pl.col("trade_id") == 3)["price"][0] is not None
-
-    def test_inner_join_excludes_unmatched_range(self):
-        """Test that inner join excludes rows with no matching range."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3],
-                "security_id": ["AAPL", "AAPL", "AAPL"],
-                "trade_date": [date(2024, 1, 15), date(2024, 6, 15), date(2024, 3, 15)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL", "AAPL"],
-                "valid_from": [date(2024, 1, 1), date(2024, 3, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 3, 31)],
-                "price": [10.0, 30.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="inner"
-        ).collect()
-
-        assert len(result) == 2
-        trade_ids = result["trade_id"].to_list()
-        assert 1 in trade_ids
-        assert 3 in trade_ids
-        assert 2 not in trade_ids
-
-    def test_gap_between_ranges_returns_null(self):
-        """Test that dates falling in gaps between ranges get null values."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame({"trade_id": [1], "security_id": ["AAPL"], "trade_date": [date(2024, 2, 15)]}).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL", "AAPL"],
-                "valid_from": [date(2024, 1, 1), date(2024, 3, 1)],
-                "valid_to": [date(2024, 1, 31), date(2024, 3, 31)],
-                "price": [10.0, 30.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="left"
-        ).collect()
-
-        assert len(result) == 1
-        assert result["price"][0] is None
-
-    def test_date_before_all_ranges(self):
-        """Test that dates before all ranges get null values."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame({"trade_id": [1], "security_id": ["AAPL"], "trade_date": [date(2023, 12, 15)]}).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL"],
-                "valid_from": [date(2024, 1, 1)],
-                "valid_to": [date(2024, 1, 31)],
-                "price": [10.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="left"
-        ).collect()
-
-        assert len(result) == 1
-        assert result["price"][0] is None
-
-    def test_date_after_all_ranges(self):
-        """Test that dates after all ranges get null values."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame({"trade_id": [1], "security_id": ["AAPL"], "trade_date": [date(2024, 12, 15)]}).lazy()
-
-        right = pl.DataFrame(
-            {
-                "security_id": ["AAPL"],
-                "valid_from": [date(2024, 1, 1)],
-                "valid_to": [date(2024, 1, 31)],
-                "price": [10.0],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id", how="left"
-        ).collect()
-
-        assert len(result) == 1
-        assert result["price"][0] is None
-
-    def test_boundary_dates_inclusive(self):
-        """Test that boundary dates (exactly on start or end) are included."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "trade_id": [1, 2, 3],
-                "security_id": ["AAPL", "AAPL", "AAPL"],
-                "trade_date": [date(2024, 1, 1), date(2024, 1, 15), date(2024, 1, 31)],
-            }
-        ).lazy()
-
-        right = pl.DataFrame({"security_id": ["AAPL"], "valid_from": [date(2024, 1, 1)], "valid_to": [date(2024, 1, 31)], "price": [10.0]}).lazy()
-
-        result = join_between(left, right, left_on="trade_date", right_on_start="valid_from", right_on_end="valid_to", by="security_id").collect()
-
-        assert len(result) == 3
-        for i in range(3):
-            assert result["price"][i] == 10.0
-
-    def test_with_datetime_columns(self):
-        """Test join_between works with datetime columns, not just dates."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame(
-            {
-                "event_id": [1, 2, 3],
-                "session_type": ["trading", "trading", "trading"],
-                "event_time": [
-                    datetime(2024, 1, 15, 10, 30),
-                    datetime(2024, 1, 15, 14, 30),
-                    datetime(2024, 1, 15, 18, 30),
-                ],
-            }
-        ).lazy()
-
-        right = pl.DataFrame(
-            {
-                "session_type": ["trading", "trading"],
-                "session_start": [datetime(2024, 1, 15, 9, 0), datetime(2024, 1, 15, 13, 0)],
-                "session_end": [datetime(2024, 1, 15, 12, 0), datetime(2024, 1, 15, 17, 0)],
-                "session_name": ["Morning", "Afternoon"],
-            }
-        ).lazy()
-
-        result = join_between(
-            left, right, left_on="event_time", right_on_start="session_start", right_on_end="session_end", by="session_type", how="left"
-        ).collect()
-
-        assert len(result) == 3
-        assert result.filter(pl.col("event_id") == 1)["session_name"][0] == "Morning"
-        assert result.filter(pl.col("event_id") == 2)["session_name"][0] == "Afternoon"
-        assert result.filter(pl.col("event_id") == 3)["session_name"][0] is None
-
-    def test_column_name_collision_nulls_right_not_left(self):
-        """Regression: when left and right share a column name, only the right (suffixed) column should be nulled."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame({"ts": [5], "value": ["left"]}).lazy()
-        right = pl.DataFrame({"start": [1], "end": [3], "value": ["right"]}).lazy()
-
-        result = join_between(left, right, left_on="ts", right_on_start="start", right_on_end="end", how="left").collect()
-
-        assert len(result) == 1
-        # Left column must be preserved
-        assert result["value"][0] == "left"
-        # Right column (suffixed) must be nulled — no range match
-        assert result["value_right"][0] is None
-
-    def test_right_on_end_name_collision_validation(self):
-        """Regression: when right_on_end collides with a left column name, validation must use the suffixed name."""
-        from polars_io_tools import join_between
-
-        # Window B ends at 10:00:04, reading is at 10:00:05 — should NOT match
-        windows = pl.DataFrame(
-            {
-                "event_id": ["A", "B"],
-                "window_start": [datetime(2023, 1, 1, 10, 0, 0), datetime(2023, 1, 1, 10, 0, 3)],
-                "timestamp": [datetime(2023, 1, 1, 10, 0, 10), datetime(2023, 1, 1, 10, 0, 4)],
-            }
-        ).lazy()
-        readings = pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 10, 0, 5)], "value": [99]}).lazy()
-
-        result = join_between(readings, windows, left_on="timestamp", right_on_start="window_start", right_on_end="timestamp", how="inner").collect()
-
-        # B.timestamp (10:00:04) < reading.timestamp (10:00:05) — inner join should exclude it
-        assert len(result) == 0
-
-    def test_right_on_start_equal_left_on_preserves_left_key(self):
-        """Regression: when right_on_start == left_on, invalid left joins must not null the preserved left key."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame({"x": [10]}).lazy()
-        right = pl.DataFrame({"x": [1], "end": [5], "payload": [99]}).lazy()
-
-        result = join_between(left, right, left_on="x", right_on_start="x", right_on_end="end", how="left").collect()
-
-        assert len(result) == 1
-        assert result["x"][0] == 10
-        assert result["end"][0] is None
-        assert result["payload"][0] is None
-
-    def test_overlapping_intervals_returns_single_match(self):
-        """Document: join_between returns at most one match per left row (nearest start via asof)."""
-        from polars_io_tools import join_between
-
-        left = pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 10, 0, 4)], "value": [99]}).lazy()
-        right = pl.DataFrame(
-            {
-                "event_id": ["A", "B"],
-                "window_start": [datetime(2023, 1, 1, 10, 0, 0), datetime(2023, 1, 1, 10, 0, 3)],
-                "window_end": [datetime(2023, 1, 1, 10, 0, 5), datetime(2023, 1, 1, 10, 0, 8)],
-            }
-        ).lazy()
-
-        result = join_between(left, right, left_on="timestamp", right_on_start="window_start", right_on_end="window_end", how="inner").collect()
-
-        # Both A and B contain 10:00:04, but only B (nearest start) is returned
-        assert len(result) == 1
-        assert result["event_id"][0] == "B"
-
-
+# (left, right, join_asof arguments, predicates collected in turn from the same joined frame)
 _DT_LEFT = pl.DataFrame({"t": [datetime(2024, 1, 1, 0, 0, 0, 500), datetime(2024, 1, 1, 13)]})
 _DT_RIGHT = pl.DataFrame({"t": [datetime(2023, 12, 31, 23), datetime(2024, 1, 1, 0, 0, 0, 400), datetime(2024, 1, 1, 12, 30)], "y": [0, 1, 2]})
 _DATE_LEFT = pl.DataFrame({"t": [date(2024, 1, 1)]})
 _DATE_RIGHT = pl.DataFrame({"t": [date(2023, 12, 31), date(2024, 1, 1)], "y": [0, 1]})
 _UTC = {"t": pl.Datetime("us", "UTC")}
+_HOUR = {"on": "t", "tolerance": timedelta(hours=1)}
+_EMPTY_TS = pl.DataFrame(schema={"timestamp": pl.Datetime, "value": pl.Float64})
+_TWO_QUOTES = pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 9, 0, 0), datetime(2023, 1, 1, 9, 5, 0)], "data": ["a", "b"]})
+ASOF_MATCHES = [
+    # A joined frame collected with one filter and then another must not keep the first filter.
+    Case(
+        "filtered_join_asof_collects_do_not_retain_previous_filters",
+        [c("t") >= date(2025, 1, 10), c("t") <= date(2025, 1, 2), None],
+        (pl.DataFrame({"t": [date(2025, 1, 2), date(2025, 1, 11)]}), pl.DataFrame({"t": [date(2025, 1, 1), date(2025, 1, 10)], "value": [10, 20]})),
+        {"on": "t", "tolerance": timedelta(days=2)},
+    ),
+    Case("filtered_join_asof_empty_left_dataframe", [None], (_EMPTY_TS, _TWO_QUOTES), {"on": "timestamp", "strategy": "backward"}),
+    Case(
+        "filtered_join_asof_empty_right_dataframe",
+        [None],
+        (pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 9)], "value": [1]}), pl.DataFrame(schema={"timestamp": pl.Datetime, "data": pl.Utf8})),
+        {"on": "timestamp", "strategy": "backward"},
+    ),
+    Case("filtered_join_asof_keeps_matches-cast_date", [c("t").cast(pl.Date) < datetime(2024, 1, 1, 12)], (_DT_LEFT, _DT_RIGHT), _HOUR),
+    Case("filtered_join_asof_keeps_matches-cast_ms", [c("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1)], (_DT_LEFT, _DT_RIGHT), _HOUR),
+    Case(
+        "filtered_join_asof_keeps_matches-date_forward",
+        [c("t") < datetime(2024, 1, 1, 12)],
+        (_DATE_LEFT, _DATE_RIGHT),
+        {"on": "t", "strategy": "forward", "tolerance": timedelta(hours=1)},
+    ),
+    Case(
+        "filtered_join_asof_keeps_matches-date_backward",
+        [c("t") < datetime(2024, 1, 1, 12)],
+        (_DATE_LEFT, _DATE_RIGHT),
+        {"on": "t", "strategy": "backward", "tolerance": timedelta(days=1)},
+    ),
+    Case("filtered_join_asof_keeps_matches-utc", [c("t") >= datetime(2024, 1, 1, tzinfo=UTC)], (_DT_LEFT.cast(_UTC), _DT_RIGHT.cast(_UTC)), _HOUR),
+]
 
 
-@pytest.mark.parametrize(
-    ("left", "right", "pred", "kwargs"),
-    [
-        (_DT_LEFT, _DT_RIGHT, pl.col("t").cast(pl.Date) < datetime(2024, 1, 1, 12), {"tolerance": timedelta(hours=1)}),
-        (_DT_LEFT, _DT_RIGHT, pl.col("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1), {"tolerance": timedelta(hours=1)}),
-        (_DATE_LEFT, _DATE_RIGHT, pl.col("t") < datetime(2024, 1, 1, 12), {"strategy": "forward", "tolerance": timedelta(hours=1)}),
-        (_DATE_LEFT, _DATE_RIGHT, pl.col("t") < datetime(2024, 1, 1, 12), {"strategy": "backward", "tolerance": timedelta(days=1)}),
-        (_DT_LEFT.cast(_UTC), _DT_RIGHT.cast(_UTC), pl.col("t") >= datetime(2024, 1, 1, tzinfo=UTC), {"tolerance": timedelta(hours=1)}),
-    ],
-)
-def test_filtered_join_asof_keeps_matches(left, right, pred, kwargs):
-    left, right = left.lazy().set_sorted("t"), right.lazy().set_sorted("t")
-    expected = left.join_asof(right, on="t", **kwargs).filter(pred).collect()
-    assert_frame_equal(left.piot.filtered_join_asof(right, on="t", **kwargs).filter(pred).collect(), expected)
+@pytest.mark.parametrize(("preds", "frames", "kwargs"), params(ASOF_MATCHES, "pred", "expect", "kw"))
+def test_filtered_join_asof_matches_native(preds, frames, kwargs):
+    on = kwargs["on"]
+    left, right = (df.lazy().set_sorted(on) for df in frames)
+    joined, reference = left.piot.filtered_join_asof(right, **kwargs), left.join_asof(right, **kwargs)
+    for pred in preds:
+        assert_matches_native(joined, reference, pred, check_row_order=True)
 
 
-@pytest.mark.parametrize(
-    "keys",
-    [
-        pl.Series([1001, 2002]).cast(pl.Datetime("ns")),
-        pl.Series([1001, 2002]).cast(pl.Duration("ns")),
-        pl.Series([1001]).cast(pl.Time),
-        pl.Series([Decimal("1.25"), Decimal("2.50")], dtype=pl.Decimal(10, 2)),
-    ],
-)
-def test_filtered_join_keys_keep_dtype(keys):
-    """The right-side key filter must not lose key precision through Python values."""
-    left = pl.LazyFrame({"k": keys, "v": range(len(keys))})
-    right = pl.LazyFrame({"k": keys, "w": range(len(keys))})
-    assert_frame_equal(left.piot.filtered_join(right, on="k").collect(), left.join(right, on="k").collect(), check_row_order=False)
+# join_between: (left, right, keyword arguments) -> the expected joined columns, compared after sorting by the first.
+def _trades(dates, securities="AAPL", **extra):
+    securities = [securities] * len(dates) if isinstance(securities, str) else securities
+    return pl.DataFrame({"trade_id": range(1, len(dates) + 1), "security_id": securities, "trade_date": dates, **extra})
 
 
-def test_filtered_join_pushes_integer_keys_as_a_list():
-    """Keys a Python list holds exactly are pushed as a list, so the pushed predicate shows the values."""
-    seen = []
-    right_df = pl.DataFrame({"k": [1, 2, 3, 4], "w": [10, 20, 30, 40]})
-    right = io_source_assert(right_df, seen.append)
-    left = pl.LazyFrame({"k": [2, 3], "v": [0, 1]})
-    result = left.piot.filtered_join(right, on="k").collect()
-    assert sorted(result["w"].to_list()) == [20, 30]
-    pushed = [str(p) for p in seen if p is not None]
-    assert any("2" in p and "3" in p and "Series" not in p for p in pushed)
+def _prices(starts, ends, prices, securities="AAPL", **extra):
+    securities = [securities] * len(starts) if isinstance(securities, str) else securities
+    return pl.DataFrame({"security_id": securities, "valid_from": starts, "valid_to": ends, "price": prices, **extra})
 
 
-def test_filtered_join_keys_beyond_python_datetime_range():
-    keys = pl.Series("k", [253402318799999998, 253402318799999999], dtype=pl.Datetime("us", "UTC"))
-    left = keys.to_frame().lazy()
-    assert_frame_equal(left.piot.filtered_join(left, on="k").collect(), left.join(left, on="k").collect(), check_row_order=False)
+def _expect(**cols):
+    return pl.DataFrame(cols)
+
+
+D = date
+JAN, MAR = (D(2024, 1, 1), D(2024, 1, 31)), (D(2024, 3, 1), D(2024, 3, 31))
+TRADE = {"left_on": "trade_date", "right_on_start": "valid_from", "right_on_end": "valid_to"}
+BY_SECURITY = {**TRADE, "by": "security_id"}
+TWO_SECURITIES = _prices([JAN[0]] * 2, [JAN[1]] * 2, [150.0, 140.0], securities=["AAPL", "GOOG"])
+JAN_MAR = _prices([JAN[0], MAR[0]], [JAN[1], MAR[1]], [10.0, 30.0])
+JAN_ONLY = _prices([JAN[0]], [JAN[1]], [10.0])
+WINDOWS = pl.DataFrame({"event_id": ["A", "B"], "window_start": [datetime(2023, 1, 1, 10, 0, 0), datetime(2023, 1, 1, 10, 0, 3)]})
+JOIN_BETWEEN = [
+    Case(
+        "basic_range_join_no_by",
+        (
+            _trades([D(2024, 1, 15), D(2024, 2, 15), D(2024, 3, 15)]).drop("security_id"),
+            _prices([D(2024, 1, 1), D(2024, 2, 1), D(2024, 3, 1)], [D(2024, 1, 31), D(2024, 2, 29), D(2024, 3, 31)], [10.0, 20.0, 30.0]).drop(
+                "security_id"
+            ),
+        ),
+        _expect(trade_id=[1, 2, 3], price=[10.0, 20.0, 30.0]),
+        TRADE,
+    ),
+    Case(
+        "equi_join_with_by_column",
+        (
+            _trades([D(2024, 1, 15), D(2024, 2, 15)] * 2, ["AAPL", "AAPL", "GOOG", "GOOG"]),
+            _prices(
+                [D(2024, 1, 1), D(2024, 2, 1)] * 2,
+                [D(2024, 1, 31), D(2024, 2, 29)] * 2,
+                [150.0, 155.0, 140.0, 145.0],
+                ["AAPL", "AAPL", "GOOG", "GOOG"],
+            ),
+        ),
+        _expect(trade_id=[1, 2, 3, 4], price=[150.0, 155.0, 140.0, 145.0]),
+        BY_SECURITY,
+    ),
+    Case(
+        "left_join_preserves_rows_when_by_not_in_right",
+        (_trades([D(2024, 1, 15)] * 3, ["AAPL", "MSFT", "GOOG"]), TWO_SECURITIES),
+        _expect(trade_id=[1, 2, 3], price=[150.0, None, 140.0]),
+        {**BY_SECURITY, "how": "left"},
+    ),
+    Case(
+        "inner_join_drops_rows_when_by_not_in_right",
+        (_trades([D(2024, 1, 15)] * 3, ["AAPL", "MSFT", "GOOG"]), TWO_SECURITIES),
+        _expect(trade_id=[1, 3], price=[150.0, 140.0]),
+        {**BY_SECURITY, "how": "inner"},
+    ),
+    Case(
+        "equi_join_with_composite_key",
+        (
+            _trades([D(2024, 1, 15)] * 2, "ABC", source=["Bloomberg", "Reuters"]),
+            _prices([JAN[0]] * 2, [JAN[1]] * 2, [100.0, 101.0], "ABC", source=["Bloomberg", "Reuters"]),
+        ),
+        _expect(trade_id=[1, 2], price=[100.0, 101.0]),
+        {**TRADE, "by": ["security_id", "source"]},
+    ),
+    Case(
+        "left_join_preserves_unmatched_range",
+        (_trades([D(2024, 1, 15), D(2024, 6, 15), D(2024, 3, 15)]), JAN_MAR),
+        _expect(trade_id=[1, 2, 3], price=[10.0, None, 30.0]),
+        {**BY_SECURITY, "how": "left"},
+    ),
+    Case(
+        "inner_join_excludes_unmatched_range",
+        (_trades([D(2024, 1, 15), D(2024, 6, 15), D(2024, 3, 15)]), JAN_MAR),
+        _expect(trade_id=[1, 3], price=[10.0, 30.0]),
+        {**BY_SECURITY, "how": "inner"},
+    ),
+    Case(
+        "gap_between_ranges_returns_null", (_trades([D(2024, 2, 15)]), JAN_MAR), _expect(trade_id=[1], price=[None]), {**BY_SECURITY, "how": "left"}
+    ),
+    Case("date_before_all_ranges", (_trades([D(2023, 12, 15)]), JAN_ONLY), _expect(trade_id=[1], price=[None]), {**BY_SECURITY, "how": "left"}),
+    Case("date_after_all_ranges", (_trades([D(2024, 12, 15)]), JAN_ONLY), _expect(trade_id=[1], price=[None]), {**BY_SECURITY, "how": "left"}),
+    Case(
+        "boundary_dates_inclusive",
+        (_trades([D(2024, 1, 1), D(2024, 1, 15), D(2024, 1, 31)]), JAN_ONLY),
+        _expect(trade_id=[1, 2, 3], price=[10.0] * 3),
+        BY_SECURITY,
+    ),
+    Case(
+        "with_datetime_columns",
+        (
+            pl.DataFrame(
+                {"event_id": [1, 2, 3], "session_type": ["trading"] * 3, "event_time": [datetime(2024, 1, 15, h, 30) for h in (10, 14, 18)]}
+            ),
+            pl.DataFrame(
+                {
+                    "session_type": ["trading"] * 2,
+                    "session_start": [datetime(2024, 1, 15, 9), datetime(2024, 1, 15, 13)],
+                    "session_end": [datetime(2024, 1, 15, 12), datetime(2024, 1, 15, 17)],
+                    "session_name": ["Morning", "Afternoon"],
+                }
+            ),
+        ),
+        _expect(event_id=[1, 2, 3], session_name=["Morning", "Afternoon", None]),
+        {"left_on": "event_time", "right_on_start": "session_start", "right_on_end": "session_end", "by": "session_type", "how": "left"},
+    ),
+    # Regressions: a name shared by both sides, or by right_on_end or right_on_start and left_on.
+    Case(
+        "column_name_collision_nulls_right_not_left",
+        (pl.DataFrame({"ts": [5], "value": ["left"]}), pl.DataFrame({"start": [1], "end": [3], "value": ["right"]})),
+        _expect(value=["left"], value_right=[None]),
+        {"left_on": "ts", "right_on_start": "start", "right_on_end": "end", "how": "left"},
+    ),
+    # Window B ends at 10:00:04, before the reading at 10:00:05.
+    Case(
+        "right_on_end_name_collision_validation",
+        (
+            pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 10, 0, 5)], "value": [99]}),
+            WINDOWS.with_columns(timestamp=pl.Series([datetime(2023, 1, 1, 10, 0, 10), datetime(2023, 1, 1, 10, 0, 4)])),
+        ),
+        _expect(value=pl.Series([], dtype=pl.Int64)),
+        {"left_on": "timestamp", "right_on_start": "window_start", "right_on_end": "timestamp", "how": "inner"},
+    ),
+    Case(
+        "right_on_start_equal_left_on_preserves_left_key",
+        (pl.DataFrame({"x": [10]}), pl.DataFrame({"x": [1], "end": [5], "payload": [99]})),
+        _expect(x=[10], end=pl.Series([None], dtype=pl.Int64), payload=pl.Series([None], dtype=pl.Int64)),
+        {"left_on": "x", "right_on_start": "x", "right_on_end": "end", "how": "left"},
+    ),
+    # At most one match per left row: the window with the nearest start (B), though A contains 10:00:04 too.
+    Case(
+        "overlapping_intervals_returns_single_match",
+        (
+            pl.DataFrame({"timestamp": [datetime(2023, 1, 1, 10, 0, 4)], "value": [99]}),
+            WINDOWS.with_columns(window_end=pl.Series([datetime(2023, 1, 1, 10, 0, 5), datetime(2023, 1, 1, 10, 0, 8)])),
+        ),
+        _expect(event_id=["B"]),
+        {"left_on": "timestamp", "right_on_start": "window_start", "right_on_end": "window_end", "how": "inner"},
+    ),
+]
+
+
+@pytest.mark.parametrize(("frames", "expect", "kwargs"), params(JOIN_BETWEEN, "pred", "expect", "kw"))
+def test_join_between(frames, expect, kwargs):
+    left, right = (df.lazy() for df in frames)
+    result = join_between(left, right, **kwargs).collect()
+    assert_frame_equal(result.select(expect.columns).sort(expect.columns[0]), expect, check_dtypes=False)
