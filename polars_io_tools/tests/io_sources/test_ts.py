@@ -1,540 +1,194 @@
-from collections.abc import Iterator
+"""ts_with_columns: a filter on the index column or a linked column is widened by the lookback and lookahead before it
+reaches the source, so window expressions see the rows they need, and the result is then trimmed to the filter.
+
+The source sits behind a ``PredicateTracker``. Most rows forward-fill ``Value`` (non-null only on the first day) and
+name the expected fill; a lookback that does not reach the first day leaves it null.
+"""
+
 from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
-from polars.io.plugins import register_io_source
 from polars.testing import assert_frame_equal
 
-from polars_io_tools.io_sources.base import CastNode, ColumnNode, FunctionNode, get_parsed_expr
-from polars_io_tools.io_sources.enum import BooleanFunctionType
+from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.catalogue import Case, params
+from polars_io_tools.tests.helpers.oracles import assert_pushed_bounds
+
+c = pl.col
+FFILL = c("Value").forward_fill(3).alias("ForwardFill")
+LINKED = {"index_col": "Date", "lookback": timedelta(days=3), "linked_cols": ["EventDate"]}
+SELECTED = ["Date", "EventDate", "PointID", "Value", "ForwardFill"]
 
 
-def _get_column_name_from_node(node):
-    """Extract the column name from a node, handling both ColumnNode and CastNode wrapping ColumnNode."""
-    if isinstance(node, ColumnNode):
-        return node.name
-    elif isinstance(node, CastNode) and isinstance(node.input, ColumnNode):
-        return node.input.name
-    else:
-        raise ValueError(f"Cannot extract column name from node type: {type(node).__name__}")
-
-
-def _assert_date_between_predicate_if_pushed(last_predicate, expected_lower: date, expected_upper: date) -> None:
-    """Assert the pushed predicate shape when Polars chooses to expose one."""
-    if last_predicate is None:
-        return
-
-    parsed_last_predicate = get_parsed_expr(last_predicate)
-    assert isinstance(parsed_last_predicate, FunctionNode)
-    assert parsed_last_predicate.function_type == BooleanFunctionType.IS_BETWEEN
-    assert _get_column_name_from_node(parsed_last_predicate.inputs[0]) == "Date"
-
-    lower_val = parsed_last_predicate.inputs[1].value
-    upper_val = parsed_last_predicate.inputs[2].value
-    lower_date = lower_val.date() if isinstance(lower_val, datetime) else lower_val
-    upper_date = upper_val.date() if isinstance(upper_val, datetime) else upper_val
-    assert lower_date == expected_lower
-    assert upper_date == expected_upper
-
-
-def generate_lazy_frame_and_container_with_pushed_predicate(df: pl.DataFrame) -> tuple[pl.LazyFrame, dict[str, pl.Expr]]:
-    container = {}
-
-    def my_scan(df):
-        def source_generator(
-            with_columns: list[str] | None,
-            predicate: pl.Expr | None,
-            n_rows: int | None,
-            batch_size: int | None,
-        ) -> Iterator[pl.DataFrame]:
-            # Capture the predicate
-            container["last_predicate"] = predicate
-            df2 = df.clone()
-            # Apply column projection if requested
-            if with_columns is not None:
-                df2 = df2.select(with_columns)
-
-            # Apply predicate filtering if provided
-            if predicate is not None:
-                df2 = df2.filter(predicate)
-
-            # Apply row limiting if requested
-            if n_rows is not None:
-                df2 = df2.head(n_rows)
-
-            yield df2
-
-        return register_io_source(io_source=source_generator, schema=df.schema)
-
-    return my_scan(df), container
-
-
-def _generate_df(index_col_typ: pl.DataType) -> pl.DataFrame:
-    schema = {"Date": index_col_typ, "EventDate": pl.Date, "PointID": pl.Int64, "Value": pl.Int64, "DummyValue": pl.Int64}
-    func = datetime if index_col_typ == pl.Datetime else date
-    datetime_vals = [
-        func(2023, 1, 1),
-        func(2023, 1, 2),
-        func(2023, 1, 3),
-    ]
-    df = pl.LazyFrame(
+def _frame(index_dtype, days: int = 3) -> pl.DataFrame:
+    """``days`` rows from 1 Jan 2023: EventDate is the next day, and Value is 100 on the first day, 200 on a fourth."""
+    func = datetime if index_dtype == pl.Datetime else date
+    return pl.DataFrame(
         {
-            "Date": datetime_vals,
-            "EventDate": [date(2023, 1, 2), date(2023, 1, 3), date(2023, 1, 4)],
-            "PointID": [1, 1, 1],
-            "Value": [100, None, None],
-            "DummyValue": [1, 2, 3],
+            "Date": [func(2023, 1, d) for d in range(1, days + 1)],
+            "EventDate": [date(2023, 1, d + 1) for d in range(1, days + 1)],
+            "PointID": [1] * days,
+            "Value": [100, None, None, 200][:days],
+            "DummyValue": list(range(1, days + 1)),
         },
-        schema=schema,
+        schema={"Date": index_dtype, "EventDate": pl.Date, "PointID": pl.Int64, "Value": pl.Int64, "DummyValue": pl.Int64},
     )
-    return df
 
 
-def test_errors():
-    df = _generate_df(pl.Date).lazy()
-
-    # Validation is deferred until collect time. Polars wraps user-raised exceptions
-    # from the schema callable in a ComputeError, preserving the original message.
-    with pytest.raises((ValueError, pl.exceptions.ComputeError), match="missing from the schema"):
-        df.piot.ts_with_columns(
-            [pl.col("Value").forward_fill(3).alias("ForwardFill")],
-            index_col="Date_MISSING",
-            lookback=timedelta(days=3),
-            linked_cols=["EventDate"],
-        ).collect()
-
-    with pytest.raises((ValueError, pl.exceptions.ComputeError), match="but found type"):
-        df.piot.ts_with_columns(
-            [pl.col("Value").forward_fill(3).alias("ForwardFill")],
-            index_col="DummyValue",
-            lookback=timedelta(days=3),
-            linked_cols=["EventDate"],
-        ).collect()
+def _filled(index_dtype, ffill, dtype=pl.Int64, empty=False) -> pl.DataFrame:
+    """The 3 Jan row (EventDate 4 Jan) with ``ForwardFill`` set to ``ffill``, or no row."""
+    schema = {**_frame(index_dtype).drop("DummyValue").schema, "ForwardFill": dtype}
+    if empty:
+        return pl.DataFrame(schema=schema)
+    day = datetime(2023, 1, 3) if index_dtype == pl.Datetime else date(2023, 1, 3)
+    return pl.DataFrame({"Date": [day], "EventDate": [date(2023, 1, 4)], "PointID": [1], "Value": [None], "ForwardFill": [ffill]}, schema=schema)
 
 
-def test_simple_lookback():
-    dates = pl.Series("Date", [date(2023, 1, 1), date(2023, 1, 2), date(2023, 1, 3)])
-    values = pl.Series("Value", [1, 2, 3])
+@pytest.mark.parametrize(
+    ("index_col", "match"),
+    [("Date_MISSING", "missing from the schema"), ("DummyValue", "but found type")],
+    ids=["errors-missing", "errors-not_temporal"],
+)
+def test_errors(index_col, match):
+    # Validation is deferred to collect time, where Polars wraps the error in a ComputeError.
+    lf = _frame(pl.Date).lazy().piot.ts_with_columns([FFILL], index_col=index_col, lookback=timedelta(days=3), linked_cols=["EventDate"])
+    with pytest.raises((ValueError, pl.exceptions.ComputeError), match=match):
+        lf.collect()
 
-    df = pl.DataFrame([dates, values])
-    lf, container = generate_lazy_frame_and_container_with_pushed_predicate(df)
 
-    add_business_days = pl.col.Date.dt.add_business_days(2, roll="forward")
-    lf = lf.with_columns(add_business_days.alias("BusinessDatePlus2"))
-    # Now, we expect the Dates to be [2023-01-04, 2023-01-04, 2023-01-05]
-    assert dates.dt.add_business_days(2, roll="forward").to_list() == [date(2023, 1, 4), date(2023, 1, 4), date(2023, 1, 5)]
-
-    # Now, we can use lookback to convert filters on BusinessDatePlus2 to Date filters
+# A filter on BusinessDatePlus2 (the date two business days on) becomes a Date filter widened by the window.
+@pytest.mark.parametrize(
+    ("lookahead", "upper"), [(None, date(2023, 1, 4)), (timedelta(days=1), date(2023, 1, 5))], ids=["simple_lookback", "simple_lookahead"]
+)
+def test_linked_business_days(lookahead, upper):
+    tracker = PredicateTracker(pl.DataFrame({"Date": [date(2023, 1, d) for d in (1, 2, 3)], "Value": [1, 2, 3]}))
+    lf = tracker.lazy_frame.with_columns(c("Date").dt.add_business_days(2, roll="forward").alias("BusinessDatePlus2"))
     result = (
-        lf.piot.ts_with_columns(
-            [],
-            "Date",
-            linked_cols=["BusinessDatePlus2"],
-            lookback=timedelta(days=3),  # Look back 3 days
-        )
-        .filter(pl.col("BusinessDatePlus2") == date(2023, 1, 4))  # This filter will be converted to a Date filter
-        .filter((pl.col("Date") == pl.col.Date.max()).over("BusinessDatePlus2"))  # we then filter for the max Date per BusinessDatePlus2
+        lf.piot.ts_with_columns([], "Date", linked_cols=["BusinessDatePlus2"], lookback=timedelta(days=3), lookahead=lookahead)
+        .filter(c("BusinessDatePlus2") == date(2023, 1, 4))
+        .filter((c("Date") == c("Date").max()).over("BusinessDatePlus2"))
         .collect()
     )
-    expected = pl.DataFrame(
-        {
-            "Date": [date(2023, 1, 2)],
-            "Value": [2],
-            "BusinessDatePlus2": [date(2023, 1, 4)],
-        }
-    )
-    assert_frame_equal(result, expected)
-    _assert_date_between_predicate_if_pushed(container["last_predicate"], date(2023, 1, 1), date(2023, 1, 4))
+    assert_frame_equal(result, pl.DataFrame({"Date": [date(2023, 1, 2)], "Value": [2], "BusinessDatePlus2": [date(2023, 1, 4)]}))
+    # Some Polars versions push nothing here.
+    if tracker.last_predicate is not None:
+        assert_pushed_bounds(tracker, "Date", date(2023, 1, 1), upper)
 
 
-def test_simple_lookahead():
-    dates = pl.Series("Date", [date(2023, 1, 1), date(2023, 1, 2), date(2023, 1, 3)])
-    values = pl.Series("Value", [1, 2, 3])
+# Forward fill through a linked column (EventDate == 4 Jan becomes Date == 4 Jan) or the index itself (Date == 3 Jan, on
+# four rows). The lookback must reach 1 Jan; a sub-day remainder reaches it only on a Date index, rounded out to whole days.
+WINDOWED_FILLS = [
+    Case("ts_ffill", "linked", None, {"days": 3, "reach": 3, "ts": {"linked_cols": ["EventDate"]}, "filter": c("EventDate") == date(2023, 1, 4)}),
+    Case("ts_ffill_no_indexed_column", "index", None, {"days": 4, "reach": 2, "ts": {}, "filter": c("Date") == date(2023, 1, 3)}),
+]
 
-    df = pl.DataFrame([dates, values])
-    lf, container = generate_lazy_frame_and_container_with_pushed_predicate(df)
 
-    add_business_days = pl.col.Date.dt.add_business_days(2, roll="forward")
-    lf = lf.with_columns(add_business_days.alias("BusinessDatePlus2"))
-    assert dates.dt.add_business_days(2, roll="forward").to_list() == [date(2023, 1, 4), date(2023, 1, 4), date(2023, 1, 5)]
-
+@pytest.mark.parametrize("index_dtype", [pl.Date, pl.Datetime], ids=["Date", "Datetime"])
+@pytest.mark.parametrize("short", [None, timedelta(days=1), timedelta(hours=6), timedelta()], ids=["none", "day_short", "hours_short", "reaches"])
+@pytest.mark.parametrize(("via", "kw"), params(WINDOWED_FILLS, "pred", "kw"))
+def test_windowed_forward_fill(via, kw, short, index_dtype):
+    """``short`` is how far the lookback falls short of 1 Jan; ``None`` is no lookback."""
+    lookback = None if short is None else timedelta(days=kw["reach"]) - short
     result = (
-        lf.piot.ts_with_columns(
-            [],
-            "Date",
-            linked_cols=["BusinessDatePlus2"],
-            lookback=timedelta(days=3),
-            lookahead=timedelta(days=1),  # Extend the upper bound by 1 day
-        )
-        .filter(pl.col("BusinessDatePlus2") == date(2023, 1, 4))
-        .filter((pl.col("Date") == pl.col.Date.max()).over("BusinessDatePlus2"))
+        _frame(index_dtype, kw["days"])
+        .lazy()
+        .piot.ts_with_columns([FFILL], index_col="Date", lookback=lookback, **kw["ts"])
+        .filter(kw["filter"])
+        .select(SELECTED)
         .collect()
     )
-
-    expected = pl.DataFrame(
-        {
-            "Date": [date(2023, 1, 2)],
-            "Value": [2],
-            "BusinessDatePlus2": [date(2023, 1, 4)],
-        }
-    )
-    assert_frame_equal(result, expected)
-    _assert_date_between_predicate_if_pushed(container["last_predicate"], date(2023, 1, 1), date(2023, 1, 5))
-
-
-@pytest.mark.parametrize("lookback", [None, timedelta(days=2), timedelta(days=2, hours=18), timedelta(days=3)])
-@pytest.mark.parametrize("index_col_typ", [pl.Date, pl.Datetime])
-def test_ts_ffill(lookback, index_col_typ):
-    func = datetime if index_col_typ == pl.Datetime else date
-    target_val = func(2023, 1, 3)
-    df = _generate_df(index_col_typ).lazy()
-
-    result = (
-        df.piot.ts_with_columns(
-            [pl.col("Value").forward_fill(3).alias("ForwardFill")],
-            index_col="Date",
-            lookback=lookback,
-            linked_cols=["EventDate"],
-        )
-        .filter(pl.col("EventDate") == date(2023, 1, 4))  # This filter will be converted to a Date filter
-        .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
-        .collect()
-    )
-    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Int64}
-    expected_schema.pop("DummyValue")  # DummyValue is not in the result
-
-    # We look back 3 rows, but we need our lookback to contain the only non-null value in our table.
-    # That non-null-value has EventDate = 2023-01-02, which is 2 days before our target date of 2023-01-04.
-    # However, we utililze "Date" to determine the lookback
-    if lookback is None:
-        # If lookback is None, we try to filter for Date = 2023-01-04, but that is empty so we get an empty result.
-        expected = pl.DataFrame({}, schema=expected_schema)
+    if short is None:
+        # Without a lookback a linked filter becomes Date == 4 Jan, which has no row.
+        expected = _filled(index_dtype, None, empty=via == "linked")
     else:
-        if lookback >= timedelta(days=3):
-            ffill = 100
-        elif lookback > timedelta(days=2):
-            # We only forward fill if the index_col type is Date, so we round down to the nearest day.
-            ffill = 100 if index_col_typ == pl.Date else None
-        else:
-            ffill = None
-        expected = pl.DataFrame(
-            {"Date": [target_val], "EventDate": [date(2023, 1, 4)], "PointID": [1], "Value": [None], "ForwardFill": [ffill]}, schema=expected_schema
-        )
+        expected = _filled(index_dtype, 100 if not short or (short < timedelta(days=1) and index_dtype == pl.Date) else None)
     assert_frame_equal(result, expected)
 
 
-@pytest.mark.parametrize("lookback", [None, timedelta(days=1), timedelta(days=1, hours=18), timedelta(days=2)])
-@pytest.mark.parametrize("index_col_typ", [pl.Date, pl.Datetime])
-def test_ts_ffill_no_indexed_column(lookback, index_col_typ):
-    schema = {"Date": index_col_typ, "EventDate": pl.Date, "PointID": pl.Int64, "Value": pl.Int64, "DummyValue": pl.Int64}
-    func = datetime if index_col_typ == pl.Datetime else date
-    datetime_vals = [
-        func(2023, 1, 1),
-        func(2023, 1, 2),
-        func(2023, 1, 3),
-        func(2023, 1, 4),  # Added an extra date to ensure we can test lookback correctly
-    ]
-    target_val = func(2023, 1, 3)
-    df = pl.LazyFrame(
-        {
-            "Date": datetime_vals,
-            "EventDate": [date(2023, 1, 2), date(2023, 1, 3), date(2023, 1, 4), date(2023, 1, 5)],
-            "PointID": [1, 1, 1, 1],
-            "Value": [100, None, None, 200],
-            "DummyValue": [1, 2, 3, 4],
-        },
-        schema=schema,
-    )
+def _ffill_callable(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.with_columns(FFILL.cast(pl.Float64))
+
+
+# The window reaches back for the fill even where a later filter drops the row it fills from.
+FILLS = [
+    Case("ts_ffill_multiple_filters-date", [FFILL.cast(pl.Float64)], c("Date") > date(2023, 1, 1)),
+    Case("ts_ffill_multiple_filters-dummy", [FFILL.cast(pl.Float64)], c("DummyValue") > 1),
+    Case("ts_with_columns_callable_expression", _ffill_callable, None),
+]
+
+
+@pytest.mark.parametrize(("exprs", "extra"), params(FILLS, "pred", "expect"))
+def test_forward_fill_reaches_back(exprs, extra):
+    lf = _frame(pl.Date).lazy().piot.ts_with_columns(exprs, **LINKED).filter(c("EventDate") == date(2023, 1, 4))
+    lf = lf if extra is None else lf.filter(extra)
+    assert_frame_equal(lf.select(SELECTED).collect(), _filled(pl.Date, 100.0, pl.Float64))
+
+
+def _between_3_and_4(**cols) -> pl.DataFrame:
+    base = _frame(pl.Date).slice(1, 2).with_columns(Value=pl.lit(None, dtype=pl.Int64))
+    return base.with_columns(**{name: pl.Series(values) for name, values in cols.items()})
+
+
+# (positional arguments to ts_with_columns) -> the rows with EventDate in [3 Jan, 4 Jan]
+BETWEEN = [
+    Case("ts_rolling_mean", [[c("DummyValue").sum().rolling(index_column="Date", period="2d")]], _between_3_and_4(DummyValue=[3, 5])),
+    Case("ts_with_columns_args-list", [[c("DummyValue").alias("col1"), c("DummyValue").alias("col2")]], _between_3_and_4(col1=[2, 3], col2=[2, 3])),
+    Case("ts_with_columns_args-varargs", [c("DummyValue").alias("col1"), c("DummyValue").alias("col2")], _between_3_and_4(col1=[2, 3], col2=[2, 3])),
+]
+
+
+@pytest.mark.parametrize(("args", "expected"), params(BETWEEN, "pred", "expect"))
+def test_linked_range(args, expected):
     result = (
-        df.piot.ts_with_columns(
-            [pl.col("Value").forward_fill(3).alias("ForwardFill")],
-            index_col="Date",
-            lookback=lookback,
-        )
-        .filter(pl.col("Date") == date(2023, 1, 3))
-        .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
-        .collect()
-    )
-    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Int64}
-    expected_schema.pop("DummyValue")  # DummyValue is not in the result
-
-    # We look back 3 rows, but we need our lookback to contain the only non-null value in our table.
-    if lookback is None:
-        # No lookback
-        ffill = None
-    elif lookback >= timedelta(days=2):
-        # We always lookback
-        ffill = 100
-    elif lookback > timedelta(days=1):
-        # Here we have timedeltas between 1 and 2 days.
-        # We only forward fill if the index_col type is Date, since we expand our range to the nearest day.
-        ffill = 100 if index_col_typ == pl.Date else None
-    else:
-        ffill = None
-    expected = pl.DataFrame(
-        {"Date": [target_val], "EventDate": [date(2023, 1, 4)], "PointID": [1], "Value": [None], "ForwardFill": [ffill]}, schema=expected_schema
-    )
-    assert_frame_equal(result, expected)
-
-
-@pytest.mark.parametrize("expr", [pl.col("Date") > date(2023, 1, 1), pl.col("DummyValue") > 1])
-def test_ts_ffill_multiple_filters(expr):
-    df = _generate_df(pl.Date).lazy()
-    result = (
-        df.piot.ts_with_columns(
-            [pl.col("Value").forward_fill(3).alias("ForwardFill").cast(pl.Float64)],
-            index_col="Date",
-            lookback=timedelta(days=3),
-            linked_cols=["EventDate"],
-        )
-        .filter(pl.col("EventDate") == date(2023, 1, 4))  # This filter will be converted to a Date filter
-        .filter(expr)
-        .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
-        .collect()
-    )
-    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Float64}
-    expected_schema.pop("DummyValue")  # DummyValue is not in the result
-
-    # Now, in either case we get the forward fill, because even though our filter on "Date" filters out the first row,
-    # the lookback logic we apply extends our logic to include the first row, which gets filtered out afterwards.
-    ffill = 100.0
-    expected = pl.DataFrame(
-        {"Date": [date(2023, 1, 3)], "EventDate": [date(2023, 1, 4)], "PointID": [1], "Value": [None], "ForwardFill": [ffill]}, schema=expected_schema
-    )
-    assert_frame_equal(result, expected)
-
-
-def test_ts_rolling_mean():
-    df = _generate_df(pl.Date).lazy()
-    result = (
-        df.piot.ts_with_columns(
-            [pl.col("DummyValue").sum().rolling(index_column="Date", period="2d")],
-            index_col="Date",
-            lookback=timedelta(days=3),
-            linked_cols=["EventDate"],
-        )
-        .filter(pl.col("EventDate").is_between(date(2023, 1, 3), date(2023, 1, 4)))  # This filter will be converted to a Date filter
-        .collect()
-    )
-    expected_schema = df.collect_schema()
-
-    # Now, in either case we get the forward fill, because even though our filter on "Date" filters out the first row,
-    # the lookback logic we apply extends our logic to include the first row, which gets filtered out afterwards.
-    expected = pl.DataFrame(
-        {
-            "Date": [date(2023, 1, 2), date(2023, 1, 3)],
-            "EventDate": [date(2023, 1, 3), date(2023, 1, 4)],
-            "PointID": [1, 1],
-            "Value": [None, None],
-            "DummyValue": [3, 5],  # note that we sum the DummyValue over a 2-day rolling window
-        },
-        schema=expected_schema,
-    )
-    assert_frame_equal(result, expected)
-
-
-def test_ts_with_columns_args():
-    df = _generate_df(pl.Date).lazy()
-    kwargs = {
-        "index_col": "Date",
-        "lookback": timedelta(days=3),
-        "linked_cols": ["EventDate"],
-    }
-    res = [
-        # Just pass list as first args.
-        df.piot.ts_with_columns(
-            [pl.col("DummyValue").alias("col1"), pl.col("DummyValue").alias("col2")],
-            **kwargs,
-        ),
-        # As args.
-        df.piot.ts_with_columns(
-            pl.col("DummyValue").alias("col1"),
-            pl.col("DummyValue").alias("col2"),
-            **kwargs,
-        ),
-    ]
-
-    for r in res:
-        result = r.filter(
-            pl.col("EventDate").is_between(date(2023, 1, 3), date(2023, 1, 4))
-        ).collect()  # This filter will be converted to a Date filter
-        expected_schema = df.collect_schema()
-        expected_schema["col1"] = pl.Int64
-        expected_schema["col2"] = pl.Int64
-
-        # Now, in either case we get the forward fill, because even though our filter on "Date" filters out the first row,
-        # the lookback logic we apply extends our logic to include the first row, which gets filtered out afterwards.
-        expected = pl.DataFrame(
-            {
-                "Date": [date(2023, 1, 2), date(2023, 1, 3)],
-                "EventDate": [date(2023, 1, 3), date(2023, 1, 4)],
-                "PointID": [1, 1],
-                "Value": [None, None],
-                "DummyValue": [2, 3],
-                "col1": [2, 3],
-                "col2": [2, 3],
-            },
-            schema=expected_schema,
-        )
-        assert_frame_equal(result, expected)
-
-
-def test_ts_with_columns_callable_expression():
-    """Ensure callable expressions are supported and integrated with lookback pushdown."""
-    df = _generate_df(pl.Date).lazy()
-
-    def expr_fn(lf: pl.LazyFrame) -> pl.LazyFrame:
-        return lf.with_columns(pl.col("Value").forward_fill(3).alias("ForwardFill").cast(pl.Float64))
-
-    result = (
-        df.piot.ts_with_columns(
-            expr_fn,
-            index_col="Date",
-            lookback=timedelta(days=3),
-            linked_cols=["EventDate"],
-        )
-        .filter(pl.col("EventDate") == date(2023, 1, 4))
-        .select("Date", "EventDate", "PointID", "Value", "ForwardFill")
-        .collect()
-    )
-
-    expected_schema = {**df.collect_schema(), "ForwardFill": pl.Float64}
-    expected_schema.pop("DummyValue")
-    assert result.collect_schema() == expected_schema
-    expected = pl.DataFrame(
-        {"Date": [date(2023, 1, 3)], "EventDate": [date(2023, 1, 4)], "PointID": [1], "Value": [None], "ForwardFill": [100.0]},
-        schema=expected_schema,
+        _frame(pl.Date).lazy().piot.ts_with_columns(*args, **LINKED).filter(c("EventDate").is_between(date(2023, 1, 3), date(2023, 1, 4))).collect()
     )
     assert_frame_equal(result, expected)
 
 
 def test_ts_with_columns_callable_no_filters():
-    """Callable expressions should behave like .pipe when no filters are present."""
-    df = pl.DataFrame(
-        {
-            "Date": [date(2023, 1, 1), date(2023, 1, 2)],
-            "val": [1, 2],
-        }
-    ).lazy()
-
-    def expr_fn(lf: pl.LazyFrame) -> pl.LazyFrame:
-        return lf.with_columns(pl.lit(42).alias("answer"))
-
-    res = df.piot.ts_with_columns(expr_fn, index_col="Date").collect()
-    exp = df.pipe(expr_fn).collect()
-    assert_frame_equal(res, exp)
+    """Without a filter a callable behaves like ``pipe``."""
+    lf = pl.LazyFrame({"Date": [date(2023, 1, 1), date(2023, 1, 2)], "val": [1, 2]})
+    assert_frame_equal(
+        lf.piot.ts_with_columns(lambda x: x.with_columns(pl.lit(42).alias("answer")), index_col="Date").collect(),
+        lf.with_columns(answer=pl.lit(42)).collect(),
+    )
 
 
 @pytest.mark.parametrize("lookback", [timedelta(days=1), timedelta(days=3)])
-@pytest.mark.parametrize("index_col_typ", [pl.Date, pl.Datetime])
-def test_ts_ffill_over_with_filtering(lookback, index_col_typ):
+@pytest.mark.parametrize("index_dtype", [pl.Date, pl.Datetime])
+def test_ts_ffill_over_with_filtering(lookback, index_dtype):
+    """A forward fill over Symbol, then a filter on Symbol after ts_with_columns: Polars pushes both Date and Symbol.
+
+    A has a value on day 1 only, so its day-3 fill needs a 2-day lookback; B has one on day 3.
     """
-    Test forward fill with over() clause and subsequent symbol filtering.
-
-    This test verifies that:
-    1. Forward fill works correctly for each symbol independently using the over() clause
-    2. Filters on symbol applied AFTER ts_with_columns work correctly
-    3. The lookback parameter correctly determines which values are included
-
-    The test creates data where:
-    - Symbol A has a value only on day 1
-    - Symbol B has a value only on day 3
-
-    Then tests if filtering to day 3 and by symbol produces the correct forward fill results.
-    """
-    schema = {"Date": index_col_typ, "EventDate": pl.Date, "Symbol": pl.Utf8, "Value": pl.Int64}
-    func = datetime if index_col_typ == pl.Datetime else date
-
-    # Create test data with two symbols A and B with different value patterns
+    func = datetime if index_dtype == pl.Datetime else date
+    schema = {"Date": index_dtype, "EventDate": pl.Date, "Symbol": pl.Utf8, "Value": pl.Int64}
+    days = [func(2023, 1, d) for d in (1, 2, 3)] * 2
     df = pl.DataFrame(
         {
-            "Date": [
-                # Symbol A data - Value on day 1 only
-                func(2023, 1, 1),
-                func(2023, 1, 2),
-                func(2023, 1, 3),
-                # Symbol B data - Value on day 3 only
-                func(2023, 1, 1),
-                func(2023, 1, 2),
-                func(2023, 1, 3),
-            ],
-            "EventDate": [
-                # Event dates matching Date column for simplicity
-                date(2023, 1, 1),
-                date(2023, 1, 2),
-                date(2023, 1, 3),
-                date(2023, 1, 1),
-                date(2023, 1, 2),
-                date(2023, 1, 3),
-            ],
-            "Symbol": ["A", "A", "A", "B", "B", "B"],
+            "Date": days,
+            "EventDate": [date(2023, 1, d) for d in (1, 2, 3)] * 2,
+            "Symbol": ["A"] * 3 + ["B"] * 3,
             "Value": [100, None, None, None, None, 300],
         },
         schema=schema,
     )
-
-    lf, container = generate_lazy_frame_and_container_with_pushed_predicate(df)
-
-    # Apply ts_with_columns with forward_fill().over("Symbol") expression
+    tracker = PredicateTracker(df)
     result = (
-        lf.clone()
-        .piot.ts_with_columns(
-            [
-                # Forward fill values within each Symbol group
-                pl.col("Value").forward_fill(3).over("Symbol").alias("ForwardFill").cast(pl.Float64)
-            ],
+        tracker.lazy_frame.piot.ts_with_columns(
+            [c("Value").forward_fill(3).over("Symbol").alias("ForwardFill").cast(pl.Float64)],
             index_col="Date",
             lookback=lookback,
             linked_cols=["EventDate"],
         )
-        .filter(pl.col("EventDate") == date(2023, 1, 3))  # Filter to just day 3
+        .filter(c("EventDate") == date(2023, 1, 3))
         .select("Date", "EventDate", "Symbol", "Value", "ForwardFill")
     )
-
-    # Filter the result by Symbol after collection
-    result_a = result.clone().filter(pl.col("Symbol") == "A").collect()
-
-    # For Symbol A, value from day 1 should be forward filled to day 3,
-    # but only if lookback is sufficient to include day 1
-    expected_schema = {"Date": index_col_typ, "EventDate": pl.Date, "Symbol": pl.Utf8, "Value": pl.Int64, "ForwardFill": pl.Float64}
-
-    # For Symbol A on day 3, we need lookback >= 2 days to reach the value on day 1
-    if lookback >= timedelta(days=2):
-        ffill_a = 100.0  # Lookback includes day 1, so value gets forward filled
-    else:
-        ffill_a = None  # Lookback doesn't reach day 1, so no value to forward fill
-
-    expected_a = pl.DataFrame(
-        {
-            "Date": [func(2023, 1, 3)],
-            "EventDate": [date(2023, 1, 3)],
-            "Symbol": ["A"],
-            "Value": [None],
-            "ForwardFill": [ffill_a],
-        },
-        schema=expected_schema,
-    )
-    assert_frame_equal(result_a, expected_a)
-    pushed_down_predicate = container.get("last_predicate")
-    # We push down filters to Date and Symbol, Polars handles this for us since
-    # We are performing the "over" operation on Symbol
-    assert sorted(pushed_down_predicate.meta.root_names()) == ["Date", "Symbol"]
-
-    # Filter to Symbol B
-    result_b = result.clone().filter(pl.col("Symbol") == "B").collect()
-
-    # For Symbol B, value is on the current day (day 3), so always available regardless of lookback
-    expected_b = pl.DataFrame(
-        {
-            "Date": [func(2023, 1, 3)],
-            "EventDate": [date(2023, 1, 3)],
-            "Symbol": ["B"],
-            "Value": [300],
-            "ForwardFill": [300.0],  # Value is from the current day
-        },
-        schema=expected_schema,
-    )
-    assert_frame_equal(result_b, expected_b)
-    pushed_down_predicate = container.get("last_predicate")
-    assert sorted(pushed_down_predicate.meta.root_names()) == ["Date", "Symbol"]
+    for symbol, value, ffill in [("A", None, 100.0 if lookback >= timedelta(days=2) else None), ("B", 300, 300.0)]:
+        expected = pl.DataFrame(
+            {"Date": [func(2023, 1, 3)], "EventDate": [date(2023, 1, 3)], "Symbol": [symbol], "Value": [value], "ForwardFill": [ffill]},
+            schema={**schema, "ForwardFill": pl.Float64},
+        )
+        assert_frame_equal(result.filter(c("Symbol") == symbol).collect(), expected)
+        assert sorted(tracker.last_predicate.meta.root_names()) == ["Date", "Symbol"]
