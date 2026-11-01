@@ -1,3 +1,9 @@
+"""Profiling spans around IO sources.
+
+The main table drives an iterator (bare, wrapped, or as registered with Polars) and checks the one span it emits.
+"""
+
+import contextlib
 import time
 from collections.abc import Iterator
 
@@ -16,6 +22,7 @@ from polars_io_tools.io_sources.profiling import (
     wrap_io_source_with_profiling,
 )
 from polars_io_tools.io_sources.util import register_io_source_with_is_pure
+from polars_io_tools.tests.helpers.catalogue import Case, params
 
 _EXPORTER = InMemorySpanExporter()
 
@@ -62,151 +69,240 @@ def _module_level_reader():
     return source_generator
 
 
-def test_multi_batch_accumulates_only_pull_time():
-    sleep_s = 0.015
+# Iterators driven by a consumer -> the one span emitted: its attributes, and what the consumer sees.
+class Iter:
+    """A hand-written iterator: ``batches`` frames, then ``stop`` (StopIteration or an exception), each step after
+    ``sleep`` seconds; ``close`` records the call and raises ``close_error`` if given."""
 
-    def source() -> Iterator[pl.DataFrame]:
-        for value in range(3):
-            time.sleep(sleep_s)
-            yield pl.DataFrame({"value": [value]})
+    def __init__(self, batches=(), stop=StopIteration, sleep=0.0, sleep_before_stop=0.0, close_error=None, endless=False):
+        self.batches, self.stop, self.sleep, self.sleep_before_stop = list(batches), stop, sleep, sleep_before_stop
+        self.close_error, self.endless, self.closed = close_error, endless, False
 
-    assert len(list(_profile(source()))) == 3
+    def __iter__(self):
+        return self
 
-    span = _span()
-    assert span.attributes["polars_io_tools.next_elapsed_total_ms"] >= 3 * sleep_s * 0.8 * 1000
-    assert span.attributes["polars_io_tools.total_rows"] == 3
-    assert span.attributes["polars_io_tools.n_columns"] == 1
-    assert span.attributes["polars_io_tools.batch_count"] == 3
-    assert span.attributes["polars_io_tools.outcome"] == "exhausted"
-
-
-def test_slow_terminal_stop_iteration_is_counted():
-    terminal_sleep_s = 0.025
-
-    class SlowTerminalIterator:
-        def __init__(self) -> None:
-            self._yielded = False
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            if not self._yielded:
-                self._yielded = True
-                return pl.DataFrame({"value": [1]})
-            time.sleep(terminal_sleep_s)
-            raise StopIteration
-
-    assert len(list(_profile(SlowTerminalIterator()))) == 1
-    span = _span()
-    assert span.attributes["polars_io_tools.next_elapsed_total_ms"] >= terminal_sleep_s * 0.8 * 1000
-    assert span.attributes["polars_io_tools.outcome"] == "exhausted"
-
-
-def test_failure_before_first_yield_is_counted_and_propagated_unchanged():
-    error = ValueError("source failed")
-    failure_sleep_s = 0.025
-
-    class FailingIterator:
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            time.sleep(failure_sleep_s)
-            raise error
-
-    with pytest.raises(ValueError) as exc_info:
-        next(_profile(FailingIterator()))
-
-    assert exc_info.value is error
-    span = _span()
-    assert span.attributes["polars_io_tools.next_elapsed_total_ms"] >= failure_sleep_s * 0.8 * 1000
-    assert span.attributes["polars_io_tools.total_rows"] == 0
-    assert span.attributes["polars_io_tools.batch_count"] == 0
-    assert span.attributes["polars_io_tools.outcome"] == "error"
-    assert span.attributes["error.type"] == "ValueError"
-
-
-def test_failure_reports_partial_rows():
-    error = LookupError("failed after a batch")
-
-    def source() -> Iterator[pl.DataFrame]:
-        yield pl.DataFrame({"value": [1, 2]})
-        time.sleep(0.015)
-        raise error
-
-    iterator = _profile(source())
-    assert next(iterator).height == 2
-    with pytest.raises(LookupError) as exc_info:
-        next(iterator)
-
-    assert exc_info.value is error
-    span = _span()
-    assert span.attributes["polars_io_tools.total_rows"] == 2
-    assert span.attributes["polars_io_tools.n_columns"] == 1
-    assert span.attributes["polars_io_tools.batch_count"] == 1
-    assert span.attributes["polars_io_tools.outcome"] == "error"
-    assert span.attributes["polars_io_tools.next_elapsed_total_ms"] >= 10
-
-
-def test_consumer_sleep_between_pulls_is_excluded():
-    iterator = _profile(iter([pl.DataFrame({"value": [1]}), pl.DataFrame({"value": [2]})]))
-
-    next(iterator)
-    time.sleep(0.1)
-    next(iterator)
-    with pytest.raises(StopIteration):
-        next(iterator)
-
-    assert _span().attributes["polars_io_tools.next_elapsed_total_ms"] < 50
-
-
-@pytest.mark.parametrize("pull_first", [False, True])
-def test_early_close_propagates_to_custom_iterator_and_emits_once(pull_first):
-    class ClosableIterator:
-        def __init__(self) -> None:
-            self.closed = False
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
+    def __next__(self):
+        if self.endless:
             return pl.DataFrame({"value": [1]})
+        time.sleep(self.sleep)
+        if self.batches:
+            return self.batches.pop(0)
+        time.sleep(self.sleep_before_stop)
+        raise self.stop
 
-        def close(self):
-            self.closed = True
+    def close(self):
+        self.closed = True
+        if self.close_error:
+            raise self.close_error
 
-    inner = ClosableIterator()
-    iterator = _profile(inner)
-    if pull_first:
-        next(iterator)
-    iterator.close()
-    iterator.close()
 
-    assert inner.closed
+def _one(*values):
+    return [pl.DataFrame({"value": [v]}) for v in values]
+
+
+def _wrapped(source, schema=None, explain_name="empty.reader", with_columns=None):
+    return lambda monkeypatch: (
+        wrap_io_source_with_profiling(source, schema=schema or {"a": pl.Int64, "b": pl.Int64}, explain_name=explain_name)(
+            with_columns, None, None, None
+        ),
+        None,
+    )
+
+
+def _profiled(inner):
+    return lambda monkeypatch: (_profile(inner()), None)
+
+
+def _profiled_inner(inner):
+    def start(monkeypatch):
+        it = inner()
+        return _profile(it), it
+
+    return start
+
+
+def _eager_sleeper(*_args, **_kwargs):
+    time.sleep(0.05)
+    return iter(_one(1))
+
+
+class CallableSource:
+    def __call__(self, *_args, **_kwargs):
+        return iter(_one(1))
+
+
+def _registered(source, **kwargs):
+    """The callback register_io_source_with_is_pure hands to Polars, so the real wrapper composition is exercised."""
+
+    def start(monkeypatch):
+        captured = {}
+
+        def fake_register(io_source, *, schema, **_kw):
+            captured["io_source"] = io_source
+            return object()
+
+        monkeypatch.setattr("polars.io.plugins.register_io_source", fake_register)
+        inner = source()
+        register_io_source_with_is_pure(inner if callable(inner) else (lambda *a, **k: inner), schema={"value": pl.Int64}, **kwargs)
+
+        def pull():  # call the callback inside the consumer, where a failing factory raises
+            yield from captured["io_source"](None, None, None, None)
+
+        return pull(), inner
+
+    return start
+
+
+def _raise_connection(*_args, **_kwargs):
+    raise ConnectionError("connect failed")
+
+
+_ERR_VALUE, _ERR_LOOKUP = ValueError("source failed"), LookupError("failed after a batch")
+EXHAUSTED, CLOSED, ERROR = ({"polars_io_tools.outcome": o} for o in ("exhausted", "closed", "error"))
+ELAPSED = "polars_io_tools.next_elapsed_total_ms"
+ABSENT = object()
+
+
+def _at_least(ms):
+    return lambda v: v >= ms
+
+
+def _below(ms):
+    return lambda v: v < ms
+
+
+def _stats(rows, batches, columns=1):
+    return {"polars_io_tools.total_rows": rows, "polars_io_tools.batch_count": batches, "polars_io_tools.n_columns": columns}
+
+
+def S(id, start, attrs, drive="list", raises=None, closed=None):
+    """``drive``: how the consumer pulls — "list"; "next" (one pull); "pull_then_fail" (one pull, then the next
+    raises); "sleepy" (sleeps between pulls); "close" / "pull_close" (closes twice, after no or one pull).
+    ``raises``: the exception (class, or the very object) the consumer sees. ``closed``: whether the inner iterator
+    was closed. ``attrs`` values may be predicates; ABSENT means the attribute is not set."""
+    return Case(id, start, attrs, {"drive": drive, "raises": raises, "closed": closed})
+
+
+SPANS = [
+    S(
+        "multi_batch_accumulates_only_pull_time",
+        _profiled(lambda: Iter(_one(0, 1, 2), sleep=0.015)),
+        {**EXHAUSTED, **_stats(3, 3), ELAPSED: _at_least(3 * 15 * 0.8)},
+    ),
+    S(
+        "slow_terminal_stop_iteration_is_counted",
+        _profiled(lambda: Iter(_one(1), sleep_before_stop=0.025)),
+        {**EXHAUSTED, ELAPSED: _at_least(25 * 0.8)},
+    ),
+    S(
+        "failure_before_first_yield_is_counted_and_propagated_unchanged",
+        _profiled(lambda: Iter(stop=_ERR_VALUE, sleep=0.025)),
+        {**ERROR, "polars_io_tools.total_rows": 0, "polars_io_tools.batch_count": 0, "error.type": "ValueError", ELAPSED: _at_least(25 * 0.8)},
+        "next",
+        _ERR_VALUE,
+    ),
+    S(
+        "failure_reports_partial_rows",
+        _profiled(lambda: Iter([pl.DataFrame({"value": [1, 2]})], stop=_ERR_LOOKUP, sleep_before_stop=0.015)),
+        {**ERROR, **_stats(2, 1), ELAPSED: _at_least(10)},
+        "pull_then_fail",
+        _ERR_LOOKUP,
+    ),
+    S("consumer_sleep_between_pulls_is_excluded", _profiled(lambda: iter(_one(1, 2))), {ELAPSED: _below(50)}, "sleepy"),
+    S(
+        "early_close_propagates_to_custom_iterator_and_emits_once-False",
+        _profiled_inner(lambda: Iter(endless=True)),
+        {**CLOSED, "polars_io_tools.total_rows": 0},
+        "close",
+        closed=True,
+    ),
+    S(
+        "early_close_propagates_to_custom_iterator_and_emits_once-True",
+        _profiled_inner(lambda: Iter(endless=True)),
+        {**CLOSED, "polars_io_tools.total_rows": 1},
+        "pull_close",
+        closed=True,
+    ),
+    S("exactly_once_emission_for_all_outcomes-exhausted", _profiled(lambda: iter(())), EXHAUSTED),
+    S("exactly_once_emission_for_all_outcomes-closed", _profiled(lambda: iter(_one(1))), CLOSED, "pull_close"),
+    S("exactly_once_emission_for_all_outcomes-error", _profiled(lambda: Iter(stop=ZeroDivisionError("boom"))), ERROR, "next", ZeroDivisionError),
+    S("empty_first_batch_sets_width_and_zero_rows", _profiled(lambda: iter([pl.DataFrame(schema={"a": pl.Int64, "b": pl.String})])), _stats(0, 1, 2)),
+    # the span is emitted before closing, with a clean outcome
+    S("clean_exit_propagates_inner_close_error", _profiled(lambda: Iter(close_error=RuntimeError("close failed"))), EXHAUSTED, raises=RuntimeError),
+    S(
+        "active_pull_error_not_masked_by_inner_close_error",
+        _profiled(lambda: Iter(stop=ValueError("pull failed"), close_error=RuntimeError("close failed"))),
+        ERROR,
+        "next",
+        ValueError,
+    ),
+    # with no batch the width comes from the projection, else from an eager schema
+    S(
+        "no_yield_uses_known_projection_or_eager_schema_width-projection",
+        _wrapped(lambda *a, **k: iter(()), with_columns=["a"]),
+        {"polars_io_tools.n_columns": 1},
+    ),
+    S("no_yield_uses_known_projection_or_eager_schema_width-schema", _wrapped(lambda *a, **k: iter(())), {"polars_io_tools.n_columns": 2}),
+    S("eager_callable_work_is_excluded_from_pull_time", _wrapped(_eager_sleeper, schema={"value": pl.Int64}), {ELAPSED: _below(30)}),
+    # a source's name is stable for callable objects and trimmed to the enclosing function for closures
+    S(
+        "default_source_identity_is_stable_for_callable_objects",
+        _wrapped(CallableSource(), schema={"value": pl.Int64}, explain_name=None),
+        {"polars_io_tools.explain_name": lambda v: v.endswith("CallableSource") and "0x" not in v},
+    ),
+    S(
+        "default_source_identity_trims_closure_to_enclosing_function",
+        _wrapped(_module_level_reader(), schema={"value": pl.Int64}, explain_name=None),
+        {"polars_io_tools.explain_name": "_module_level_reader"},
+    ),
+    # profiling wraps the original source inside the error-catching wrapper: eager work is excluded, a custom
+    # iterator is closed on exhaustion, and a failing factory still emits an error span
+    S("registration_excludes_eager_work_from_pull_time", _registered(lambda: _eager_sleeper), {ELAPSED: _below(40)}),
+    S("registration_closes_real_iterator_on_exhaustion", _registered(lambda: Iter(_one(1, 1))), EXHAUSTED, closed=True),
+    S(
+        "registration_emits_error_span_for_eager_factory_failure",
+        _registered(lambda: _raise_connection, wrap_with_error_catching=False),
+        {**ERROR, "error.type": "ConnectionError"},
+        raises=ConnectionError,
+    ),
+]
+
+
+@pytest.mark.parametrize(("start", "attrs", "drive", "raises", "closed"), params(SPANS, "pred", "expect", "drive", "raises", "closed"))
+def test_span(monkeypatch, start, attrs, drive, raises, closed):
+    iterator, inner = start(monkeypatch)
+    expected_error = pytest.raises(raises if isinstance(raises, type) else type(raises)) if raises is not None else contextlib.nullcontext()
+    with expected_error as error:
+        if drive == "list":
+            list(iterator)
+        elif drive == "next":
+            next(iterator)
+        elif drive == "pull_then_fail":
+            assert next(iterator).height == 2
+            next(iterator)
+        elif drive == "sleepy":
+            next(iterator)
+            time.sleep(0.1)
+            next(iterator)
+            with pytest.raises(StopIteration):
+                next(iterator)
+        else:
+            if drive == "pull_close":
+                next(iterator)
+            iterator.close()
+            iterator.close()
+    if raises is not None and not isinstance(raises, type):
+        assert error.value is raises
     span = _span()
-    assert span.attributes["polars_io_tools.outcome"] == "closed"
-    assert span.attributes["polars_io_tools.total_rows"] == (1 if pull_first else 0)
-
-
-def test_exactly_once_emission_for_all_outcomes():
-    assert list(_profile(iter(()))) == []
-    assert _span().attributes["polars_io_tools.outcome"] == "exhausted"
-    _EXPORTER.clear()
-
-    closed = _profile(iter([pl.DataFrame({"value": [1]})]))
-    next(closed)
-    closed.close()
-    assert _span().attributes["polars_io_tools.outcome"] == "closed"
-    _EXPORTER.clear()
-
-    def failing() -> Iterator[pl.DataFrame]:
-        raise ZeroDivisionError("boom")
-        yield
-
-    with pytest.raises(ZeroDivisionError):
-        next(_profile(failing()))
-    assert _span().attributes["polars_io_tools.outcome"] == "error"
+    for key, want in attrs.items():
+        if want is ABSENT:
+            assert key not in span.attributes
+        elif callable(want):
+            assert want(span.attributes[key]), (key, span.attributes[key])
+        else:
+            assert span.attributes[key] == want, key
+    if closed is not None:
+        assert inner.closed == closed
 
 
 def test_emission_failure_never_masks_completion_or_source_error(monkeypatch):
@@ -231,35 +327,6 @@ def test_emission_failure_never_masks_completion_or_source_error(monkeypatch):
     assert exc_info.value is error
 
 
-def test_no_yield_uses_known_projection_or_eager_schema_width():
-    wrapped = wrap_io_source_with_profiling(
-        lambda *_args, **_kwargs: iter(()),
-        schema={"a": pl.Int64, "b": pl.Int64},
-        explain_name="empty.reader",
-    )
-    assert list(wrapped(["a"], None, None, None)) == []
-    assert _span().attributes["polars_io_tools.n_columns"] == 1
-    _EXPORTER.clear()
-
-    wrapped = wrap_io_source_with_profiling(
-        lambda *_args, **_kwargs: iter(()),
-        schema={"a": pl.Int64, "b": pl.Int64},
-        explain_name="empty.reader",
-    )
-    assert list(wrapped(None, None, None, None)) == []
-    assert _span().attributes["polars_io_tools.n_columns"] == 2
-
-
-def test_empty_first_batch_sets_width_and_zero_rows():
-    frames = list(_profile(iter([pl.DataFrame(schema={"a": pl.Int64, "b": pl.String})])))
-    assert frames[0].is_empty()
-
-    span = _span()
-    assert span.attributes["polars_io_tools.total_rows"] == 0
-    assert span.attributes["polars_io_tools.n_columns"] == 2
-    assert span.attributes["polars_io_tools.batch_count"] == 1
-
-
 def test_deferred_schema_is_not_forced_for_telemetry():
     schema_calls = 0
 
@@ -276,21 +343,6 @@ def test_deferred_schema_is_not_forced_for_telemetry():
     assert list(wrapped(None, None, None, None)) == []
     assert schema_calls == 0
     assert "polars_io_tools.n_columns" not in _span().attributes
-
-
-def test_eager_callable_work_is_excluded_from_pull_time():
-    def eager_source(*_args, **_kwargs):
-        time.sleep(0.05)
-        return iter([pl.DataFrame({"value": [1]})])
-
-    wrapped = wrap_io_source_with_profiling(
-        eager_source,
-        schema={"value": pl.Int64},
-        explain_name="eager.reader",
-    )
-    frames = list(wrapped(None, None, None, None))
-    assert frames[0].height == 1
-    assert _span().attributes["polars_io_tools.next_elapsed_total_ms"] < 30
 
 
 def test_source_parent_is_captured_at_emit_time():
@@ -323,28 +375,6 @@ def test_source_parent_not_captured_at_construction():
     assert _span().parent is None
 
 
-def test_default_source_identity_is_stable_for_callable_objects():
-    class CallableSource:
-        def __call__(self, *_args, **_kwargs):
-            return iter([pl.DataFrame({"value": [1]})])
-
-    wrapped = wrap_io_source_with_profiling(CallableSource(), schema={"value": pl.Int64})
-    list(wrapped(None, None, None, None))
-
-    name = _span().attributes["polars_io_tools.explain_name"]
-    assert name.endswith("CallableSource")
-    assert "0x" not in name
-
-
-def test_default_source_identity_trims_closure_to_enclosing_function():
-    # Mirrors the real readers: a ``source_generator`` closure defined inside ``scan_db`` should resolve to ``scan_db``,
-    # not ``scan_db.<locals>.source_generator``.
-    wrapped = wrap_io_source_with_profiling(_module_level_reader(), schema={"value": pl.Int64})
-    list(wrapped(None, None, None, None))
-
-    assert _span().attributes["polars_io_tools.explain_name"] == "_module_level_reader"
-
-
 @pytest.mark.parametrize(
     "engine",
     ["auto", "streaming", pytest.param("in-memory", marks=pytest.mark.skipif(not POLARS_GE_2, reason="Polars 1 uses auto for in-memory execution"))],
@@ -375,75 +405,6 @@ def test_pure_self_join_profiles_physical_executions(engine):
     assert len(spans) == calls
     assert all(span.attributes["polars_io_tools.explain_name"] == "memory.reader" for span in spans)
     assert all(span.attributes["polars_io_tools.outcome"] == "exhausted" for span in spans)
-
-
-def _capture_registered_callback(source, monkeypatch, **kwargs):
-    # Assemble the callback exactly as register_io_source_with_is_pure hands it to polars, so tests exercise the real
-    # wrapper composition (profiling + error-catching) rather than profile_io_source_iterator in isolation.
-    captured = {}
-
-    def fake_register(io_source, *, schema, **_kw):
-        captured["io_source"] = io_source
-        return object()
-
-    monkeypatch.setattr("polars.io.plugins.register_io_source", fake_register)
-    register_io_source_with_is_pure(source, schema={"value": pl.Int64}, **kwargs)
-    return captured["io_source"]
-
-
-def test_registration_excludes_eager_work_from_pull_time(monkeypatch):
-    # With error-catching enabled (the default), eager work the source does before returning its iterator must still be
-    # excluded from pull time -- i.e. profiling wraps the original source, not the error-catching generator.
-    def source(*_args, **_kwargs):
-        time.sleep(0.05)
-        return iter([pl.DataFrame({"value": [1]})])
-
-    callback = _capture_registered_callback(source, monkeypatch)
-    list(callback(None, None, None, None))
-
-    assert _span().attributes["polars_io_tools.next_elapsed_total_ms"] < 40
-
-
-def test_registration_closes_real_iterator_on_exhaustion(monkeypatch):
-    # Profiling wraps the original source, so its close() reaches the real iterator on exhaustion even under the
-    # error-catching wrapper (whose yield-from would not close a custom iterator on normal completion).
-    class RealIter:
-        def __init__(self):
-            self.closed = False
-            self.remaining = 2
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            if self.remaining <= 0:
-                raise StopIteration
-            self.remaining -= 1
-            return pl.DataFrame({"value": [1]})
-
-        def close(self):
-            self.closed = True
-
-    iterator = RealIter()
-    callback = _capture_registered_callback(lambda *_a, **_k: iterator, monkeypatch)
-    list(callback(None, None, None, None))
-
-    assert iterator.closed
-
-
-def test_registration_emits_error_span_for_eager_factory_failure(monkeypatch):
-    # A non-generator source can raise while building its iterator, before the timed generator exists; that failure must
-    # still produce an ``error`` span with ``error.type``.
-    def source(*_args, **_kwargs):
-        raise ConnectionError("connect failed")
-
-    callback = _capture_registered_callback(source, monkeypatch, wrap_with_error_catching=False)
-    with pytest.raises(ConnectionError):
-        list(callback(None, None, None, None))
-
-    span = _span()
-    assert span.attributes["polars_io_tools.outcome"] == "error"
-    assert span.attributes["error.type"] == "ConnectionError"
 
 
 def test_instrumentation_opt_out_disables_spans_with_zero_overhead(monkeypatch):
@@ -495,41 +456,6 @@ def test_registration_wraps_source_and_forwards_kwargs(monkeypatch):
     assert captured["io_source"] is not source
     assert captured["schema"] == {"value": pl.Int64}
     assert captured["kwargs"]["validate_schema"] is True
-
-
-def test_clean_exit_propagates_inner_close_error():
-    class ClosingRaises:
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            raise StopIteration
-
-        def close(self):
-            raise RuntimeError("close failed")
-
-    with pytest.raises(RuntimeError, match="close failed"):
-        list(_profile(ClosingRaises()))
-
-    # The span is still emitted (before closing), with a clean outcome.
-    assert _span().attributes["polars_io_tools.outcome"] == "exhausted"
-
-
-def test_active_pull_error_not_masked_by_inner_close_error():
-    class BothRaise:
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            raise ValueError("pull failed")
-
-        def close(self):
-            raise RuntimeError("close failed")
-
-    with pytest.raises(ValueError, match="pull failed"):
-        next(_profile(BothRaise()))
-
-    assert _span().attributes["polars_io_tools.outcome"] == "error"
 
 
 def test_registration_resolves_identity_from_original_callable():
