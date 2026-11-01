@@ -535,7 +535,8 @@ _SHAPES = {
             s["s"]
             .rename({"data_date": "date"})
             .sort("date")
-            .join_asof(s["o"].sort("date"), on="date", by="key", strategy="backward", tolerance=timedelta(days=2))
+            # An unstable sort orders rows of equal date by the other rows present, so ties are broken by w.
+            .join_asof(s["o"].sort("date", "w"), on="date", by="key", strategy="backward", tolerance=timedelta(days=2))
         ),
     ),
     "group_by": (
