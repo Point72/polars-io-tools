@@ -1,6 +1,7 @@
 import functools
 import itertools
 import logging
+import math
 import re
 from datetime import date, timedelta
 from typing import Any, Literal
@@ -59,6 +60,15 @@ DNFOperator = Literal[
 DNFTuple = tuple[str, DNFOperator, Any]  # (column, op, value)
 DNFClause = list[DNFTuple]  # A single conjunction
 DNF = list[DNFClause]  # Full DNF expression
+
+# Distributing an AND over ORs multiplies clause counts, so an AND or a negation is not expanded past this many
+# (column, op, value) tuples in total.
+MAX_DNF_TUPLES = 100_000
+
+
+def _dnf_size(dnf: DNF) -> int:
+    """The number of (column, op, value) tuples in ``dnf``."""
+    return sum(len(clause) for clause in dnf)
 
 
 # Rewrites ``lit(1) < col`` as ``col > 1``; operators not listed are symmetric.
@@ -378,8 +388,19 @@ class DNFVisitor(ExprVisitor[DNF | None]):
         if not nodes:
             return
         results = [self._subconvert(n) for n in nodes]
-        self.result_dnf = functools.reduce(combine_and_dnf if is_and else combine_or_dnf, (dnf for dnf, _ in results))
-        self.negation_safe = all(dnf is not None and safe for dnf, safe in results)
+        exact = True
+
+        def combine(left: DNF | None, right: DNF | None) -> DNF | None:
+            nonlocal exact
+            if not is_and:
+                return combine_or_dnf(left, right)
+            combined = combine_and_dnf(left, right)
+            # Over the budget an AND stands for one of its sides, a superset that is not safe to negate.
+            exact = exact and combined is not left and combined is not right
+            return combined
+
+        self.result_dnf = functools.reduce(combine, (dnf for dnf, _ in results))
+        self.negation_safe = exact and all(dnf is not None and safe for dnf, safe in results)
 
     def default_result(self) -> DNF | None:
         """Default result is None."""
@@ -521,7 +542,7 @@ class DNFVisitor(ExprVisitor[DNF | None]):
                 inner_dnf, inner_safe = self._subconvert(inner)
                 if inner_dnf is not None and inner_safe:
                     self.result_dnf = negate_dnf(inner_dnf)
-                    self.negation_safe = True
+                    self.negation_safe = self.result_dnf is not None
 
         # Handle ALL_HORIZONTAL function (ANDing all inputs)
         elif node.function_type == BooleanFunctionType.ALL_HORIZONTAL:
@@ -565,10 +586,10 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
         # Without a safe ~P, combine_and_dnf falls back to F alone, a superset of ~P & F.
         negated_predicate = None
-        if predicate_dnf is not None and predicate_safe:
+        if predicate_dnf is not None and predicate_safe and (negated := negate_dnf(predicate_dnf)) is not None:
             # Polars also takes the otherwise branch where P is null, which happens only where a column in P is null.
             columns = dict.fromkeys(c for clause in predicate_dnf for c, _, _ in clause)
-            negated_predicate = negate_dnf(predicate_dnf) + [[(c, "is", None)] for c in columns]
+            negated_predicate = negated + [[(c, "is", None)] for c in columns]
         if node.falsy.can_extract_literal:
             not_predicate_and_falsy = negated_predicate if node.falsy.value else []
         else:
@@ -606,6 +627,9 @@ def combine_and_dnf(left_dnf: DNF | None, right_dnf: DNF | None) -> DNF | None:
         return right_dnf
     elif right_dnf is None:
         return left_dnf
+    if len(right_dnf) * _dnf_size(left_dnf) + len(left_dnf) * _dnf_size(right_dnf) > MAX_DNF_TUPLES:
+        # The AND keeps no more rows than either side, so the side holding more constraints stands for it.
+        return max(left_dnf, right_dnf, key=_dnf_size)
 
     result = []
     for left_clause in left_dnf:
@@ -643,12 +667,14 @@ def negate_operator(op: str) -> str:
     return operator_map.get(op, f"!{op}")
 
 
-def negate_dnf(dnf: DNF) -> DNF:
-    """Negate a DNF expression."""
+def negate_dnf(dnf: DNF) -> DNF | None:
+    """Negate a DNF expression, or return None when the result would exceed ``MAX_DNF_TUPLES``."""
     if not dnf:
         # Empty DNF means FALSE, negation is TRUE
         # Represent TRUE as an empty conjunction
         return [[]]
+    if math.prod(len(clause) for clause in dnf) * len(dnf) > MAX_DNF_TUPLES:
+        return None
     cnf_result = []
 
     # Convert to CNF (NOT of DNF)

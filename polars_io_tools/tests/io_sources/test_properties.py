@@ -22,7 +22,7 @@ from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import get_parsed_expr
 from polars_io_tools.io_sources.delta_io import scan_delta, sink_delta
-from polars_io_tools.io_sources.dnf_visitor import _is_contradiction, convert_expr_to_dnf
+from polars_io_tools.io_sources.dnf_visitor import MAX_DNF_TUPLES, _is_contradiction, convert_expr_to_dnf
 from polars_io_tools.io_sources.lazy_cache_memory import cache_memory
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, cache_parquet
 from polars_io_tools.io_sources.partitions import by_range, by_time, by_value
@@ -423,11 +423,20 @@ def test_long_chain_on_the_partition_column(partitioner):
     partitioner.build(pred)
 
 
-@pytest.mark.xfail(strict=True, reason="the DNF of an AND of disjunctions grows exponentially")
 def test_dnf_of_many_disjunctions_stays_within_budget():
     pred = functools.reduce(operator.and_, [(pl.col(f"a{i}") == 1) | (pl.col(f"b{i}") == 1) for i in range(16)])
     dnf = convert_expr_to_dnf(pred, {c: pl.Int64 for i in range(16) for c in (f"a{i}", f"b{i}")})
     assert dnf is None or len(dnf) <= 10_000
+
+
+def test_dnf_of_wide_clauses_stays_within_budget():
+    """Conjuncts that survive the budget are kept, and the resulting superset is not negated."""
+    pred = pl.all_horizontal([pl.col(f"c{i}") == 1 for i in range(1_000)] + [(pl.col(f"a{i}") == 1) | (pl.col(f"b{i}") == 1) for i in range(13)])
+    schema = {c: pl.Int64 for c in pred.meta.root_names()}
+    dnf = convert_expr_to_dnf(pred, schema)
+    assert dnf is not None and sum(len(clause) for clause in dnf) <= MAX_DNF_TUPLES
+    assert all(("c999", "=", 1) in clause for clause in dnf)
+    assert convert_expr_to_dnf(~pred, schema) is None
 
 
 @pytest.mark.xfail(strict=True, raises=pl.exceptions.PanicException, reason="a Polars panic on an out-of-range literal breaks the parser")
