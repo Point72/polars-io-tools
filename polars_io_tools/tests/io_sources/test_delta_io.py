@@ -453,6 +453,40 @@ def test_delta_partition_pushdown_ne_keeps_empty_string(tmp_path):
     assert sorted(out["i"]) == [1, 2]
 
 
+_NAN = float("nan")
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pl.col("c0") == -0.0,
+        pl.col("c0") == 0.0,
+        pl.col("c0").cast(pl.Float64) == -0.0,
+        pl.col("c0").is_in([-0.0]),
+        pl.col("c0").is_in([0.0, 1.5]),
+        pl.col("c0") != 0.0,
+        ~pl.col("c0").is_in([-0.0]),
+        pl.col("c0") == _NAN,
+        pl.col("c0").is_in([_NAN]),
+        pl.col("c0") != _NAN,
+        ~pl.col("c0").is_in([_NAN, 0.0]),
+    ],
+    ids=["eq_neg", "eq_pos", "cast_eq_neg", "in_neg", "in_pos", "ne_pos", "not_in_neg", "eq_nan", "in_nan", "ne_nan", "not_in_nan"],
+)
+def test_delta_partition_pushdown_on_signed_zero_and_nan_float_partitions(tmp_path, pred):
+    """Polars matches 0.0 with -0.0 and NaN with NaN, which delta-rs keeps in separate partitions.
+
+    Pruning keeps every row the predicate keeps, and only rows a lazy filter of every file keeps (before Polars 2 that
+    also keeps the null partition for some predicates).
+    """
+    table_path = os.path.join(tmp_path, "t")
+    df = pl.DataFrame({"c0": [0.0, -0.0, _NAN, 1.5, None], "v": range(5)})
+    df.write_delta(table_path, delta_write_options={"partition_by": ["c0"]})
+    unpruned = cpl.scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False)
+    out = set(cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()["v"])
+    assert set(df.filter(pred)["v"]) <= out <= set(unpruned.filter(pred).collect()["v"])
+
+
 def test_delta_partition_pushdown_ne_keeps_the_rows_of_a_native_scan_of_a_null_integer_partition(tmp_path):
     table_path = os.path.join(tmp_path, "t")
     pl.DataFrame({"q": [1, 2, None], "i": [0, 1, 2]}).write_delta(table_path, delta_write_options={"partition_by": ["q"]})

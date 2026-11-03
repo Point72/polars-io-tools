@@ -164,6 +164,11 @@ def _convert_literal_for_partition(value: Any, dtype: pl.DataType | None) -> Any
     return value
 
 
+def _is_zero(value: Any) -> bool:
+    """Whether ``value`` is a float zero of either sign."""
+    return isinstance(value, float) and value == 0.0
+
+
 def _restrict_and_normalize_partition_filters(
     dt: Any,
     predicate: pl.Expr | None,
@@ -184,9 +189,12 @@ def _restrict_and_normalize_partition_filters(
     """
     if predicate is None:
         return None
-    dnf = convert_expr_to_dnf(get_parsed_expr(predicate), _compute_exposed_schema_from_dt(dt, mapping))
+    exposed_schema = _compute_exposed_schema_from_dt(dt, mapping)
+    dnf = convert_expr_to_dnf(get_parsed_expr(predicate), exposed_schema)
     if not dnf:
         return None
+    # Polars matches 0.0 with -0.0, which delta-rs stores and prunes as separate partitions.
+    float_cols = {c for c, d in exposed_schema.items() if d.is_float()}
     # We do not restrict to partition columns; Delta may ignore non-partition filters.
     normalized: list[list[tuple[str, str, Any]]] = []
     unsafe_prune = False  # if any clause becomes empty (all unsupported), we must not prune at all
@@ -228,11 +236,15 @@ def _restrict_and_normalize_partition_filters(
                     normalized.extend([(col, "=", tok)] for tok in null_tokens)
                     if not out_vals:
                         continue
+                elif col in float_cols and any(_is_zero(v) for v in out_vals):
+                    out_vals = [*out_vals, 0.0, -0.0]
                 out_clause.append((col, op2, out_vals))
             else:
                 out_val = _convert_literal_for_partition(val2, dtype)
                 # Ensure we only keep supported ops to avoid over-pruning
-                if op2 in supported_ops:
+                if op2 == "=" and col in float_cols and _is_zero(out_val):
+                    out_clause.append((col, "in", [0.0, -0.0]))
+                elif op2 in supported_ops:
                     out_clause.append((col, op2, out_val))
                 if op2 == "!=" and val2 is not None and val2 not in null_tokens:
                     # delta-rs prunes the null partition for "!=", and reads an empty string partition as null
