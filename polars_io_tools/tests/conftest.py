@@ -7,8 +7,10 @@ try:
 except ImportError:
     pass
 else:
-    # A quick default; select a longer run with ``HYPOTHESIS_PROFILE=hunt`` or ``--hypothesis-profile=hunt``.
+    # A quick default; select a longer run with ``HYPOTHESIS_PROFILE=hunt`` or ``--hypothesis-profile=hunt``. CI runs the
+    # quick examples in a fixed order and prints how to reproduce a failure.
     settings.register_profile("quick", max_examples=50)
+    settings.register_profile("ci", settings.get_profile("quick"), derandomize=True, print_blob=True)
     settings.register_profile("hunt", max_examples=2000)
     settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "quick"))
 
