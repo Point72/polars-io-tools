@@ -1,6 +1,7 @@
 import functools
 import itertools
 import logging
+import math
 import re
 from datetime import date, timedelta
 from typing import Any, Literal
@@ -59,6 +60,15 @@ DNFOperator = Literal[
 DNFTuple = tuple[str, DNFOperator, Any]  # (column, op, value)
 DNFClause = list[DNFTuple]  # A single conjunction
 DNF = list[DNFClause]  # Full DNF expression
+
+# Distributing an AND over ORs multiplies clause counts, so an AND or a negation is not expanded past this many
+# (column, op, value) tuples in total.
+MAX_DNF_TUPLES = 100_000
+
+
+def _dnf_size(dnf: DNF) -> int:
+    """The number of (column, op, value) tuples in ``dnf``."""
+    return sum(len(clause) for clause in dnf)
 
 
 # Rewrites ``lit(1) < col`` as ``col > 1``; operators not listed are symmetric.
@@ -378,8 +388,19 @@ class DNFVisitor(ExprVisitor[DNF | None]):
         if not nodes:
             return
         results = [self._subconvert(n) for n in nodes]
-        self.result_dnf = functools.reduce(combine_and_dnf if is_and else combine_or_dnf, (dnf for dnf, _ in results))
-        self.negation_safe = all(dnf is not None and safe for dnf, safe in results)
+        exact = True
+
+        def combine(left: DNF | None, right: DNF | None) -> DNF | None:
+            nonlocal exact
+            if not is_and:
+                return combine_or_dnf(left, right)
+            combined, combined_exact = _and_dnf(left, right)
+            # Over the budget an AND is a superset, which is not safe to negate.
+            exact = exact and combined_exact
+            return combined
+
+        self.result_dnf = functools.reduce(combine, (dnf for dnf, _ in results))
+        self.negation_safe = exact and all(dnf is not None and safe for dnf, safe in results)
 
     def default_result(self) -> DNF | None:
         """Default result is None."""
@@ -521,7 +542,7 @@ class DNFVisitor(ExprVisitor[DNF | None]):
                 inner_dnf, inner_safe = self._subconvert(inner)
                 if inner_dnf is not None and inner_safe:
                     self.result_dnf = negate_dnf(inner_dnf)
-                    self.negation_safe = True
+                    self.negation_safe = self.result_dnf is not None
 
         # Handle ALL_HORIZONTAL function (ANDing all inputs)
         elif node.function_type == BooleanFunctionType.ALL_HORIZONTAL:
@@ -565,10 +586,10 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
         # Without a safe ~P, combine_and_dnf falls back to F alone, a superset of ~P & F.
         negated_predicate = None
-        if predicate_dnf is not None and predicate_safe:
+        if predicate_dnf is not None and predicate_safe and (negated := negate_dnf(predicate_dnf)) is not None:
             # Polars also takes the otherwise branch where P is null, which happens only where a column in P is null.
             columns = dict.fromkeys(c for clause in predicate_dnf for c, _, _ in clause)
-            negated_predicate = negate_dnf(predicate_dnf) + [[(c, "is", None)] for c in columns]
+            negated_predicate = negated + [[(c, "is", None)] for c in columns]
         if node.falsy.can_extract_literal:
             not_predicate_and_falsy = negated_predicate if node.falsy.value else []
         else:
@@ -599,19 +620,76 @@ class DNFVisitor(ExprVisitor[DNF | None]):
 
 
 def combine_and_dnf(left_dnf: DNF | None, right_dnf: DNF | None) -> DNF | None:
-    """Combine two DNFs with AND logic."""
+    """Combine two DNFs with AND logic.
+
+    A result of more than ``MAX_DNF_TUPLES`` tuples is not built. The side with more tuples then stands for the AND, a
+    superset of it; when it fits, each of its clauses also holds the bounds every clause of the other side puts on a
+    column (see :func:`_column_hull`).
+    """
+    return _and_dnf(left_dnf, right_dnf)[0]
+
+
+def _and_dnf(left_dnf: DNF | None, right_dnf: DNF | None) -> tuple[DNF | None, bool]:
+    """``left_dnf AND right_dnf`` as :func:`combine_and_dnf` builds it, and whether it is exact rather than a superset."""
     if left_dnf is None and right_dnf is None:
-        return None
+        return None, False
     elif left_dnf is None:
-        return right_dnf
+        return right_dnf, False
     elif right_dnf is None:
-        return left_dnf
+        return left_dnf, False
+    if len(right_dnf) * _dnf_size(left_dnf) + len(left_dnf) * _dnf_size(right_dnf) > MAX_DNF_TUPLES:
+        # The AND keeps no more rows than either side, so the side holding more constraints stands for it.
+        kept, other = (left_dnf, right_dnf) if _dnf_size(left_dnf) >= _dnf_size(right_dnf) else (right_dnf, left_dnf)
+        hull = _column_hull(other)
+        if hull and _dnf_size(kept) + len(kept) * len(hull) <= MAX_DNF_TUPLES:
+            return [clause + hull for clause in kept], False
+        return kept, False
 
     result = []
     for left_clause in left_dnf:
         for right_clause in right_dnf:
             result.append(left_clause + right_clause)
-    return result
+    return result, True
+
+
+_LOWER_OPS = frozenset({">", ">="})
+_UPPER_OPS = frozenset({"<", "<="})
+
+
+def _column_hull(dnf: DNF) -> DNFClause:
+    """A clause that every clause of ``dnf`` implies, bounding each column that all of them constrain.
+
+    A column is bounded by the union of its ``=``/``in`` values when every clause has one, else by ``>=`` the least
+    lower bound and ``<=`` the greatest upper bound when every clause has one. Columns with a null or NaN value, or
+    values that do not compare, are left out.
+    """
+    hull: DNFClause = []
+    columns = set.intersection(*({c for c, _, _ in clause} for clause in dnf)) if dnf else set()
+    for column in sorted(columns):
+        # Per clause, the values of its first membership, and its first lower and upper bounds.
+        members, lows, highs = [], [], []
+        for clause in dnf:
+            terms = [(op, value) for c, op, value in clause if c == column]
+            member = next((list(v) if op == "in" else [v] for op, v in terms if op in ("=", "==", "in")), None)
+            members.append(member)
+            lows.append(member or next(([v] for op, v in terms if op in _LOWER_OPS), None))
+            highs.append(member or next(([v] for op, v in terms if op in _UPPER_OPS), None))
+        try:
+            if all(members) and all(_is_ordinary(v) for m in members for v in m):
+                hull.append((column, "in", list(dict.fromkeys(v for m in members for v in m))))
+                continue
+            for bounds, op, pick in ((lows, ">=", min), (highs, "<=", max)):
+                if all(bounds) and all(_is_ordinary(v) for b in bounds for v in b):
+                    hull.append((column, op, pick(v for b in bounds for v in b)))
+        except TypeError:
+            # Unhashable values, or values of different types such as a date and a datetime.
+            continue
+    return hull
+
+
+def _is_ordinary(value: Any) -> bool:
+    """Whether ``value`` is neither null nor NaN, so that it compares as Polars compares it."""
+    return value is not None and not (isinstance(value, float) and math.isnan(value))
 
 
 def combine_or_dnf(left_dnf: DNF | None, right_dnf: DNF | None) -> DNF | None:
@@ -643,12 +721,14 @@ def negate_operator(op: str) -> str:
     return operator_map.get(op, f"!{op}")
 
 
-def negate_dnf(dnf: DNF) -> DNF:
-    """Negate a DNF expression."""
+def negate_dnf(dnf: DNF) -> DNF | None:
+    """Negate a DNF expression, or return None when the result would exceed ``MAX_DNF_TUPLES``."""
     if not dnf:
         # Empty DNF means FALSE, negation is TRUE
         # Represent TRUE as an empty conjunction
         return [[]]
+    if math.prod(len(clause) for clause in dnf) * len(dnf) > MAX_DNF_TUPLES:
+        return None
     cnf_result = []
 
     # Convert to CNF (NOT of DNF)
@@ -671,6 +751,9 @@ def convert_expr_to_dnf(expr_or_node: pl.Expr | BaseExprNode, schema: pl.Schema 
     """
     Convert a Polars expression tree to DNF format.
     Returns the expression in DNF format, or None if conversion fails.
+
+    An AND or a negation is not expanded past ``MAX_DNF_TUPLES`` (column, op, value) tuples: such an AND is replaced by
+    a superset (see :func:`combine_and_dnf`), and such a negation gives None.
 
     Args:
         expr_or_node: The Polars expression (or already-parsed node) to convert.
