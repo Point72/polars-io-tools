@@ -19,8 +19,17 @@ class Case(SimpleNamespace):
 
 
 def params(cases: list[Case], *names: str) -> list:
-    """``pytest.param`` per row with the row's values of ``names`` in order; a name the row leaves out is ``None``."""
-    return [pytest.param(*(getattr(c, n, None) for n in names), id=c.id, marks=c.marks) for c in cases]
+    """``pytest.param`` per row with the row's values of ``names`` in order.
+
+    Raises ``TypeError`` for a row that leaves out one of ``names`` or has a value no name asks for.
+    """
+    for case in cases:
+        fields = set(vars(case)) - {"id", "marks"}
+        if missing := set(names) - fields:
+            raise TypeError(f"case {case.id!r} has no value for {sorted(missing)}")
+        if unknown := fields - set(names):
+            raise TypeError(f"case {case.id!r} has values for no test argument: {sorted(unknown)}")
+    return [pytest.param(*(getattr(c, n) for n in names), id=c.id, marks=c.marks) for c in cases]
 
 
 # Dtypes and values

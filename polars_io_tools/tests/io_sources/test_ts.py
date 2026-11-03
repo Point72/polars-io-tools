@@ -82,10 +82,9 @@ WINDOWED_FILLS = [
     Case(
         "ts_ffill",
         via="linked",
-        expect=None,
         kw={"days": 3, "reach": 3, "ts": {"linked_cols": ["EventDate"]}, "filter": c("EventDate") == date(2023, 1, 4)},
     ),
-    Case("ts_ffill_no_indexed_column", via="index", expect=None, kw={"days": 4, "reach": 2, "ts": {}, "filter": c("Date") == date(2023, 1, 3)}),
+    Case("ts_ffill_no_indexed_column", via="index", kw={"days": 4, "reach": 2, "ts": {}, "filter": c("Date") == date(2023, 1, 3)}),
 ]
 
 
