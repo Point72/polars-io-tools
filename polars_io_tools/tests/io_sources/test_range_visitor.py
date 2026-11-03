@@ -1657,12 +1657,19 @@ class TestUnusableLiteralsLeaveColumnUnconstrained:
         [
             pl.col("x") == _NAN,
             pl.col("x").is_in([1.0, _NAN]),
-            pl.col("x").is_between(0, _NAN),
             pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN),
         ],
     )
     def test_nan(self, expr):
         assert convert_expr_to_range(expr, "x") == portion.open(-portion.inf, portion.inf)
+
+    def test_nan_bound_of_is_between_leaves_only_its_side_unbounded(self):
+        assert convert_expr_to_range(pl.col("x").is_between(0, _NAN), "x") == portion.closed(0, portion.inf)
+
+    def test_float_of_magnitude_2_53(self):
+        # An integer column is compared with a float as Float64, so a float of magnitude 2**53 or more cannot bound it.
+        expr = pl.col("x").is_between(1.0, float(2**53)) & (pl.col("x") <= 5)
+        assert convert_expr_to_range(expr, "x") == portion.closed(1.0, 5)
 
     def test_single_element_series_is_in(self):
         expr = pl.col("t").is_in(pl.Series([datetime(2024, 1, 1)]))
@@ -1912,6 +1919,7 @@ class TestPartitionsKeepMatchingRows:
             ([1.0, _NAN, 3.0], pl.col("x").is_between(0, _NAN)),
             ([1.0, _NAN, 3.0], pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN)),
             ([1, 2, 7], pl.col("x").is_in([1, 2])),
+            ([2**53 + 1], (pl.col("x") == float(2**53)) & (pl.col("x") > 2**53)),
         ],
     )
     def test_by_range(self, values, pred):

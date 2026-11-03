@@ -1,5 +1,6 @@
 import datetime
 import logging
+import math
 from functools import partial
 from typing import Annotated
 
@@ -130,6 +131,9 @@ def _next_microsecond(value: datetime.datetime) -> datetime.datetime:
 def _is_bound(value, floor: datetime.timedelta) -> bool:
     """Whether a non-null literal can bound the column: a ``date`` or ``datetime`` matching the column's floor, if any."""
     if value is None:
+        return False
+    if isinstance(value, float) and 2**53 <= abs(value) < math.inf:
+        # Polars compares an integer column with a float as Float64, where integers this large round to other values.
         return False
     if floor == _DAY:
         return isinstance(value, datetime.date) and not isinstance(value, datetime.datetime)
@@ -316,22 +320,22 @@ class IntervalVisitor(ExprVisitor[Interval]):
         if node.function_type == BooleanFunctionType.IS_BETWEEN:
             # Handle BETWEEN function
             column, floor = _extract_column(node.inputs[0])
-            if column != self.target_column or not all(_is_bound(n.value, floor) and not isinstance(n.value, str) for n in node.inputs[1:3]):
+            if column != self.target_column or any(isinstance(n.value, str) for n in node.inputs[1:3]):
                 return
 
             # Round an inexact temporal bound toward the dropped side (lower down, upper up) to keep a superset.
-            lower_value = _rounded_bound_value(node.inputs[1], round_up=False)
-            upper_value = _rounded_bound_value(node.inputs[2], round_up=True)
-            if lower_value is None or upper_value is None:
+            # A bound that cannot bound the column leaves that side unbounded.
+            lower_value = _rounded_bound_value(node.inputs[1], round_up=False) if _is_bound(node.inputs[1].value, floor) else None
+            upper_value = _rounded_bound_value(node.inputs[2], round_up=True) if _is_bound(node.inputs[2].value, floor) else None
+            if lower_value is None and upper_value is None:
                 return
 
             try:
-                if self.validate_value_func is not None:
-                    lower = self.validate_value_func(lower_value)
-                    upper = self.validate_value_func(upper_value)
-                else:
-                    lower = lower_value
-                    upper = upper_value
+                lower, upper = -portion.inf, portion.inf
+                if lower_value is not None:
+                    lower = self.validate_value_func(lower_value) if self.validate_value_func is not None else lower_value
+                if upper_value is not None:
+                    upper = self.validate_value_func(upper_value) if self.validate_value_func is not None else upper_value
                 closed = node.options.get("closed", "Both")
                 # Create range based on closed parameter
                 if closed == "Both":
