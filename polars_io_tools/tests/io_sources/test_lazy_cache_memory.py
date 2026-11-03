@@ -779,3 +779,11 @@ def test_millisecond_partitions_exclude_built_keys(dtype):
     lf = cache_memory(register_io_source(io_source=gen, schema=df.schema), schema=df.schema, partition_cols="k")
     for pred in [pl.col("k") == df["k"][0], pl.col("k").is_in(df["k"][:2].implode()), pl.lit(True)]:
         assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))
+
+
+def test_cache_memory_on_a_nan_partition_key():
+    frame = pl.DataFrame({"x": [0.0, float("nan")], "i": [0, 1]})
+    lf = cache_memory(frame.lazy(), schema=frame.schema, partition_cols="x")
+    # A literal the predicate analysis cannot read, so the query names no partition.
+    for pred in [pl.lit(True), pl.col("x") == pl.lit(pl.Series([0.0])).first(), pl.lit(True)]:
+        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
