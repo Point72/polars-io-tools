@@ -763,6 +763,9 @@ def scan_delta(
             # Simple case, no mapping
             if with_columns:
                 lf = lf.select(with_columns)
+            elif lf.collect_schema().names() != list(exposed_schema):
+                # Before Polars 2 a hive-partitioned scan puts the partition columns last.
+                lf = lf.select(list(exposed_schema))
         else:
             # Rewrite predicate for logical mapping
             pred_rewritten = translate_polars_predicate(predicate, mapping)
