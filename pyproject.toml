@@ -62,7 +62,7 @@ develop = [
     "duckdb",
     "hatch-rs",
     "hatchling",
-    "hypothesis",
+    "hypothesis>=6.100",
     "mdformat",
     "mdformat-tables>=1",
     "opentelemetry-sdk",
