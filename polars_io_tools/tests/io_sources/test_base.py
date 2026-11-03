@@ -43,7 +43,7 @@ from polars_io_tools.io_sources.enum import (
     TemporalFunctionType,
 )
 from polars_io_tools.tests.helpers.cases import Case, params
-from polars_io_tools.tests.helpers.polars_versions import polars_has
+from polars_io_tools.tests.helpers.polars_versions import polars_has, xfail_if
 
 from .conftest import PredicateTracker
 
@@ -658,7 +658,7 @@ PUSHDOWN_CASES = [
         "map_batches",
         c("int_val").map_batches(lambda x: x > 5, return_dtype=pl.Boolean, is_elementwise=True),
         check=lambda original, pushed: N(AnonymousFunctionNode).match(get_parsed_expr(pushed)),
-        marks=(pytest.mark.xfail(polars_has("anonymous_function_not_pushed"), reason="not pushed down properly from Polars 1.32.0", run=False),),
+        marks=(xfail_if("anonymous_function_not_pushed"),),
     ),
     P(
         "fill_null_constant",
