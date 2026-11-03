@@ -457,8 +457,13 @@ def test_empty_partition_result_schema():
 
 @pytest.mark.parametrize(
     ("lf", "keys"),
-    [(generate_panel(), [1, 1]), (pl.LazyFrame({"x": [1.0, _NAN], "v": [1, 2]}), [_NAN, _NAN])],
-    ids=["duplicate_key_rejected", "duplicate_nan_keys_rejected"],
+    [
+        (generate_panel(), [1, 1]),
+        (pl.LazyFrame({"x": [1.0, _NAN], "v": [1, 2]}), [_NAN, _NAN]),
+        # Both keys match the microsecond 1970-01-01 00:00:00.000001.
+        (pl.LazyFrame({"t": pl.Series([1], dtype=pl.Datetime("us")), "v": [1]}), pl.Series([1000, 1500], dtype=pl.Datetime("ns"))),
+    ],
+    ids=["duplicate_key_rejected", "duplicate_nan_keys_rejected", "keys_equal_in_the_column_dtype_rejected"],
 )
 def test_duplicate_key_rejected(lf, keys):
     with pytest.raises(ValueError, match="Duplicate partition key"):

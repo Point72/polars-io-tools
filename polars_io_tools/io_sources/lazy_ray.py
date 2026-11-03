@@ -629,10 +629,25 @@ def _execute_on_ray_by(
         if not key_cols:
             raise ValueError("`by` must select at least one key column distinct from the options column.")
 
+    # Resolve the output dtype of the key expression once, for a typed literal.
+    key_expr_dtype = None
+    if key_expr is not None:
+        key_expr_dtype = original_lf.select(key_expr.alias("__key__")).collect_schema()["__key__"]
+
     # Reject duplicate partition keys up front (cheap, deterministic). NaN keys are
     # canonicalized so that repeated NaNs (which compare unequal in a Python set but match
-    # under polars equality) are rejected. Keys that Python objects cannot tell apart are compared physically.
-    _pdf = pdf.with_columns(pl.col(c).to_physical() for c, dtype in pdf.schema.items() if _lossy_python_key(dtype))
+    # under polars equality) are rejected. Keys are compared in the dtype they are matched in,
+    # and physically where Python objects cannot tell them apart.
+    if key_expr is not None:
+        key_dtypes = {"__key__": key_expr_dtype}
+    else:
+        frame_schema = original_lf.collect_schema()
+        key_dtypes = {c: frame_schema[c] for c in key_cols if c in frame_schema}
+    try:
+        _pdf = pdf.with_columns(pl.col(c).cast(dtype) for c, dtype in key_dtypes.items())
+    except Exception:  # noqa: BLE001 -- keys that do not cast fail when their partition is matched
+        _pdf = pdf
+    _pdf = _pdf.with_columns(pl.col(c).to_physical() for c, dtype in _pdf.schema.items() if _lossy_python_key(dtype))
     if key_expr is not None:
         _keys = _pdf["__key__"].to_list()
     elif len(key_cols) > 1:
@@ -645,11 +660,6 @@ def _execute_on_ray_by(
         if _canon in _seen:
             raise ValueError(f"Duplicate partition key {_k!r} in `partitions`.")
         _seen.add(_canon)
-
-    # Resolve the output dtype of the key expression once, for a typed literal.
-    key_expr_dtype = None
-    if key_expr is not None:
-        key_expr_dtype = original_lf.select(key_expr.alias("__key__")).collect_schema()["__key__"]
 
     def make_specs(predicate: pl.Expr | None) -> list[RayPartition]:
         exec_schema = original_lf.collect_schema()
