@@ -626,7 +626,8 @@ class NodeTraverserParser:
     def _parse(self, expr: pl.Expr, visitor: Any) -> BaseExprNode:
         """Parse a single expression node by dispatching on the polars typed view's class.
 
-        Per-subtree errors are isolated here: a failure in one ``_parse_<kind>`` method collapses that subtree to an :class:`ErrorNode` rather than the whole top-level expression.
+        Per-subtree errors are isolated here: a failure in one ``_parse_<kind>`` method collapses that subtree to an
+        :class:`ErrorNode` rather than the whole top-level expression.
         """
         # The typed view skips naming wrappers (alias, name.keep, ...), so skip them here too, or the children taken from
         # ``meta.pop()`` would belong to the wrapper.
@@ -934,14 +935,22 @@ def extract_value_preserving_column_name(node: BaseExprNode, schema: pl.Schema |
 
 
 def get_parsed_expr(expr_or_node: pl.Expr | BaseExprNode) -> BaseExprNode | None:
-    """Parse a Polars expression or return the node if it's already parsed. This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars window functions or aggregations."""
+    """Parse a Polars expression or return the node if it's already parsed.
+
+    This is designed to be run after polars has applied its optimizations, such as the predicate passed to a custom io
+    plugin. Thus, we avoid handling some Polars expressions that cannot be passed as such, for example, like polars
+    window functions or aggregations.
+    """
     if isinstance(expr_or_node, BaseExprNode):
         return expr_or_node
     return NodeTraverserParser().parse(expr_or_node)
 
 
 def convert_datetime_to_polars(dt_val: datetime.datetime, schema_cast: Any | None = None) -> pl.Expr:
-    """Helper function to convert a datetime value to a Polars expression that is eligible for predicate pushdown. This is only needed for polars<1.28"""
+    """Helper function to convert a datetime value to a Polars expression that is eligible for predicate pushdown.
+
+    This is only needed for polars<1.28.
+    """
     if version.parse(pl.__version__) > version.parse("1.28"):
         new_expr = pl.lit(dt_val, dtype=pl.Datetime(time_unit="ns"))
     else:
