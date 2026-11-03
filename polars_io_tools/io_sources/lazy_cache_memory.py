@@ -70,13 +70,13 @@ __all__ = ("cache_memory",)
 _NOTHING = object()
 
 
-def _exclude_built(built_keys: set[PartitionKey]) -> pl.Expr | None:
+def _exclude_built(built_keys: set[PartitionKey], schema: pl.Schema | None = None) -> pl.Expr | None:
     """A predicate that excludes every already-built partition.
 
     Returns "not in any already-built partition" (see
     :func:`~polars_io_tools.io_sources.util.partition_exclusion_predicate`), or ``None`` when
     nothing has been built yet (no restriction needed). ``eq_missing`` semantics mean a
-    null-valued partition key excludes exactly its own rows.
+    null-valued partition key excludes exactly its own rows. Columns in ``schema`` keep its dtypes.
     """
     keys = [key for key in built_keys if key]
     if not keys:
@@ -85,7 +85,8 @@ def _exclude_built(built_keys: set[PartitionKey]) -> pl.Expr | None:
     # infer_schema_length=None scans every key so a partition column that is null in the first
     # keys but valued later still infers the correct dtype (otherwise Polars infers Null and
     # fails to append the later value).
-    known = pl.DataFrame([dict(key) for key in keys], infer_schema_length=None)
+    overrides = {col: schema[col] for col in cols if col in schema} if schema is not None else None
+    known = pl.DataFrame([dict(key) for key in keys], infer_schema_length=None, schema_overrides=overrides)
     return partition_exclusion_predicate(known, cols)
 
 
@@ -225,7 +226,7 @@ def cache_memory(
             # The exclusion predicate cannot express physical-valued keys, so rebuild everything.
             return None
         # Subtract already-built partitions so each partition is collected at most once.
-        not_built = _exclude_built(built_keys)
+        not_built = _exclude_built(built_keys, get_schema())
         return restricted_pred if not_built is None else restricted_pred & not_built
 
     def get_partitions(restricted_pred: pl.Expr | None) -> list[pl.DataFrame]:
