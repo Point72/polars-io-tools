@@ -4345,3 +4345,10 @@ def test_unnamed_partition_files_are_removed_when_the_file_visitor_raises(tmp_pa
     with pytest.raises(Exception, match="visitor failed"):
         cache_parquet(src, tmp_path, "date", extra_partition_cols="x", file_visitor=visitor).collect()
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_cache_parquet_after_caching_only_null_partition_keys(tmp_path):
+    frame = pl.DataFrame({"date": [D(2024, 1, 31), D(2024, 2, 1)], "x": [None, 1], "i": [0, 1]})
+    lf = cache_parquet(frame.lazy(), tmp_path, "date", extra_partition_cols="x")
+    for pred in [pl.col("date") < D(2024, 2, 1), pl.col("x") == 1]:
+        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
