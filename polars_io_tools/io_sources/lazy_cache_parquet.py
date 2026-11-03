@@ -2283,14 +2283,13 @@ def cache_parquet(
             file_key_column=file_key_column,
         )
 
+        cache_keys = set(existing_parts_df[file_key_column])
         if refresh_keys and no_write and read_plan.use_paths is None:
             # Upstream supplies the expired partitions, so scan only the other cached files.
-            read_plan = ReadPlan(
-                use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(plan_parts & set(existing_parts_df[file_key_column]))]
-            )
-        if read_plan.use_paths is None and len(set(existing_parts_df[file_key_column])) < len(existing_parts):
+            read_plan = ReadPlan(use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(plan_parts & cache_keys)])
+        if read_plan.use_paths is None and len(cache_keys) < len(existing_parts):
             # A glob would also read the files whose names are not cache keys (e.g. written by older versions).
-            read_plan = ReadPlan(use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(set(existing_parts_df[file_key_column]))])
+            read_plan = ReadPlan(use_paths=[_cache_file_uri(time_unit_dir, key) for key in sorted(cache_keys)])
 
         scan_kwargs = _storage_kwargs(polars_opts, credential_provider)
         scan_kwargs.update(read_kwargs)
