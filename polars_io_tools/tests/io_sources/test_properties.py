@@ -26,7 +26,7 @@ from polars.testing import assert_frame_equal
 from polars_io_tools.io_sources.base import get_parsed_expr
 from polars_io_tools.io_sources.concat_named import concat_named
 from polars_io_tools.io_sources.delta_io import scan_delta, sink_delta
-from polars_io_tools.io_sources.dnf_visitor import MAX_DNF_TUPLES, _is_contradiction, convert_expr_to_dnf
+from polars_io_tools.io_sources.dnf_visitor import _is_contradiction, convert_expr_to_dnf
 from polars_io_tools.io_sources.lazy_cache_memory import cache_memory
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, cache_parquet
 from polars_io_tools.io_sources.lazy_narwhals_reader import scan_narwhals
@@ -437,6 +437,8 @@ def test_dnf_of_many_disjunctions_stays_within_budget():
 
 def test_dnf_of_wide_clauses_stays_within_budget():
     """Conjuncts that survive the budget are kept, and the resulting superset is not negated."""
+    from polars_io_tools.io_sources.dnf_visitor import MAX_DNF_TUPLES
+
     pred = pl.all_horizontal([pl.col(f"c{i}") == 1 for i in range(1_000)] + [(pl.col(f"a{i}") == 1) | (pl.col(f"b{i}") == 1) for i in range(13)])
     schema = {c: pl.Int64 for c in pred.meta.root_names()}
     dnf = convert_expr_to_dnf(pred, schema)
@@ -458,6 +460,8 @@ def _any_of(col: str, n: int) -> pl.Expr:
     ids=["members", "range"],
 )
 def test_an_and_over_the_budget_keeps_the_bounds_of_the_side_it_drops(last, bounds):
+    from polars_io_tools.io_sources.dnf_visitor import MAX_DNF_TUPLES
+
     pred = _any_of("a", 50) & _any_of("b", 50) & last
     values = pl.DataFrame({"a": [0, 1, 49, 50, 51, -1, None]}, schema={"a": pl.Int64})
     frame = values.join(values.rename({"a": "b"}), how="cross").join(values.rename({"a": "c"}), how="cross")
