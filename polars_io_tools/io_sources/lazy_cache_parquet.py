@@ -2030,8 +2030,12 @@ def cache_parquet(
             yield from generate(with_columns, predicate, n_rows, batch_size, unnamed_files)
         finally:
             for f in unnamed_files:
-                with contextlib.suppress(FileNotFoundError):
+                try:
                     _delete_cache_file(fs, fs_path_prefix, f)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:  # noqa: BLE001 -- keep the error that ended the query, if any
+                    log.warning("Failed to delete temporary partition file %s: %s", f, e)
 
     def generate(
         with_columns: list[str] | None,

@@ -2200,6 +2200,25 @@ def test_files_with_names_that_are_not_cache_keys_are_not_read(tmp_path, date_co
     assert_frame_equal(out, src.collect(), check_row_order=False)
 
 
+def test_a_failed_temporary_file_deletion_ends_no_query(tmp_path, monkeypatch):
+    import pyarrow.fs
+
+    class UndeletableTemporaryFiles(pyarrow.fs.LocalFileSystem):
+        def delete_file(self, path):
+            if path.endswith(".tmp"):
+                raise PermissionError(path)
+            super().delete_file(path)
+
+    def visitor(path):
+        raise RuntimeError("visitor failed")
+
+    monkeypatch.setattr(pyarrow.fs, "LocalFileSystem", UndeletableTemporaryFiles)
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": ["a/b", "ok"], "v": [1, 2]})
+    assert_frame_equal(cache_parquet(src, tmp_path / "a", "date", extra_partition_cols="x").collect(), src.collect(), check_row_order=False)
+    with pytest.raises(Exception, match="visitor failed"):
+        cache_parquet(src, tmp_path / "b", "date", extra_partition_cols="x", file_visitor=visitor).collect()
+
+
 def test_unnamed_partition_files_are_removed_when_the_file_visitor_raises(tmp_path):
     def visitor(path):
         raise RuntimeError("visitor failed")
