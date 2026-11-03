@@ -228,3 +228,18 @@ def test_decimal_on_values_filter_matches_bare(extra):
     bare = df.lazy().pivot(**kw).filter(pl.col("1") < pl.col("2")).select(cols).collect()
     wrapped = pushdown_pivot(df.lazy(), **kw).filter(pl.col("1") < pl.col("2")).select(cols).collect()
     assert_frame_equal(wrapped, bare)
+
+
+_DAYS = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2), datetime(2024, 1, 3)])
+
+
+@pytest.mark.parametrize(
+    "days",
+    [_DAYS.cast(pl.Datetime("ms")), _DAYS.cast(pl.Datetime("ns")), pl.Series([1000, 1001, 1002]).cast(pl.Datetime("ns"))],
+    ids=["ms", "ns", "ns_sub_us"],
+)
+def test_series_on_columns_are_named_in_their_unit(days):
+    df = pl.DataFrame({"id": [1, 1, 1], "kind": days, "v": [0, 1, 2]})
+    kw = {"on": "kind", "on_columns": days, "index": "id", "values": "v"}
+    cols = df.lazy().pivot(**kw).collect_schema().names()[:3]
+    assert_frame_equal(pushdown_pivot(df.lazy(), **kw).select(cols).collect(), df.lazy().pivot(**kw).select(cols).collect())
