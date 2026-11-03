@@ -421,6 +421,13 @@ def test_delta_partition_pushdown_ne_keeps_the_rows_of_a_native_scan_of_a_null_i
     assert sorted(out["i"]) == sorted(pl.scan_delta(path).filter(pred).collect()["i"])
 
 
+def test_scan_delta_collects_the_columns_of_its_schema_in_order(tmp_path):
+    path = str(tmp_path / "t")
+    write_deltalake(path, pl.DataFrame({"p": ["a", "b"], "v": [1, 2]}).to_arrow(), mode="overwrite", partition_by=["p"])
+    lf = cpl.scan_delta(path, credential_provider=None)
+    assert lf.collect().columns == lf.collect_schema().names() == ["p", "v"]
+
+
 def _run_delta_io_roundtrip(path: str, aws_profile: str | None) -> None:
     """Overwrite, append through the streaming path, and filter like a native scan of the stored integers.
 
