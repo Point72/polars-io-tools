@@ -2,7 +2,8 @@
 
 A row builds a pipeline over ``PredicateTracker`` sources and names, per source, whether a predicate or a projection
 reached it (``assert_pushdown``). Rows marked ``gap`` lock in a pushdown Polars could perform but does not; their build
-is the minimal reproducer for an upstream issue. Pivot and unpivot rows live with their wrappers in
+is a starting point for a reproducer of an upstream issue, which still needs a source that does not depend on this
+package. Pivot and unpivot rows live with their wrappers in
 ``io_sources/test_pushdown_pivot.py`` and ``io_sources/test_pushdown_unpivot.py``.
 """
 
