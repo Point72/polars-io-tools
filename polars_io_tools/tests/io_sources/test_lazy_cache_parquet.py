@@ -2139,6 +2139,15 @@ def test_values_without_a_path_segment_of_their_own_are_read_from_upstream(tmp_p
     assert len(list(tmp_path.rglob("*.*"))) == 2
 
 
+@pytest.mark.parametrize("value", ["x" * 201, "a.", "a ", "CON", "nul.txt", "Com1"], ids=["long", "dot", "space", "con", "nul_ext", "com1"])
+def test_values_no_file_can_be_named_are_read_from_upstream(tmp_path, value):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": [value, "ok"], "v": [1, 2]})
+    for pred in [pl.lit(True), pl.col("x") == value]:
+        out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(pred).collect()
+        assert_frame_equal(out, src.filter(pred).collect(), check_row_order=False)
+    assert [p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*.*")] == ["monthly/ok/2024-01.parquet"]
+
+
 @pytest.mark.parametrize(
     ("date_column", "legacy_file", "mode"),
     [(None, "null/a/b.parquet", CacheMode.CACHE), ("date", "monthly/a/b/2024-01.parquet", CacheMode.REBUILD)],

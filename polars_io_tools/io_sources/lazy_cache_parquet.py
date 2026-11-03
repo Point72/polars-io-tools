@@ -518,6 +518,9 @@ def _split_custom_partition_keys(
 # Null partition values: "None" from PartitionBy (polars >= 1.38), "null" from PartitionByKey
 _NULL_KEY_TOKENS = ("None", "null")
 _UNNAMED_DIR = "__piot_unnamed__"
+# A separator or control character, a trailing dot or space, or a Windows device name, which no file can be named.
+_UNNAMED_PATTERN = r"[/\\\x00-\x1f]|[. ]$|^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)"
+_MAX_SEGMENT_BYTES = 200
 _BOOL_KEYS = {"True": True, "true": True, "False": False, "false": False}
 
 
@@ -532,7 +535,7 @@ def _unnamed_expr(cols: list[str], schema: pl.Schema) -> pl.Expr | None:
             exprs.append(pl.col(c).dt.nanosecond() % 1000 != 0)
         elif schema[c] in (pl.String, pl.Categorical) or isinstance(schema[c], pl.Enum):
             name = pl.col(c).cast(pl.String)
-            exprs.append(name.is_in(["", ".", "..", *_NULL_KEY_TOKENS]) | name.str.contains(r"[/\\\x00-\x1f]"))
+            exprs.append(name.is_in(["", *_NULL_KEY_TOKENS]) | name.str.contains(_UNNAMED_PATTERN) | (name.str.len_bytes() > _MAX_SEGMENT_BYTES))
     return pl.any_horizontal(exprs).fill_null(False) if exprs else None
 
 
@@ -1717,7 +1720,8 @@ def cache_parquet(
             will be used for partitioning (no date-based organization).
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
             Duration and nanosecond Datetime columns are not supported. Rows whose value cannot name a path segment of its own (for
-            example a string containing ``/``, ``""``, ``"None"``, or a Time with a sub-microsecond part) are always read from upstream.
+            example a string containing ``/``, ``""``, ``"None"``, one ending in ``.`` or a space, a Windows device name such as
+            ``"CON"``, one longer than 200 bytes, or a Time with a sub-microsecond part) are always read from upstream.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
         partition_format (str, optional): Format using ``$year``, ``$month``, ``$day`` placeholders. If None, defaults based on time_unit:
 
