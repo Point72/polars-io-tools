@@ -303,13 +303,23 @@ def test_read_only_null_partition_key_cached(tmp_path):
     assert _values(lf) == [0, 1]
 
 
-def test_read_only_projection_limit_and_streaming(jan_cached):
+@pytest.mark.parametrize(
+    ("collect", "height"),
+    [
+        (lambda lf: lf.select("value").collect(), 3),
+        (lambda lf: lf.head(2).collect(), 2),
+        (lambda lf: lf.collect(engine="streaming"), 3),
+    ],
+    ids=["projection", "limit", "streaming"],
+)
+def test_read_only_projection_limit_and_streaming(jan_cached, collect, height):
+    # January is read from the cache and February from upstream.
+    expected = pl.concat([_source().filter(pl.col("date").dt.month() == 1), _source(offset=90).filter(pl.col("date").dt.month() == 2)]).collect()
     lf = cache_parquet(_source(offset=90), jan_cached, "date", time_unit="monthly", cache_mode=CacheMode.READ_ONLY).filter(JAN_FEB)
-    projected = lf.select("value").collect()
-    assert projected.columns == ["value"]
-    assert sorted(projected["value"].to_list()) == [0, 1, 92]
-    assert lf.head(2).collect().height == 2
-    assert sorted(lf.collect(engine="streaming")["value"].to_list()) == [0, 1, 92]
+    got = collect(lf)
+    assert got.height == height
+    assert got.join(expected.select(got.columns), on=got.columns, how="anti").is_empty()
+    assert not got.is_duplicated().any()
 
 
 @pytest.mark.parametrize("name", ["READ_ONLY", "CACHE_ONLY"])
