@@ -4169,3 +4169,107 @@ def test_monthly_cache_retains_history_after_verified_finalization(tmp_path, set
     assert_frame_equal(pl.concat([pl.read_parquet(path) for path in monthly_root.rglob("*.parquet")]).sort("date"), expected)
     assert _mtimes(monthly_root) == finalized
     assert calls == []
+
+
+def test_values_without_a_path_segment_of_their_own_are_read_from_upstream(tmp_path):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 6, "x": ["BRK/B", "None", "", "..", None, "ok"], "v": [1, 2, 3, 4, 5, 6]})
+    jan = pl.col("date").is_between(D(2024, 1, 1), D(2024, 1, 31))
+    for pred in [jan, jan & (pl.col("x") == "BRK/B"), jan & pl.col("x").is_in(["None", ""]), jan & pl.col("x").is_null(), jan]:
+        out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(pred).collect()
+        assert_frame_equal(out, src.filter(pred).collect(), check_row_order=False)
+    # Only the null and "ok" partitions are cached, and no other file is left behind.
+    assert len(list(tmp_path.rglob("*.*"))) == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["x" * 201, "%" * 100, "a.", "a ", "CON", "nul.txt", "Com1"],
+    ids=["long", "long_when_percent_encoded", "dot", "space", "con", "nul_ext", "com1"],
+)
+def test_values_no_file_can_be_named_are_read_from_upstream(tmp_path, value):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": [value, "ok"], "v": [1, 2]})
+    for pred in [pl.lit(True), pl.col("x") == value]:
+        out = cache_parquet(src, tmp_path, "date", extra_partition_cols="x").filter(pred).collect()
+        assert_frame_equal(out, src.filter(pred).collect(), check_row_order=False)
+    assert [p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*.*")] == ["monthly/ok/2024-01.parquet"]
+
+
+@pytest.mark.parametrize(
+    ("value", "dtype"),
+    [(["../../victim"], pl.List(pl.String)), (b"../../victim", pl.Binary), ({"a": "../../victim"}, pl.Struct({"a": pl.String}))],
+    ids=["list", "binary", "struct"],
+)
+def test_a_nested_or_binary_partition_value_writes_and_deletes_nothing(tmp_path, value, dtype):
+    victim = tmp_path / "victim.parquet"
+    victim.write_bytes(b"data")
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)], "x": [value], "v": [1]}, schema={"date": pl.Date, "x": dtype, "v": pl.Int64})
+    with pytest.raises(ValueError, match="cannot partition on"):
+        cache_parquet(src, tmp_path / "cache", "date", extra_partition_cols="x")
+    assert [p.name for p in tmp_path.rglob("*")] == ["victim.parquet"]
+    assert victim.read_bytes() == b"data"
+
+
+def test_a_partition_path_outside_its_directory_is_refused(tmp_path):
+    # The default monthly file of January 2024 sits next to the monthly directory.
+    victim = tmp_path / "2024-01.parquet"
+    victim.write_bytes(b"data")
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)], "v": [1]})
+    with pytest.raises(Exception, match="refusing to write partition path '../2024-01'"):
+        cache_parquet(src, tmp_path, "date", partition_format="../$year-$month").collect()
+    assert victim.read_bytes() == b"data"
+
+
+def test_cleanup_deletes_nothing_outside_the_cache_directory(tmp_path):
+    from pyarrow.fs import LocalFileSystem
+
+    from polars_io_tools.io_sources.lazy_cache_parquet import _delete_cache_file
+
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "inside.parquet").write_bytes(b"data")
+    (tmp_path / "victim.parquet").write_bytes(b"data")
+    for path in ["../victim.parquet", "inside.parquet"]:
+        _delete_cache_file(LocalFileSystem(), str(tmp_path / "cache"), path)
+    assert [p.name for p in tmp_path.rglob("*.parquet")] == ["victim.parquet"]
+
+
+@pytest.mark.parametrize(
+    ("date_column", "legacy_file", "mode"),
+    [(None, "null/a/b.parquet", CacheMode.CACHE), ("date", "monthly/a/b/2024-01.parquet", CacheMode.REBUILD)],
+    ids=["no_date", "date"],
+)
+def test_files_with_names_that_are_not_cache_keys_are_not_read(tmp_path, date_column, legacy_file, mode):
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": ["a/b", "ok"], "v": [1, 2]})
+    stale = tmp_path / legacy_file
+    stale.parent.mkdir(parents=True)
+    src.with_columns(v=pl.lit(0, pl.Int64)).collect().write_parquet(stale)
+    out = cache_parquet(src, tmp_path, date_column, extra_partition_cols="x", cache_mode=mode).collect()
+    assert_frame_equal(out, src.collect(), check_row_order=False)
+
+
+def test_a_failed_temporary_file_deletion_ends_no_query(tmp_path, monkeypatch):
+    import pyarrow.fs
+
+    class UndeletableTemporaryFiles(pyarrow.fs.LocalFileSystem):
+        def delete_file(self, path):
+            if path.endswith(".tmp"):
+                raise PermissionError(path)
+            super().delete_file(path)
+
+    def visitor(path):
+        raise RuntimeError("visitor failed")
+
+    monkeypatch.setattr(pyarrow.fs, "LocalFileSystem", UndeletableTemporaryFiles)
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": ["a/b", "ok"], "v": [1, 2]})
+    assert_frame_equal(cache_parquet(src, tmp_path / "a", "date", extra_partition_cols="x").collect(), src.collect(), check_row_order=False)
+    with pytest.raises(Exception, match="visitor failed"):
+        cache_parquet(src, tmp_path / "b", "date", extra_partition_cols="x", file_visitor=visitor).collect()
+
+
+def test_unnamed_partition_files_are_removed_when_the_file_visitor_raises(tmp_path):
+    def visitor(path):
+        raise RuntimeError("visitor failed")
+
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": ["a/b", "ok"], "v": [1, 2]})
+    with pytest.raises(Exception, match="visitor failed"):
+        cache_parquet(src, tmp_path, "date", extra_partition_cols="x", file_visitor=visitor).collect()
+    assert not list(tmp_path.rglob("*.tmp"))
