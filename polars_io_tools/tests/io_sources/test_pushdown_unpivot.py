@@ -1,202 +1,179 @@
-"""
-Result-equivalence and pushdown matrix for ``polars_io_tools.pushdown_unpivot``.
+"""pushdown_unpivot against bare ``LazyFrame.unpivot``, and what each pushes to the source.
 
-Each scenario is checked against bare ``pl.LazyFrame.unpivot`` to verify the wrapper preserves semantics, and against the
-:class:`PredicateTracker` to verify the wrapper actually drives pushdown the bare implementation misses (filter-on-
-``variable`` ↔ source-side column projection).
+Every row runs twice: on plain ``unpivot`` ("bare") and on ``pushdown_unpivot`` ("wrapped"). Both must return what plain
+unpivot returns, and each states whether a filter or a column selection reached the source. Bare runs of rows with
+``bare_misses_pushdown`` are marked ``pytest.mark.gap``: Polars could hand something to the source there but does not.
+For example ``filter(variable == "A")`` could become the column selection ``[id, A]`` on the source, and
+``filter(value > X)`` a looser source filter ``(A > X) | (B > X) | ...`` with the exact filter kept after the unpivot.
+The wrapper does the first.
 """
 
-from __future__ import annotations
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass, field
 
 import polars as pl
 import pytest
-from polars.testing import assert_frame_equal
 
 from polars_io_tools import pushdown_unpivot
 from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.assertions import ExpectedPushdown, assert_matches_plain_polars, assert_pushdown
+from polars_io_tools.tests.helpers.cases import as_params
 
-MODES = ["bare", "wrapped"]
-
-
-@pytest.fixture
-def tracker() -> PredicateTracker:
-    df = pl.DataFrame(
-        {
-            "id": [1, 2, 3],
-            "A": [10, 20, 30],
-            "B": [100, 200, 300],
-            "C": [1000, 2000, 3000],
-        }
-    )
-    return PredicateTracker(df)
+WIDE = pl.DataFrame({"id": [1, 2, 3], "A": [10, 20, 30], "B": [100, 200, 300], "C": [1000, 2000, 3000]})
+NOTHING_PUSHED = ExpectedPushdown(predicate=False, projection=False)
 
 
-def _unpivot(tracker: PredicateTracker, mode: str, **kwargs) -> pl.LazyFrame:
-    if mode == "bare":
-        return tracker.lazy_frame.unpivot(**kwargs)
-    return pushdown_unpivot(tracker.lazy_frame, **kwargs)
+@dataclass(frozen=True)
+class UnpivotCase:
+    """A query on ``WIDE.unpivot(index="id")``, and what the source should receive with and without the wrapper."""
+
+    id: str
+    _: KW_ONLY
+    # receives the unpivoted frame and returns the query to collect
+    query: Callable[[pl.LazyFrame], pl.LazyFrame]
+    # what the source should receive from plain ``unpivot``
+    expected_bare: ExpectedPushdown = field(default_factory=ExpectedPushdown)
+    # what the source should receive from ``pushdown_unpivot``
+    expected_wrapped: ExpectedPushdown = field(default_factory=ExpectedPushdown)
+    # Polars could hand something to the source in the bare run but does not; that run is marked ``gap``
+    bare_misses_pushdown: bool = False
+    # the columns of the result, if checked
+    expected_columns: list[str] | None = None
 
 
-def _check(
-    tracker: PredicateTracker,
-    lf: pl.LazyFrame,
-    *,
-    expected_df: pl.DataFrame,
-    predicate_pushed: bool | None = None,
-    projection_pushed: bool | None = None,
-) -> None:
+# Queries on ``WIDE.unpivot(index="id")``, and what reaches the source with and without the wrapper.
+ROWS = [
+    UnpivotCase(
+        "filter_on_id_is_pushed",
+        query=lambda lf: lf.filter(pl.col("id") > 1),
+        expected_bare=ExpectedPushdown(predicate=True),
+        expected_wrapped=ExpectedPushdown(predicate=True),
+    ),
+    UnpivotCase(
+        "filter_on_variable_eq",
+        query=lambda lf: lf.filter(pl.col("variable") == "A"),
+        expected_bare=NOTHING_PUSHED,
+        expected_wrapped=ExpectedPushdown(projection=True),
+        bare_misses_pushdown=True,
+    ),
+    UnpivotCase(
+        "filter_on_variable_isin",
+        query=lambda lf: lf.filter(pl.col("variable").is_in(["A", "B"])),
+        expected_bare=NOTHING_PUSHED,
+        expected_wrapped=ExpectedPushdown(projection=True),
+        bare_misses_pushdown=True,
+    ),
+    # Not pushable in general; the wrapper keeps the filter after the unpivot.
+    UnpivotCase(
+        "filter_on_value_NOT_pushed",
+        query=lambda lf: lf.filter(pl.col("value") > 50),
+        expected_bare=ExpectedPushdown(predicate=False),
+        expected_wrapped=ExpectedPushdown(predicate=False),
+        bare_misses_pushdown=True,
+    ),
+    # Only the count of value columns matters for select("id"); select("variable") needs only their names.
+    UnpivotCase(
+        "select_id_only",
+        query=lambda lf: lf.select("id"),
+        expected_bare=ExpectedPushdown(projection=False),
+        expected_wrapped=ExpectedPushdown(projection=True),
+        bare_misses_pushdown=True,
+    ),
+    UnpivotCase(
+        "select_variable_only",
+        query=lambda lf: lf.select("variable"),
+        expected_bare=ExpectedPushdown(projection=False),
+        expected_wrapped=ExpectedPushdown(projection=True),
+        bare_misses_pushdown=True,
+    ),
+    UnpivotCase(
+        "select_value_only",
+        query=lambda lf: lf.select("value"),
+        expected_bare=ExpectedPushdown(projection=False),
+        expected_wrapped=ExpectedPushdown(projection=True),
+        bare_misses_pushdown=True,
+    ),
+    UnpivotCase(
+        "filter_id_and_select_value",
+        query=lambda lf: lf.select("id", "value").filter(pl.col("id") > 1),
+        expected_bare=ExpectedPushdown(predicate=True, projection=False),
+        expected_wrapped=ExpectedPushdown(predicate=True),
+        bare_misses_pushdown=True,
+    ),
+    # An OR across id and variable must not be split into pushable parts.
+    UnpivotCase("or_predicate_spanning_columns", query=lambda lf: lf.filter((pl.col("id") > 2) | (pl.col("variable") == "A"))),
+    UnpivotCase("predicate_references_value_and_variable", query=lambda lf: lf.filter((pl.col("variable") == "B") & (pl.col("value") > 100))),
+    UnpivotCase("empty_variable_set", query=lambda lf: lf.filter(pl.col("variable").is_in([])), expected_columns=["id", "variable", "value"]),
+]
+
+
+def _one_param_per_mode():
+    for case in ROWS:
+        for mode in ("bare", "wrapped"):
+            marks = pytest.mark.gap if mode == "bare" and case.bare_misses_pushdown else ()
+            yield pytest.param(mode, case, id=f"{mode}-{case.id}", marks=marks)
+
+
+@pytest.mark.parametrize(("mode", "case"), list(_one_param_per_mode()))
+def test_unpivot(mode: str, case: UnpivotCase):
+    tracker = PredicateTracker(WIDE)
+    lf = tracker.lazy_frame.unpivot(index=["id"]) if mode == "bare" else pushdown_unpivot(tracker.lazy_frame, index=["id"])
+    reference = case.query(tracker.lazy_frame.unpivot(index=["id"])).collect()
     tracker.reset()
-    got = lf.collect()
-    assert_frame_equal(
-        got.sort(got.columns),
-        expected_df.sort(expected_df.columns),
-        check_dtypes=True,
-        check_column_order=False,
-    )
-    if predicate_pushed is True:
-        assert tracker.last_predicate is not None, "predicate was not pushed"
-    elif predicate_pushed is False:
-        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
-    if projection_pushed is True:
-        assert tracker.last_with_columns is not None, "projection was not pushed"
-    elif projection_pushed is False:
-        assert tracker.last_with_columns is None, f"projection was unexpectedly pushed: {tracker.last_with_columns!r}"
+    got = assert_matches_plain_polars(case.query(lf), reference.lazy(), None)
+    assert_pushdown(tracker, case.expected_bare if mode == "bare" else case.expected_wrapped)
+    if case.expected_columns:
+        assert got.columns == case.expected_columns
 
 
-def _expected(tracker: PredicateTracker, build) -> pl.DataFrame:
-    return build(tracker.lazy_frame.unpivot(index=["id"])).collect()
+@dataclass(frozen=True)
+class UnpivotMatchesBareCase:
+    """A frame, the index columns to unpivot it by, and a query whose result the wrapper and plain unpivot must agree
+    on."""
+
+    id: str
+    _: KW_ONLY
+    df: pl.DataFrame
+    # receives the unpivoted frame and returns the query to collect
+    query: Callable[[pl.LazyFrame], pl.LazyFrame]
+    index: str | list[str]
 
 
-@pytest.mark.parametrize("mode", MODES)
-def test_filter_on_id_is_pushed(tracker, mode):
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pl.col("id") > 1)
-    expected = _expected(tracker, lambda lf_: lf_.filter(pl.col("id") > 1))
-    _check(tracker, lf, expected_df=expected, predicate_pushed=True)
+MATCHES_BARE = [
+    # Mixed value dtypes promote to a common supertype even when a variable filter keeps only the Int column.
+    UnpivotMatchesBareCase(
+        "mixed_dtype_value_unification_wrapped",
+        df=pl.DataFrame({"id": [1, 2], "i": [10, 20], "f": [1.5, 2.5]}),
+        query=lambda lf: lf.filter(pl.col("variable") == "i"),
+        index=["id"],
+    ),
+    UnpivotMatchesBareCase("select_id_only_row_count_invariant_wrapped", df=WIDE.drop("C"), query=lambda lf: lf.select("id"), index=["id"]),
+    UnpivotMatchesBareCase(
+        "restricted_unpivot_matches_bare-no_index",
+        df=pl.DataFrame({"A": [10, 20], "B": [30, 40]}),
+        query=lambda lf: lf.filter(pl.col("variable") == "A").select("variable"),
+        index=[],
+    ),
+    # The subset (i, f) has supertype Float64, but the full unpivot casts i straight to String.
+    UnpivotMatchesBareCase(
+        "restricted_unpivot_matches_bare-string_supertype",
+        df=pl.DataFrame({"id": [1], "i": [10], "f": [1.5], "s": ["abc"]}),
+        query=lambda lf: lf.filter(pl.col("variable").is_in(["i", "f"]) & (pl.col("value") == "10")),
+        index="id",
+    ),
+]
 
 
-@pytest.mark.parametrize("mode,proj", [("bare", False), ("wrapped", True)])
-def test_filter_on_variable_eq(tracker, mode, proj):
-    """``filter(variable == "A")`` becomes upstream projection ``[id, A]`` under the wrapper."""
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pl.col("variable") == "A")
-    expected = _expected(tracker, lambda lf_: lf_.filter(pl.col("variable") == "A"))
-    _check(tracker, lf, expected_df=expected, projection_pushed=proj)
-
-
-@pytest.mark.parametrize("mode,proj", [("bare", False), ("wrapped", True)])
-def test_filter_on_variable_isin(tracker, mode, proj):
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pl.col("variable").is_in(["A", "B"]))
-    expected = _expected(tracker, lambda lf_: lf_.filter(pl.col("variable").is_in(["A", "B"])))
-    _check(tracker, lf, expected_df=expected, projection_pushed=proj)
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_filter_on_value_NOT_pushed(tracker, mode):
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pl.col("value") > 50)
-    expected = _expected(tracker, lambda lf_: lf_.filter(pl.col("value") > 50))
-    _check(tracker, lf, expected_df=expected, predicate_pushed=False)
-
-
-@pytest.mark.parametrize("mode,proj", [("bare", False), ("wrapped", True)])
-def test_select_id_only(tracker, mode, proj):
-    lf = _unpivot(tracker, mode, index=["id"]).select("id")
-    expected = _expected(tracker, lambda lf_: lf_.select("id"))
-    _check(tracker, lf, expected_df=expected, projection_pushed=proj)
-
-
-@pytest.mark.parametrize("mode,proj", [("bare", False), ("wrapped", True)])
-def test_select_variable_only(tracker, mode, proj):
-    lf = _unpivot(tracker, mode, index=["id"]).select("variable")
-    expected = _expected(tracker, lambda lf_: lf_.select("variable"))
-    _check(tracker, lf, expected_df=expected, projection_pushed=proj)
-
-
-@pytest.mark.parametrize("mode,proj", [("bare", False), ("wrapped", True)])
-def test_select_value_only(tracker, mode, proj):
-    lf = _unpivot(tracker, mode, index=["id"]).select("value")
-    expected = _expected(tracker, lambda lf_: lf_.select("value"))
-    _check(tracker, lf, expected_df=expected, projection_pushed=proj)
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_filter_id_and_select_value(tracker, mode):
-    lf = _unpivot(tracker, mode, index=["id"]).select(["id", "value"]).filter(pl.col("id") > 1)
-    expected = _expected(tracker, lambda lf_: lf_.select(["id", "value"]).filter(pl.col("id") > 1))
-    _check(tracker, lf, expected_df=expected, predicate_pushed=True)
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_or_predicate_spanning_columns(tracker, mode):
-    """OR across id and variable: must not split into pushable parts and produce wrong results."""
-    pred = (pl.col("id") > 2) | (pl.col("variable") == "A")
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pred)
-    expected = _expected(tracker, lambda lf_: lf_.filter(pred))
-    _check(tracker, lf, expected_df=expected)
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_predicate_references_value_and_variable(tracker, mode):
-    pred = (pl.col("variable") == "B") & (pl.col("value") > 100)
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pred)
-    expected = _expected(tracker, lambda lf_: lf_.filter(pred))
-    _check(tracker, lf, expected_df=expected)
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_empty_variable_set(tracker, mode):
-    """``variable.is_in([])`` produces a zero-row frame with the declared schema."""
-    lf = _unpivot(tracker, mode, index=["id"]).filter(pl.col("variable").is_in([]))
-    got = lf.collect()
-    assert got.height == 0
-    assert got.columns == ["id", "variable", "value"]
-
-
-def test_mixed_dtype_value_unification_wrapped():
-    """When ``value`` columns have mixed dtypes, bare unpivot promotes to a common supertype (Float64). The wrapper must emit
-    the same dtype even when restricted to a single Int column upstream by a variable filter."""
-    df = pl.DataFrame({"id": [1, 2], "i": [10, 20], "f": [1.5, 2.5]})
-    t = PredicateTracker(df)
-    bare = t.lazy_frame.unpivot(index=["id"]).filter(pl.col("variable") == "i").collect()
-    wrapped = pushdown_unpivot(t.lazy_frame, index=["id"]).filter(pl.col("variable") == "i").collect()
-    assert wrapped.schema["value"] == bare.schema["value"]
-    assert_frame_equal(wrapped.sort(wrapped.columns), bare.sort(bare.columns), check_dtypes=True)
+@pytest.mark.parametrize("case", as_params(MATCHES_BARE))
+def test_wrapped_matches_bare(case: UnpivotMatchesBareCase):
+    wrapped, bare = pushdown_unpivot(case.df.lazy(), index=case.index), case.df.lazy().unpivot(index=case.index)
+    assert_matches_plain_polars(case.query(wrapped), case.query(bare), None)
 
 
 def test_value_filter_remains_in_wrapped_plan():
-    """``filter(value > X)`` is *not* a replacement for the synthesized upstream column projection — the residual filter must
-    still apply after unpivot. Inspect the plan to lock this in."""
-    df = pl.DataFrame({"id": [1, 2], "A": [10, 200], "B": [20, 300]})
-    t = PredicateTracker(df)
-    lf = pushdown_unpivot(t.lazy_frame, index=["id"]).filter(pl.col("value") > 50)
-    plan = lf.explain()
-    assert "value" in plan and ("> 50" in plan or "(50)" in plan), f"expected residual filter on value in plan:\n{plan}"
-    bare = t.lazy_frame.unpivot(index=["id"]).filter(pl.col("value") > 50).collect()
-    assert_frame_equal(lf.collect().sort(lf.collect().columns), bare.sort(bare.columns), check_dtypes=True)
-
-
-def test_select_id_only_row_count_invariant_wrapped():
-    """``select("id")`` after unpivot must still produce ``len(rows) * len(on)`` rows."""
-    df = pl.DataFrame({"id": [1, 2, 3], "A": [10, 20, 30], "B": [100, 200, 300]})
-    t = PredicateTracker(df)
-    out = pushdown_unpivot(t.lazy_frame, index=["id"]).select("id").collect()
-    assert out.height == 3 * 2
-
-
-@pytest.mark.parametrize(
-    ("df", "index", "pred", "select"),
-    [
-        (pl.DataFrame({"A": [10, 20], "B": [30, 40]}), [], pl.col("variable") == "A", ["variable"]),
-        # The subset (i, f) has supertype Float64, but the full unpivot casts i straight to String.
-        (
-            pl.DataFrame({"id": [1], "i": [10], "f": [1.5], "s": ["abc"]}),
-            "id",
-            pl.col("variable").is_in(["i", "f"]) & (pl.col("value") == "10"),
-            None,
-        ),
-    ],
-)
-def test_restricted_unpivot_matches_bare(df, index, pred, select):
-    bare = df.lazy().unpivot(index=index).filter(pred)
-    wrapped = pushdown_unpivot(df.lazy(), index=index).filter(pred)
-    if select is not None:
-        bare, wrapped = bare.select(select), wrapped.select(select)
-    assert_frame_equal(wrapped.collect(), bare.collect(), check_row_order=False)
+    """``filter(value > X)`` cannot replace the synthesized source projection, so it stays after the unpivot."""
+    lf = pl.LazyFrame({"id": [1, 2], "A": [10, 200], "B": [20, 300]})
+    wrapped = pushdown_unpivot(lf, index=["id"]).filter(pl.col("value") > 50)
+    plan = wrapped.explain()
+    assert "value" in plan and ("> 50" in plan or "(50)" in plan), plan
+    assert_matches_plain_polars(wrapped, lf.unpivot(index=["id"]).filter(pl.col("value") > 50), None)

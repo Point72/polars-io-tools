@@ -1,17 +1,20 @@
+"""convert_expr_to_range and convert_expr_to_datetime_range: the range of values a filter allows in one column.
+
+Ranges are ``portion`` intervals. A range may be wider than the filter needs but must hold every value of a row the
+filter keeps; several tests check that on real rows. Also tests the helpers that shift, widen and split ranges.
+"""
+
 import operator
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
-from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import polars as pl
 import portion
 import pytest
-from polars.testing import assert_frame_equal
 from portion import Bound, Interval
 
-from polars_io_tools.io_sources.join import filtered_join_asof
-from polars_io_tools.io_sources.partitions import by_range, by_time
-from polars_io_tools.io_sources.pushdown_combine import FilterSpec, pushdown_combine
 from polars_io_tools.io_sources.range_visitor import (
     IntervalVisitor,
     _convert_atomic_interval_to_polars_expr,
@@ -22,1667 +25,938 @@ from polars_io_tools.io_sources.range_visitor import (
     convert_expr_to_datetime_range,
     convert_expr_to_range,
 )
-from polars_io_tools.testing import PredicateTracker
-
-
-class TestRangeExtractor:
-    """Test suite for the range extraction functionality using numeric values."""
-
-    def test_simple_equality_range(self):
-        """Test range extraction with a single equality."""
-        # Test with integer
-        test_value = 42
-        expr = pl.col("value_col") == test_value
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should be a singleton interval
-        assert result.atomic  # Single interval
-        assert result.lower == test_value
-        assert result.upper == test_value
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-        # Test with custom point creation function
-        expr = pl.col("value_col") == test_value
-        result = convert_expr_to_range(expr, "value_col", create_point_func=lambda x: Interval.from_atomic(Bound.CLOSED, x, x + 1, Bound.OPEN))
-
-        # Should create a small range from value to value+1
-        assert result.atomic
-        assert result.lower == test_value
-        assert result.upper == test_value + 1
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_numeric_range(self):
-        """Test extracting a simple numeric range."""
-        start_value = 10
-        end_value = 100
-
-        expr = (pl.col("value_col") >= start_value) & (pl.col("value_col") < end_value)
-        result = convert_expr_to_range(expr, "value_col")
-
-        assert result.atomic
-        assert result.lower == start_value
-        assert result.upper == end_value
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_mixed_int_float_range(self):
-        """Test range extraction with mixed int and float types."""
-        int_val = 10
-        float_val = 20.5
-
-        # Range from int to float
-        expr = (pl.col("mixed_col") >= int_val) & (pl.col("mixed_col") < float_val)
-        result = convert_expr_to_range(expr, "mixed_col")
-
-        assert result.atomic
-        assert result.lower == int_val
-        assert result.upper == float_val
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_or_int_float_range(self):
-        """Test range with OR conditions mixing int and float."""
-        int_val = 15
-        float_val = 20.5
-
-        # OR between int equality and float equality
-        expr = (pl.col("mixed_col") == int_val) | (pl.col("mixed_col") == float_val)
-        result = convert_expr_to_range(expr, "mixed_col")
-
-        # Should result in two distinct points
-        assert not result.atomic
-        # Check if int_val is in the resulting interval
-        assert int_val in result
-        # Check if float_val is in the resulting interval
-        assert float_val in result
-
-        # Test with different validation function
-        expr = (pl.col("mixed_col") == int_val) | (pl.col("mixed_col") == float_val)
-        result = convert_expr_to_range(
-            expr,
-            "mixed_col",
-            validate_value_func=lambda x: int(x) if isinstance(x, float) else x,
-            create_point_func=lambda x: portion.singleton(int(x)),
-        )
-
-        # Check if both values are in the resulting interval
-        # The float will be converted to an integer
-        assert int_val in result
-        assert int(float_val) in result
-        # The original float should not be in the result
-        assert float_val not in result
-
-    def test_in_operator_range(self):
-        """Test 'is_in' operator with a list of numbers."""
-        num_list = [10, 20, 30]
-        # Using is_in instead of 'in' operator
-        expr = pl.col("value_col").is_in(num_list)
-
-        # Test with standard point creation
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should contain exactly the numbers in the list
-        assert not result.atomic  # Multiple intervals
-        for n in num_list:
-            assert n in result
-            # Shouldn't include values in between
-            if n < num_list[-1]:
-                mid_point = n + 0.5  # midpoint between n and n+1
-                assert mid_point not in result
-
-        # Test with custom point creation that expands each point to a range
-        result = convert_expr_to_range(expr, "value_col", create_point_func=lambda x: Interval.from_atomic(Bound.CLOSED, x, x + 1, Bound.OPEN))
-
-        # Should include numbers and their expansions
-        assert not result.atomic  # Multiple intervals
-        for n in num_list:
-            assert n in result
-            assert n + 0.5 in result  # Should include values within expanded range
-
-    def test_complex_nested_expression(self):
-        """Test with complex nested expressions mixing int and float."""
-        int_val = 15
-        float_val1 = 30.5
-        float_val2 = 50.5
-
-        # Complex nested expression with mixed types
-        expr = (pl.col("mixed_col") >= int_val) & ((pl.col("mixed_col") < float_val1) | (pl.col("mixed_col") == float_val2))
-        result = convert_expr_to_range(expr, "mixed_col")
-
-        # Should contain two disjoint intervals
-        assert not result.atomic
-        for i in range(15, 31):
-            assert i in result
-
-        assert 31 not in result
-        assert 50 not in result
-        assert 50.5 in result
-
-    def test_unbounded_ranges(self):
-        """Test unbounded ranges with mixed int/float types."""
-        int_val = 15
-        float_val = 30.5
-
-        # Unbounded upper range with int
-        expr1 = pl.col("mixed_col") >= int_val
-        result1 = convert_expr_to_range(expr1, "mixed_col")
-
-        assert result1.atomic
-        assert result1.lower == int_val
-        assert result1.upper == portion.inf
-        assert result1.left is Bound.CLOSED
-
-        # Unbounded lower range with float
-        expr2 = pl.col("mixed_col") < float_val
-        result2 = convert_expr_to_range(expr2, "mixed_col")
-
-        assert result2.atomic
-        assert result2.lower == -portion.inf
-        assert result2.upper == float_val
-        assert result2.right is Bound.OPEN
-
-    def test_value_validation(self):
-        """Test with a custom validation function."""
-        float_val = 42.7
-        expr = pl.col("value_col") >= float_val
-
-        # Custom validation that rounds numbers
-        def round_value(value):
-            if isinstance(value, (int, float)):
-                return round(value)
-            return value
-
-        result = convert_expr_to_range(expr, "value_col", validate_value_func=round_value)
-
-        # Should use the rounded value (43)
-        assert result.atomic
-        assert result.lower == 43  # 42.7 rounded to 43
-        assert result.upper == portion.inf
-        assert result.left is Bound.CLOSED
-
-
-class TestAdvancedMixedDateTimeRanges:
-    """Advanced tests for ranges with mixed date/datetime types."""
-
-    def test_contradictory_mixed_types(self):
-        """Test contradictory expressions with mixed types."""
-        date_val = date(2023, 5, 15)
-        datetime_val = datetime(2023, 5, 10, 12, 0)  # Earlier than date_val
-
-        # This is impossible: mixed_col >= date_val AND mixed_col < datetime_val
-        # since datetime_val is earlier than date_val
-        expr = (pl.col("mixed_col") >= date_val) & (pl.col("mixed_col") < datetime_val)
-        result = convert_expr_to_datetime_range(expr, "mixed_col")
-
-        # Should be None since the condition is impossible
-        assert result.empty
-
-    def test_is_between_mixed_types(self):
-        """Test is_between function with mixed types."""
-        date_val = date(2023, 5, 15)
-        datetime_val = datetime(2023, 5, 16, 12, 0)
-
-        # Using is_between with mixed types
-        expr = pl.col("mixed_col").is_between(date_val, datetime_val)
-        result = convert_expr_to_datetime_range(expr, "mixed_col", get_enclosure=False)
-
-        assert result.atomic
-        assert result.lower == datetime.combine(date_val, time())
-        assert result.upper == datetime_val
-        assert result.left is Bound.CLOSED  # is_between is inclusive by default
-        assert result.right is Bound.CLOSED
-
-        # Test with different bound types and closed="left"
-        expr2 = pl.col("mixed_col").is_between(date_val, datetime_val, closed="left")
-        result2 = convert_expr_to_datetime_range(expr2, "mixed_col", get_enclosure=False)
-
-        assert result2.atomic
-        assert result2.lower == datetime.combine(date_val, time())
-        assert result2.upper == datetime_val
-        assert result2.left is Bound.CLOSED
-        assert result2.right is Bound.OPEN
-
-    def test_complex_or_with_mixed_types(self):
-        """Test complex OR expressions with mixed date and datetime types."""
-        expr1 = (pl.col("mixed_col") >= date(2023, 1, 1)) & (pl.col("mixed_col") < datetime(2023, 3, 1, 0, 0))
-        expr2 = (pl.col("mixed_col") >= datetime(2023, 5, 1, 12, 0)) & (pl.col("mixed_col") < date(2023, 6, 1))
-        expr = expr1 | expr2
-
-        result = convert_expr_to_datetime_range(expr, "mixed_col", get_enclosure=False)
-
-        # Should have two separate ranges
-        assert not result.atomic
-
-        # Check both ranges are in result
-        for test_date in [datetime(2023, 1, 15), datetime(2023, 2, 15), datetime(2023, 5, 15, 0, 0)]:
-            assert test_date in result
-
-        # Check dates not in either range
-        assert datetime.combine(date(2023, 4, 1), time()) not in result
-        assert datetime.combine(date(2023, 7, 1), time()) not in result
-
-    def test_different_timezone_ranges(self):
-        """Test ranges with datetimes in different timezones."""
-        utc_dt = datetime(2023, 5, 15, 12, 0, tzinfo=UTC)
-        est_dt = datetime(2023, 5, 15, 8, 0, tzinfo=timezone(timedelta(hours=-4)))  # EST, same time as UTC 12:00
-
-        # Test with equivalent times in different zones
-        expr = (pl.col("timestamp") >= utc_dt) & (pl.col("timestamp") < est_dt)
-        result = convert_expr_to_range(
-            expr, "timestamp", validate_value_func=lambda dt: dt if dt.tzinfo is None else dt.astimezone(UTC).replace(tzinfo=None)
-        )
-
-        # The result should be an empty interval as they represent the same time when normalized
-        assert result.empty or utc_dt.replace(tzinfo=None) in result
-
-    def test_complex_overlapping_ranges(self):
-        """Test complex overlapping ranges with mixed types."""
-        # Create multiple overlapping ranges
-        expr1 = (pl.col("mixed_col") >= date(2023, 1, 1)) & (pl.col("mixed_col") < datetime(2023, 3, 1, 0, 0))
-        expr2 = (pl.col("mixed_col") >= date(2023, 2, 15)) & (pl.col("mixed_col") < datetime(2023, 4, 1, 0, 0))
-        expr3 = (pl.col("mixed_col") >= date(2023, 6, 1)) & (pl.col("mixed_col") < datetime(2023, 7, 1, 0, 0))
-
-        expr = expr1 | expr2 | expr3
-        result = convert_expr_to_datetime_range(expr, "mixed_col", get_enclosure=False)
-
-        # Should contain two disjoint intervals
-        assert not result.atomic
-
-        # Under the hood, everything gets converted to a datetime
-
-        # First interval should be Jan 1 to Apr 1
-        assert datetime(2023, 1, 1) in result
-        assert datetime(2023, 3, 31) in result
-        assert datetime(2023, 3, 31, 23, 59, 59) in result
-
-        # Second interval should be Jun 1 to Jul 1
-        assert datetime(2023, 6, 1) in result
-        assert datetime(2023, 6, 30) in result
-
-        # And no dates in between
-        assert datetime(2023, 5, 1) not in result
-
-    def test_in_with_mixed_types_combined_with_range(self):
-        """Test combining is_in with range conditions using mixed types."""
-        date_list = [date(2023, 1, 15), date(2023, 2, 15), date(2023, 3, 15)]
-        min_date = date(2023, 2, 1)
-
-        # Combine is_in with a range condition (AND)
-        expr1 = pl.col("mixed_col").is_in(date_list) & (pl.col("mixed_col") >= min_date)
-        result1 = convert_expr_to_range(expr1, "mixed_col")
-
-        # Should filter out dates before min_date
-        assert not result1.atomic
-        assert date(2023, 1, 15) not in result1  # This date is before min_date
-        assert date(2023, 2, 15) in result1
-        assert date(2023, 3, 15) in result1
-
-
-class TestTernaryExpressionRanges:
-    """Test suite for range extraction with ternary expressions."""
-
-    def test_simple_ternary_with_date_ranges(self):
-        """Test range extraction with simple ternary expression involving date ranges."""
-        # we currently do not factor in the predicate, this test confirms that behavior
-        expr1 = (
-            pl.when(pl.col("is_us_market"))
-            .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 3, 1)))
-            .otherwise((pl.col("date") >= date(2023, 6, 1)) & (pl.col("date") < date(2023, 9, 1)))
-        )
-        expr2 = (
-            pl.when(pl.col("is_us_market") & pl.col("date") >= date(2023, 2, 1))
-            .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 3, 1)))
-            .otherwise((pl.col("date") >= date(2023, 6, 1)) & (pl.col("date") < date(2023, 9, 1)))
-        )
-
-        for expr in [expr1, expr2]:
-            # This should extract the union of both ranges
-            result = convert_expr_to_range(expr, "date")
-
-            # Should have two separate ranges
-            assert not result.atomic
-
-            # The interval should include both date ranges
-            assert date(2023, 1, 15) in result  # In first range
-            assert date(2023, 2, 15) in result  # In first range
-            assert date(2023, 6, 15) in result  # In second range
-            assert date(2023, 8, 15) in result  # In second range
-
-            # But not dates in between
-            assert date(2023, 4, 15) not in result
-            assert date(2023, 5, 15) not in result
-
-            # This should extract the union of both ranges
-            result = convert_expr_to_range(expr, "date")
-
-            # Should have two separate ranges
-            assert not result.atomic
-
-            # The interval should include both date ranges
-            assert date(2023, 1, 15) in result  # In first range
-            assert date(2023, 2, 15) in result  # In first range
-            assert date(2023, 6, 15) in result  # In second range
-            assert date(2023, 8, 15) in result  # In second range
-
-            # But not dates in between
-            assert date(2023, 4, 15) not in result
-            assert date(2023, 5, 15) not in result
-
-    def test_ternary_one_branch_with_date_range(self):
-        """Test range extraction with ternary where only one branch has date ranges."""
-        # When is_weekend is True, use date range (weekends in Q1)
-        # Otherwise, no date constraint
-        expr = (
-            pl.when(pl.col("is_weekend"))
-            .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 4, 1)))
-            .otherwise(
-                pl.lit(True)  # No date constraint
-            )
-        )
-
-        result = convert_expr_to_range(expr, "date")
-
-        # Should cover all dates since one branch has no constraints
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-    def test_ternary_combined_with_other_conditions(self):
-        """Test ternary expressions combined with other filter conditions."""
-        # Ternary combined with additional date range filter
-        expr = pl.when(pl.col("region") == "US").then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 4, 1))).otherwise(
-            (pl.col("date") >= date(2023, 6, 1)) & (pl.col("date") < date(2023, 9, 1))
-        ) & (pl.col("date") < date(2023, 12, 31))
-
-        # This should extract both ranges, each within the overall constraint
-        result = convert_expr_to_range(expr, "date")
-
-        # Should have two separate ranges
-        assert not result.atomic
-
-        # First range: Jan 1 to Apr 1
-        assert date(2023, 1, 15) in result
-        assert date(2023, 3, 15) in result
-
-        # Second range: Jun 1 to Sep 1
-        assert date(2023, 6, 15) in result
-        assert date(2023, 8, 15) in result
-
-        # But not dates outside either range or after Dec 31
-        assert date(2023, 5, 1) not in result
-        assert date(2023, 10, 1) not in result
-
-
-class TestDatetimeRangeExtractor:
-    """Test suite for the datetime range extraction functionality."""
-
-    def test_single_equality(self):
-        """Test filter with a single equality."""
-        test_date = date(2023, 5, 15)
-        # Simple equality expression
-        expr = pl.col("date_col") == test_date
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        # we include everything on the date
-        assert result.atomic
-        assert result.lower == datetime.combine(test_date, time())
-        assert result.upper == datetime.combine(test_date + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=True)
-        # we include only the specific date
-        assert result.atomic
-        assert result.lower == datetime.combine(test_date, time())
-        assert result.upper == datetime.combine(test_date, time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_date_range(self):
-        """Test simple date range with >= and <."""
-        start_date = date(2023, 1, 1)
-        end_date = date(2023, 12, 31)
-        # Combine two conditions with AND to create a range
-        expr = (pl.col("date_col") >= start_date) & (pl.col("date_col") < end_date)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == datetime.combine(end_date, time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_datetime_range(self):
-        """Test datetime range with time components."""
-        start_time = datetime(2023, 5, 15, 9, 0)
-        end_time = datetime(2023, 5, 15, 17, 0)
-        # Using > and <= operators to create a datetime range
-        expr = (pl.col("timestamp") > start_time) & (pl.col("timestamp") <= end_time)
-        result = convert_expr_to_datetime_range(expr, "timestamp")
-        assert result.atomic
-        assert result.lower == start_time
-        assert result.upper == end_time
-        assert result.left is Bound.OPEN
-        assert result.right is Bound.CLOSED
-
-    @pytest.mark.parametrize("strict", [True, False])
-    def test_cast_date_and_datetime(self, strict):
-        """Test casting date to datetime in a range."""
-        start_date = date(2023, 1, 1)
-        end_date = datetime(2023, 12, 31)
-        # Using >= and < operators to create a range
-        expr = (pl.col("date_col") >= start_date) & (pl.col("date_col").cast(pl.Datetime, strict=strict) < end_date)
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=True)
-        assert result.atomic
-        assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == datetime.combine(end_date, time())
-        assert result.left is Bound.CLOSED
-        # Closed: Polars truncates a finer literal to a coarser column's unit.
-        assert result.right is Bound.CLOSED
-
-    @pytest.mark.parametrize("coerce", [True, False])
-    def test_cast_datetime_time_unit(self, coerce):
-        """A ``date`` literal does not bound a column cast to a sub-day unit."""
-        expr = pl.col("datetime_col").cast(pl.Datetime(time_unit="ns")) == date(2023, 12, 31)
-        result = convert_expr_to_datetime_range(expr, "datetime_col", coerce_date_to_datetime=coerce)
-        assert result == portion.open(-portion.inf, portion.inf)
-
-    def test_datetime_cast_time(self):
-        """Test casting datetime to time"""
-        end = datetime(2023, 1, 1, 17, 0)
-        expr = pl.col("datetime_col").is_between(end - timedelta(hours=1), end + timedelta(hours=1))
-        # The time cast can't get converted to a datetime, so we ignore it
-        expr2 = pl.col("datetime_col").cast(pl.Time()).is_between(time(12, 15), time(19, 0))
-        result = convert_expr_to_datetime_range(expr & expr2, "datetime_col", coerce_date_to_datetime=True)
-        assert result.atomic
-        assert result.lower == (end - timedelta(hours=1))
-        assert result.upper == (end + timedelta(hours=1))
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_cast_datetime_time_zone(self):
-        """Test casting date to datetime in a range."""
-        end = datetime(2023, 1, 1, 17, 0, tzinfo=ZoneInfo("America/New_York"))
-        expr = (
-            pl.col("datetime_col")
-            .cast(pl.Datetime(time_unit="ns", time_zone="America/New_York"))
-            .is_between(end - timedelta(hours=1), end + timedelta(hours=1))
-        )
-        # We convert to UTC
-        result = convert_expr_to_datetime_range(expr, "datetime_col", coerce_date_to_datetime=True)
-        assert result.atomic
-        assert result.lower == (end - timedelta(hours=1)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-        assert result.upper == (end + timedelta(hours=1)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None) + timedelta(microseconds=1)
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_or_conditions(self):
-        """Test multiple conditions with OR logic."""
-        date1 = date(2023, 1, 15)
-        date2 = date(2023, 2, 15)
-        # Using OR to combine two equalities
-        expr = (pl.col("date_col") == date1) | (pl.col("date_col") == date2)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Should include both dates in the enclosure
-        assert result is not None
-        assert result.atomic
-        assert result.lower <= datetime.combine(date1, time())  # Min date is at most date1
-        assert result.upper >= datetime.combine(date2, time())  # Max date is at least date2
-
-    def test_unbounded_min(self):
-        """Test range with only an upper bound."""
-        end_date = date(2023, 12, 31)
-        # Only upper bound specified
-        expr = pl.col("date_col") <= end_date
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == datetime.combine(end_date, time())
-        assert result.right is Bound.CLOSED
-
-    def test_unbounded_max(self):
-        """Test range with only a lower bound."""
-        start_date = date(2023, 1, 1)
-        # Only lower bound specified
-        expr = pl.col("date_col") >= start_date
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == portion.inf
-        assert result.left is Bound.CLOSED
-
-    def test_in_operator(self):
-        """Test 'is_in' operator with a list of dates."""
-        date_list = [date(2023, 1, 15), date(2023, 2, 15), date(2023, 3, 15)]
-        # Using is_in instead of 'in' operator
-        expr = pl.col("date_col").is_in(date_list)
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        # Should include min and max from the list (enclosure)
-        assert result.atomic
-        assert result.lower == datetime.combine(min(date_list), time())
-        assert result.upper == datetime.combine(max(date_list) + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=True)
-        assert result.atomic
-        assert result.lower == datetime.combine(min(date_list), time())
-        assert result.upper == datetime.combine(max(date_list), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_in_with_other_conditions(self):
-        """Test 'is_in' operator combined with range conditions."""
-        date_list = [date(2023, 1, 15), date(2023, 2, 15), date(2023, 3, 15)]
-        min_date = date(2023, 2, 1)
-        # Combine is_in with a range condition
-        expr = pl.col("date_col").is_in(date_list) & (pl.col("date_col") >= min_date)
-        # Because we have an AND value, both conditions must be True
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 2, 15), time())
-        assert result.upper == datetime.combine(date(2023, 3, 15) + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-        expr = pl.col("date_col").is_in(date_list) | (pl.col("date_col") >= min_date)
-        # Because we have an OR, either condition is True
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 15), time())
-        assert result.upper == portion.inf
-        assert result.left is Bound.CLOSED
-
-    def test_not_equal(self):
-        """Test != operator in a range."""
-        test_date = date(2023, 5, 15)
-        other_date = date(2023, 5, 10)
-        # Combine range conditions with not equal
-        expr = (pl.col("date_col") >= other_date) & (pl.col("date_col") <= date(2023, 5, 20)) & (pl.col("date_col") != test_date)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Range should still be valid, we just can't express the excluded value
-        assert result is not None
-        assert datetime.combine(other_date, time()) <= result.lower or result.lower == -portion.inf
-        assert datetime(2023, 5, 20) >= result.upper or result.upper == portion.inf
-
-    def test_contradiction_equal_not_equal(self):
-        """Test contradiction with = and != on the same value."""
-        test_date = date(2023, 5, 15)
-        expr = (pl.col("date_col") == test_date) & (pl.col("date_col") != test_date)
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        # we ignore != for datetime
-        assert result.atomic
-        assert result.lower == datetime.combine(test_date, time())
-        assert result.upper == datetime.combine(test_date + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_contradiction_range(self):
-        """Test contradiction with conflicting ranges."""
-        # This is impossible: date >= 5/15 AND date < 5/10
-        expr_list = [
-            pl.col("time_col").is_between(datetime(2024, 2, 2), datetime(2023, 2, 3), closed="left"),
-            (pl.col("time_col") >= date(2023, 5, 15)) & (pl.col("time_col") < date(2023, 5, 10)),
-        ]
-        for expr in expr_list:
-            result = convert_expr_to_datetime_range(expr, "time_col")
-            assert result.empty
-
-    def test_multiple_equalities_consistent(self):
-        """Test multiple consistent equality constraints."""
-        test_date = date(2023, 5, 15)
-        # Same value with redundant condition
-        expr = (pl.col("date_col") == test_date) & (pl.col("date_col") == test_date)
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        assert result.atomic
-        assert result.lower == datetime.combine(test_date, time())
-        assert result.upper == datetime.combine(test_date + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_multiple_equalities_contradictory(self):
-        """Test multiple contradictory equality constraints."""
-        # Different equality values - contradiction
-        expr = (pl.col("date_col") == date(2023, 5, 15)) & (pl.col("date_col") == date(2023, 5, 16))
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.empty
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        assert result.empty
-
-    def test_column_not_in_expression(self):
-        """Test expression that doesn't mention the column at all."""
-        # No mention of date_col
-        expr = (pl.col("other_col1") == "value1") | (pl.col("other_col2") == "value2")
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-    def test_column_with_other_columns(self):
-        """Test where the column appears alongside others."""
-        # date_col appears with other columns
-        expr = (pl.col("other_col") == "some_value") & (pl.col("date_col") >= date(2023, 5, 15))
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 5, 15), time())
-        assert result.upper == portion.inf
-        assert result.left is Bound.CLOSED
-
-    def test_is_null(self):
-        """Test 'is_null' operator for NULL checks."""
-        expr = pl.col("date_col").is_null()
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-    def test_datetime_comparisons_with_timezone(self):
-        """Test comparisons with timezone-aware datetimes."""
-        # Create timezone-aware datetimes
-        dt1 = datetime(2023, 5, 15, 9, 0, tzinfo=UTC)
-        dt2 = datetime(2023, 5, 15, 17, 0, tzinfo=UTC)
-
-        expr = (pl.col("timestamp") >= dt1) & (pl.col("timestamp") <= dt2)
-        result = convert_expr_to_datetime_range(expr, "timestamp")
-        assert result.atomic
-        assert result.lower == dt1.replace(tzinfo=None)
-        assert result.upper == dt2.replace(tzinfo=None)
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_complex_or_conditions(self):
-        """Test complex OR conditions with overlapping ranges."""
-        # Two partially overlapping date ranges
-        expr1 = (pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 6, 1))
-        expr2 = (pl.col("date_col") >= date(2023, 5, 1)) & (pl.col("date_col") < date(2023, 12, 31))
-        expr = expr1 | expr2
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Combined range should be from Jan 1 to Dec 31
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 1), time())
-        assert result.upper == datetime.combine(date(2023, 12, 31), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_disjoint_ranges(self):
-        """Test OR conditions with disjoint ranges."""
-        # Two non-overlapping date ranges
-        expr1 = (pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 3, 1))
-        expr2 = (pl.col("date_col") >= date(2023, 6, 1)) & (pl.col("date_col") < date(2023, 9, 1))
-        expr = expr1 | expr2
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Combined range should span both (enclosure)
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 1), time())
-        assert result.upper == datetime.combine(date(2023, 9, 1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_datetime_vs_date(self):
-        """Test mixing datetime and date objects."""
-        date_only = date(2023, 5, 15)
-        datetime_val = datetime(2023, 5, 15, 12, 0)
-
-        expr = (pl.col("mixed_col") >= date_only) & (pl.col("mixed_col") < datetime_val)
-        result = convert_expr_to_datetime_range(expr, "mixed_col")
-        # Should work fine even with mixed types
-        assert result.atomic
-        assert result.lower == datetime.combine(date_only, time())
-        assert result.upper == datetime_val
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_datetime_with_multiple_expr(self):
-        datetime_val = datetime(2023, 5, 15, 12, 0)
-        expr = pl.col("Date").is_between(datetime_val, datetime_val + timedelta(1)) & pl.col("symol").is_in(["A", "B"])
-        result = convert_expr_to_datetime_range(expr, "Date")
-        assert result.atomic
-        assert result.lower == datetime_val
-        assert result.upper == datetime_val + timedelta(1)
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-
-class TestDatetimeRangeEdgeCases:
-    """Test edge cases and unusual scenarios."""
-
-    def test_datetime_microseconds(self):
-        """Test handling of microsecond precision."""
-        dt1 = datetime(2023, 5, 15, 9, 0, 0, 0)
-        dt2 = datetime(2023, 5, 15, 9, 0, 0, 1)  # 1 microsecond later
-        # Convert tuple filter to polars expression
-        expr = (pl.col("timestamp") > dt1) & (pl.col("timestamp") <= dt2)
-        result = convert_expr_to_datetime_range(expr, "timestamp")
-        assert result.atomic
-        assert result.lower == dt1
-        assert result.upper == dt2
-        assert result.left is Bound.OPEN
-        assert result.right is Bound.CLOSED
-
-    def test_adjacent_date_ranges(self):
-        """Test union of adjacent but non-overlapping ranges."""
-        # Convert two distinct filter conditions to OR of expressions
-        expr1 = (pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 2, 1))
-        expr2 = (pl.col("date_col") >= date(2023, 2, 1)) & (pl.col("date_col") < date(2023, 3, 1))
-        expr = expr1 | expr2
-
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Should create a continuous range (enclosure)
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 1), time())
-        assert result.upper == datetime.combine(date(2023, 3, 1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_contradiction_in_one_conjunction(self):
-        """Test case where one part has a contradiction."""
-        # First part is a contradiction, second part is valid
-        expr_contradiction = (pl.col("date_col") >= date(2023, 5, 15)) & (pl.col("date_col") < date(2023, 5, 10))
-        expr_valid = pl.col("date_col") == date(2023, 6, 1)
-        expr = expr_contradiction | expr_valid
-
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Should ignore the contradictory expression
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 6, 1), time())
-        assert result.upper == datetime.combine(date(2023, 6, 1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-        # Should ignore the contradictory expression
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 6, 1), time())
-        assert result.upper == datetime.combine(date(2023, 6, 1) + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_in_empty_list(self):
-        """Test 'is_in' operator with an empty list."""
-        # Convert to is_in with empty list
-        expr = pl.col("date_col").is_in([])
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.empty
-
-    def test_not_in_combined_with_range(self):
-        """Test 'not in' combined with range conditions."""
-        # Use ~ operator for NOT with is_in
-        expr = (pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") <= date(2023, 12, 31)) & ~pl.col("date_col").is_in([date(2023, 7, 4)])
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        # Should return the full range since we can't represent the exclusion
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 1), time())
-        assert result.upper == datetime.combine(date(2023, 12, 31), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_datetime_range_with_complex_expr(self):
-        """Test extracting date range from a complex Polars expression."""
-        # Create a complex expression with multiple date conditions
-        expr = ((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 6, 1))) | (
-            (pl.col("date") >= date(2023, 8, 1)) & (pl.col("date") < date(2023, 12, 31))
-        )
-
-        # Extract the date range using our visitor
-        result = convert_expr_to_datetime_range(expr, "date")
-
-        # Verify the result spans both ranges (enclosure)
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 1), time())
-        assert result.upper == datetime.combine(date(2023, 12, 31), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_multiple_in_expressions(self):
-        """Test multiple 'is_in' expressions combined."""
-        # Using multiple is_in expressions with OR
-        dates_set1 = [date(2023, 1, 15), date(2023, 2, 15)]
-        dates_set2 = [date(2023, 3, 15), date(2023, 4, 15)]
-
-        expr = pl.col("date_col").is_in(dates_set1) | pl.col("date_col").is_in(dates_set2)
-        result = convert_expr_to_datetime_range(expr, "date_col", coerce_date_to_datetime=False)
-
-        # Should cover the full range from min to max of both sets (enclosure)
-        assert result.atomic
-        assert result.lower == datetime.combine(min(dates_set1 + dates_set2), time())
-        assert result.upper == datetime.combine(max(dates_set1 + dates_set2) + timedelta(1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_nested_expressions(self):
-        """Test with deeply nested expressions."""
-        # Complex nested expression
-        expr = (pl.col("date_col") >= date(2023, 1, 1)) & (
-            (pl.col("date_col") < date(2023, 3, 1)) | ((pl.col("date_col") >= date(2023, 6, 1)) & (pl.col("date_col") < date(2023, 9, 1)))
-        )
-
-        # This should extract either:
-        # - dates from Jan 1 to Mar 1 (exclusive), or
-        # - dates from Jun 1 to Sep 1 (exclusive)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-
-        # The overall range covers from Jan 1 to Sep 1 (enclosure)
-        assert result.atomic
-        assert result.lower == datetime.combine(date(2023, 1, 1), time())
-        assert result.upper == datetime.combine(date(2023, 9, 1), time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-
-class TestRangeVisitor:
-    """Test suite for the RangeVisitor class."""
-
-    def test_range_visitor_copy(self):
-        """Test the RangeVisitor class with a simple expression."""
-        # Create a simple expression
-        constraints_list = [None, portion.empty(), Interval.from_atomic(Bound.CLOSED, date(2023, 1, 1), date(2023, 1, 2), Bound.OPEN)]
-
-        for constraints in constraints_list:
-            visitor = IntervalVisitor(
-                "date_col",
-                None,
-                None,
-            )
-            if constraints is not None:
-                visitor.constraints = constraints
-            new_visitor = visitor.copy()
-            assert new_visitor is not visitor
-            assert new_visitor.target_column == visitor.target_column
-            assert new_visitor.constraints == visitor.constraints
-
-
-class TestCastNodeVisitor:
-    """Test suite for the visit_cast method in IntervalVisitor."""
-
-    def test_boolean_cast_processes_input_node(self):
-        """Test that Boolean casts process their input node."""
-        # Create a comparison and cast to Boolean
-        expr = (pl.col("value_col") >= 10).cast(pl.Boolean)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract constraint from input node
-        assert result.atomic
-        assert result.lower == 10
-        assert result.upper == portion.inf
-        assert result.left is Bound.CLOSED
-
-    def test_non_boolean_cast_ignores_input_node(self):
-        """Test that non-Boolean casts ignore their input node."""
-        # Create a comparison and cast to non-Boolean
-        expr = (pl.col("value_col") >= 10).cast(pl.Utf8)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should not extract constraint
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-    def test_target_column_check_in_cast(self):
-        """Test the target column check in visit_cast."""
-        # Cast involving non-target column
-        expr = (pl.col("other_col") >= 10).cast(pl.Boolean)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should not extract constraint for different column
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-    def test_nested_boolean_casts_process_all_levels(self):
-        """Test that nested Boolean casts process all levels."""
-        # Multiple levels of Boolean casts
-        expr = ((pl.col("value_col") >= 10).cast(pl.Boolean)).cast(pl.Boolean)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract constraint from innermost level
-        assert result.atomic
-        assert result.lower == 10
-        assert result.upper == portion.inf
-
-    def test_boolean_cast_with_complex_input(self):
-        """Test Boolean cast with complex input expression."""
-        # Complex input with AND condition
-        expr = ((pl.col("value_col") >= 10) & (pl.col("value_col") < 100)).cast(pl.Boolean)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract full range from complex input
-        assert result.atomic
-        assert result.lower == 10
-        assert result.upper == 100
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_boolean_cast_in_conjunction(self):
-        """Test Boolean cast as part of a conjunction."""
-        # Boolean cast in conjunction with another expression
-        expr = ((pl.col("value_col") >= 10).cast(pl.Boolean)) & (pl.col("value_col") < 100)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should combine constraints from both parts
-        assert result.atomic
-        assert result.lower == 10
-        assert result.upper == 100
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_cast_with_function(self):
-        """Test Boolean cast with function expressions."""
-        # Function result cast to Boolean
-        expr = (pl.col("value_col").is_in([10, 20, 30])).cast(pl.Boolean)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract values from function
-        assert not result.atomic  # Multiple discrete values
-        assert 10 in result
-        assert 20 in result
-        assert 30 in result
-        assert 15 not in result  # Point between values should not be included
-
-    def test_cast_with_ternary(self):
-        """Test Boolean cast with ternary expression."""
-        # Ternary expression cast to Boolean
-        expr = (
-            pl.when(pl.col("condition"))
-            .then((pl.col("value_col") >= 10) & (pl.col("value_col") < 50))
-            .otherwise((pl.col("value_col") >= 100) & (pl.col("value_col") < 150))
-        ).cast(pl.Boolean)
-
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract constraints from both branches
-        # Note: The actual behavior here depends on how the visitor handles ternaries
-        # It will likely be a joined interval covering both ranges
-        assert 20 in result  # In first range
-        assert 120 in result  # In second range
-        # Don't check if value between ranges is included since that depends on implementation
-
-    def test_boolean_cast_with_datetime(self):
-        """Test Boolean cast with datetime expressions."""
-        # Datetime comparison cast to Boolean
-        start_date = date(2023, 1, 1)
-        end_date = date(2023, 12, 31)
-        expr = ((pl.col("date_col") >= start_date) & (pl.col("date_col") < end_date)).cast(pl.Boolean)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-
-        # Should extract the date range
-        assert result.atomic
-        assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == datetime.combine(end_date, time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_mixed_boolean_casts_in_expr(self):
-        """Test mixing Boolean and non-Boolean casts."""
-        # Mix of Boolean and non-Boolean casts in expression
-        expr = ((pl.col("value_col") >= 10).cast(pl.Boolean)) & ((pl.col("value_col") < 100).cast(pl.Utf8))
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract constraint from the Boolean cast only
-        assert result.atomic
-        assert result.lower == 10
-        assert result.upper == portion.inf
-        assert result.left is Bound.CLOSED
-
-    def test_boolean_cast_column_directly(self):
-        """Test casting the column itself to Boolean."""
-        # Direct cast of column to Boolean
-        expr = pl.col("value_col").cast(pl.Boolean)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # No constraints should be added since there's no comparison
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-
-class TestCastWithDatetimeRanges:
-    """Test cast node with datetime range extraction."""
-
-    @pytest.mark.parametrize("strict", [True, False])
-    def test_cast_date_to_datetime_with_comparison(self, strict):
-        """Test casting a date column to datetime before comparison."""
-        start_date = date(2023, 1, 1)
-        end_datetime = datetime(2023, 12, 31, 12, 0)
-
-        # Cast date column to datetime, then compare
-        expr = (pl.col("date_col") >= start_date) & (pl.col("date_col").cast(pl.Datetime, strict=strict) <= end_datetime)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-
-        assert result.atomic
-        assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == end_datetime + timedelta(microseconds=1)
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_cast_with_time_unit_and_timezone(self):
-        """Test casting with time unit and timezone specifications."""
-        # Cast with specific time unit and timezone
-        expr = pl.col("date_col").cast(pl.Datetime(time_unit="us", time_zone="UTC")) >= datetime(2023, 1, 1, tzinfo=UTC)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-        assert result.atomic
-        assert result.lower == datetime(2023, 1, 1)
-        assert result.upper == portion.inf
-
-    def test_boolean_cast_of_datetime_comparison(self):
-        """Test Boolean cast of a datetime comparison."""
-        dt = datetime(2023, 5, 15, 12, 0)
-
-        # Cast a datetime comparison to Boolean
-        expr = (pl.col("dt_col") == dt).cast(pl.Boolean)
-        result = convert_expr_to_datetime_range(expr, "dt_col", coerce_date_to_datetime=True)
-
-        # Should extract the equality constraint
-        assert result.atomic
-        assert result.lower == dt
-        assert result.upper == dt
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_cast_boolean_to_datetime(self):
-        """Test casting a Boolean to datetime (not meaningful but should be handled)."""
-        expr = pl.col("bool_col").cast(pl.Datetime)
-        result = convert_expr_to_datetime_range(expr, "bool_col")
-
-        # No meaningful range can be extracted
-        assert result.atomic
-        assert result.lower == -portion.inf
-        assert result.upper == portion.inf
-
-    def test_nested_cast_to_boolean(self):
-        expr = (
-            ((pl.col("a").is_in([1, 5, 2])) & (pl.col("a").is_in([5, 2]).not_()))
-            .cast(pl.Boolean)
-            .and_(((pl.col("date") >= date(2023, 10, 1)) & (pl.col("date") <= date(2023, 10, 3))).cast(pl.Boolean))
-        )
-        result = convert_expr_to_datetime_range(expr, "date", get_enclosure=False)
-        expected = portion.closed(datetime(2023, 10, 1), datetime(2023, 10, 3))
-        assert result == expected
-
-
-class TestRangeExtractorAliasHandling:
-    """Test suite for alias handling in range extraction."""
-
-    def test_alias_simple_equality(self):
-        """Test range extraction with aliased column equality."""
-        test_value = 42
-        # Create an expression with alias - the key bug scenario
-        expr = pl.col("original_col").alias("renamed_col") == test_value
-
-        # This should work by looking through the alias to find the original column
-        result = convert_expr_to_range(expr, "original_col")
-
-        # Should be a singleton interval
-        assert result.atomic
-        assert result.lower == test_value
-        assert result.upper == test_value
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_alias_with_range_constraints(self):
-        """Test range extraction with aliased column range constraints."""
-        start_value = 10
-        end_value = 100
-
-        # Expression with aliased column in range constraints
-        expr = (pl.col("value_col").alias("renamed_value") >= start_value) & (pl.col("value_col").alias("renamed_value") < end_value)
-        result = convert_expr_to_range(expr, "value_col")
-
-        # Should extract the proper range
-        assert result.atomic
-        assert result.lower == start_value
-        assert result.upper == end_value
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.OPEN
-
-    def test_alias_with_in_function(self):
-        """Test range extraction with aliased column in IS_IN function."""
-        values = [10, 20, 30]
-
-        # Expression with aliased column in IS_IN
-        expr = pl.col("test_col").alias("test_alias").is_in(values)
-        result = convert_expr_to_range(expr, "test_col")
-
-        # Should create union of point intervals
-        expected_intervals = [portion.singleton(v) for v in values]
-        expected = expected_intervals[0]
-        for interval in expected_intervals[1:]:
-            expected = expected | interval
-
-        assert result == expected
-
-    def test_alias_with_between_function(self):
-        """Test range extraction with aliased column in IS_BETWEEN function."""
-        lower = 5
-        upper = 15
-
-        # Expression with aliased column in IS_BETWEEN
-        expr = pl.col("range_col").alias("range_alias").is_between(lower, upper)
-        result = convert_expr_to_range(expr, "range_col")
-
-        # Should be a closed interval
-        assert result.atomic
-        assert result.lower == lower
-        assert result.upper == upper
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_alias_datetime_range_extraction(self):
-        """Test datetime range extraction with aliased columns."""
-        start_date = date(2023, 1, 1)
-        end_date = date(2023, 12, 31)
-
-        # Expression with aliased datetime column
-        expr = (pl.col("date_col").alias("date_alias") >= start_date) & (pl.col("date_col").alias("date_alias") <= end_date)
-        result = convert_expr_to_datetime_range(expr, "date_col")
-
-        # Should extract proper datetime range
-        assert result.atomic
-        assert result.lower == datetime.combine(start_date, time())
-        assert result.upper == datetime.combine(end_date, time())
-        assert result.left is Bound.CLOSED
-        assert result.right is Bound.CLOSED
-
-    def test_complex_nested_alias_cast_combinations(self):
-        """Test complex combinations of nested aliases and casts."""
-        test_value = 42
-
-        # Test cast -> alias -> alias
-        expr1 = pl.col("original").cast(pl.Float64).alias("first").alias("second") == test_value
-        result1 = convert_expr_to_range(expr1, "original")
-        assert result1.atomic
-        assert result1.lower == test_value
-        assert result1.upper == test_value
-
-        # Test alias -> cast -> alias
-        expr2 = pl.col("original").alias("first").cast(pl.Float64).alias("second") == test_value
-        result2 = convert_expr_to_range(expr2, "original")
-        assert result2.atomic
-        assert result2.lower == test_value
-        assert result2.upper == test_value
-
-        # Test with IS_BETWEEN and complex nesting
-        start_val, end_val = 10, 20
-        expr3 = pl.col("value").cast(pl.Float64).alias("v1").alias("v2").is_between(start_val, end_val)
-        result3 = convert_expr_to_range(expr3, "value")
-        assert result3.atomic
-        assert result3.lower == start_val
-        assert result3.upper == end_val
-
-
-def _test_expression_with_df(expr, index_col, test_dates, expected_indices):
-    """Helper function to test polars expressions against a test dataframe.
-
-    Args:
-        expr: The polars expression to test
-        index_col: The name of the date column
-        test_dates: List of dates to test
-        expected_indices: Indices of test_dates that should pass the filter
-    """
-    test_df = pl.DataFrame({index_col: test_dates})
-    if expr is None:
-        # If expression is None, we should get all rows
-        filtered_df = test_df
-    else:
-        # Apply the expression
-        filtered_df = test_df.filter(expr)
-
-    # Get the filtered dates and compare with expected
-    filtered_dates = filtered_df[index_col].to_list()
-    expected_dates = [test_dates[i] for i in expected_indices]
-
-    assert set(filtered_dates) == set(expected_dates)
-
-
-class TestLookbackInterval:
-    def test_simple_closed_interval(self):
-        """Test lookback on a basic closed interval."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.closed(start, end)
-        lookback = timedelta(days=1)
-
-        result = _lookback_interval(interval, lookback)
-        expected = portion.closed(datetime(2023, 1, 4), end)
-        assert result == expected
-
-    def test_open_interval(self):
-        """Test lookback on an open interval."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.open(start, end)
-        lookback = timedelta(days=2)
-
-        result = _lookback_interval(interval, lookback)
-        expected = portion.open(lower=datetime(2023, 1, 3), upper=end)
-        assert result == expected
-
-    def test_infinite_lower_bound(self):
-        """Test lookback on interval with infinite lower bound."""
-        end = datetime(2023, 1, 10)
-        interval = portion.openclosed(lower=-portion.inf, upper=end)
-        lookback = timedelta(days=1)
-
-        result = _lookback_interval(interval, lookback)
-        assert result == interval
-
-    def test_compound_interval(self):
-        """Test lookback on a compound interval (union of intervals)."""
-        interval1 = portion.closed(datetime(2023, 1, 1), datetime(2023, 1, 3))
-        interval2 = portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 7))
-        compound_interval = interval1 | interval2
-        lookback = timedelta(days=1)
-
-        result = _lookback_interval(compound_interval, lookback)
-        expected = portion.closed(datetime(2022, 12, 31), datetime(2023, 1, 3)) | portion.closed(datetime(2023, 1, 4), datetime(2023, 1, 7))
-        assert result == expected
-
-    def test_date_bounds(self):
-        """Test lookback on interval with date (not datetime) bounds."""
-        start = date(2023, 1, 5)
-        end = date(2023, 1, 10)
-        interval = portion.closed(start, end)
-        lookback = timedelta(days=3)
-
-        result = _lookback_interval(interval, lookback)
-        expected = portion.closed(date(2023, 1, 2), end)
-        assert result == expected
-
-
-class TestLookaheadInterval:
-    def test_simple_closed_interval(self):
-        """Test lookahead on a basic closed interval."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.closed(start, end)
-        lookahead = timedelta(days=1)
-
-        result = _lookahead_interval(interval, lookahead)
-        expected = portion.closed(start, datetime(2023, 1, 11))
-        assert result == expected
-
-    def test_open_interval(self):
-        """Test lookahead on an open interval."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.open(start, end)
-        lookahead = timedelta(days=2)
-
-        result = _lookahead_interval(interval, lookahead)
-        expected = portion.open(lower=start, upper=datetime(2023, 1, 12))
-        assert result == expected
-
-    def test_infinite_upper_bound(self):
-        """Test lookahead on interval with infinite upper bound."""
-        start = datetime(2023, 1, 10)
-        interval = portion.closedopen(lower=start, upper=portion.inf)
-        lookahead = timedelta(days=1)
-
-        result = _lookahead_interval(interval, lookahead)
-        assert result == interval
-
-    def test_compound_interval(self):
-        """Test lookahead on a compound interval (union of intervals)."""
-        interval1 = portion.closed(datetime(2023, 1, 1), datetime(2023, 1, 3))
-        interval2 = portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 7))
-        compound_interval = interval1 | interval2
-        lookahead = timedelta(days=1)
-
-        result = _lookahead_interval(compound_interval, lookahead)
-        expected = portion.closed(datetime(2023, 1, 1), datetime(2023, 1, 4)) | portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 8))
-        assert result == expected
-
-    def test_date_bounds(self):
-        """Test lookahead on interval with date (not datetime) bounds."""
-        start = date(2023, 1, 5)
-        end = date(2023, 1, 10)
-        interval = portion.closed(start, end)
-        lookahead = timedelta(days=3)
-
-        result = _lookahead_interval(interval, lookahead)
-        expected = portion.closed(start, date(2023, 1, 13))
-        assert result == expected
-
-
-class TestExtendToFullDates:
-    def test_datetime_bounds(self):
-        """Test extending intervals with datetime bounds to full dates."""
-        start = datetime(2023, 1, 5, 12, 30, 45)
-        end = datetime(2023, 1, 10, 14, 20, 15)
-        interval = portion.closed(start, end)
-
-        result = _extend_to_full_dates(interval)
-        expected = portion.closed(date(2023, 1, 5), date(2023, 1, 10))
-        assert result == expected
-
-    def test_date_bounds(self):
-        """Test extending intervals that already have date bounds."""
-        start = date(2023, 1, 5)
-        end = date(2023, 1, 10)
-        interval = portion.closed(start, end)
-
-        result = _extend_to_full_dates(interval)
-        assert result == interval
-
-    def test_infinite_bounds(self):
-        """Test extending intervals with infinite bounds."""
-        interval = portion.open(-portion.inf, portion.inf)
-
-        result = _extend_to_full_dates(interval)
-        assert result == interval
-
-    def test_compound_interval(self):
-        """Test extending compound intervals to full dates."""
-        interval1 = portion.closed(datetime(2023, 1, 1, 8, 30), datetime(2023, 1, 3, 16, 45))
-        interval2 = portion.closed(datetime(2023, 1, 5, 9, 15), datetime(2023, 1, 7, 17, 30))
-        compound_interval = interval1 | interval2
-
-        result = _extend_to_full_dates(compound_interval)
-        expected = portion.closed(date(2023, 1, 1), date(2023, 1, 3)) | portion.closed(date(2023, 1, 5), date(2023, 1, 7))
-        assert result == expected
-
-    def test_open_upper_bound_keeps_date_after_midnight(self):
-        """A Date column value ``d`` satisfies ``d < upper`` when ``upper`` falls after midnight on ``d``."""
-        result = _extend_to_full_dates(portion.closedopen(datetime(2023, 12, 1), datetime(2024, 1, 1, 12)))
-        assert result == portion.closed(date(2023, 12, 1), date(2024, 1, 1))
-
-
-class TestConvertAtomicIntervalToPolarsExpr:
-    def test_fully_open_interval(self):
-        """Test converting open interval to polars expression."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.open(start, end)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 10),
-            datetime(2023, 1, 11),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [2])
-
-    def test_fully_closed_interval(self):
-        """Test converting closed interval to polars expression."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.closed(start, end)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 10),
-            datetime(2023, 1, 11),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [1, 2, 3])
-
-    def test_left_open_right_closed_interval(self):
-        """Test converting left-open, right-closed interval to polars expression."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.openclosed(start, end)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 10),
-            datetime(2023, 1, 11),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [2, 3])
-
-    def test_left_closed_right_open_interval(self):
-        """Test converting left-closed, right-open interval to polars expression."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.closedopen(start, end)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 10),
-            datetime(2023, 1, 11),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [1, 2])
-
-    def test_infinite_lower_bound(self):
-        """Test converting interval with infinite lower bound to polars expression."""
-        end = datetime(2023, 1, 10)
-        interval = portion.openclosed(lower=-portion.inf, upper=end)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2022, 1, 1),
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 10),
-            datetime(2023, 1, 11),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [0, 1, 2])
-
-    def test_infinite_upper_bound(self):
-        """Test converting interval with infinite upper bound to polars expression."""
-        start = datetime(2023, 1, 5)
-        interval = portion.closedopen(lower=start, upper=portion.inf)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 10),
-            datetime(2024, 1, 1),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [1, 2, 3])
-
-    def test_full_infinite_interval(self):
-        """Test converting fully infinite interval to polars expression."""
-        interval = portion.open(-portion.inf, portion.inf)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [datetime(2022, 1, 1), datetime(2023, 1, 5), datetime(2023, 1, 10), datetime(2024, 1, 1)]
-
-        assert result is None
-        _test_expression_with_df(result, index_col, test_dates, [0, 1, 2, 3])
-
-    def test_singleton_interval(self):
-        """Test converting singleton interval to polars expression."""
-        value = datetime(2023, 1, 5)
-        interval = portion.singleton(value)
-        index_col = "date"
-
-        result = _convert_atomic_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 6),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [1])
-
-
-class TestConvertIntervalToPolarsExpr:
-    def test_simple_atomic_interval(self):
-        """Test converting simple atomic interval to polars expression."""
-        start = datetime(2023, 1, 5)
-        end = datetime(2023, 1, 10)
-        interval = portion.closed(start, end)
-        index_col = "date"
-
-        result = _convert_interval_to_polars_expr(interval, index_col)
-        test_dates = [
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 10),
-            datetime(2023, 1, 11),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [1, 2, 3])
-
-    def test_compound_interval(self):
-        """Test converting compound interval to polars expression."""
-        interval1 = portion.closed(datetime(2023, 1, 1), datetime(2023, 1, 3))
-        interval2 = portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 7))
-        compound_interval = interval1 | interval2
-        index_col = "date"
-
-        result = _convert_interval_to_polars_expr(compound_interval, index_col)
-        test_dates = [
-            datetime(2022, 12, 31),
-            datetime(2023, 1, 1),
-            datetime(2023, 1, 2),
-            datetime(2023, 1, 3),
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 6),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 8),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [1, 2, 3, 5, 6, 7])
-
-    def test_empty_interval(self):
-        """Test converting empty interval returns False (not None)."""
-        interval = portion.empty()
-        index_col = "date"
-
-        result = _convert_interval_to_polars_expr(interval, index_col)
-        assert result is False, "Empty interval should return False, not None"
-
-    def test_universe_interval(self):
-        """Test that universe interval returns None (no restriction)."""
-        universe = portion.closed(-portion.inf, portion.inf)
-        assert _convert_interval_to_polars_expr(universe, "date") is None
-
-    def test_mixed_bounds_compound(self):
-        """Test converting compound interval with mixed bound types to polars expression."""
-        interval1 = portion.openclosed(datetime(2023, 1, 1), datetime(2023, 1, 3))
-        interval2 = portion.closedopen(datetime(2023, 1, 5), datetime(2023, 1, 7))
-        compound_interval = interval1 | interval2
-        index_col = "date"
-
-        result = _convert_interval_to_polars_expr(compound_interval, index_col)
-        test_dates = [
-            datetime(2022, 12, 31),
-            datetime(2023, 1, 1),
-            datetime(2023, 1, 2),
-            datetime(2023, 1, 3),
-            datetime(2023, 1, 4),
-            datetime(2023, 1, 5),
-            datetime(2023, 1, 6),
-            datetime(2023, 1, 7),
-            datetime(2023, 1, 8),
-        ]
-        _test_expression_with_df(result, index_col, test_dates, [2, 3, 5, 6])
-
-
-class TestDateWindows:
-    """Calendar window generation (``partitions._date_windows``): calendar flooring and the
-    exclusive-vs-inclusive upper-bound handling that the ``closed="left"`` regression guards."""
-
-    @staticmethod
-    def _windows(lower, upper, right, every):
-        import portion
-
-        from polars_io_tools.io_sources.partitions import _date_windows
-
-        return _date_windows(portion.Interval.from_atomic(portion.CLOSED, lower, upper, right), every)
-
-    def test_exclusive_upper_drops_boundary_window(self):
-        import portion
-
-        w = self._windows(datetime(2024, 1, 2), datetime(2024, 1, 10), portion.OPEN, "1d")
-        assert len(w) == 8  # Jan 2..Jan 9; the Jan 10 window is excluded
-        assert w[-1] == (datetime(2024, 1, 9), datetime(2024, 1, 10))
-        assert datetime(2024, 1, 10) not in {lo for lo, _ in w}
-
-    def test_inclusive_upper_keeps_boundary_window(self):
-        import portion
-
-        w = self._windows(datetime(2024, 1, 2), datetime(2024, 1, 10), portion.CLOSED, "1d")
-        assert len(w) == 9  # Jan 2..Jan 10 inclusive
-        assert w[-1] == (datetime(2024, 1, 10), datetime(2024, 1, 11))
-
-    def test_monthly_floors_to_calendar_boundary(self):
-        import portion
-
-        w = self._windows(datetime(2024, 1, 15), datetime(2024, 3, 10), portion.CLOSED, "1mo")
-        assert len(w) == 3
-        assert w[0] == (datetime(2024, 1, 1), datetime(2024, 2, 1))  # floored to Jan 1, not Jan 15
-        assert w[1] == (datetime(2024, 2, 1), datetime(2024, 3, 1))
-        assert w[-1] == (datetime(2024, 3, 1), datetime(2024, 4, 1))
-
-    def test_disjoint_interval_skips_the_gaps(self):
-        import portion
-
-        from polars_io_tools.io_sources.partitions import _date_windows
-
-        # January and December only: two monthly windows, not twelve across the gap between them.
-        iv = portion.closedopen(datetime(2024, 1, 1), datetime(2024, 1, 15)) | portion.closedopen(datetime(2024, 12, 1), datetime(2024, 12, 15))
-        w = _date_windows(iv, "1mo")
-        assert w == [
-            (datetime(2024, 1, 1), datetime(2024, 2, 1)),
-            (datetime(2024, 12, 1), datetime(2025, 1, 1)),
-        ]
-
-
+from polars_io_tools.tests.helpers.assertions import assert_pushed_filter_keeps_rows
+from polars_io_tools.tests.helpers.cases import as_params
+
+ANY_VALUE = portion.open(-portion.inf, portion.inf)
+EMPTY = portion.empty()
+NEW_YORK = ZoneInfo("America/New_York")
 _NAN = float("nan")
-_NS_LITERAL = pl.lit(1704103200000000500).cast(pl.Datetime("ns"))  # 2024-01-01 10:00:00.000000500
 
 
-class TestUnusableLiteralsLeaveColumnUnconstrained:
-    @pytest.mark.parametrize(
-        "expr",
+@dataclass(frozen=True)
+class RangeCase:
+    """A filter, and the range of values it allows in one column."""
+
+    id: str
+    _: KW_ONLY
+    predicate: pl.Expr
+    expected_range: Interval
+    column: str = "value_col"
+    # passed on to ``convert_expr_to_range``
+    create_point_func: Callable | None = None
+    validate_value_func: Callable | None = None
+
+
+def _from_value_to_next_integer(x):
+    return Interval.from_atomic(Bound.CLOSED, x, x + 1, Bound.OPEN)
+
+
+# --- convert_expr_to_range --------------------------------------------------------------------------------------------
+
+# Filters on numbers (and some dates), and the range each one allows.
+RANGE_CASES = [
+    RangeCase("simple_equality_range", predicate=pl.col("value_col") == 42, expected_range=portion.singleton(42)),
+    RangeCase(
+        "simple_equality_range-point_func",
+        predicate=pl.col("value_col") == 42,
+        expected_range=portion.closedopen(42, 43),
+        create_point_func=_from_value_to_next_integer,
+    ),
+    RangeCase("numeric_range", predicate=(pl.col("value_col") >= 10) & (pl.col("value_col") < 100), expected_range=portion.closedopen(10, 100)),
+    RangeCase(
+        "mixed_int_float_range",
+        predicate=(pl.col("mixed_col") >= 10) & (pl.col("mixed_col") < 20.5),
+        expected_range=portion.closedopen(10, 20.5),
+        column="mixed_col",
+    ),
+    RangeCase(
+        "or_int_float_range",
+        predicate=(pl.col("mixed_col") == 15) | (pl.col("mixed_col") == 20.5),
+        expected_range=portion.singleton(15) | portion.singleton(20.5),
+        column="mixed_col",
+    ),
+    RangeCase(
+        "or_int_float_range-validate_func",
+        predicate=(pl.col("mixed_col") == 15) | (pl.col("mixed_col") == 20.5),
+        expected_range=portion.singleton(15) | portion.singleton(20),
+        column="mixed_col",
+        validate_value_func=lambda x: int(x) if isinstance(x, float) else x,
+        create_point_func=lambda x: portion.singleton(int(x)),
+    ),
+    RangeCase(
+        "in_operator_range",
+        predicate=pl.col("value_col").is_in([10, 20, 30]),
+        expected_range=portion.singleton(10) | portion.singleton(20) | portion.singleton(30),
+    ),
+    RangeCase(
+        "in_operator_range-point_func",
+        predicate=pl.col("value_col").is_in([10, 20, 30]),
+        expected_range=portion.closedopen(10, 11) | portion.closedopen(20, 21) | portion.closedopen(30, 31),
+        create_point_func=_from_value_to_next_integer,
+    ),
+    RangeCase(
+        "complex_nested_expression",
+        predicate=(pl.col("mixed_col") >= 15) & ((pl.col("mixed_col") < 30.5) | (pl.col("mixed_col") == 50.5)),
+        expected_range=portion.closedopen(15, 30.5) | portion.singleton(50.5),
+        column="mixed_col",
+    ),
+    RangeCase("unbounded_ranges-lower", predicate=pl.col("mixed_col") >= 15, expected_range=portion.closedopen(15, portion.inf), column="mixed_col"),
+    RangeCase("unbounded_ranges-upper", predicate=pl.col("mixed_col") < 30.5, expected_range=portion.open(-portion.inf, 30.5), column="mixed_col"),
+    RangeCase(
+        "value_validation", predicate=pl.col("value_col") >= 42.7, expected_range=portion.closedopen(43, portion.inf), validate_value_func=round
+    ),
+    RangeCase(
+        "different_timezone_ranges",
+        predicate=(pl.col("timestamp") >= datetime(2023, 5, 15, 12, tzinfo=UTC))
+        & (pl.col("timestamp") < datetime(2023, 5, 15, 8, tzinfo=timezone(timedelta(hours=-4)))),
+        expected_range=EMPTY,
+        column="timestamp",
+        validate_value_func=lambda t: t if t.tzinfo is None else t.astimezone(UTC).replace(tzinfo=None),
+    ),
+    RangeCase(
+        "in_with_mixed_types_combined_with_range",
+        predicate=pl.col("mixed_col").is_in([date(2023, 1, 15), date(2023, 2, 15), date(2023, 3, 15)]) & (pl.col("mixed_col") >= date(2023, 2, 1)),
+        expected_range=portion.singleton(date(2023, 2, 15)) | portion.singleton(date(2023, 3, 15)),
+        column="mixed_col",
+    ),
+    # when/then/otherwise: the range covers both branches; the condition is ignored.
+    RangeCase(
+        "simple_ternary_with_date_ranges-column_condition",
+        predicate=pl.when(pl.col("is_us_market"))
+        .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 3, 1)))
+        .otherwise((pl.col("date") >= date(2023, 6, 1)) & (pl.col("date") < date(2023, 9, 1))),
+        expected_range=portion.closedopen(date(2023, 1, 1), date(2023, 3, 1)) | portion.closedopen(date(2023, 6, 1), date(2023, 9, 1)),
+        column="date",
+    ),
+    RangeCase(
+        "simple_ternary_with_date_ranges-date_condition",
+        predicate=pl.when(pl.col("is_us_market") & pl.col("date") >= date(2023, 2, 1))
+        .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 3, 1)))
+        .otherwise((pl.col("date") >= date(2023, 6, 1)) & (pl.col("date") < date(2023, 9, 1))),
+        expected_range=portion.closedopen(date(2023, 1, 1), date(2023, 3, 1)) | portion.closedopen(date(2023, 6, 1), date(2023, 9, 1)),
+        column="date",
+    ),
+    RangeCase(
+        "ternary_one_branch_with_date_range",
+        predicate=pl.when(pl.col("is_weekend"))
+        .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 4, 1)))
+        .otherwise(pl.lit(True)),
+        expected_range=ANY_VALUE,
+        column="date",
+    ),
+    RangeCase(
+        "ternary_combined_with_other_conditions",
+        predicate=pl.when(pl.col("region") == "US")
+        .then((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 4, 1)))
+        .otherwise((pl.col("date") >= date(2023, 6, 1)) & (pl.col("date") < date(2023, 9, 1)))
+        & (pl.col("date") < date(2023, 12, 31)),
+        expected_range=portion.closedopen(date(2023, 1, 1), date(2023, 4, 1)) | portion.closedopen(date(2023, 6, 1), date(2023, 9, 1)),
+        column="date",
+    ),
+    # A cast to Boolean is ignored; any other cast hides the comparison, so the range is unlimited.
+    RangeCase(
+        "boolean_cast_processes_input_node",
+        predicate=(pl.col("value_col") >= 10).cast(pl.Boolean),
+        expected_range=portion.closedopen(10, portion.inf),
+    ),
+    RangeCase("non_boolean_cast_ignores_input_node", predicate=(pl.col("value_col") >= 10).cast(pl.Utf8), expected_range=ANY_VALUE),
+    RangeCase("target_column_check_in_cast", predicate=(pl.col("other_col") >= 10).cast(pl.Boolean), expected_range=ANY_VALUE),
+    RangeCase(
+        "nested_boolean_casts_process_all_levels",
+        predicate=(pl.col("value_col") >= 10).cast(pl.Boolean).cast(pl.Boolean),
+        expected_range=portion.closedopen(10, portion.inf),
+    ),
+    RangeCase(
+        "boolean_cast_with_complex_input",
+        predicate=((pl.col("value_col") >= 10) & (pl.col("value_col") < 100)).cast(pl.Boolean),
+        expected_range=portion.closedopen(10, 100),
+    ),
+    RangeCase(
+        "boolean_cast_in_conjunction",
+        predicate=(pl.col("value_col") >= 10).cast(pl.Boolean) & (pl.col("value_col") < 100),
+        expected_range=portion.closedopen(10, 100),
+    ),
+    RangeCase(
+        "cast_with_function",
+        predicate=pl.col("value_col").is_in([10, 20, 30]).cast(pl.Boolean),
+        expected_range=portion.singleton(10) | portion.singleton(20) | portion.singleton(30),
+    ),
+    RangeCase(
+        "cast_with_ternary",
+        predicate=pl.when(pl.col("condition"))
+        .then((pl.col("value_col") >= 10) & (pl.col("value_col") < 50))
+        .otherwise((pl.col("value_col") >= 100) & (pl.col("value_col") < 150))
+        .cast(pl.Boolean),
+        expected_range=portion.closedopen(10, 50) | portion.closedopen(100, 150),
+    ),
+    RangeCase(
+        "mixed_boolean_casts_in_expr",
+        predicate=(pl.col("value_col") >= 10).cast(pl.Boolean) & (pl.col("value_col") < 100).cast(pl.Utf8),
+        expected_range=portion.closedopen(10, portion.inf),
+    ),
+    RangeCase("boolean_cast_column_directly", predicate=pl.col("value_col").cast(pl.Boolean), expected_range=ANY_VALUE),
+    # Aliases are ignored.
+    RangeCase(
+        "range_alias_simple_equality",
+        predicate=pl.col("original_col").alias("renamed_col") == 42,
+        expected_range=portion.singleton(42),
+        column="original_col",
+    ),
+    RangeCase(
+        "alias_with_range_constraints",
+        predicate=(pl.col("value_col").alias("renamed_value") >= 10) & (pl.col("value_col").alias("renamed_value") < 100),
+        expected_range=portion.closedopen(10, 100),
+    ),
+    RangeCase(
+        "alias_with_in_function",
+        predicate=pl.col("test_col").alias("test_alias").is_in([10, 20, 30]),
+        expected_range=portion.singleton(10) | portion.singleton(20) | portion.singleton(30),
+        column="test_col",
+    ),
+    RangeCase(
+        "alias_with_between_function",
+        predicate=pl.col("range_col").alias("range_alias").is_between(5, 15),
+        expected_range=portion.closed(5, 15),
+        column="range_col",
+    ),
+    RangeCase(
+        "complex_nested_alias_cast_combinations-cast_alias_alias",
+        predicate=pl.col("original").cast(pl.Float64).alias("first").alias("second") == 42,
+        expected_range=portion.singleton(42),
+        column="original",
+    ),
+    RangeCase(
+        "complex_nested_alias_cast_combinations-alias_cast_alias",
+        predicate=pl.col("original").alias("first").cast(pl.Float64).alias("second") == 42,
+        expected_range=portion.singleton(42),
+        column="original",
+    ),
+    RangeCase(
+        "complex_nested_alias_cast_combinations-between",
+        predicate=pl.col("value").cast(pl.Float64).alias("v1").alias("v2").is_between(10, 20),
+        expected_range=portion.closed(10, 20),
+        column="value",
+    ),
+    # A NaN cannot limit a column.
+    RangeCase("unusable_nan-eq", predicate=pl.col("x") == _NAN, expected_range=ANY_VALUE, column="x"),
+    RangeCase("unusable_nan-is_in", predicate=pl.col("x").is_in([1.0, _NAN]), expected_range=ANY_VALUE, column="x"),
+    RangeCase("unusable_nan-is_between", predicate=pl.col("x").is_between(0, _NAN), expected_range=portion.closed(0, portion.inf), column="x"),
+    RangeCase("unusable_nan-or", predicate=pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN), expected_range=ANY_VALUE, column="x"),
+    # an integer column is compared with a float as Float64, so a float of magnitude 2**53 or more cannot bound it
+    RangeCase(
+        "float_rounds_int-is_between",
+        predicate=pl.col("x").is_between(1.0, float(2**53)) & (pl.col("x") <= 5),
+        expected_range=portion.closed(1.0, 5),
+        column="x",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(RANGE_CASES))
+def test_range(case: RangeCase):
+    assert convert_expr_to_range(case.predicate, case.column, case.create_point_func, case.validate_value_func) == case.expected_range
+
+
+# --- convert_expr_to_datetime_range -----------------------------------------------------------------------------------
+
+_15TH_OF_JAN_FEB_MAR_2023 = [date(2023, 1, 15), date(2023, 2, 15), date(2023, 3, 15)]
+_NEW_YORK_5PM_JAN_1_2023 = datetime(2023, 1, 1, 17, tzinfo=NEW_YORK)
+# 2024-01-02 00:00:00 plus 999 ns, the widened upper bound Polars hands on for an inclusive ``<=`` on a ns column.
+_JAN_2_2024_NS = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
+_JAN_2_2024_PLUS_999_NS = pl.lit(_JAN_2_2024_NS + 999).cast(pl.Datetime("ns"))
+_MICROSECOND_FROM_JAN_2_2024 = portion.closed(datetime(2024, 1, 2), datetime(2024, 1, 2, 0, 0, 0, 1))
+
+
+def _as_naive_utc(t: datetime) -> datetime:
+    return t.astimezone(UTC).replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class DatetimeRangeCase:
+    """A filter, and the range of date and time values it allows in one column."""
+
+    id: str
+    _: KW_ONLY
+    predicate: pl.Expr
+    expected_range: Interval
+    column: str = "date_col"
+    # passed on to ``convert_expr_to_datetime_range``
+    coerce_date_to_datetime: bool = True
+    get_enclosure: bool = True
+
+
+# Filters on dates and datetimes, and the range of datetimes each one allows.
+DATETIME_CASES = [
+    DatetimeRangeCase(
+        "single_equality-whole_day",
+        predicate=pl.col("date_col") == date(2023, 5, 15),
+        expected_range=portion.closedopen(datetime(2023, 5, 15), datetime(2023, 5, 16)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "single_equality-midnight",
+        predicate=pl.col("date_col") == date(2023, 5, 15),
+        expected_range=portion.singleton(datetime(2023, 5, 15)),
+        coerce_date_to_datetime=True,
+    ),
+    DatetimeRangeCase(
+        "date_range",
+        predicate=(pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 12, 31)),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+    ),
+    DatetimeRangeCase(
+        "datetime_range",
+        predicate=(pl.col("timestamp") > datetime(2023, 5, 15, 9)) & (pl.col("timestamp") <= datetime(2023, 5, 15, 17)),
+        expected_range=portion.openclosed(datetime(2023, 5, 15, 9), datetime(2023, 5, 15, 17)),
+        column="timestamp",
+    ),
+    # The range is closed: Polars cuts a finer literal down to the coarser unit of the column.
+    *[
+        DatetimeRangeCase(
+            f"cast_date_and_datetime-strict={strict}",
+            predicate=(pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col").cast(pl.Datetime, strict=strict) < datetime(2023, 12, 31)),
+            expected_range=portion.closed(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+            coerce_date_to_datetime=True,
+        )
+        for strict in (True, False)
+    ],
+    # A date literal does not bound a column cast to a sub-day unit.
+    *[
+        DatetimeRangeCase(
+            f"cast_datetime_time_unit-coerce={coerce}",
+            predicate=pl.col("datetime_col").cast(pl.Datetime(time_unit="ns")) == date(2023, 12, 31),
+            expected_range=ANY_VALUE,
+            column="datetime_col",
+            coerce_date_to_datetime=coerce,
+        )
+        for coerce in (True, False)
+    ],
+    DatetimeRangeCase(
+        "datetime_cast_time",
+        predicate=pl.col("datetime_col").is_between(datetime(2023, 1, 1, 16), datetime(2023, 1, 1, 18))
+        & pl.col("datetime_col").cast(pl.Time()).is_between(time(12, 15), time(19)),
+        expected_range=portion.closed(datetime(2023, 1, 1, 16), datetime(2023, 1, 1, 18)),
+        column="datetime_col",
+        coerce_date_to_datetime=True,
+    ),
+    DatetimeRangeCase(
+        "cast_datetime_time_zone",
+        predicate=pl.col("datetime_col")
+        .cast(pl.Datetime("ns", "America/New_York"))
+        .is_between(_NEW_YORK_5PM_JAN_1_2023 - timedelta(hours=1), _NEW_YORK_5PM_JAN_1_2023 + timedelta(hours=1)),
+        expected_range=portion.closed(
+            _as_naive_utc(_NEW_YORK_5PM_JAN_1_2023 - timedelta(hours=1)),
+            _as_naive_utc(_NEW_YORK_5PM_JAN_1_2023 + timedelta(hours=1)) + timedelta(microseconds=1),
+        ),
+        column="datetime_col",
+        coerce_date_to_datetime=True,
+    ),
+    DatetimeRangeCase(
+        "or_conditions",
+        predicate=(pl.col("date_col") == date(2023, 1, 15)) | (pl.col("date_col") == date(2023, 2, 15)),
+        expected_range=portion.closed(datetime(2023, 1, 15), datetime(2023, 2, 15)),
+    ),
+    DatetimeRangeCase(
+        "unbounded_min", predicate=pl.col("date_col") <= date(2023, 12, 31), expected_range=portion.openclosed(-portion.inf, datetime(2023, 12, 31))
+    ),
+    DatetimeRangeCase(
+        "unbounded_max", predicate=pl.col("date_col") >= date(2023, 1, 1), expected_range=portion.closedopen(datetime(2023, 1, 1), portion.inf)
+    ),
+    DatetimeRangeCase(
+        "in_operator-whole_days",
+        predicate=pl.col("date_col").is_in(_15TH_OF_JAN_FEB_MAR_2023),
+        expected_range=portion.closedopen(datetime(2023, 1, 15), datetime(2023, 3, 16)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "in_operator-midnights",
+        predicate=pl.col("date_col").is_in(_15TH_OF_JAN_FEB_MAR_2023),
+        expected_range=portion.closed(datetime(2023, 1, 15), datetime(2023, 3, 15)),
+        coerce_date_to_datetime=True,
+    ),
+    DatetimeRangeCase(
+        "in_with_other_conditions-and",
+        predicate=pl.col("date_col").is_in(_15TH_OF_JAN_FEB_MAR_2023) & (pl.col("date_col") >= date(2023, 2, 1)),
+        expected_range=portion.closedopen(datetime(2023, 2, 15), datetime(2023, 3, 16)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "in_with_other_conditions-or",
+        predicate=pl.col("date_col").is_in(_15TH_OF_JAN_FEB_MAR_2023) | (pl.col("date_col") >= date(2023, 2, 1)),
+        expected_range=portion.closedopen(datetime(2023, 1, 15), portion.inf),
+        coerce_date_to_datetime=False,
+    ),
+    # != cannot be written as a range and is ignored
+    DatetimeRangeCase(
+        "not_equal",
+        predicate=(pl.col("date_col") >= date(2023, 5, 10)) & (pl.col("date_col") <= date(2023, 5, 20)) & (pl.col("date_col") != date(2023, 5, 15)),
+        expected_range=portion.closed(datetime(2023, 5, 10), datetime(2023, 5, 20)),
+    ),
+    DatetimeRangeCase(
+        "contradiction_equal_not_equal",
+        predicate=(pl.col("date_col") == date(2023, 5, 15)) & (pl.col("date_col") != date(2023, 5, 15)),
+        expected_range=portion.closedopen(datetime(2023, 5, 15), datetime(2023, 5, 16)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "contradiction_range-is_between",
+        predicate=pl.col("time_col").is_between(datetime(2024, 2, 2), datetime(2023, 2, 3), closed="left"),
+        expected_range=EMPTY,
+        column="time_col",
+    ),
+    DatetimeRangeCase(
+        "contradiction_range-ge_lt",
+        predicate=(pl.col("time_col") >= date(2023, 5, 15)) & (pl.col("time_col") < date(2023, 5, 10)),
+        expected_range=EMPTY,
+        column="time_col",
+    ),
+    DatetimeRangeCase(
+        "multiple_equalities_consistent",
+        predicate=(pl.col("date_col") == date(2023, 5, 15)) & (pl.col("date_col") == date(2023, 5, 15)),
+        expected_range=portion.closedopen(datetime(2023, 5, 15), datetime(2023, 5, 16)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "multiple_equalities_contradictory-midnight",
+        predicate=(pl.col("date_col") == date(2023, 5, 15)) & (pl.col("date_col") == date(2023, 5, 16)),
+        expected_range=EMPTY,
+    ),
+    DatetimeRangeCase(
+        "multiple_equalities_contradictory-whole_day",
+        predicate=(pl.col("date_col") == date(2023, 5, 15)) & (pl.col("date_col") == date(2023, 5, 16)),
+        expected_range=EMPTY,
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "column_not_in_expression", predicate=(pl.col("other_col1") == "value1") | (pl.col("other_col2") == "value2"), expected_range=ANY_VALUE
+    ),
+    DatetimeRangeCase(
+        "column_with_other_columns",
+        predicate=(pl.col("other_col") == "some_value") & (pl.col("date_col") >= date(2023, 5, 15)),
+        expected_range=portion.closedopen(datetime(2023, 5, 15), portion.inf),
+    ),
+    DatetimeRangeCase("is_null", predicate=pl.col("date_col").is_null(), expected_range=ANY_VALUE),
+    DatetimeRangeCase(
+        "datetime_comparisons_with_timezone",
+        predicate=(pl.col("timestamp") >= datetime(2023, 5, 15, 9, tzinfo=UTC)) & (pl.col("timestamp") <= datetime(2023, 5, 15, 17, tzinfo=UTC)),
+        expected_range=portion.closed(datetime(2023, 5, 15, 9), datetime(2023, 5, 15, 17)),
+        column="timestamp",
+    ),
+    # By default an OR of ranges gives one range from the lowest start to the highest end.
+    DatetimeRangeCase(
+        "complex_or_conditions",
+        predicate=((pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 6, 1)))
+        | ((pl.col("date_col") >= date(2023, 5, 1)) & (pl.col("date_col") < date(2023, 12, 31))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+    ),
+    DatetimeRangeCase(
+        "disjoint_ranges",
+        predicate=((pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 3, 1)))
+        | ((pl.col("date_col") >= date(2023, 6, 1)) & (pl.col("date_col") < date(2023, 9, 1))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 9, 1)),
+    ),
+    DatetimeRangeCase(
+        "datetime_vs_date",
+        predicate=(pl.col("mixed_col") >= date(2023, 5, 15)) & (pl.col("mixed_col") < datetime(2023, 5, 15, 12)),
+        expected_range=portion.closedopen(datetime(2023, 5, 15), datetime(2023, 5, 15, 12)),
+        column="mixed_col",
+    ),
+    DatetimeRangeCase(
+        "datetime_with_multiple_expr",
+        predicate=pl.col("Date").is_between(datetime(2023, 5, 15, 12), datetime(2023, 5, 16, 12)) & pl.col("symol").is_in(["A", "B"]),
+        expected_range=portion.closed(datetime(2023, 5, 15, 12), datetime(2023, 5, 16, 12)),
+        column="Date",
+    ),
+    DatetimeRangeCase(
+        "datetime_microseconds",
+        predicate=(pl.col("timestamp") > datetime(2023, 5, 15, 9)) & (pl.col("timestamp") <= datetime(2023, 5, 15, 9, 0, 0, 1)),
+        expected_range=portion.openclosed(datetime(2023, 5, 15, 9), datetime(2023, 5, 15, 9, 0, 0, 1)),
+        column="timestamp",
+    ),
+    DatetimeRangeCase(
+        "adjacent_date_ranges",
+        predicate=((pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 2, 1)))
+        | ((pl.col("date_col") >= date(2023, 2, 1)) & (pl.col("date_col") < date(2023, 3, 1))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 3, 1)),
+    ),
+    DatetimeRangeCase(
+        "contradiction_in_one_conjunction-midnight",
+        predicate=((pl.col("date_col") >= date(2023, 5, 15)) & (pl.col("date_col") < date(2023, 5, 10))) | (pl.col("date_col") == date(2023, 6, 1)),
+        expected_range=portion.singleton(datetime(2023, 6, 1)),
+    ),
+    DatetimeRangeCase(
+        "contradiction_in_one_conjunction-whole_day",
+        predicate=((pl.col("date_col") >= date(2023, 5, 15)) & (pl.col("date_col") < date(2023, 5, 10))) | (pl.col("date_col") == date(2023, 6, 1)),
+        expected_range=portion.closedopen(datetime(2023, 6, 1), datetime(2023, 6, 2)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase("in_empty_list", predicate=pl.col("date_col").is_in([]), expected_range=EMPTY),
+    DatetimeRangeCase(
+        "not_in_combined_with_range",
+        predicate=(pl.col("date_col") >= date(2023, 1, 1))
+        & (pl.col("date_col") <= date(2023, 12, 31))
+        & ~pl.col("date_col").is_in([date(2023, 7, 4)]),
+        expected_range=portion.closed(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+    ),
+    DatetimeRangeCase(
+        "datetime_range_with_complex_expr",
+        predicate=((pl.col("date") >= date(2023, 1, 1)) & (pl.col("date") < date(2023, 6, 1)))
+        | ((pl.col("date") >= date(2023, 8, 1)) & (pl.col("date") < date(2023, 12, 31))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+        column="date",
+    ),
+    DatetimeRangeCase(
+        "multiple_in_expressions",
+        predicate=pl.col("date_col").is_in([date(2023, 1, 15), date(2023, 2, 15)]) | pl.col("date_col").is_in([date(2023, 3, 15), date(2023, 4, 15)]),
+        expected_range=portion.closedopen(datetime(2023, 1, 15), datetime(2023, 4, 16)),
+        coerce_date_to_datetime=False,
+    ),
+    DatetimeRangeCase(
+        "nested_expressions",
+        predicate=(pl.col("date_col") >= date(2023, 1, 1))
+        & ((pl.col("date_col") < date(2023, 3, 1)) | ((pl.col("date_col") >= date(2023, 6, 1)) & (pl.col("date_col") < date(2023, 9, 1)))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 9, 1)),
+    ),
+    # mixed date and datetime literals
+    DatetimeRangeCase(
+        "contradictory_mixed_types",
+        predicate=(pl.col("mixed_col") >= date(2023, 5, 15)) & (pl.col("mixed_col") < datetime(2023, 5, 10, 12)),
+        expected_range=EMPTY,
+        column="mixed_col",
+    ),
+    DatetimeRangeCase(
+        "is_between_mixed_types-both",
+        predicate=pl.col("mixed_col").is_between(date(2023, 5, 15), datetime(2023, 5, 16, 12)),
+        expected_range=portion.closed(datetime(2023, 5, 15), datetime(2023, 5, 16, 12)),
+        column="mixed_col",
+        get_enclosure=False,
+    ),
+    DatetimeRangeCase(
+        "is_between_mixed_types-left",
+        predicate=pl.col("mixed_col").is_between(date(2023, 5, 15), datetime(2023, 5, 16, 12), closed="left"),
+        expected_range=portion.closedopen(datetime(2023, 5, 15), datetime(2023, 5, 16, 12)),
+        column="mixed_col",
+        get_enclosure=False,
+    ),
+    DatetimeRangeCase(
+        "complex_or_with_mixed_types",
+        predicate=((pl.col("mixed_col") >= date(2023, 1, 1)) & (pl.col("mixed_col") < datetime(2023, 3, 1)))
+        | ((pl.col("mixed_col") >= datetime(2023, 5, 1, 12)) & (pl.col("mixed_col") < date(2023, 6, 1))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 3, 1))
+        | portion.closedopen(datetime(2023, 5, 1, 12), datetime(2023, 6, 1)),
+        column="mixed_col",
+        get_enclosure=False,
+    ),
+    DatetimeRangeCase(
+        "complex_overlapping_ranges",
+        predicate=((pl.col("mixed_col") >= date(2023, 1, 1)) & (pl.col("mixed_col") < datetime(2023, 3, 1)))
+        | ((pl.col("mixed_col") >= date(2023, 2, 15)) & (pl.col("mixed_col") < datetime(2023, 4, 1)))
+        | ((pl.col("mixed_col") >= date(2023, 6, 1)) & (pl.col("mixed_col") < datetime(2023, 7, 1))),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 4, 1))
+        | portion.closedopen(datetime(2023, 6, 1), datetime(2023, 7, 1)),
+        column="mixed_col",
+        get_enclosure=False,
+    ),
+    # casts
+    DatetimeRangeCase(
+        "boolean_cast_with_datetime",
+        predicate=((pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col") < date(2023, 12, 31))).cast(pl.Boolean),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+    ),
+    *[
+        DatetimeRangeCase(
+            f"cast_date_to_datetime_with_comparison-strict={strict}",
+            predicate=(pl.col("date_col") >= date(2023, 1, 1)) & (pl.col("date_col").cast(pl.Datetime, strict=strict) <= datetime(2023, 12, 31, 12)),
+            expected_range=portion.closed(datetime(2023, 1, 1), datetime(2023, 12, 31, 12, 0, 0, 1)),
+        )
+        for strict in (True, False)
+    ],
+    DatetimeRangeCase(
+        "cast_with_time_unit_and_timezone",
+        predicate=pl.col("date_col").cast(pl.Datetime("us", "UTC")) >= datetime(2023, 1, 1, tzinfo=UTC),
+        expected_range=portion.closedopen(datetime(2023, 1, 1), portion.inf),
+    ),
+    DatetimeRangeCase(
+        "boolean_cast_of_datetime_comparison",
+        predicate=(pl.col("dt_col") == datetime(2023, 5, 15, 12)).cast(pl.Boolean),
+        expected_range=portion.singleton(datetime(2023, 5, 15, 12)),
+        column="dt_col",
+        coerce_date_to_datetime=True,
+    ),
+    DatetimeRangeCase("cast_boolean_to_datetime", predicate=pl.col("bool_col").cast(pl.Datetime), expected_range=ANY_VALUE, column="bool_col"),
+    DatetimeRangeCase(
+        "nested_cast_to_boolean",
+        predicate=(pl.col("a").is_in([1, 5, 2]) & pl.col("a").is_in([5, 2]).not_())
+        .cast(pl.Boolean)
+        .and_(((pl.col("date") >= date(2023, 10, 1)) & (pl.col("date") <= date(2023, 10, 3))).cast(pl.Boolean)),
+        expected_range=portion.closed(datetime(2023, 10, 1), datetime(2023, 10, 3)),
+        column="date",
+        get_enclosure=False,
+    ),
+    DatetimeRangeCase(
+        "alias_datetime_range_extraction",
+        predicate=(pl.col("date_col").alias("date_alias") >= date(2023, 1, 1)) & (pl.col("date_col").alias("date_alias") <= date(2023, 12, 31)),
+        expected_range=portion.closed(datetime(2023, 1, 1), datetime(2023, 12, 31)),
+    ),
+    # A cast to a coarser unit rounds down, so the range covers every value that rounds down onto the literal.
+    DatetimeRangeCase(
+        "microsecond_cast_bound_covers_sub_microseconds-eq",
+        predicate=pl.col("t").cast(pl.Datetime("us")) == datetime(2024, 1, 2, 12, 30),
+        expected_range=portion.closed(datetime(2024, 1, 2, 12, 30), datetime(2024, 1, 2, 12, 30, 0, 1)),
+        column="t",
+    ),
+    DatetimeRangeCase(
+        "microsecond_cast_bound_covers_sub_microseconds-le",
+        predicate=pl.col("t").cast(pl.Datetime("us")) <= datetime(2024, 1, 2, 12, 30),
+        expected_range=portion.openclosed(-portion.inf, datetime(2024, 1, 2, 12, 30, 0, 1)),
+        column="t",
+    ),
+    DatetimeRangeCase(
+        "floored_membership_at_maximum_is_unbounded",
+        predicate=pl.col("t").cast(pl.Datetime("us")).is_in([datetime.max]),
+        expected_range=portion.closedopen(datetime.max, portion.inf),
+        column="t",
+    ),
+    # Literals that cannot limit a column leave its range unlimited.
+    DatetimeRangeCase("unusable_datetime-gt_none", predicate=pl.col("t") > None, expected_range=ANY_VALUE, column="t"),
+    DatetimeRangeCase("unusable_datetime-eq_missing_none", predicate=pl.col("t").eq_missing(None), expected_range=ANY_VALUE, column="t"),
+    DatetimeRangeCase(
+        "unusable_datetime-is_in_with_null",
+        predicate=pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True),
+        expected_range=ANY_VALUE,
+        column="t",
+    ),
+    DatetimeRangeCase(
+        "unusable_datetime-is_in_only_null", predicate=pl.col("t").is_in([None], nulls_equal=True), expected_range=ANY_VALUE, column="t"
+    ),
+    DatetimeRangeCase(
+        "single_element_series_is_in",
+        predicate=pl.col("t").is_in(pl.Series([datetime(2024, 1, 1)])),
+        expected_range=portion.singleton(datetime(2024, 1, 1)),
+        column="t",
+    ),
+    DatetimeRangeCase(
+        "is_in_with_failed_literal_leaves_column_unconstrained",
+        predicate=pl.col("t").is_in(pl.Series([1_704_153_600_000_000_000], dtype=pl.Int64).cast(pl.Datetime("us"))),
+        expected_range=ANY_VALUE,
+        column="t",
+    ),
+    # A nanosecond bound with a sub-microsecond part is rounded away from the kept side to whole microseconds, so the
+    # range stays finite (issue #92); an equality or is_in member widens to its enclosing microsecond window.
+    DatetimeRangeCase(
+        "is_between_window_is_not_lost",
+        predicate=pl.col("t").is_between(datetime(2024, 1, 1), _JAN_2_2024_PLUS_999_NS),
+        expected_range=portion.closed(datetime(2024, 1, 1), _MICROSECOND_FROM_JAN_2_2024.upper),
+        column="t",
+        get_enclosure=False,
+    ),
+    DatetimeRangeCase(
+        "equality_widens_to_microsecond_window",
+        predicate=pl.col("t") == _JAN_2_2024_PLUS_999_NS,
+        expected_range=_MICROSECOND_FROM_JAN_2_2024,
+        column="t",
+        get_enclosure=False,
+    ),
+    DatetimeRangeCase(
+        "is_in_keeps_exact_member_as_point_and_widens_sub_microsecond_member",
+        predicate=pl.col("t").is_in(pl.Series([_JAN_2_2024_NS - 1_000_000_000, _JAN_2_2024_NS + 999], dtype=pl.Int64).cast(pl.Datetime("ns"))),
+        expected_range=portion.singleton(datetime(2024, 1, 1, 23, 59, 59)) | _MICROSECOND_FROM_JAN_2_2024,
+        column="t",
+        get_enclosure=False,
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(DATETIME_CASES))
+def test_datetime_range(case: DatetimeRangeCase):
+    got = convert_expr_to_datetime_range(case.predicate, case.column, case.coerce_date_to_datetime, case.get_enclosure)
+    assert got == case.expected_range
+
+
+@pytest.mark.parametrize(
+    "constraints", [None, portion.empty(), portion.closedopen(date(2023, 1, 1), date(2023, 1, 2))], ids=["none", "empty", "interval"]
+)
+def test_range_visitor_copy(constraints):
+    visitor = IntervalVisitor("date_col", None, None)
+    if constraints is not None:
+        visitor.constraints = constraints
+    new_visitor = visitor.copy()
+    assert new_visitor is not visitor
+    assert new_visitor.target_column == visitor.target_column
+    assert new_visitor.constraints == visitor.constraints
+
+
+# --- interval helpers -------------------------------------------------------------------------------------------------
+
+_JAN_1_TO_3_AND_5_TO_7 = portion.closed(datetime(2023, 1, 1), datetime(2023, 1, 3)) | portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 7))
+
+
+@dataclass(frozen=True)
+class ShiftIntervalCase:
+    """An interval shifted by a number of days, and the result."""
+
+    id: str
+    _: KW_ONLY
+    # the lookback or lookahead shift
+    shift: Callable
+    interval: Interval
+    # days
+    delta: int
+    expect: Interval
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
         [
-            pl.col("t") > None,
-            pl.col("t").eq_missing(None),
-            pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True),
-            pl.col("t").is_in([None], nulls_equal=True),
-        ],
-    )
-    def test_datetime(self, expr):
-        assert convert_expr_to_datetime_range(expr, "t") == portion.open(-portion.inf, portion.inf)
+            ShiftIntervalCase(
+                "lookback-simple_closed_interval",
+                shift=_lookback_interval,
+                interval=portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                delta=1,
+                expect=portion.closed(datetime(2023, 1, 4), datetime(2023, 1, 10)),
+            ),
+            ShiftIntervalCase(
+                "lookback-open_interval",
+                shift=_lookback_interval,
+                interval=portion.open(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                delta=2,
+                expect=portion.open(datetime(2023, 1, 3), datetime(2023, 1, 10)),
+            ),
+            ShiftIntervalCase(
+                "lookback-infinite_lower_bound",
+                shift=_lookback_interval,
+                interval=portion.openclosed(-portion.inf, datetime(2023, 1, 10)),
+                delta=1,
+                expect=portion.openclosed(-portion.inf, datetime(2023, 1, 10)),
+            ),
+            ShiftIntervalCase(
+                "lookback-compound_interval",
+                shift=_lookback_interval,
+                interval=_JAN_1_TO_3_AND_5_TO_7,
+                delta=1,
+                expect=portion.closed(datetime(2022, 12, 31), datetime(2023, 1, 3)) | portion.closed(datetime(2023, 1, 4), datetime(2023, 1, 7)),
+            ),
+            ShiftIntervalCase(
+                "lookback-date_bounds",
+                shift=_lookback_interval,
+                interval=portion.closed(date(2023, 1, 5), date(2023, 1, 10)),
+                delta=3,
+                expect=portion.closed(date(2023, 1, 2), date(2023, 1, 10)),
+            ),
+            ShiftIntervalCase(
+                "lookahead-simple_closed_interval",
+                shift=_lookahead_interval,
+                interval=portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                delta=1,
+                expect=portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 11)),
+            ),
+            ShiftIntervalCase(
+                "lookahead-open_interval",
+                shift=_lookahead_interval,
+                interval=portion.open(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                delta=2,
+                expect=portion.open(datetime(2023, 1, 5), datetime(2023, 1, 12)),
+            ),
+            ShiftIntervalCase(
+                "lookahead-infinite_upper_bound",
+                shift=_lookahead_interval,
+                interval=portion.closedopen(datetime(2023, 1, 10), portion.inf),
+                delta=1,
+                expect=portion.closedopen(datetime(2023, 1, 10), portion.inf),
+            ),
+            ShiftIntervalCase(
+                "lookahead-compound_interval",
+                shift=_lookahead_interval,
+                interval=_JAN_1_TO_3_AND_5_TO_7,
+                delta=1,
+                expect=portion.closed(datetime(2023, 1, 1), datetime(2023, 1, 4)) | portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 8)),
+            ),
+            ShiftIntervalCase(
+                "lookahead-date_bounds",
+                shift=_lookahead_interval,
+                interval=portion.closed(date(2023, 1, 5), date(2023, 1, 10)),
+                delta=3,
+                expect=portion.closed(date(2023, 1, 5), date(2023, 1, 13)),
+            ),
+        ]
+    ),
+)
+def test_shift_interval(case: ShiftIntervalCase):
+    assert case.shift(case.interval, timedelta(days=case.delta)) == case.expect
 
-    @pytest.mark.parametrize(
-        "expr",
+
+@dataclass(frozen=True)
+class FullDatesCase:
+    """An interval, and the interval widened to whole days."""
+
+    id: str
+    _: KW_ONLY
+    interval: Interval
+    expect: Interval
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
         [
-            pl.col("x") == _NAN,
-            pl.col("x").is_in([1.0, _NAN]),
-            pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN),
-        ],
-    )
-    def test_nan(self, expr):
-        assert convert_expr_to_range(expr, "x") == portion.open(-portion.inf, portion.inf)
+            FullDatesCase(
+                "datetime_bounds",
+                interval=portion.closed(datetime(2023, 1, 5, 12, 30, 45), datetime(2023, 1, 10, 14, 20, 15)),
+                expect=portion.closed(date(2023, 1, 5), date(2023, 1, 10)),
+            ),
+            FullDatesCase(
+                "date_bounds",
+                interval=portion.closed(date(2023, 1, 5), date(2023, 1, 10)),
+                expect=portion.closed(date(2023, 1, 5), date(2023, 1, 10)),
+            ),
+            FullDatesCase("infinite_bounds", interval=ANY_VALUE, expect=ANY_VALUE),
+            FullDatesCase(
+                "compound_interval",
+                interval=portion.closed(datetime(2023, 1, 1, 8, 30), datetime(2023, 1, 3, 16, 45))
+                | portion.closed(datetime(2023, 1, 5, 9, 15), datetime(2023, 1, 7, 17, 30)),
+                expect=portion.closed(date(2023, 1, 1), date(2023, 1, 3)) | portion.closed(date(2023, 1, 5), date(2023, 1, 7)),
+            ),
+            # A Date value ``d`` satisfies ``d < upper`` when ``upper`` falls after midnight on ``d``.
+            FullDatesCase(
+                "open_upper_bound_keeps_date_after_midnight",
+                interval=portion.closedopen(datetime(2023, 12, 1), datetime(2024, 1, 1, 12)),
+                expect=portion.closed(date(2023, 12, 1), date(2024, 1, 1)),
+            ),
+        ]
+    ),
+)
+def test_extend_to_full_dates(case: FullDatesCase):
+    assert _extend_to_full_dates(case.interval) == case.expect
 
-    def test_nan_bound_of_is_between_leaves_only_its_side_unbounded(self):
-        assert convert_expr_to_range(pl.col("x").is_between(0, _NAN), "x") == portion.closed(0, portion.inf)
 
-    def test_float_of_magnitude_2_53(self):
-        # An integer column is compared with a float as Float64, so a float of magnitude 2**53 or more cannot bound it.
-        expr = pl.col("x").is_between(1.0, float(2**53)) & (pl.col("x") <= 5)
-        assert convert_expr_to_range(expr, "x") == portion.closed(1.0, 5)
+_FIVE_DAYS_IN_JAN = [datetime(2023, 1, n) for n in (4, 5, 7, 10, 11)]
+_DEC_31_TO_JAN_8 = [datetime(2022, 12, 31), *(datetime(2023, 1, n) for n in range(1, 9))]
 
-    def test_single_element_series_is_in(self):
-        expr = pl.col("t").is_in(pl.Series([datetime(2024, 1, 1)]))
-        assert convert_expr_to_datetime_range(expr, "t") == portion.singleton(datetime(2024, 1, 1))
+
+@dataclass(frozen=True)
+class IntervalExprCase:
+    """An interval converted to a Polars filter, and the rows of ``dates`` the filter keeps."""
+
+    id: str
+    _: KW_ONLY
+    convert: Callable
+    interval: Interval
+    dates: list
+    # indices into ``dates``; None and False are the literal results for no restriction and for nothing
+    kept: list[int] | bool | None
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            IntervalExprCase(
+                "atomic-fully_open_interval",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.open(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                dates=_FIVE_DAYS_IN_JAN,
+                kept=[2],
+            ),
+            IntervalExprCase(
+                "atomic-fully_closed_interval",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                dates=_FIVE_DAYS_IN_JAN,
+                kept=[1, 2, 3],
+            ),
+            IntervalExprCase(
+                "atomic-left_open_right_closed_interval",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.openclosed(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                dates=_FIVE_DAYS_IN_JAN,
+                kept=[2, 3],
+            ),
+            IntervalExprCase(
+                "atomic-left_closed_right_open_interval",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.closedopen(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                dates=_FIVE_DAYS_IN_JAN,
+                kept=[1, 2],
+            ),
+            IntervalExprCase(
+                "atomic-infinite_lower_bound",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.openclosed(-portion.inf, datetime(2023, 1, 10)),
+                dates=[datetime(2022, 1, 1), datetime(2023, 1, 4), datetime(2023, 1, 10), datetime(2023, 1, 11)],
+                kept=[0, 1, 2],
+            ),
+            IntervalExprCase(
+                "atomic-infinite_upper_bound",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.closedopen(datetime(2023, 1, 5), portion.inf),
+                dates=[datetime(2023, 1, 4), datetime(2023, 1, 5), datetime(2023, 1, 10), datetime(2024, 1, 1)],
+                kept=[1, 2, 3],
+            ),
+            IntervalExprCase(
+                "atomic-full_infinite_interval", convert=_convert_atomic_interval_to_polars_expr, interval=ANY_VALUE, dates=[], kept=None
+            ),
+            IntervalExprCase(
+                "atomic-singleton_interval",
+                convert=_convert_atomic_interval_to_polars_expr,
+                interval=portion.singleton(datetime(2023, 1, 5)),
+                dates=[datetime(2023, 1, n) for n in (4, 5, 6)],
+                kept=[1],
+            ),
+            IntervalExprCase(
+                "simple_atomic_interval",
+                convert=_convert_interval_to_polars_expr,
+                interval=portion.closed(datetime(2023, 1, 5), datetime(2023, 1, 10)),
+                dates=_FIVE_DAYS_IN_JAN,
+                kept=[1, 2, 3],
+            ),
+            IntervalExprCase(
+                "compound_interval",
+                convert=_convert_interval_to_polars_expr,
+                interval=_JAN_1_TO_3_AND_5_TO_7,
+                dates=_DEC_31_TO_JAN_8,
+                kept=[1, 2, 3, 5, 6, 7],
+            ),
+            IntervalExprCase("empty_interval", convert=_convert_interval_to_polars_expr, interval=EMPTY, dates=[], kept=False),
+            IntervalExprCase(
+                "universe_interval", convert=_convert_interval_to_polars_expr, interval=portion.closed(-portion.inf, portion.inf), dates=[], kept=None
+            ),
+            IntervalExprCase(
+                "mixed_bounds_compound",
+                convert=_convert_interval_to_polars_expr,
+                interval=portion.openclosed(datetime(2023, 1, 1), datetime(2023, 1, 3))
+                | portion.closedopen(datetime(2023, 1, 5), datetime(2023, 1, 7)),
+                dates=_DEC_31_TO_JAN_8,
+                kept=[2, 3, 5, 6],
+            ),
+        ]
+    ),
+)
+def test_interval_to_polars_expr(case: IntervalExprCase):
+    """The expression keeps the rows at indices ``kept``; ``None`` (no restriction) and ``False`` (nothing) are literal."""
+    expr = case.convert(case.interval, "date")
+    if case.kept is None or case.kept is False:
+        assert expr is case.kept
+    else:
+        assert pl.DataFrame({"date": case.dates}).filter(expr)["date"].to_list() == [case.dates[i] for i in case.kept]
+
+
+# --- every row a filter keeps stays inside its range ------------------------------------------------------------------
+
+
+def _assert_range_keeps_rows(df: pl.DataFrame, pred: pl.Expr, col: str, interval: portion.Interval) -> None:
+    expr = _convert_interval_to_polars_expr(interval, col)
+    assert_pushed_filter_keeps_rows(df, pred, pl.lit(expr) if isinstance(expr, bool) else expr)
 
 
 @pytest.mark.parametrize(
     "pred",
     [
-        pl.col("t").dt.date() == date(2024, 1, 1),
-        pl.col("t").dt.date() <= date(2024, 1, 1),
-        pl.col("t").cast(pl.Date).is_in([date(2024, 1, 1)]),
-        pl.col("t").dt.date().is_between(date(2023, 12, 1), date(2024, 1, 1)),
+        pytest.param(pl.col("t").dt.date() == date(2024, 1, 1), id="eq"),
+        pytest.param(pl.col("t").dt.date() <= date(2024, 1, 1), id="le"),
+        pytest.param(pl.col("t").cast(pl.Date).is_in([date(2024, 1, 1)]), id="cast_is_in"),
+        pytest.param(pl.col("t").dt.date().is_between(date(2023, 12, 1), date(2024, 1, 1)), id="is_between"),
     ],
 )
 def test_day_floored_column_bound_covers_whole_day(pred):
@@ -1691,254 +965,108 @@ def test_day_floored_column_bound_covers_whole_day(pred):
     assert all(t in interval for t in df.filter(pred)["t"])
 
 
-@pytest.mark.parametrize("op", [operator.eq, operator.le])
-def test_microsecond_cast_bound_covers_sub_microseconds(op):
-    """``cast(pl.Datetime("us"))`` floors a nanosecond column, so ``<=``/``==`` 12:30 also holds at 12:30 plus 500 ns."""
-    interval = convert_expr_to_datetime_range(op(pl.col("t").cast(pl.Datetime("us")), datetime(2024, 1, 2, 12, 30)), "t")
-    assert interval.upper == datetime(2024, 1, 2, 12, 30, 0, 1) and interval.right == portion.CLOSED
-
-
-def test_floored_membership_at_maximum_is_unbounded():
-    pred = pl.col("t").cast(pl.Datetime("us")).is_in([datetime.max])
-    assert convert_expr_to_datetime_range(pred, "t").upper == portion.inf
-
-
-class TestNanosecondInexactBoundStaysFiniteSuperset:
-    """A nanosecond bound with a sub-microsecond part is not exactly representable as a Python ``datetime``.
-
-    Polars holds microseconds, so such a bound floors to the microsecond. Rather than discard it (which loses the whole
-    ``is_between`` window and leaves the range unbounded, issue #92), it is rounded to microseconds away from the kept
-    side — down for a lower bound, up for an upper bound — so the range stays finite and keeps every matching row. An
-    equality or ``is_in`` member against such a literal widens to its enclosing microsecond window rather than dropping
-    to unbounded.
-    """
-
-    # 2024-01-02 00:00:00 plus 999 ns, the widened upper bound Polars pushes for an inclusive ``<=`` on a ns column.
-    _NS_UPPER = pl.lit(pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0] + 999).cast(pl.Datetime("ns"))
-
-    def test_is_between_window_is_not_lost(self):
-        pred = pl.col("t").is_between(datetime(2024, 1, 1), self._NS_UPPER)
-        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
-        assert interval.lower == datetime(2024, 1, 1) and interval.upper == datetime(2024, 1, 2, 0, 0, 0, 1)
-
-    def test_equality_widens_to_microsecond_window(self):
-        interval = convert_expr_to_datetime_range(pl.col("t") == self._NS_UPPER, "t", get_enclosure=False)
-        assert interval.lower == datetime(2024, 1, 2) and interval.upper == datetime(2024, 1, 2, 0, 0, 0, 1)
-        assert interval.left == portion.CLOSED and interval.right == portion.CLOSED
-
-    def test_is_in_keeps_exact_member_as_point_and_widens_sub_microsecond_member(self):
-        base = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
-        exact = base - 1_000_000_000  # one second earlier, an exact microsecond
-        members = pl.Series([exact, base + 999], dtype=pl.Int64).cast(pl.Datetime("ns"))
-        interval = convert_expr_to_datetime_range(pl.col("t").is_in(members), "t", get_enclosure=False)
-        assert interval == portion.singleton(datetime(2024, 1, 1, 23, 59, 59)) | portion.closed(
-            datetime(2024, 1, 2), datetime(2024, 1, 2, 0, 0, 0, 1)
-        )
-
-    @pytest.mark.parametrize(
-        "pred",
-        [
-            pl.col("t").is_between(datetime(2024, 1, 1), _NS_UPPER),
-            pl.col("t").is_between(datetime(2024, 1, 1), _NS_UPPER, closed="right"),
-            pl.col("t") <= _NS_UPPER,
-            pl.col("t") < _NS_UPPER,
-            pl.col("t") >= _NS_UPPER,
-            pl.col("t") > _NS_UPPER,
-            pl.col("t") == _NS_UPPER,
-        ],
-    )
-    def test_range_keeps_every_matching_row(self, pred):
-        base = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
-        offsets = [-2000, -1, 0, 1, 500, 999, 1000, 2000]
-        t = pl.Series([base + o for o in offsets], dtype=pl.Int64).cast(pl.Datetime("ns"))
-        df = pl.DataFrame({"t": t})
-        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
-        assert not interval.empty and interval != portion.open(-portion.inf, portion.inf)
-        range_expr = _convert_interval_to_polars_expr(interval, "t")
-        kept_by_range = df if range_expr is None else df.filter(range_expr)
-        dropped = df.filter(pred).join(kept_by_range, on="t", how="anti")
-        assert dropped.is_empty()
-
-    @pytest.mark.parametrize(
-        "pred",
-        [
-            ~(pl.col("t") < _NS_UPPER),
-            ~(pl.col("t") <= _NS_UPPER),
-            ~(pl.col("t") > _NS_UPPER),
-            ~(pl.col("t") >= _NS_UPPER),
-            pl.col("t") != _NS_UPPER,
-            ~pl.col("t").is_between(datetime(2024, 1, 1), _NS_UPPER),
-            ~(~(pl.col("t") < _NS_UPPER)),
-        ],
-    )
-    def test_negation_does_not_narrow_below_matching_rows(self, pred):
-        """Widening a bound must not invert into a too-narrow range under ``NOT``.
-
-        The visitor never complements an interval, so a negated subexpression collapses to the universe (the safe
-        superset) rather than an inverted-narrow range. The extracted range must still keep every matching row.
-        """
-        base = pl.Series([datetime(2024, 1, 2)], dtype=pl.Datetime("ns")).to_physical()[0]
-        offsets = [-2000, -1, 0, 1, 500, 999, 1000, 2000]
-        t = pl.Series([base + o for o in offsets], dtype=pl.Int64).cast(pl.Datetime("ns"))
-        df = pl.DataFrame({"t": t})
-        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
-        range_expr = _convert_interval_to_polars_expr(interval, "t")
-        kept_by_range = df if range_expr is None else df.filter(range_expr)
-        dropped = df.filter(pred).join(kept_by_range, on="t", how="anti")
-        assert dropped.is_empty()
-
-    @pytest.mark.parametrize("op", [operator.ge, operator.gt, operator.eq, operator.le, operator.lt])
-    def test_sub_microsecond_negative_duration_bound_keeps_matching_rows(self, op):
-        """Polars converts a negative ``Duration("ns")`` toward zero, not flooring like a datetime.
-
-        Rounding such a literal like a datetime would push a lower bound past matching rows and drop them. A sub-
-        microsecond duration bound must instead stay unusable (unconstrained), preserving the superset guarantee.
-        """
-        d = pl.Series([-1200, -1001, -1, 0, 1, 1200], dtype=pl.Int64).cast(pl.Duration("ns"))
-        df = pl.DataFrame({"d": d})
-        pred = op(pl.col("d"), pl.lit(-1200).cast(pl.Duration("ns")))
-        interval = convert_expr_to_range(pred, "d")
-        range_expr = _convert_interval_to_polars_expr(interval, "d")
-        kept_by_range = df if range_expr is None or range_expr is True else df.filter(range_expr)
-        assert df.filter(pred).join(kept_by_range, on="d", how="anti").is_empty()
-
-    # 2024-11-03 06:30:00 UTC plus 999 ns: 01:30 in the repeated (fall-back) hour in New York, the second pass (fold=1).
-    _NY = pl.Datetime("ns", "America/New_York")
-    _NY_REPEATED = pl.lit(pl.Series([datetime(2024, 11, 3, 6, 30)], dtype=pl.Datetime("ns")).to_physical()[0] + 999).cast(_NY)
-
-    @pytest.mark.parametrize(
-        "pred",
-        [
-            pl.col("t") == _NY_REPEATED,
-            pl.col("t").is_in(pl.concat_list(_NY_REPEATED)),
-            pl.col("t") < _NY_REPEATED,
-            pl.col("t") <= _NY_REPEATED,
-            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="both"),
-            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="left"),
-            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="right"),
-            pl.col("t").is_between(pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NY), _NY_REPEATED, closed="none"),
-        ],
-    )
-    def test_rounding_up_in_repeated_dst_hour_keeps_matching_rows(self, pred):
-        """Adding a microsecond to an aware datetime is wall-clock arithmetic that resets ``fold``; it must not move the bound back an hour."""
-        times = [datetime(2024, 11, 3, h, m, tzinfo=UTC) for h, m in [(4, 30), (5, 0), (5, 30), (6, 0), (6, 29), (6, 30)]]
-        df = pl.DataFrame({"t": pl.Series(times).cast(self._NY).dt.offset_by("999ns")}).vstack(pl.DataFrame({"t": pl.Series(times).cast(self._NY)}))
-        interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
-        matching = df.filter(pred)["t"].to_physical().to_list()
-        assert matching
-        # Compare in UTC nanoseconds: the range holds naive UTC bounds.
-        to_ns = lambda b: (b - datetime(1970, 1, 1)) // timedelta(microseconds=1) * 1000
-        interval_ns = interval.apply(lambda a: a.replace(lower=to_ns, upper=to_ns))
-        assert all(t in interval_ns for t in matching)
-
-    def test_is_in_with_failed_literal_leaves_column_unconstrained(self):
-        # A ``Datetime("us")`` value outside Python's year range: extracting it fails, which must not raise.
-        members = pl.Series([1_704_153_600_000_000_000], dtype=pl.Int64).cast(pl.Datetime("us"))
-        assert convert_expr_to_datetime_range(pl.col("t").is_in(members), "t") == portion.open(-portion.inf, portion.inf)
-
-
-@pytest.mark.parametrize(
-    ("dtype", "t", "pred", "kwargs"),
-    [
-        # A ``Datetime("ms")`` column cast to ``us`` is exact; its bound must survive truncation to milliseconds.
-        (
-            pl.Datetime("ms"),
-            datetime(2024, 1, 1, 12),
-            pl.col("t").cast(pl.Datetime("us")) == datetime(2024, 1, 1, 12),
-            {"tolerance": timedelta(seconds=1)},
-        ),
-        (pl.Datetime("us"), datetime(9999, 12, 31), pl.col("t") == datetime(9999, 12, 31), {"strategy": "forward", "tolerance": timedelta(days=1)}),
-        (pl.Datetime("us"), datetime(1, 1, 1), pl.col("t") == datetime(1, 1, 1), {"strategy": "backward", "tolerance": timedelta(days=1)}),
-    ],
+_ROWS_AROUND_JAN_2_2024_NS = pl.DataFrame(
+    {"t": pl.Series([_JAN_2_2024_NS + o for o in [-2000, -1, 0, 1, 500, 999, 1000, 2000]], dtype=pl.Int64).cast(pl.Datetime("ns"))}
 )
-def test_filtered_join_asof_keeps_matches(dtype, t, pred, kwargs):
-    left = pl.DataFrame({"t": pl.Series([t], dtype=dtype)}).lazy().set_sorted("t")
-    right = left.with_columns(v=pl.lit(7)).set_sorted("t")
-    pred = pred & (pl.col("v") == 7)
-    expected = left.join_asof(right, on="t", **kwargs).filter(pred).collect()
-    assert_frame_equal(filtered_join_asof(left, right, on="t", log_explain=False, **kwargs).filter(pred).collect(), expected)
-
-
-@pytest.mark.parametrize(
-    ("value", "pred", "spec"),
-    [
-        (date.max, pl.col("d") <= date.max, FilterSpec(lookahead=timedelta(days=1))),
-        (date.max, pl.col("d") == date.max, FilterSpec(lookahead=timedelta(days=1))),
-        (date.min, pl.col("d") >= date.min, FilterSpec(lookback=timedelta(days=1))),
-        (datetime(9999, 12, 31), pl.col("d") == datetime(9999, 12, 31), FilterSpec(lookahead=timedelta(days=1))),
-    ],
-)
-def test_pushdown_combine_expansion_past_extremes(value, pred, spec):
-    df = pl.DataFrame({"d": [value], "v": [1]})
-    lf = pushdown_combine(sources={"data": (df.lazy(), {"d": spec})}, combine=lambda s: s["data"])
-    assert_frame_equal(lf.filter(pred).collect(), df.filter(pred))
-
-
-_ENUM = pl.Enum(["b", "a"])
 
 
 @pytest.mark.parametrize(
     "pred",
     [
-        pl.col("x") > pl.lit("b", dtype=_ENUM),
-        pl.col("x") > "b",
-        pl.col("x") < "a",
-        pl.col("x").is_between(pl.lit("b", dtype=_ENUM), pl.lit("a", dtype=_ENUM)),
+        pytest.param(pl.col("t").is_between(datetime(2024, 1, 1), _JAN_2_2024_PLUS_999_NS), id="is_between"),
+        pytest.param(pl.col("t").is_between(datetime(2024, 1, 1), _JAN_2_2024_PLUS_999_NS, closed="right"), id="is_between_right"),
+        pytest.param(pl.col("t") <= _JAN_2_2024_PLUS_999_NS, id="le"),
+        pytest.param(pl.col("t") < _JAN_2_2024_PLUS_999_NS, id="lt"),
+        pytest.param(pl.col("t") >= _JAN_2_2024_PLUS_999_NS, id="ge"),
+        pytest.param(pl.col("t") > _JAN_2_2024_PLUS_999_NS, id="gt"),
+        pytest.param(pl.col("t") == _JAN_2_2024_PLUS_999_NS, id="eq"),
+    ],
+)
+def test_range_keeps_every_matching_row(pred):
+    interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+    assert not interval.empty and interval != ANY_VALUE
+    _assert_range_keeps_rows(_ROWS_AROUND_JAN_2_2024_NS, pred, "t", interval)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pytest.param(~(pl.col("t") < _JAN_2_2024_PLUS_999_NS), id="not_lt"),
+        pytest.param(~(pl.col("t") <= _JAN_2_2024_PLUS_999_NS), id="not_le"),
+        pytest.param(~(pl.col("t") > _JAN_2_2024_PLUS_999_NS), id="not_gt"),
+        pytest.param(~(pl.col("t") >= _JAN_2_2024_PLUS_999_NS), id="not_ge"),
+        pytest.param(pl.col("t") != _JAN_2_2024_PLUS_999_NS, id="ne"),
+        pytest.param(~pl.col("t").is_between(datetime(2024, 1, 1), _JAN_2_2024_PLUS_999_NS), id="not_is_between"),
+        pytest.param(~(~(pl.col("t") < _JAN_2_2024_PLUS_999_NS)), id="not_not_lt"),
+    ],
+)
+def test_negation_does_not_narrow_below_matching_rows(pred):
+    """The range of a negated part of the filter is unlimited (the converter never takes the complement), so no row is lost."""
+    _assert_range_keeps_rows(_ROWS_AROUND_JAN_2_2024_NS, pred, "t", convert_expr_to_datetime_range(pred, "t", get_enclosure=False))
+
+
+@pytest.mark.parametrize("op", [operator.ge, operator.gt, operator.eq, operator.le, operator.lt], ids=lambda op: op.__name__)
+def test_sub_microsecond_negative_duration_bound_keeps_matching_rows(op):
+    """Polars rounds a negative ``Duration("ns")`` toward zero, so such a bound is left unlimited instead of rounded."""
+    df = pl.DataFrame({"d": pl.Series([-1200, -1001, -1, 0, 1, 1200], dtype=pl.Int64).cast(pl.Duration("ns"))})
+    pred = op(pl.col("d"), pl.lit(-1200).cast(pl.Duration("ns")))
+    _assert_range_keeps_rows(df, pred, "d", convert_expr_to_range(pred, "d"))
+
+
+# 2024-11-03 06:30:00 UTC plus 999 ns: 01:30 in New York in the repeated hour when clocks go back, the second time
+# (``fold=1`` in Python).
+_NEW_YORK_NS = pl.Datetime("ns", "America/New_York")
+_NEW_YORK_REPEATED_HOUR_PLUS_999_NS = pl.lit(pl.Series([datetime(2024, 11, 3, 6, 30)], dtype=pl.Datetime("ns")).to_physical()[0] + 999).cast(
+    _NEW_YORK_NS
+)
+_NEW_YORK_0030_ON_CLOCK_CHANGE_DAY = pl.lit(datetime(2024, 11, 3, 4, 30, tzinfo=UTC)).cast(_NEW_YORK_NS)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pytest.param(pl.col("t") == _NEW_YORK_REPEATED_HOUR_PLUS_999_NS, id="eq"),
+        pytest.param(pl.col("t").is_in(pl.concat_list(_NEW_YORK_REPEATED_HOUR_PLUS_999_NS)), id="is_in"),
+        pytest.param(pl.col("t") < _NEW_YORK_REPEATED_HOUR_PLUS_999_NS, id="lt"),
+        pytest.param(pl.col("t") <= _NEW_YORK_REPEATED_HOUR_PLUS_999_NS, id="le"),
+        *[
+            pytest.param(
+                pl.col("t").is_between(_NEW_YORK_0030_ON_CLOCK_CHANGE_DAY, _NEW_YORK_REPEATED_HOUR_PLUS_999_NS, closed=cl), id=f"is_between_{cl}"
+            )
+            for cl in ("both", "left", "right", "none")
+        ],
+    ],
+)
+def test_rounding_up_in_repeated_dst_hour_keeps_matching_rows(pred):
+    """Adding a microsecond to an aware datetime is wall-clock arithmetic that forgets which of the two 01:30s of the
+    repeated hour when clocks go back it was (``fold``); it must not move the bound back an hour."""
+    times = [datetime(2024, 11, 3, h, mi, tzinfo=UTC) for h, mi in [(4, 30), (5, 0), (5, 30), (6, 0), (6, 29), (6, 30)]]
+    df = pl.DataFrame({"t": pl.Series(times).cast(_NEW_YORK_NS).dt.offset_by("999ns")}).vstack(
+        pl.DataFrame({"t": pl.Series(times).cast(_NEW_YORK_NS)})
+    )
+    interval = convert_expr_to_datetime_range(pred, "t", get_enclosure=False)
+    matching = df.filter(pred)["t"].to_physical().to_list()
+    assert matching
+    # Compare in UTC nanoseconds: the range holds naive UTC bounds.
+    to_ns = lambda b: (b - datetime(1970, 1, 1)) // timedelta(microseconds=1) * 1000
+    interval_ns = interval.apply(lambda a: a.replace(lower=to_ns, upper=to_ns))
+    assert all(t in interval_ns for t in matching)
+
+
+_B_BEFORE_A_ENUM = pl.Enum(["b", "a"])
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pytest.param(pl.col("x") > pl.lit("b", dtype=_B_BEFORE_A_ENUM), id="gt_enum_literal"),
+        pytest.param(pl.col("x") > "b", id="gt_str"),
+        pytest.param(pl.col("x") < "a", id="lt_str"),
+        pytest.param(pl.col("x").is_between(pl.lit("b", dtype=_B_BEFORE_A_ENUM), pl.lit("a", dtype=_B_BEFORE_A_ENUM)), id="is_between"),
     ],
 )
 def test_enum_ordering_comparison_keeps_rows(pred):
     """Enum values order by category, so ``"a" > "b"`` for ``Enum(["b", "a"])``."""
-    df = pl.DataFrame({"x": pl.Series(["b", "a"], dtype=_ENUM)})
+    df = pl.DataFrame({"x": pl.Series(["b", "a"], dtype=_B_BEFORE_A_ENUM)})
     interval = convert_expr_to_range(pred, "x")
     assert all(x in interval for x in df.filter(pred)["x"])
-
-
-def _partitioned_rows(df: pl.DataFrame, partitioner, pred: pl.Expr) -> pl.DataFrame:
-    """Rows of ``df`` matching ``pred`` when read through the partitions built from the pushed-down predicate."""
-    tracker = PredicateTracker(df)
-    tracker.lazy_frame.filter(pred).collect()
-    parts = partitioner.build(tracker.last_predicate)
-    if parts is None:  # unpartitioned read
-        return df.filter(pred)
-    return pl.concat([df.clear(), *(df.filter(p.predicate) for p in parts)]).filter(pred)
-
-
-class TestPartitionsKeepMatchingRows:
-    """Partitions built from the pushed-down predicate must contain every row the predicate keeps."""
-
-    @pytest.mark.parametrize(
-        ("values", "pred"),
-        [
-            ([1, 5, 257, -3], pl.col("x").cast(pl.Int8, wrap_numerical=True).is_between(0, 10)),
-            ([1, 5, 257, -3], pl.col("x").cast(pl.UInt8, wrap_numerical=True).is_between(0, 1)),
-            ([-0.5, 1.0, 3.5, 7.0], pl.col("x").cast(pl.Int64).is_between(0, 4)),
-            ([1, 2, 7], pl.col("x").cast(pl.String).is_between(pl.lit("1"), pl.lit("3"))),
-            ([1, None, 7], pl.col("x").is_in([1, None], nulls_equal=True)),
-            ([1.0, _NAN, 3.0], pl.col("x") == _NAN),
-            ([1.0, _NAN, 3.0], pl.col("x").is_in([1.0, _NAN])),
-            ([1.0, _NAN, 3.0], pl.col("x").is_between(0, _NAN)),
-            ([1.0, _NAN, 3.0], pl.col("x").is_between(0, 10) | (pl.col("x") == _NAN)),
-            ([1, 2, 7], pl.col("x").is_in([1, 2])),
-            ([2**53 + 1], (pl.col("x") == float(2**53)) & (pl.col("x") > 2**53)),
-        ],
-    )
-    def test_by_range(self, values, pred):
-        df = pl.DataFrame({"x": values})
-        assert_frame_equal(_partitioned_rows(df, by_range("x", 5), pred), df.filter(pred), check_row_order=False)
-
-    def test_by_range_decimal_bounds_with_float_width(self):
-        df = pl.DataFrame({"x": pl.Series([Decimal("1.0"), Decimal("1.5"), Decimal("3.0")], dtype=pl.Decimal(10, 1))})
-        pred = pl.col("x").is_between(Decimal("1.0"), Decimal("2.0"))
-        parts = by_range("x", 0.5).build(pred)
-        assert_frame_equal(pl.concat([df.filter(p.predicate) for p in parts]).filter(pred), df.filter(pred), check_row_order=False)
-
-    @pytest.mark.parametrize(("value", "every"), [(datetime(9999, 12, 31), "1d"), (date(9999, 12, 31), "1d"), (date(9999, 12, 31), "1mo")])
-    def test_by_time_window_past_maximum(self, value, every):
-        df = pl.DataFrame({"t": [value]})
-        pred = pl.col("t") == value
-        assert_frame_equal(_partitioned_rows(df, by_time("t", every), pred), df.filter(pred))
-
-    def test_by_time_null_membership(self):
-        df = pl.DataFrame({"t": [datetime(2024, 1, 1), None, datetime(2024, 1, 2)]})
-        pred = pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True)
-        assert_frame_equal(_partitioned_rows(df, by_time("t", "1d"), pred), df.filter(pred), check_row_order=False)

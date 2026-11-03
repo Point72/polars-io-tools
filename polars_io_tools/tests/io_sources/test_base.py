@@ -1,16 +1,21 @@
+"""Parsing Polars expressions into nodes (``get_parsed_expr``), and reading literal values and column names from them.
+
+A parsed tree is compared with a ``NodeShape`` (``helpers.node_shapes``): the node class expected at that place, plus
+the attributes to check. Which filters Polars hands to an IO source is recorded in ``tests/pushdown/test_filter.py``.
+"""
+
 import json
 import math
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 
 import polars as pl
 import pytest
-from packaging import version
-from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import (
     FAILED_LITERAL_RESULT,
     AliasNode,
-    AnonymousFunctionNode,
     BaseExprNode,
     BinaryExprNode,
     CastNode,
@@ -24,7 +29,6 @@ from polars_io_tools.io_sources.base import (
     OperatorType,
     TernaryNode,
     UnknownNode,
-    convert_datetime_to_polars,
     extract_column_name,
     extract_value_preserving_column_name,
     get_literal_value,
@@ -38,801 +42,324 @@ from polars_io_tools.io_sources.enum import (
     StringFunctionType,
     TemporalFunctionType,
 )
-
-from .conftest import PredicateTracker
-
-
-def assert_node_type(node: BaseExprNode, expected_type: type[BaseExprNode]) -> None:
-    """Assert that a node is of the expected type."""
-    assert isinstance(node, expected_type), f"Expected {expected_type.__name__}, got {type(node).__name__}"
-
-
-def check_binary_expression(node: BinaryExprNode, left_type: type[BaseExprNode], op: OperatorType, right_type: type[BaseExprNode]) -> None:
-    """Check the structure of a binary expression."""
-    assert isinstance(node.left, left_type), f"Expected left to be {left_type.__name__}, got {type(node.left).__name__}"
-    assert node.op == op, f"Expected op to be {op}, got {node.op}"
-    assert isinstance(node.right, right_type), f"Expected right to be {right_type.__name__}, got {type(node.right).__name__}"
-
-
-def test_extract_column_name():
-    """Test column name extraction from expressions with casts and aliases."""
-    expr = pl.col("test_column1").cast(pl.Int32)
-    assert "test_column1" == extract_column_name(get_parsed_expr(expr))
-
-    expr = pl.col("test_column2").cast(pl.Datetime)
-    assert "test_column2" == extract_column_name(get_parsed_expr(expr))
-
-    expr = pl.col("test_column3").cast(pl.Datetime(time_unit="ns"))
-    assert "test_column3" == extract_column_name(get_parsed_expr(expr))
-
-    expr = pl.struct(pl.col("a"), pl.col("b"))
-    assert None is extract_column_name(get_parsed_expr(expr))
-
-    expr = pl.col("b").mul(2).cast(pl.Float64)
-    assert None is extract_column_name(get_parsed_expr(expr))
-
-    # Aliases should be handled correctly by looking through to the underlying column
-    expr = pl.col("b").alias("big_b")
-    assert "b" == extract_column_name(get_parsed_expr(expr))
-
-    # Nested aliases and casts should work
-    expr = pl.col("b").cast(pl.Int64).alias("first").alias("second")
-    assert "b" == extract_column_name(get_parsed_expr(expr))
-
-    # .dt.date() floors a Datetime column to day granularity (order-preserving, like cast(pl.Date)) and should
-    # resolve to the underlying column so temporal predicates push down.
-    expr = pl.col("ts").dt.date()
-    assert "ts" == extract_column_name(get_parsed_expr(expr))
-    expr = pl.col("ts").dt.date().alias("d")
-    assert "ts" == extract_column_name(get_parsed_expr(expr))
-
-
-def test_extract_value_preserving_column_name():
-    """The strict extractor unwraps aliases always, but a cast only when a schema proves it value-preserving."""
-    # Aliases are always unwrapped (they only rename).
-    assert "b" == extract_value_preserving_column_name(get_parsed_expr(pl.col("b").alias("big_b")))
-
-    # Without a schema, the source dtype is unknown, so any cast is refused.
-    assert extract_value_preserving_column_name(get_parsed_expr(pl.col("a").cast(pl.Int32))) is None
-
-    # Narrowing / wrapping casts are refused even with a schema (Int64 -> Int8 can change 257 to 1).
-    narrowing = get_parsed_expr(pl.col("a").cast(pl.Int8, wrap_numerical=True))
-    assert extract_value_preserving_column_name(narrowing, {"a": pl.Int64}) is None
-
-    # Value- and order-preserving widening casts are unwrapped when the schema proves safety.
-    widening = get_parsed_expr(pl.col("a").cast(pl.Int64))
-    assert "a" == extract_value_preserving_column_name(widening, {"a": pl.Int8})
-
-    decimal_widen = get_parsed_expr(pl.col("x").cast(pl.Decimal(38, 2)))
-    assert "x" == extract_value_preserving_column_name(decimal_widen, {"x": pl.Decimal(10, 2)})
-
-
-def test_is_value_order_preserving_cast():
-    """Only identity, integer widening, and same-scale decimal widening preserve values and order."""
-    assert is_value_order_preserving_cast(pl.Int64, pl.Int64) is True
-    assert is_value_order_preserving_cast(pl.Int8, pl.Int64) is True
-    assert is_value_order_preserving_cast(pl.Int64, pl.Int8) is False
-    assert is_value_order_preserving_cast(pl.UInt8, pl.Int16) is True
-    assert is_value_order_preserving_cast(pl.Decimal(10, 2), pl.Decimal(38, 2)) is True
-    assert is_value_order_preserving_cast(pl.Decimal(10, 2), pl.Decimal(38, 4)) is False  # rescaling
-    assert is_value_order_preserving_cast(pl.Int64, pl.Float64) is False  # cross-family
-    assert is_value_order_preserving_cast(pl.Datetime, pl.Datetime("ms")) is False  # unparameterized dtype
-
-
-def test_parse_simple_column():
-    """Test parsing a simple column reference."""
-    expr = pl.col("test_column")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, ColumnNode)
-    assert node.name == "test_column"
-
-
-def test_parse_literal():
-    """Test parsing literal values of different types."""
-    # Test integer
-    expr = pl.lit(42)
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value == 42
-
-    # Test string
-    expr = pl.lit("hello")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value == "hello"
-
-    # Test boolean
-    expr = pl.lit(True)
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value is True
-
-    # Test None
-    expr = pl.lit(None)
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value is None
-
-    # Test list
-    expr = pl.lit([1, 2, 3])
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value == [1, 2, 3]
-
-
-def test_special_literals():
-    """Test parsing special literals like NaN and Infinity."""
-    # Test NaN
-    expr = pl.lit(float("nan"))
-    node = get_parsed_expr(expr)
-    assert_node_type(node, LiteralNode)
-    assert math.isnan(node.value)
-
-    # Test Infinity
-    expr = pl.lit(float("inf"))
-    node = get_parsed_expr(expr)
-    assert_node_type(node, LiteralNode)
-    assert node.value == float("inf")
-
-    # Test -Infinity
-    expr = pl.lit(float("-inf"))
-    node = get_parsed_expr(expr)
-    assert_node_type(node, LiteralNode)
-    assert node.value == float("-inf")
-
-
-def test_date_time_literals_parsed():
-    """Test parsing date and time literals."""
-    # Test datetime
-    dt = datetime(2023, 1, 1, 12, 0, 0)
-    expr = pl.lit(dt)
-    node = get_parsed_expr(expr)
-
-    if version.parse(pl.__version__) >= version.parse("1.36.0-beta.1"):
-        # In polars 1.36+, datetime literals are parsed directly as LiteralNode
-        assert_node_type(node, LiteralNode)
-        assert node.value == dt
-    else:
-        assert_node_type(node, CastNode)
-        # Polars casts this to UTC automatically
-        assert node.input.value == dt.replace(tzinfo=UTC)
-
-    # Test date
-    d = date(2023, 1, 1)
-    expr = pl.lit(d)
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value == d
-
-    # Test time
-    t = time(12, 30, 45)
-    expr = pl.lit(t)
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value == t
-
-
-def test_complex_literals():
-    """Test parsing complex data structure literals."""
-    # Test dictionary
-    expr = pl.lit({"a": 1, "b": 2})
-    node = get_parsed_expr(expr)
-
-    # We cant use dictionaries as literal values
-    if version.parse(pl.__version__) > version.parse("1.31.0"):
-        assert_node_type(node, LiteralNode)
-        assert node.value == {"a": 1, "b": 2}
-    else:
-        assert_node_type(node, ErrorNode)
-
-    # Test nested list
-    expr = pl.lit([[1, 2], [3, 4]])
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, LiteralNode)
-    assert node.value == [[1, 2], [3, 4]]
-
-
-def test_basic_literals():
-    """Test extraction of basic literal values."""
-    assert get_literal_value(pl.lit(5)) == 5
-    assert get_literal_value(pl.lit("test")) == "test"
-    assert get_literal_value(pl.lit(True)) is True
-    assert get_literal_value(pl.lit(None)) is None
-
-
-def test_list_literals():
-    """Test extraction of list literals."""
-    assert get_literal_value(pl.lit([1, 2, 3])) == [1, 2, 3]
-    # Note: Tuples might be converted to lists by Polars
-    result = get_literal_value(pl.lit((4, 5, 6)))
-    assert result == (4, 5, 6) or result == [4, 5, 6]
-
-
-def test_non_literal_expressions():
-    """Test behavior with non-literal expressions."""
-    # Should return None without raising exceptions
-    # but we still get an error logged
-    assert get_literal_value(pl.col("non_existent")) is FAILED_LITERAL_RESULT
-
-
-def test_numeric_literals():
-    """Test extraction of various numeric literal types."""
-    assert get_literal_value(pl.lit(42)) == 42
-    assert get_literal_value(pl.lit(3.14)) == 3.14
-    assert get_literal_value(pl.lit(-10)) == -10
-    assert get_literal_value(pl.lit(0)) == 0
-    assert get_literal_value(pl.lit(float("inf"))) == float("inf")
-    assert math.isnan(get_literal_value(pl.lit(float("nan"))))
-
-
-def test_string_literals_special_cases():
-    """Test extraction of string literals with special cases."""
-    assert get_literal_value(pl.lit("")) == ""  # Empty string
-    assert get_literal_value(pl.lit(" ")) == " "  # Space
-    assert get_literal_value(pl.lit("Special chars: !@#$%^&*()")) == "Special chars: !@#$%^&*()"
-    assert get_literal_value(pl.lit("Line1\nLine2")) == "Line1\nLine2"  # With newline
-
-
-def test_boolean_literals():
-    """Test extraction of boolean literals."""
-    assert get_literal_value(pl.lit(True)) is True
-    assert get_literal_value(pl.lit(False)) is False
-
-
-def test_date_time_literals():
-    """Test extraction of date and time literals."""
-
-    today = date.today()
-    assert get_literal_value(pl.lit(today)) == today
-
-    now = datetime.now()
-    assert get_literal_value(pl.lit(now)) == now
-
-    t = time(12, 30, 45)
-    assert get_literal_value(pl.lit(t)) == t
-
-    delta = timedelta(days=1, hours=2)
-    assert get_literal_value(pl.lit(delta)) == delta
-
-
-def test_complex_nested_structures():
-    """Test extraction of complex nested data structures."""
-    # Dictionary
-    assert get_literal_value(pl.lit({"a": 1, "b": 2})) == {"a": 1, "b": 2}
-
-    # Nested list
-    assert get_literal_value(pl.lit([[1, 2], [3, 4]])) == [[1, 2], [3, 4]]
-
-    # Mixed structure
-    complex_struct = {"name": "test", "values": [1, 2, 3], "metadata": {"active": True}}
-    assert get_literal_value(pl.lit(complex_struct)) == complex_struct
-
-
-def test_edge_cases():
-    """Test edge cases and potential failure scenarios."""
-    # Very large integer
-    large_int = 10**20
-    assert get_literal_value(pl.lit(large_int)) == large_int
-
-    # Very long string
-    long_str = "a" * 10000
-    assert get_literal_value(pl.lit(long_str)) == long_str
-
-
-def test_compound_expressions():
-    """Test behavior with compound expressions that aren't pure literals."""
-    # Expression combining literals
-    assert get_literal_value(pl.lit(5) + pl.lit(3)) == 8
-
-    # Expression with function call
-    assert get_literal_value(pl.lit("test").str.to_uppercase()) == "TEST"
-
-
-def test_binary_data():
-    """Test extraction of binary data literals."""
-    binary_data = b"binary\x00data"
-    assert get_literal_value(pl.lit(binary_data)) == binary_data
-
-
-def test_parse_binary_operation():
-    """Test parsing binary operations."""
-    # Test equality
-    expr = pl.col("a") == pl.col("b")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, BinaryExprNode)
-    check_binary_expression(node, ColumnNode, OperatorType.EQ, ColumnNode)
-
-    # Test addition
-    expr = pl.col("a") + pl.lit(5)
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, BinaryExprNode)
-    check_binary_expression(node, ColumnNode, OperatorType.PLUS, LiteralNode)
-
-
-def test_parse_all_comparison_operators():
-    """Test parsing all comparison operators."""
-    col_a = pl.col("a")
-    value = pl.lit(10)
-
-    operations = [
-        (col_a == value, OperatorType.EQ),
-        (col_a != value, OperatorType.NOT_EQ),
-        (col_a < value, OperatorType.LT),
-        (col_a <= value, OperatorType.LT_EQ),
-        (col_a > value, OperatorType.GT),
-        (col_a >= value, OperatorType.GT_EQ),
-    ]
-
-    for expr, expected_op in operations:
-        node = get_parsed_expr(expr)
-        assert_node_type(node, BinaryExprNode)
-        assert node.op == expected_op
-
-
-def test_parse_all_arithmetic_operators():
-    """Test parsing all arithmetic operators."""
-    col_a = pl.col("a")
-    value = pl.lit(10)
-
-    operations = [
-        (col_a + value, OperatorType.PLUS),
-        (col_a - value, OperatorType.MINUS),
-        (col_a * value, OperatorType.MULTIPLY),
-        (col_a / value, OperatorType.TRUE_DIVIDE),
-    ]
-
-    for expr, expected_op in operations:
-        node = get_parsed_expr(expr)
-        assert_node_type(node, BinaryExprNode)
-        assert node.op == expected_op
-
-
-def test_parse_all_logical_operators():
-    """Test parsing all logical operators."""
-    expr_a = pl.col("a") > 5
-    expr_b = pl.col("b") < 10
-
-    operations = [
-        (expr_a & expr_b, OperatorType.AND),
-        (expr_a | expr_b, OperatorType.OR),
-    ]
-
-    for expr, expected_op in operations:
-        node = get_parsed_expr(expr)
-        assert_node_type(node, BinaryExprNode)
-        assert node.op == expected_op
-
-
-def test_binary_expr_node_contents():
-    """Test the contents of a BinaryExprNode in detail."""
-    # Create a simple binary expression
-    expr = pl.col("a") + pl.col("b")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, BinaryExprNode)
-    binary_node = node
-
-    # Check operation
-    assert binary_node.op == OperatorType.PLUS
-
-    # Check left side
-    assert_node_type(binary_node.left, ColumnNode)
-    assert binary_node.left.name == "a"
-
-    # Check right side
-    assert_node_type(binary_node.right, ColumnNode)
-    assert binary_node.right.name == "b"
-
-
-def test_nested_alias():
-    """Test parsing nested aliases."""
-    if version.parse(pl.__version__) > version.parse("1.30.0"):
-        # Nested aliases parsing is not correct in 1.31.0-beta.1
-        # Since `.meta.pop()` returns an empty list improperly.
-        return
-    expr = pl.col("a").alias("b").alias("c")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, AliasNode)
-    assert node.name == "c"
-    assert_node_type(node.input, AliasNode)
-    assert node.input.name == "b"
-    assert_node_type(node.input.input, ColumnNode)
-    assert node.input.input.name == "a"
-
-
-def test_parse_string_function():
-    """Test parsing string functions."""
-    # Test string contains function
-    expr = pl.col("text").str.contains("pattern")
-    node = get_parsed_expr(expr)
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == StringFunctionType.CONTAINS
-
-    assert len(node.inputs) == 2
-    col_input = node.inputs[0]
-    assert isinstance(col_input, ColumnNode)
-    assert col_input.name == "text"
-
-    lit_input = node.inputs[1]
-    assert isinstance(lit_input, LiteralNode)
-    assert lit_input.value == "pattern"
-
-    # Test string uppercase function
-    expr = pl.col("text").str.to_uppercase()
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == StringFunctionType.UPPERCASE
-
-    assert len(node.inputs) == 1
-    col_input = node.inputs[0]
-    assert isinstance(col_input, ColumnNode)
-    assert col_input.name == "text"
-
-
-def test_parse_not():
-    """Test parsing NOT expressions."""
-    expr = ~pl.col("flag")
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, FunctionNode)
-    assert len(node.inputs) == 1
-    assert_node_type(node.inputs[0], ColumnNode)
-    assert node.inputs[0].name == "flag"
-
-
-def test_parse_boolean_function():
-    """Test parsing boolean functions."""
-    # Test is_null
-    expr = pl.col("value").is_null()
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == BooleanFunctionType.IS_NULL
-
-    assert len(node.inputs) == 1
-    assert_node_type(node.inputs[0], ColumnNode)
-    assert node.inputs[0].name == "value"
-
-    # Test is_not_null
-    expr = pl.col("value").is_not_null()
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == BooleanFunctionType.IS_NOT_NULL
-
-    assert len(node.inputs) == 1
-    assert_node_type(node.inputs[0], ColumnNode)
-    assert node.inputs[0].name == "value"
-
-
-def test_parse_is_in_function():
-    """Test parsing is_in function."""
-    # Test with list of values
-    expr = pl.col("value").is_in([1, 2, 3])
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == BooleanFunctionType.IS_IN
-
-    assert len(node.inputs) == 2
-    col_input = node.inputs[0]
-    assert isinstance(col_input, ColumnNode)
-    assert col_input.name == "value"
-
-    lit_input = node.inputs[1]
-    assert isinstance(lit_input, LiteralNode)
-    assert lit_input.value == [1, 2, 3]
-
-    # Test with column
-    expr = pl.col("value").is_in(pl.col("other_list"))
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, FunctionNode)
-    assert node.function_type == BooleanFunctionType.IS_IN
-
-    assert len(node.inputs) == 2
-    col_input = node.inputs[0]
-    assert isinstance(col_input, ColumnNode)
-    assert col_input.name == "value"
-
-    col_input = node.inputs[1]
-    assert isinstance(col_input, ColumnNode)
-    assert col_input.name == "other_list"
-
-
-def test_parse_is_between():
-    """Test parsing is_between function."""
-    # Basic is_between
-    for closed in [None, "both", "left", "right", "none"]:
-        if closed is None:
-            expr = pl.col("value").is_between(1, 10)
-        else:
-            expr = pl.col("value").is_between(1, 10, closed=closed)
-        node = get_parsed_expr(expr)
-
-        assert isinstance(node, FunctionNode)
-        assert node.function_type == BooleanFunctionType.IS_BETWEEN
-        # Note the capitalization switch
-        if closed in [None, "both"]:
-            assert node.options == {"closed": "Both"}
-        elif closed == "left":
-            assert node.options == {"closed": "Left"}
-        elif closed == "right":
-            assert node.options == {"closed": "Right"}
-        elif closed == "none":
-            assert node.options == {"closed": "None"}
-        else:
-            # This should never be hit
-            assert False
-
-        assert len(node.inputs) == 3
-        col_input = node.inputs[0]
-        assert isinstance(col_input, ColumnNode)
-        assert col_input.name == "value"
-
-        lit_input = node.inputs[1]
-        assert isinstance(lit_input, LiteralNode)
-        assert lit_input.value == 1
-
-        lit_input = node.inputs[2]
-        assert isinstance(lit_input, LiteralNode)
-        assert lit_input.value == 10
-
-
-def test_parse_cast():
-    """Test parsing cast operations."""
-    # Test casting to different types
-    dtypes = [pl.Int32, pl.Float64, pl.Utf8, pl.Boolean, pl.Date, pl.Datetime]
-
-    for dtype in dtypes:
-        expr = pl.col("value").cast(dtype)
-        node = get_parsed_expr(expr)
-        assert isinstance(node, CastNode)
-
-
-def test_parse_complex_expression():
-    """Test parsing a complex expression with multiple operations."""
-    expr = (pl.col("age") >= 18) & (pl.col("country").is_in(["USA", "Canada", "Mexico"]))
-    node = get_parsed_expr(expr)
-
-    assert_node_type(node, BinaryExprNode)
-    binary_node = node
-
-    # Check the AND operation
-    assert binary_node.op == OperatorType.AND
-
-    # Check left side (age >= 18)
-    assert_node_type(binary_node.left, BinaryExprNode)
-    left_binary = binary_node.left
-    assert left_binary.op == OperatorType.GT_EQ
-    assert_node_type(left_binary.left, ColumnNode)
-    assert left_binary.left.name == "age"
-    assert_node_type(left_binary.right, LiteralNode)
-    assert left_binary.right.value == 18
-
-    # Check right side (country.is_in(...))
-    assert_node_type(binary_node.right, BaseExprNode)
-    assert isinstance(binary_node.right, FunctionNode)
-    assert binary_node.right.function_type == BooleanFunctionType.IS_IN
-    assert binary_node.right.options == {"nulls_equal": False}
-    assert len(binary_node.right.inputs) == 2
-    assert binary_node.right.inputs[0].name == "country"
-    assert binary_node.right.inputs[1].value == ["USA", "Canada", "Mexico"]
-
-
-def test_parse_complex_nested_expressions():
-    """Test parsing complex nested expressions."""
-    # Build a complex expression with multiple levels of nesting
-    expr = (
-        pl.when((pl.col("a") > 10) & ((pl.col("b") < 5) | (pl.col("c").is_in([1, 2, 3]))))
+from polars_io_tools.tests.helpers.cases import as_params
+from polars_io_tools.tests.helpers.node_shapes import NodeShape, match_shape
+from polars_io_tools.tests.helpers.polars_versions import polars_has
+
+
+def member_of(enum: type) -> callable:
+    return lambda function_type: isinstance(function_type, enum)
+
+
+def column_shape(name: str) -> NodeShape:
+    return NodeShape(ColumnNode, name=name)
+
+
+def literal_shape(value) -> NodeShape:
+    return NodeShape(LiteralNode, value=value)
+
+
+def binary_shape(op: OperatorType, left: NodeShape, right: NodeShape) -> NodeShape:
+    return NodeShape(BinaryExprNode, op=op, left=left, right=right)
+
+
+def function_shape(function_type, *inputs: NodeShape, **attrs) -> NodeShape:
+    """A function node of ``function_type``; ``inputs`` are checked only if given."""
+    return NodeShape(FunctionNode, function_type=function_type, **({"inputs": list(inputs)} if inputs else {}), **attrs)
+
+
+# --- get_parsed_expr --------------------------------------------------------------------------------------------------
+
+_NOON_JAN_1_2023 = datetime(2023, 1, 1, 12)
+_IS_BETWEEN_INPUTS = [column_shape("value"), literal_shape(1), literal_shape(10)]
+
+
+def _datetime_literal_shape() -> NodeShape:
+    if polars_has("datetime_literal_unwrapped"):
+        return literal_shape(_NOON_JAN_1_2023)
+    # Older Polars wraps the literal in a cast to the naive dtype.
+    return NodeShape(CastNode, input=NodeShape(BaseExprNode, value=_NOON_JAN_1_2023.replace(tzinfo=UTC)))
+
+
+@dataclass(frozen=True)
+class ParseCase:
+    """An expression and the tree it parses into."""
+
+    id: str
+    _: KW_ONLY
+    expr: pl.Expr
+    shape: NodeShape
+    marks: tuple = ()
+
+
+PARSE_CASES = [
+    ParseCase("parse_simple_column", expr=pl.col("test_column"), shape=column_shape("test_column")),
+    # literals
+    ParseCase("value_property_on_different_node_types-literal", expr=pl.lit(42), shape=NodeShape(LiteralNode, value=42, can_extract_literal=True)),
+    ParseCase("parse_literal-string", expr=pl.lit("hello"), shape=literal_shape("hello")),
+    ParseCase("parse_literal-boolean", expr=pl.lit(True), shape=literal_shape(True)),
+    ParseCase("parse_literal-none", expr=pl.lit(None), shape=literal_shape(None)),
+    ParseCase("parse_literal-list", expr=pl.lit([1, 2, 3]), shape=literal_shape([1, 2, 3])),
+    ParseCase("special_literals-nan", expr=pl.lit(float("nan")), shape=literal_shape(math.isnan)),
+    ParseCase("special_literals-inf", expr=pl.lit(float("inf")), shape=literal_shape(float("inf"))),
+    ParseCase("special_literals-neg_inf", expr=pl.lit(float("-inf")), shape=literal_shape(float("-inf"))),
+    ParseCase("date_time_literals_parsed-datetime", expr=pl.lit(_NOON_JAN_1_2023), shape=_datetime_literal_shape()),
+    ParseCase("date_time_literals_parsed-date", expr=pl.lit(date(2023, 1, 1)), shape=literal_shape(date(2023, 1, 1))),
+    ParseCase("date_time_literals_parsed-time", expr=pl.lit(time(12, 30, 45)), shape=literal_shape(time(12, 30, 45))),
+    ParseCase(
+        "complex_literals-dict",
+        expr=pl.lit({"a": 1, "b": 2}),
+        shape=literal_shape({"a": 1, "b": 2}) if polars_has("struct_literal_parsed") else NodeShape(ErrorNode),
+    ),
+    ParseCase("complex_literals-nested_list", expr=pl.lit([[1, 2], [3, 4]]), shape=literal_shape([[1, 2], [3, 4]])),
+    ParseCase("value_property_on_different_node_types-column", expr=pl.col("x"), shape=NodeShape(ColumnNode, value=None, can_extract_literal=False)),
+    ParseCase(
+        "value_property_on_different_node_types-function",
+        expr=pl.col("x").str.to_uppercase(),
+        shape=NodeShape(FunctionNode, value=None, can_extract_literal=False),
+    ),
+    ParseCase(
+        "value_property_on_different_node_types-cast_literal",
+        expr=pl.lit(42).cast(pl.Float64),
+        shape=NodeShape(CastNode, value=42.0, can_extract_literal=True),
+    ),
+    # binary operators
+    ParseCase(
+        "parse_binary_operation-eq",
+        expr=pl.col("a") == pl.col("b"),
+        shape=binary_shape(OperatorType.EQ, NodeShape(ColumnNode), NodeShape(ColumnNode)),
+    ),
+    ParseCase(
+        "parse_binary_operation-plus",
+        expr=pl.col("a") + pl.lit(5),
+        shape=binary_shape(OperatorType.PLUS, NodeShape(ColumnNode), NodeShape(LiteralNode)),
+    ),
+    ParseCase(
+        "binary_expr_node_contents", expr=pl.col("a") + pl.col("b"), shape=binary_shape(OperatorType.PLUS, column_shape("a"), column_shape("b"))
+    ),
+    *[
+        ParseCase(f"parse_all_comparison_operators-{op.name.lower()}", expr=fn(pl.col("a"), pl.lit(10)), shape=NodeShape(BinaryExprNode, op=op))
+        for fn, op in [
+            (lambda a, b: a == b, OperatorType.EQ),
+            (lambda a, b: a != b, OperatorType.NOT_EQ),
+            (lambda a, b: a < b, OperatorType.LT),
+            (lambda a, b: a <= b, OperatorType.LT_EQ),
+            (lambda a, b: a > b, OperatorType.GT),
+            (lambda a, b: a >= b, OperatorType.GT_EQ),
+        ]
+    ],
+    *[
+        ParseCase(f"parse_all_arithmetic_operators-{op.name.lower()}", expr=fn(pl.col("a"), pl.lit(10)), shape=NodeShape(BinaryExprNode, op=op))
+        for fn, op in [
+            (lambda a, b: a + b, OperatorType.PLUS),
+            (lambda a, b: a - b, OperatorType.MINUS),
+            (lambda a, b: a * b, OperatorType.MULTIPLY),
+            (lambda a, b: a / b, OperatorType.TRUE_DIVIDE),
+        ]
+    ],
+    ParseCase("parse_all_logical_operators-and", expr=(pl.col("a") > 5) & (pl.col("b") < 10), shape=NodeShape(BinaryExprNode, op=OperatorType.AND)),
+    ParseCase("parse_all_logical_operators-or", expr=(pl.col("a") > 5) | (pl.col("b") < 10), shape=NodeShape(BinaryExprNode, op=OperatorType.OR)),
+    ParseCase(
+        "nested_alias",
+        expr=pl.col("a").alias("b").alias("c"),
+        shape=NodeShape(AliasNode, name="c", input=NodeShape(AliasNode, name="b", input=column_shape("a"))),
+        marks=(pytest.mark.skipif(polars_has("nested_alias_dropped"), reason="meta.pop() drops a nested alias"),),
+    ),
+    # functions
+    ParseCase(
+        "parse_string_function-contains",
+        expr=pl.col("text").str.contains("pattern"),
+        shape=function_shape(StringFunctionType.CONTAINS, column_shape("text"), literal_shape("pattern")),
+    ),
+    ParseCase(
+        "parse_string_function-uppercase",
+        expr=pl.col("text").str.to_uppercase(),
+        shape=function_shape(StringFunctionType.UPPERCASE, column_shape("text")),
+    ),
+    ParseCase("parse_not", expr=~pl.col("flag"), shape=NodeShape(FunctionNode, inputs=[column_shape("flag")])),
+    ParseCase(
+        "parse_boolean_function-is_null", expr=pl.col("value").is_null(), shape=function_shape(BooleanFunctionType.IS_NULL, column_shape("value"))
+    ),
+    ParseCase(
+        "parse_boolean_function-is_not_null",
+        expr=pl.col("value").is_not_null(),
+        shape=function_shape(BooleanFunctionType.IS_NOT_NULL, column_shape("value")),
+    ),
+    ParseCase(
+        "parse_is_in_function-list",
+        expr=pl.col("value").is_in([1, 2, 3]),
+        shape=function_shape(BooleanFunctionType.IS_IN, column_shape("value"), literal_shape([1, 2, 3])),
+    ),
+    ParseCase(
+        "parse_is_in_function-column",
+        expr=pl.col("value").is_in(pl.col("other_list")),
+        shape=function_shape(BooleanFunctionType.IS_IN, column_shape("value"), column_shape("other_list")),
+    ),
+    ParseCase(
+        "parse_is_between-default",
+        expr=pl.col("value").is_between(1, 10),
+        shape=function_shape(BooleanFunctionType.IS_BETWEEN, *_IS_BETWEEN_INPUTS, options={"closed": "Both"}),
+    ),
+    *[
+        ParseCase(
+            f"parse_is_between-{closed}",
+            expr=pl.col("value").is_between(1, 10, closed=closed),
+            shape=function_shape(BooleanFunctionType.IS_BETWEEN, *_IS_BETWEEN_INPUTS, options={"closed": closed.capitalize()}),
+        )
+        for closed in ("both", "left", "right", "none")
+    ],
+    *[
+        ParseCase(f"parse_cast-{dtype.__name__}", expr=pl.col("value").cast(dtype), shape=NodeShape(CastNode))
+        for dtype in [pl.Int32, pl.Float64, pl.Utf8, pl.Boolean, pl.Date, pl.Datetime]
+    ],
+    *[
+        ParseCase(f"parse_datetime_functions-{name}", expr=expr, shape=NodeShape(FunctionNode, function_type=member_of(TemporalFunctionType)))
+        for name, expr in [
+            ("year", pl.col("date").dt.year()),
+            ("month", pl.col("date").dt.month()),
+            ("day", pl.col("date").dt.day()),
+            ("hour", pl.col("date").dt.hour()),
+            ("minute", pl.col("date").dt.minute()),
+            ("second", pl.col("date").dt.second()),
+            ("strftime", pl.col("date").dt.strftime("%Y-%m-%d")),
+        ]
+    ],
+    *[
+        ParseCase(f"parse_string_manipulation-{name}", expr=expr, shape=NodeShape(FunctionNode, function_type=member_of(StringFunctionType)))
+        for name, expr in [
+            ("to_lowercase", pl.col("text").str.to_lowercase()),
+            ("starts_with", pl.col("text").str.starts_with("prefix")),
+            ("ends_with", pl.col("text").str.ends_with("suffix")),
+            ("replace", pl.col("text").str.replace("old", "new")),
+            ("split", pl.col("text").str.split("delimiter")),
+            ("join", pl.col("text").str.join("other")),
+        ]
+    ],
+    ParseCase(
+        "unknown_expressions",
+        expr=pl.coalesce(pl.col("a"), pl.col("b"), pl.col("c")),
+        shape=NodeShape(FunctionNode, function_type=GenericFunctionType.UNKNOWN),
+    ),
+    ParseCase(
+        "ternary_operations",
+        expr=pl.when(pl.col("a") > 0).then(1).otherwise(0),
+        shape=NodeShape(TernaryNode, predicate=NodeShape(BinaryExprNode, op=OperatorType.GT), truthy=literal_shape(1), falsy=literal_shape(0)),
+    ),
+    ParseCase(
+        "fill_null_function_parsing",
+        expr=pl.col("nullable").fill_null(42) > 50,
+        shape=binary_shape(
+            OperatorType.GT, function_shape(GenericFunctionType.FILL_NULL, column_shape("nullable"), literal_shape(42)), literal_shape(50)
+        ),
+    ),
+    ParseCase(
+        "fill_null_with_expression",
+        expr=pl.col("nullable").fill_null(pl.when(pl.col("id") > 5).then(100).otherwise(0)) > 50,
+        shape=NodeShape(
+            BinaryExprNode,
+            op=OperatorType.GT,
+            left=function_shape(
+                GenericFunctionType.FILL_NULL,
+                column_shape("nullable"),
+                NodeShape(TernaryNode, predicate=NodeShape(BinaryExprNode, op=OperatorType.GT)),
+            ),
+        ),
+    ),
+    ParseCase(
+        "parse_complex_expression",
+        expr=(pl.col("age") >= 18) & pl.col("country").is_in(["USA", "Canada", "Mexico"]),
+        shape=binary_shape(
+            OperatorType.AND,
+            binary_shape(OperatorType.GT_EQ, column_shape("age"), literal_shape(18)),
+            function_shape(
+                BooleanFunctionType.IS_IN, column_shape("country"), literal_shape(["USA", "Canada", "Mexico"]), options={"nulls_equal": False}
+            ),
+        ),
+    ),
+    ParseCase(
+        "parse_complex_nested_expressions",
+        expr=pl.when((pl.col("a") > 10) & ((pl.col("b") < 5) | pl.col("c").is_in([1, 2, 3])))
         .then(pl.col("d") * 2 + pl.col("e").cast(pl.Float64))
-        .otherwise(pl.col("f").str.to_uppercase().str.contains("X") | pl.col("g").is_null())
-    )
-
-    node = get_parsed_expr(expr)
-
-    # Verify it's a TernaryNode (when-then-otherwise)
-    assert_node_type(node, TernaryNode)
-    ternary_node = node
-
-    # Check predicate part: (a > 10) & ((b < 5) | (c.is_in([1, 2, 3])))
-    assert_node_type(ternary_node.predicate, BinaryExprNode)
-    predicate = ternary_node.predicate
-    assert predicate.op == OperatorType.AND
-
-    # Check left side of AND: (a > 10)
-    assert_node_type(predicate.left, BinaryExprNode)
-    left_pred = predicate.left
-    assert left_pred.op == OperatorType.GT
-    assert_node_type(left_pred.left, ColumnNode)
-    assert left_pred.left.name == "a"
-    assert_node_type(left_pred.right, LiteralNode)
-    assert left_pred.right.value == 10
-
-    # Check right side of AND: ((b < 5) | (c.is_in([1, 2, 3])))
-    assert_node_type(predicate.right, BinaryExprNode)
-    right_pred = predicate.right
-    assert right_pred.op == OperatorType.OR
-
-    # Check left part of OR: (b < 5)
-    assert_node_type(right_pred.left, BinaryExprNode)
-    left_or = right_pred.left
-    assert left_or.op == OperatorType.LT
-    assert_node_type(left_or.left, ColumnNode)
-    assert left_or.left.name == "b"
-    assert_node_type(left_or.right, LiteralNode)
-    assert left_or.right.value == 5
-
-    # Check right part of OR: (c.is_in([1, 2, 3]))
-    assert_node_type(right_pred.right, FunctionNode)
-    right_or = right_pred.right
-    assert right_or.function_type == BooleanFunctionType.IS_IN
-    assert len(right_or.inputs) == 2
-    assert_node_type(right_or.inputs[0], ColumnNode)
-    assert right_or.inputs[0].name == "c"
-    assert_node_type(right_or.inputs[1], LiteralNode)
-    assert right_or.inputs[1].value == [1, 2, 3]
-
-    # Check "then" branch: pl.col("d") * 2 + pl.col("e").cast(pl.Float64)
-    assert_node_type(ternary_node.truthy, BinaryExprNode)
-    then_expr = ternary_node.truthy
-    assert then_expr.op == OperatorType.PLUS
-
-    # Left side of addition: d * 2
-    assert_node_type(then_expr.left, BinaryExprNode)
-    left_add = then_expr.left
-    assert left_add.op == OperatorType.MULTIPLY
-    assert_node_type(left_add.left, ColumnNode)
-    assert left_add.left.name == "d"
-    assert_node_type(left_add.right, LiteralNode)
-    assert left_add.right.value == 2
-
-    # Right side of addition: e.cast(pl.Float64)
-    assert_node_type(then_expr.right, CastNode)
-    right_add = then_expr.right
-    assert_node_type(right_add.input, ColumnNode)
-    assert right_add.input.name == "e"
-    assert isinstance(right_add.dtype, pl.Float64)
-
-    # Check "otherwise" branch: f.str.to_uppercase().str.contains("X") | g.is_null()
-    assert_node_type(ternary_node.falsy, BinaryExprNode)
-    else_expr = ternary_node.falsy
-    assert else_expr.op == OperatorType.OR
-
-    # Left side of OR: string operations
-    assert_node_type(else_expr.left, FunctionNode)
-    left_or_else = else_expr.left
-    assert left_or_else.function_type == StringFunctionType.CONTAINS
-    assert len(left_or_else.inputs) == 2
-
-    # Check input to contains is uppercase function
-    assert_node_type(left_or_else.inputs[0], FunctionNode)
-    upper_fn = left_or_else.inputs[0]
-    assert upper_fn.function_type == StringFunctionType.UPPERCASE
-    assert len(upper_fn.inputs) == 1
-    assert_node_type(upper_fn.inputs[0], ColumnNode)
-    assert upper_fn.inputs[0].name == "f"
-
-    # Check literal parameter to contains
-    assert_node_type(left_or_else.inputs[1], LiteralNode)
-    assert left_or_else.inputs[1].value == "X"
-
-    # Right side of OR: g.is_null()
-    assert_node_type(else_expr.right, FunctionNode)
-    right_or_else = else_expr.right
-    assert right_or_else.function_type == BooleanFunctionType.IS_NULL
-    assert len(right_or_else.inputs) == 1
-    assert_node_type(right_or_else.inputs[0], ColumnNode)
-    assert right_or_else.inputs[0].name == "g"
+        .otherwise(pl.col("f").str.to_uppercase().str.contains("X") | pl.col("g").is_null()),
+        shape=NodeShape(
+            TernaryNode,
+            predicate=binary_shape(
+                OperatorType.AND,
+                binary_shape(OperatorType.GT, column_shape("a"), literal_shape(10)),
+                binary_shape(
+                    OperatorType.OR,
+                    binary_shape(OperatorType.LT, column_shape("b"), literal_shape(5)),
+                    function_shape(BooleanFunctionType.IS_IN, column_shape("c"), literal_shape([1, 2, 3])),
+                ),
+            ),
+            truthy=binary_shape(
+                OperatorType.PLUS,
+                binary_shape(OperatorType.MULTIPLY, column_shape("d"), literal_shape(2)),
+                NodeShape(CastNode, input=column_shape("e"), dtype=pl.Float64),
+            ),
+            falsy=binary_shape(
+                OperatorType.OR,
+                function_shape(StringFunctionType.CONTAINS, function_shape(StringFunctionType.UPPERCASE, column_shape("f")), literal_shape("X")),
+                function_shape(BooleanFunctionType.IS_NULL, column_shape("g")),
+            ),
+        ),
+    ),
+]
 
 
-def test_large_expression():
-    """Test parsing a large expression with many operations."""
-    # Build a large expression with many operations
-    expr = pl.lit(0)
-    for i in range(50):
+@pytest.mark.parametrize("case", as_params(PARSE_CASES))
+def test_parse(case: ParseCase):
+    case.shape.match(get_parsed_expr(case.expr))
+
+
+@dataclass(frozen=True)
+class AdditionChainCase:
+    """A long chain of additions of literals, which must parse into a left-deep tree."""
+
+    id: str
+    _: KW_ONLY
+    # the left-most operand
+    start: pl.Expr
+    # the first literal added
+    first: int
+    # how many literals are added
+    count: int
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            AdditionChainCase("large_expression", start=pl.lit(0), first=0, count=50),
+            AdditionChainCase("parse_nested_expressions", start=pl.col("val"), first=1, count=10),
+        ]
+    ),
+)
+def test_parse_long_addition_chain(case: AdditionChainCase):
+    """``start + lit(first) + ... + lit(first + count - 1)`` parses into a left-deep chain with each literal on the right."""
+    expr = case.start
+    for i in range(case.first, case.first + case.count):
         expr = expr + pl.lit(i)
-
     node = get_parsed_expr(expr)
-    assert isinstance(node, BinaryExprNode)
-    cur_node = node
-    # We now unwrap the expression tree
-    # We work backwards, as every right node is a literal
-    for i in range(49, -1, -1):
-        assert isinstance(cur_node, BinaryExprNode)
-        right_node = cur_node.right
-        assert isinstance(right_node, LiteralNode)
-        assert right_node.value == i
-        cur_node = cur_node.left
-
-
-def test_parse_nested_expressions():
-    """Test parsing deeply nested expressions."""
-
-    # Build a recursive expression
-    def build_recursive_expr(depth: int, col_name: str = "val") -> pl.Expr:
-        if depth <= 0:
-            return pl.col(col_name)
-        return build_recursive_expr(depth - 1, col_name) + pl.lit(depth)
-
-    expr = build_recursive_expr(10)
-    node = get_parsed_expr(expr)
-
-    # Verify it's parsed without errors
-    assert isinstance(node, BinaryExprNode)
-    for i in range(10, -1, -1):
-        if i == 0:
-            # base case
-            assert isinstance(node, ColumnNode)
-            assert node.name == "val"
-            break
-        assert isinstance(node, BinaryExprNode)
-        right_node = node.right
-        assert isinstance(right_node, LiteralNode)
-        assert right_node.value == i
+    for i in reversed(range(case.first, case.first + case.count)):
+        binary_shape(OperatorType.PLUS, NodeShape(BaseExprNode), literal_shape(i)).match(node)
         node = node.left
+    (literal_shape(0) if case.first == 0 else column_shape("val")).match(node)
 
 
-def test_parse_datetime_functions():
-    """Test parsing datetime functions."""
-    date_col = pl.col("date")
-
-    # Test datetime component extraction functions
-    expressions = [
-        date_col.dt.year(),
-        date_col.dt.month(),
-        date_col.dt.day(),
-        date_col.dt.hour(),
-        date_col.dt.minute(),
-        date_col.dt.second(),
-        date_col.dt.strftime("%Y-%m-%d"),
-    ]
-
-    for expr in expressions:
+def test_list_eval_is_an_error_node_until_polars_serializes_it():
+    expr = pl.col("list_column").list.eval(pl.element() > 0)
+    if not polars_has("list_eval_serializes"):
         node = get_parsed_expr(expr)
-        # Verify it's parsed without errors
-        assert isinstance(node, FunctionNode)
-        assert isinstance(node.function_type, TemporalFunctionType)
-
-
-def test_parse_string_manipulation():
-    """Test parsing string manipulation functions."""
-    text_col = pl.col("text")
-
-    # Test various string functions
-    expressions = [
-        text_col.str.to_uppercase(),
-        text_col.str.to_lowercase(),
-        text_col.str.contains("pattern"),
-        text_col.str.starts_with("prefix"),
-        text_col.str.ends_with("suffix"),
-        text_col.str.replace("old", "new"),
-        text_col.str.split("delimiter"),
-        text_col.str.join("other"),
-    ]
-
-    for expr in expressions:
-        node = get_parsed_expr(expr)
-        # Verify it's parsed without errors
-        assert isinstance(node, FunctionNode)
-        assert isinstance(node.function_type, StringFunctionType)
+        assert isinstance(node, ErrorNode)
+        assert "serialization not supported for this 'opaque' function" in node.error
+    else:
+        val_dict = json.loads(expr.meta.serialize(format="json"))
+        assert len(val_dict) == 1 and "Eval" in val_dict
 
 
 class ExampleTestVisitor(ExprVisitor[list[str]]):
-    """Visitor that collects node type names during traversal."""
+    """Collects node type names during traversal."""
 
     def __init__(self):
         self.visited = []
@@ -853,24 +380,16 @@ class ExampleTestVisitor(ExprVisitor[list[str]]):
 
 
 def test_visitor_pattern():
-    """Test the visitor pattern implementation."""
-    # Create an expression
-    expr = (pl.col("a") == 5) & (pl.col("b") > 10)
-    node = get_parsed_expr(expr)
-
-    # Apply the visitor
     visitor = ExampleTestVisitor()
-    visitor.visit(node)
+    visitor.visit(get_parsed_expr((pl.col("a") == 5) & (pl.col("b") > 10)))
     result = visitor.process_results()
-
-    # Check results
     assert result[0] == f"BinaryExpr({OperatorType.AND})"
     assert "Column(a)" in result
     assert "Column(b)" in result
 
 
 class CountingVisitor(ExprVisitor[dict[str, int]]):
-    """Visitor that counts node types."""
+    """Counts node types, visiting children through ``visit_children``."""
 
     def __init__(self):
         self.counts = {}
@@ -885,655 +404,33 @@ class CountingVisitor(ExprVisitor[dict[str, int]]):
 
 
 def test_counting_visitor():
-    """Test a visitor that counts node types."""
-    # Create a complex expression
-    expr = (pl.col("a") > 5) & (pl.col("b").is_in(["x", "y", "z"]))
-    node = get_parsed_expr(expr)
-
-    # Count node types
     visitor = CountingVisitor()
-    visitor.visit(node)
-    counts = visitor.process_results()
+    visitor.visit(get_parsed_expr((pl.col("a") > 5) & pl.col("b").is_in(["x", "y", "z"])))
+    assert visitor.process_results() == {"BinaryExprNode": 2, "ColumnNode": 2, "LiteralNode": 2, "FunctionNode": 1}
 
-    # Check that we have the expected nodes
-    # > and & comparisons
-    assert counts.get("BinaryExprNode", 0) == 2
-    assert counts.get("ColumnNode", 0) == 2
-    # 5 and ["x", "y", "z"] literals
-    assert counts.get("LiteralNode", 0) == 2
-    # is_in function
-    assert counts.get("FunctionNode", 0) == 1
 
-
-def test_list_eval():
-    """Test parsing filter operations."""
-    # Filter a list column by a condition
-    expr = pl.col("list_column").list.eval(pl.element() > 0)
-    # In `1.31.0` we added a new "Eval" node type
-    if version.parse(pl.__version__) <= version.parse("1.30.0"):
-        node = get_parsed_expr(expr)
-        assert isinstance(node, ErrorNode)
-        assert "serialization not supported for this 'opaque' function" in node.error
-    else:
-        val = expr.meta.serialize(format="json")
-        val_dict = json.loads(val)
-        assert len(val_dict) == 1 and "Eval" in val_dict
-        # TODO: Support parsing this node type
-
-
-def test_ternary_operations():
-    """Test parsing ternary operations (if-then-else)."""
-    # When-then-otherwise expression
-    expr = pl.when(pl.col("a") > 0).then(1).otherwise(0)
-    node = get_parsed_expr(expr)
-
-    # Verify it's parsed without errors
-    assert isinstance(node, TernaryNode)
-    assert isinstance(node.predicate, BinaryExprNode)
-    assert node.predicate.op == OperatorType.GT
-
-    assert node.truthy.value == 1
-    assert node.falsy.value == 0
-
-
-def test_unknown_expressions():
-    """Test an unmapped expression (coalesce)"""
-    # Create a COALESCE like operation
-    expr = pl.coalesce(pl.col("a"), pl.col("b"), pl.col("c"))
-    node = get_parsed_expr(expr)
-
-    # Verify it's parsed without errors
-    assert isinstance(node, FunctionNode)
-    # We don't map this specific function, so it gets mapped to unknown
-    assert node.function_type == GenericFunctionType.UNKNOWN
-
-
-def test_get_literal_value():
-    """Test the get_literal_value function."""
-    # Test basic types
-    assert get_literal_value(pl.lit(5)) == 5
-    assert get_literal_value(pl.lit("test")) == "test"
-    assert get_literal_value(pl.lit(True)) is True
-    assert get_literal_value(pl.lit(None)) is None
-
-    # Test lists
-    assert get_literal_value(pl.lit([1, 2, 3])) == [1, 2, 3]
-
-    # Test dictionaries
-    assert get_literal_value(pl.lit({"a": 1, "b": 2})) == {"a": 1, "b": 2}
-
-    # Test date/time
-    dt = datetime(2023, 1, 1)
-    assert get_literal_value(pl.lit(dt)) == dt
-
-    # Test with non-literal expressions
-    assert get_literal_value(pl.col("non_existent")) is FAILED_LITERAL_RESULT
-
-
-def test_numeric_predicates(tester):
-    """Test that numeric predicates are pushed down and give correct results"""
-    # Simple comparisons
-    expr1 = pl.col("id") > 5
-    tester.assert_predicate_pushed_down(expr1)
-
-    expr2 = pl.col("float_val") <= 3.0
-    tester.assert_predicate_pushed_down(expr2)
-
-    # Compound conditions
-    expr3 = (pl.col("id") > 3) & (pl.col("int_val") < 70)
-    tester.assert_predicate_pushed_down(expr3)
-
-    # Math expressions
-    expr4 = pl.col("float_val") * 2 > 5
-    tester.assert_predicate_pushed_down(expr4)
-
-
-def test_string_predicates(tester):
-    """Test that string predicates are pushed down and give correct results"""
-    # Exact match
-    expr1 = pl.col("string_val") == "A"
-    tester.assert_predicate_pushed_down(expr1)
-
-    # String contains - version dependent
-    expr2 = pl.col("long_string").str.contains("text_")
-    if version.parse(pl.__version__) >= version.parse("1.25.2"):
-        # Should be pushed down in newer versions
-        tester.assert_predicate_pushed_down(expr2)
-    tester.assert_results_match(expr2)
-
-    # String patterns
-    expr3 = pl.col("string_val").is_in(["A", "B"])
-    tester.assert_predicate_pushed_down(expr3)
-
-
-def test_strip_chars_predicate_pushed_down():
-    """str.strip_chars / str.strip_chars_start / str.strip_chars_end translate to TRIM / LTRIM / RTRIM."""
-    df = pl.DataFrame({"padded": ["  A  ", "  B  ", "  C  ", " D ", "E"]})
-    tracker = PredicateTracker(df)
-
-    for expr in [
-        pl.col("padded").str.strip_chars() == "A",
-        pl.col("padded").str.strip_chars_start() == "A  ",
-        pl.col("padded").str.strip_chars_end() == "  A",
-    ]:
-        tracker.assert_predicate_pushed_down(expr)
-        tracker.assert_results_match(expr)
-
-
-def test_concat_horizontal_predicate_pushed_down():
-    """pl.concat_str translates to SQL CONCAT(...)."""
-    df = pl.DataFrame({"first": ["A", "B", "C"], "last": ["X", "Y", "Z"]})
-    tracker = PredicateTracker(df)
-
-    expr = pl.concat_str([pl.col("first"), pl.lit("-"), pl.col("last")]) == "A-X"
-    tracker.assert_predicate_pushed_down(expr)
-    tracker.assert_results_match(expr)
-
-
-def test_fill_null_predicates(tester):
-    for val in [0, 1, 9]:
-        expr = pl.col("nullable").fill_null(val) > 5
-        tester.assert_predicate_pushed_down(expr)
-
-
-def test_same_dtype_column_comparison(tester):
-    expr = pl.col("id") < pl.col("int_val")
-    tester.assert_predicate_pushed_down(expr)
-
-
-def test_struct_field_pushed_down(tester):
-    expr = pl.col("struct").struct.field("value") > 5
-    tester.assert_predicate_pushed_down(expr)
-
-
-def test_fill_ternary_predicates(tester):
-    expr = (
-        pl.when(
-            pl.col("nullable") > 3,
-            pl.col("int_val") > 5,
-        )
-        .then(pl.col("int_val") > 2)
-        .when(pl.col("float_val") > 0)
-        .then(pl.col("string_val").is_in(["a", "b"]))
-        .when(pl.col("float_val") < 1)
-        .then(pl.lit(True))
-        .otherwise(pl.col("float_val") < 5)
-    )
-    tester.assert_predicate_pushed_down(expr)
-
-
-def test_temporal_predicates(tester):
-    """Test that temporal predicates are pushed down and give correct results"""
-    # Date comparisons
-    expr1 = pl.col("date_val") > date(2023, 1, 5)
-    tester.assert_predicate_pushed_down(expr1)
-
-    # DateTime operations - we have two cases
-    datetime_val = datetime(2023, 1, 1, 18, 0, 0)
-    datetime_val_end = datetime(2023, 1, 1, 23, 59, 59)
-
-    # Case 1: Standard Python datetime
-    expr2 = pl.col("datetime_val") < datetime_val
-    tester.assert_results_match(expr2)
-    if version.parse(pl.__version__) >= version.parse("1.26.0"):
-        # Fixed in polars 1.26
-        tester.assert_predicate_pushed_down(expr2)
-
-    # Case 2: Converted datetime (should push down)
-    expr3 = pl.col("datetime_val") < convert_datetime_to_polars(datetime_val)
-    tester.assert_predicate_pushed_down(expr3)
-
-    # Case 3: IsBetween check
-    expr3 = pl.col("datetime_val").is_between(convert_datetime_to_polars(datetime_val), convert_datetime_to_polars(datetime_val_end))
-    tester.assert_predicate_pushed_down(expr3)
-
-    expr4 = pl.col("datetime_val").is_between(datetime_val, datetime_val_end)
-    if version.parse(pl.__version__) >= version.parse("1.26.0"):
-        # Fixed in polars 1.26
-        tester.assert_predicate_pushed_down(expr4)
-
-    # Extract components
-    expr5 = pl.col("date_val").dt.day() == 3
-    if version.parse(pl.__version__) >= version.parse("1.25.2"):
-        # Should be pushed down in newer versions
-        tester.assert_predicate_pushed_down(expr5)
-
-
-def test_temporal_schema_edge_case():
-    # Create a tracker with a custom dataframe where datetime values have
-    # schema of nanoseconds.
-    df = pl.DataFrame(
-        {
-            "timestamp": [
-                datetime(2024, 1, 1),
-                datetime(2024, 1, 2),
-                datetime(2024, 1, 3),
-            ],
-            "value": [10, 20, 30],
-        },
-        schema={"timestamp": pl.Datetime(time_unit="ns"), "value": pl.Int64},
-    )
-    tracker = PredicateTracker(df)
-    datetime_val = datetime(2023, 1, 1, 18, 0, 0)
-    datetime_val_end = datetime(2023, 1, 1, 23, 59, 59)
-    expr = pl.col("timestamp").is_between(datetime_val, datetime_val_end)
-    expected_pushed_down = False
-    if version.parse(pl.__version__) >= version.parse("1.28.0"):
-        expected_pushed_down = True
-    tracker.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushed_down)
-
-    expr_converted = pl.col("timestamp").is_between(convert_datetime_to_polars(datetime_val), convert_datetime_to_polars(datetime_val_end))
-    if version.parse(pl.__version__) >= version.parse("1.26.0"):
-        tracker.assert_predicate_pushed_down(expr_converted)
-
-
-def test_boolean_predicates(tester):
-    """Test that boolean predicates are pushed down and give correct results"""
-    # Direct boolean filtering
-    expr1 = pl.col("bool_val")
-    tester.assert_predicate_pushed_down(expr1)
-
-    # Boolean operators
-    expr2 = ~pl.col("bool_val")
-    tester.assert_predicate_pushed_down(expr2)
-
-
-def test_null_predicates(tester):
-    """Test that null predicates are pushed down and give correct results"""
-    # Is null checks
-    expr1 = pl.col("nullable").is_null()
-    tester.assert_predicate_pushed_down(expr1)
-
-    # Is not null checks
-    expr2 = pl.col("nullable").is_not_null()
-    tester.assert_predicate_pushed_down(expr2)
-
-
-def test_categorical_predicates(tester):
-    """Test that categorical predicates are pushed down and give correct results"""
-    # Categorical comparisons
-    expr = pl.col("cat_val") == "A"
-    tester.assert_predicate_pushed_down(expr)
-
-
-def test_complex_predicates(tester):
-    """Test that complex predicates are pushed down and give correct results"""
-    # Complex nested expressions
-    complex_expr = (pl.col("id") > 3) & ((pl.col("string_val") == "A") | (pl.col("float_val") > 3.0)) & ~pl.col("bool_val") | pl.col("cat_val").is_in(
-        ["A", "C"]
-    )
-    tester.assert_predicate_pushed_down(complex_expr)
-
-    # Multiple column types in the same expression
-    mixed_expr = (pl.col("date_val") > date(2023, 1, 3)) & (pl.col("string_val").is_in(["A", "B"])) & (pl.col("float_val") > 2.0)
-    tester.assert_predicate_pushed_down(mixed_expr)
-
-
-def test_predicates_with_implicit_casts(tester):
-    if version.parse(pl.__version__) < version.parse("1.28.0"):
-        # Implicit casts prevent any predicate pushdown in
-        # previouse versions of polars
-        return
-    datetime_expr = pl.col("datetime_val") > date(2023, 1, 2)
-    datetime_expr_is_between = pl.col("datetime_val").is_between(date(2023, 1, 2), date(2023, 1, 3))
-    tester.assert_predicate_pushed_down(datetime_expr)
-    tester.assert_predicate_pushed_down(datetime_expr_is_between)
-
-    float_int_col = pl.col("int_val") == pl.col("float_val")
-    tester.assert_predicate_pushed_down(float_int_col)
-
-    date_expr = pl.col("date_val") > datetime(2023, 1, 2, 12)
-    tester.assert_predicate_pushed_down(date_expr)
-
-
-@pytest.mark.parametrize("strict", [True, False])
-def test_predicate_with_explicit_cast_on_column(tester, strict):
-    """A filter with an explicit (redundant) cast on a column is pushed down.
-
-    Parametrized to verify both strict=True and strict=False cast behavior.
-    """
-    # Use a no-op cast (Int -> Int64) so both strict modes succeed
-    expr = pl.col("int_val").cast(pl.Int64, strict=strict) > 30
-    tester.assert_predicate_pushed_down(expr)
-
-
-@pytest.mark.parametrize("strict", [True, False])
-def test_compare_float_gt_int_with_int_to_float_cast_pushed_down(tester, strict):
-    """Ensure pushdown when casting int_val to Float64 in a float vs int comparison."""
-    expr = pl.col("float_val") > pl.col("int_val").cast(pl.Float64, strict=strict)
-    expected_pushed_down = version.parse(pl.__version__) >= version.parse("1.28.0")
-    tester.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushed_down)
-
-
-@pytest.mark.parametrize("strict", [True, False])
-def test_compare_float_gt_int_with_float_to_int_cast_pushed_down(tester, strict):
-    """Ensure pushdown when casting float_val to Int64 in a float vs int comparison."""
-    expr = pl.col("float_val").cast(pl.Int64, strict=strict) > pl.col("int_val")
-    expected_pushed_down = version.parse(pl.__version__) >= version.parse("1.28.0")
-    tester.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushed_down)
-
-
-def test_unsimplified_not_predicates(tester):
-    # NOTE: Here we test that the polars optimization process
-    # applies DeMorgan's law for us here
-    expr = ~((pl.col("string_val") == "A") | (pl.col("id") > 3))
-
-    def assert_func(original_expr, pushed_expr):
-        # Check that the original expression is equivalent to the pushed expression
-        # expected_pushed = (pl.col("string_val") != "A") & (pl.col("id") <= 3)
-
-        pushed_expr_node = get_parsed_expr(pushed_expr)
-        assert isinstance(pushed_expr_node, BinaryExprNode)
-        assert pushed_expr_node.op == OperatorType.AND
-
-        original_expr_node = get_parsed_expr(original_expr)
-        assert isinstance(original_expr_node, FunctionNode)
-        assert original_expr_node.function_type == BooleanFunctionType.NOT
-        assert len(original_expr_node.inputs) == 1
-        inner_node = original_expr_node.inputs[0]
-        assert isinstance(inner_node, BinaryExprNode)
-        assert inner_node.op == OperatorType.OR
-
-    tester.assert_predicate_pushed_down(expr, assert_func)
-
-    double_nested_expr = ~((pl.col("string_val") == "A") | (~(pl.col("date_val") == date(2023, 1, 3)) & (pl.col("float_val") > 2.0)))
-    tester.assert_predicate_pushed_down(double_nested_expr)
-
-
-def test_map_batches(tester):
-    expr = pl.col("int_val").map_batches(lambda x: x > 5, return_dtype=pl.Boolean, is_elementwise=True)
-
-    def assert_func(original_expr, pushed_expr):
-        pushed_expr_node = get_parsed_expr(pushed_expr)
-        assert isinstance(pushed_expr_node, AnonymousFunctionNode)
-
-    # TODO: Check the actual shit
-    if version.parse(pl.__version__) > version.parse("1.31.0"):
-        pytest.xfail("This is not pushed down properly in polars 1.32.0 pre-release")
-    tester.assert_predicate_pushed_down(expr, assert_func)
-
-
-def test_fill_null_constant(tester):
-    expr = pl.col("nullable").fill_null(pl.when(pl.col("id") > 5).then(100).otherwise(0)) > 50
-
-    def assert_func(original_expr, pushed_expr):
-        node = get_parsed_expr(pushed_expr)
-        # TODO: The function is FillNull, add support for this in parsing
-        assert node.left.function_type == GenericFunctionType.FILL_NULL
-
-    if version.parse(pl.__version__) > version.parse("1.30.0"):
-        tester.assert_predicate_pushed_down(expr, assert_func)
-    else:
-        # In versions 1.30.0 and before, this is not pushed down
-        tester.assert_predicate_pushed_down(expr, expected_pushed_down=False)
-
-
-def test_column_selection_with_predicates(tester):
-    """Test that column selection works together with predicates"""
-    lf = tester.lazy_frame
-    expr = pl.col("id") > 5
-
-    # Reset the tracker
-    tester.reset()
-
-    # Apply filter and select only certain columns
-    filtered_result = lf.filter(expr).select(["id", "string_val", "date_val"]).collect()
-
-    # Direct equivalent operation
-    direct_result = tester.df.filter(expr).select(["id", "string_val", "date_val"])
-
-    # Verify the results match
-    assert_frame_equal(filtered_result, direct_result)
-
-    # Verify both projection and predicate were pushed down
-    assert tester.last_predicate is not None, "Predicate was not pushed down"
-    assert tester.last_with_columns is not None, "Column projection was not pushed down"
-    assert set(tester.last_with_columns) == {"id", "string_val", "date_val"}
-
-
-def test_all_results_match_regardless_of_pushdown(tester):
-    """
-    Test that results match the direct filter even for expressions
-    that might not be pushed down
-    """
-    # A mix of expressions that may or may not be pushed down
-    expressions = [
-        # Basic expressions (likely pushed down)
-        (pl.col("id") > 5, True),
-        (pl.col("string_val") == "A", True),
-        # Complex expressions
-        (pl.col("float_val").sin() > 0, False),
-        (pl.col("string_val").str.to_uppercase() == "A", False),
-        (pl.col("date_val").dt.strftime("%Y-%m-%d") == "2023-01-01", False),
-        # In 1.30.0, this is not pushed down. Uncomment when this issue is fixed
-        # https://github.com/pola-rs/polars/issues/22860
-        # (pl.col("float_val").map_elements(lambda x: x > 2.0), False),
-    ]
-
-    # For each expression, ensure results match regardless of pushdown
-    for expr, expected_pushdown in expressions:
-        expected_pushdown = expected_pushdown or version.parse(pl.__version__) >= version.parse("1.25.2")
-        tester.assert_predicate_pushed_down(expr, expected_pushed_down=expected_pushdown)
-        if expected_pushdown:
-            tester.assert_results_match(expr)
-
-
-def test_expected_not_pushed_down(tester):
-    filter_expressions = [
-        # Filters with Window Functions
-        pl.col("float_val") > pl.col("float_val").mean().over("string_val"),
-        (pl.col("float_val") - pl.col("float_val").mean().over("string_val")) / pl.col("float_val").std().over("string_val") > 1.0,
-        pl.col("float_val").diff().over([pl.col("string_val")]) > 0.5,
-        # Filters with Aggregations
-        pl.col("int_val") > pl.col("int_val").mean(),
-        (pl.col("float_val") > pl.col("float_val").mean()) & (pl.col("int_val") < pl.col("int_val").median()),
-        (pl.col("float_val") - pl.col("float_val").min()) / (pl.col("float_val").max() - pl.col("float_val").min()) > 0.5,
-        # Filters with Group By Operations Combined with Other Complex Logic
-        (pl.col("float_val") > pl.col("float_val").mean()) & (pl.col("float_val") > pl.col("float_val").mean().over("string_val")),
-        (pl.col("id").count().over("string_val") > 1) & (pl.col("nullable").null_count() < pl.len()).over("string_val"),
-        pl.col("float_val") > (pl.col("float_val").mean().over("string_val") + pl.col("float_val").std().over("string_val")),
-        # Mixed Complex Expressions
-        pl.col("nullable").fill_null(pl.col("nullable").mean().over("string_val")) > pl.col("nullable").fill_null(0).mean(),
-        pl.when(pl.col("string_val") == "A")
-        .then(pl.col("float_val") > pl.col("float_val").mean().over("string_val"))
-        .otherwise(pl.col("int_val") > pl.col("int_val").median()),
-        pl.col("float_val") > pl.col("float_val").first().over("string_val"),
-        # Filters with fill_null that are not elementwise are not pushed down
-        pl.col("nullable").fill_null(strategy="min") > 3,
-        pl.col("float_val").diff() > 0.5,
-        pl.col("int_val").map_batches(lambda x: x > 5, return_dtype=pl.Boolean, is_elementwise=False),
-    ]
-    for expr in filter_expressions:
-        # Check that the predicate is not pushed down
-        tester.assert_predicate_pushed_down(expr, expected_pushed_down=False)
-
-
-def test_fill_null_function_parsing():
-    """Test that FillNull functions are parsed correctly with proper function type."""
-    # Test simple FillNull with literal
-    expr = pl.col("nullable").fill_null(42) > 50
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, BinaryExprNode)
-    assert node.op == OperatorType.GT
-    assert isinstance(node.left, FunctionNode)
-    assert node.left.function_type == GenericFunctionType.FILL_NULL
-    assert len(node.left.inputs) == 2
-
-    # Check inputs
-    assert isinstance(node.left.inputs[0], ColumnNode)
-    assert node.left.inputs[0].name == "nullable"
-    assert isinstance(node.left.inputs[1], LiteralNode)
-    assert node.left.inputs[1].value == 42
-
-    # Check right side of comparison
-    assert isinstance(node.right, LiteralNode)
-    assert node.right.value == 50
-
-
-def test_fill_null_with_expression():
-    """Test that FillNull with complex expressions is parsed correctly."""
-    # Test FillNull with ternary expression
-    expr = pl.col("nullable").fill_null(pl.when(pl.col("id") > 5).then(100).otherwise(0)) > 50
-    node = get_parsed_expr(expr)
-
-    assert isinstance(node, BinaryExprNode)
-    assert node.op == OperatorType.GT
-    assert isinstance(node.left, FunctionNode)
-    assert node.left.function_type == GenericFunctionType.FILL_NULL
-    assert len(node.left.inputs) == 2
-
-    # Check first input is column
-    assert isinstance(node.left.inputs[0], ColumnNode)
-    assert node.left.inputs[0].name == "nullable"
-
-    # Check second input is ternary expression
-    assert isinstance(node.left.inputs[1], TernaryNode)
-    fill_expr = node.left.inputs[1]
-    assert isinstance(fill_expr.predicate, BinaryExprNode)
-    assert fill_expr.predicate.op == OperatorType.GT
-
-
-def test_value_property_on_different_node_types():
-    """Test that the value property works correctly on different node types.
-
-    This tests that:
-    - LiteralNode.value returns the literal value
-    - ColumnNode.value returns None (uses BaseExprNode default)
-    - Non-extractable nodes return None
-    """
-    # Test LiteralNode - should return the literal value
-    literal_expr = pl.lit(42)
-    literal_node = get_parsed_expr(literal_expr)
-    assert isinstance(literal_node, LiteralNode)
-    assert literal_node.value == 42
-    assert literal_node.can_extract_literal is True
-
-    # Test ColumnNode - should return None (from BaseExprNode default)
-    col_expr = pl.col("x")
-    col_node = get_parsed_expr(col_expr)
-    assert isinstance(col_node, ColumnNode)
-    assert col_node.value is None
-    assert col_node.can_extract_literal is False
-
-    # Test FunctionNode with column input - should not be extractable
-    func_expr = pl.col("x").str.to_uppercase()
-    func_node = get_parsed_expr(func_expr)
-    assert isinstance(func_node, FunctionNode)
-    assert func_node.value is None  # Because input is column, not literal
-    assert func_node.can_extract_literal is False
-
-    # Test nested literal - LiteralNode inside CastNode
-    cast_lit_expr = pl.lit(42).cast(pl.Float64)
-    cast_node = get_parsed_expr(cast_lit_expr)
-    assert isinstance(cast_node, CastNode)
-    # CastNode with literal input should be extractable
-    assert cast_node.can_extract_literal is True
-    # The value should be the casted literal
-    assert cast_node.value == 42.0
-
-
-class TestLimitNotPushedWithFilter:
-    """
-    Polars does NOT push head()/limit() (n_rows) to IO sources when a filter is present.
-
-    This is critical - if the limit were pushed along with a filter that the source
-    can't fully handle, you'd get fewer rows than expected.
-    """
-
-    @pytest.mark.parametrize("limit_method", ["head", "limit"])
-    def test_limit_not_pushed_when_filter_present(self, limit_method):
-        """
-        Verify that Polars passes n_rows=None when there's a predicate.
-
-        This is the fundamental safety behavior that prevents incorrect results
-        when filters can't be fully pushed to the data source.
-        """
-        from polars.io.plugins import register_io_source
-
-        received_params = {}
-
-        def tracking_source(with_columns, predicate, n_rows, batch_size):
-            received_params["predicate"] = predicate
-            received_params["n_rows"] = n_rows
-            yield pl.DataFrame({"x": [1, 2, 3, 4, 5], "y": [10, 20, 30, 40, 50]})
-
-        schema = {"x": pl.Int64, "y": pl.Int64}
-
-        lf = register_io_source(tracking_source, schema=schema)
-        lf_filtered = lf.filter(pl.col("x") > 2)
-
-        if limit_method == "head":
-            lf_filtered.head(2).collect()
-        else:
-            lf_filtered.limit(2).collect()
-
-        assert received_params["predicate"] is not None, "Predicate should be passed"
-        assert received_params["n_rows"] is None, (
-            f"n_rows should NOT be pushed when predicate is present (using {limit_method}), got {received_params['n_rows']}"
-        )
-
-    @pytest.mark.parametrize("limit_method", ["head", "limit"])
-    def test_limit_pushed_when_no_filter(self, limit_method):
-        """Verify that head()/limit() IS pushed when there's no filter."""
-        from polars.io.plugins import register_io_source
-
-        received_params = {}
-
-        def tracking_source(with_columns, predicate, n_rows, batch_size):
-            received_params["predicate"] = predicate
-            received_params["n_rows"] = n_rows
-            yield pl.DataFrame({"x": [1, 2, 3, 4, 5]})
-
-        schema = {"x": pl.Int64}
-
-        lf = register_io_source(tracking_source, schema=schema)
-
-        if limit_method == "head":
-            lf.head(3).collect()
-        else:
-            lf.limit(3).collect()
-
-        assert received_params["predicate"] is None, "No predicate should be passed"
-        assert received_params["n_rows"] == 3, f"n_rows should be 3 (using {limit_method}), got {received_params['n_rows']}"
-
-
-# ---------------------------------------------------------------------------
-# NodeTraverserParser-specific behavior tests
-# ---------------------------------------------------------------------------
 def test_node_traverser_parser_isolates_subtree_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A deep failure in one ``_parse_<kind>`` collapses only the affected subtree to ``ErrorNode``; the rest of the tree continues to
-    parse normally. Guards against a future simplification of ``_parse`` silently dropping the isolation.
-    """
+    """A failure in one ``_parse_<kind>`` collapses only that subtree to ``ErrorNode``; the rest still parses."""
 
     def boom(self: NodeTraverserParser, expr: pl.Expr, obj: object, visitor: object) -> BaseExprNode:
         raise RuntimeError("simulated subtree failure")
 
     monkeypatch.setattr(NodeTraverserParser, "_parse_function_expr", boom)
-
-    # Outer BinaryExpr (And) with one normal child (BinaryExpr Gt) and one child that goes through the function dispatch (is_null).
-    expr = (pl.col("x") > 5) & pl.col("y").is_null()
-    node = NodeTraverserParser().parse(expr)
-
-    assert isinstance(node, BinaryExprNode), "outer And should survive"
-    assert isinstance(node.left, BinaryExprNode), "left subtree (x > 5) should parse normally"
-    assert isinstance(node.right, ErrorNode), "right subtree (is_null) should collapse to ErrorNode"
-    assert "simulated subtree failure" in node.right.error
+    node = NodeTraverserParser().parse((pl.col("x") > 5) & pl.col("y").is_null())
+    NodeShape(BinaryExprNode, left=NodeShape(BinaryExprNode), right=NodeShape(ErrorNode, error=lambda e: "simulated subtree failure" in e)).match(
+        node
+    )
 
 
 def test_node_traverser_parser_unsupported_expression_degrades_to_unknown() -> None:
-    """An expression shape that polars' typed view refuses (here, a Python UDF via ``map_batches``) must degrade to ``UnknownNode``
-    rather than raise. Guards the ``_view → NotImplementedError → UnknownNode`` fallback path, which is not exercised by the IO-source
-    end-to-end suite.
-    """
-    expr = pl.col("x").map_batches(lambda s: s, return_dtype=pl.Boolean)
-    node = NodeTraverserParser().parse(expr)
-    assert isinstance(node, UnknownNode)
+    """A Python UDF, which Polars' typed view refuses, degrades to ``UnknownNode`` rather than raising."""
+    assert isinstance(NodeTraverserParser().parse(pl.col("x").map_batches(lambda s: s, return_dtype=pl.Boolean)), UnknownNode)
 
 
 @pytest.mark.parametrize(
     "expr",
     [pl.col("x").is_null().alias("p"), pl.col("x").is_null().name.keep(), (~pl.col("x").is_null()).alias("p").alias("q")],
+    ids=["alias", "keep_name", "nested_alias"],
 )
 def test_naming_wrapper_does_not_repeat_function(expr):
     df = pl.DataFrame({"x": [None, 1]})
@@ -1545,29 +442,252 @@ def test_naming_wrapper_does_not_repeat_function(expr):
     assert not isinstance(node.inputs[0], FunctionNode) or node.inputs[0].function_type != node.function_type
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "options"), [({"strict": True}, "Strict"), ({"strict": False}, "NonStrict"), ({"wrap_numerical": True}, "Overflowing")]
-)
-def test_cast_options_parsed(kwargs, options):
-    node = get_parsed_expr(pl.col("x").cast(pl.Int8, **kwargs))
-    assert isinstance(node, CastNode)
-    assert node.options == options
+@dataclass(frozen=True)
+class CastOptionsCase:
+    """Keyword arguments to ``cast``, and the options the parsed cast node holds."""
+
+    id: str
+    _: KW_ONLY
+    kwargs: dict
+    options: str
 
 
 @pytest.mark.parametrize(
-    ("value", "collection", "expected"),
-    [
-        (pl.lit(1), False, True),
-        (pl.lit([1, 2]), False, False),
-        (pl.lit([1, 2]), True, True),
-        (pl.lit(pl.Series(["a", "b"])), False, False),
-        (pl.lit(float("nan")), False, False),
-        (pl.lit([float("nan"), 1.0]), True, False),
-        # Valid in Polars, but outside Python's date range.
-        (pl.lit(4_000_000).cast(pl.Date), False, False),
-        (pl.lit(10**18).cast(pl.Datetime("us")), False, False),
-    ],
+    "case",
+    as_params(
+        [
+            CastOptionsCase("strict", kwargs={"strict": True}, options="Strict"),
+            CastOptionsCase("non_strict", kwargs={"strict": False}, options="NonStrict"),
+            CastOptionsCase("wrap_numerical", kwargs={"wrap_numerical": True}, options="Overflowing"),
+        ]
+    ),
 )
-def test_has_exact_value(value, collection, expected):
-    node = get_parsed_expr(pl.col("x") == value).right
-    assert has_exact_value(node, collection=collection) is expected
+def test_cast_options_parsed(case: CastOptionsCase):
+    NodeShape(CastNode, options=case.options).match(get_parsed_expr(pl.col("x").cast(pl.Int8, **case.kwargs)))
+
+
+@dataclass(frozen=True)
+class ExactValueCase:
+    """A literal compared with a column, and whether ``has_exact_value`` finds its value exact."""
+
+    id: str
+    _: KW_ONLY
+    value: pl.Expr
+    # read the literal as a collection of values
+    collection: bool
+    expected: bool
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            ExactValueCase("int", value=pl.lit(1), collection=False, expected=True),
+            ExactValueCase("list_as_scalar", value=pl.lit([1, 2]), collection=False, expected=False),
+            ExactValueCase("list_as_collection", value=pl.lit([1, 2]), collection=True, expected=True),
+            ExactValueCase("series", value=pl.lit(pl.Series(["a", "b"])), collection=False, expected=False),
+            ExactValueCase("nan", value=pl.lit(float("nan")), collection=False, expected=False),
+            ExactValueCase("nan_in_collection", value=pl.lit([float("nan"), 1.0]), collection=True, expected=False),
+            # Valid in Polars, but outside Python's date range.
+            ExactValueCase("date_past_python_max", value=pl.lit(4_000_000).cast(pl.Date), collection=False, expected=False),
+            ExactValueCase("datetime_past_python_max", value=pl.lit(10**18).cast(pl.Datetime("us")), collection=False, expected=False),
+        ]
+    ),
+)
+def test_has_exact_value(case: ExactValueCase):
+    node = get_parsed_expr(pl.col("x") == case.value).right
+    assert has_exact_value(node, collection=case.collection) is case.expected
+
+
+# --- get_literal_value ------------------------------------------------------------------------------------------------
+
+_NOW, _TODAY = datetime.now(), date.today()
+_NESTED_STRUCT = {"name": "test", "values": [1, 2, 3], "metadata": {"active": True}}
+
+
+@dataclass(frozen=True)
+class LiteralValueCase:
+    """A literal expression and the Python value ``get_literal_value`` reads from it."""
+
+    id: str
+    _: KW_ONLY
+    expr: pl.Expr
+    # the value, or a function the value must pass
+    expected: object
+
+
+LITERAL_CASES = [
+    LiteralValueCase("basic_literals-int", expr=pl.lit(5), expected=5),
+    LiteralValueCase("basic_literals-string", expr=pl.lit("test"), expected="test"),
+    LiteralValueCase("basic_literals-true", expr=pl.lit(True), expected=True),
+    LiteralValueCase("basic_literals-none", expr=pl.lit(None), expected=None),
+    LiteralValueCase("boolean_literals-false", expr=pl.lit(False), expected=False),
+    LiteralValueCase("list_literals-list", expr=pl.lit([1, 2, 3]), expected=[1, 2, 3]),
+    LiteralValueCase("list_literals-tuple", expr=pl.lit((4, 5, 6)), expected=lambda v: v in ((4, 5, 6), [4, 5, 6])),
+    LiteralValueCase("non_literal_expressions", expr=pl.col("non_existent"), expected=lambda v: v is FAILED_LITERAL_RESULT),
+    LiteralValueCase("numeric_literals-int", expr=pl.lit(42), expected=42),
+    LiteralValueCase("numeric_literals-float", expr=pl.lit(3.14), expected=3.14),
+    LiteralValueCase("numeric_literals-negative", expr=pl.lit(-10), expected=-10),
+    LiteralValueCase("numeric_literals-zero", expr=pl.lit(0), expected=0),
+    LiteralValueCase("numeric_literals-inf", expr=pl.lit(float("inf")), expected=float("inf")),
+    LiteralValueCase("numeric_literals-nan", expr=pl.lit(float("nan")), expected=math.isnan),
+    LiteralValueCase("string_literals_special_cases-empty", expr=pl.lit(""), expected=""),
+    LiteralValueCase("string_literals_special_cases-space", expr=pl.lit(" "), expected=" "),
+    LiteralValueCase("string_literals_special_cases-punctuation", expr=pl.lit("Special chars: !@#$%^&*()"), expected="Special chars: !@#$%^&*()"),
+    LiteralValueCase("string_literals_special_cases-newline", expr=pl.lit("Line1\nLine2"), expected="Line1\nLine2"),
+    LiteralValueCase("date_time_literals-date", expr=pl.lit(_TODAY), expected=_TODAY),
+    LiteralValueCase("date_time_literals-datetime", expr=pl.lit(_NOW), expected=_NOW),
+    LiteralValueCase("get_literal_value-datetime", expr=pl.lit(datetime(2023, 1, 1)), expected=datetime(2023, 1, 1)),
+    LiteralValueCase("date_time_literals-time", expr=pl.lit(time(12, 30, 45)), expected=time(12, 30, 45)),
+    LiteralValueCase("date_time_literals-timedelta", expr=pl.lit(timedelta(days=1, hours=2)), expected=timedelta(days=1, hours=2)),
+    LiteralValueCase("complex_nested_structures-dict", expr=pl.lit({"a": 1, "b": 2}), expected={"a": 1, "b": 2}),
+    LiteralValueCase("complex_nested_structures-nested_list", expr=pl.lit([[1, 2], [3, 4]]), expected=[[1, 2], [3, 4]]),
+    LiteralValueCase("complex_nested_structures-mixed", expr=pl.lit(_NESTED_STRUCT), expected=_NESTED_STRUCT),
+    LiteralValueCase("edge_cases-large_int", expr=pl.lit(10**20), expected=10**20),
+    LiteralValueCase("edge_cases-long_string", expr=pl.lit("a" * 10000), expected="a" * 10000),
+    LiteralValueCase("compound_expressions-sum", expr=pl.lit(5) + pl.lit(3), expected=8),
+    LiteralValueCase("compound_expressions-function", expr=pl.lit("test").str.to_uppercase(), expected="TEST"),
+    LiteralValueCase("binary_data", expr=pl.lit(b"binary\x00data"), expected=b"binary\x00data"),
+]
+
+
+@pytest.mark.parametrize("case", as_params(LITERAL_CASES))
+def test_get_literal_value(case: LiteralValueCase):
+    match_shape(get_literal_value(case.expr), case.expected, "value")
+
+
+# --- column extraction ------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ColumnNameCase:
+    """An expression, a column-name extractor and the column name it reads from the expression."""
+
+    id: str
+    _: KW_ONLY
+    expr: pl.Expr
+    # the column name, or None when the expression has no single column
+    expected: str | None
+    extractor: Callable[..., str | None]
+    # column dtypes, for extractors that need them
+    schema: dict[str, pl.DataType] | None
+
+
+COLUMN_CASES = [
+    ColumnNameCase(
+        "extract_column_name-cast_int",
+        expr=pl.col("test_column1").cast(pl.Int32),
+        expected="test_column1",
+        extractor=extract_column_name,
+        schema=None,
+    ),
+    ColumnNameCase(
+        "extract_column_name-cast_datetime",
+        expr=pl.col("test_column2").cast(pl.Datetime),
+        expected="test_column2",
+        extractor=extract_column_name,
+        schema=None,
+    ),
+    ColumnNameCase(
+        "extract_column_name-cast_datetime_ns",
+        expr=pl.col("test_column3").cast(pl.Datetime("ns")),
+        expected="test_column3",
+        extractor=extract_column_name,
+        schema=None,
+    ),
+    ColumnNameCase("extract_column_name-struct", expr=pl.struct(pl.col("a"), pl.col("b")), expected=None, extractor=extract_column_name, schema=None),
+    ColumnNameCase(
+        "extract_column_name-arithmetic", expr=pl.col("b").mul(2).cast(pl.Float64), expected=None, extractor=extract_column_name, schema=None
+    ),
+    ColumnNameCase("extract_column_name-alias", expr=pl.col("b").alias("big_b"), expected="b", extractor=extract_column_name, schema=None),
+    ColumnNameCase(
+        "extract_column_name-cast_and_aliases",
+        expr=pl.col("b").cast(pl.Int64).alias("first").alias("second"),
+        expected="b",
+        extractor=extract_column_name,
+        schema=None,
+    ),
+    # ``dt.date()`` floors to day granularity, order-preserving like ``cast(pl.Date)``.
+    ColumnNameCase("extract_column_name-dt_date", expr=pl.col("ts").dt.date(), expected="ts", extractor=extract_column_name, schema=None),
+    ColumnNameCase(
+        "extract_column_name-dt_date_alias", expr=pl.col("ts").dt.date().alias("d"), expected="ts", extractor=extract_column_name, schema=None
+    ),
+    # The strict extractor unwraps a cast only when the schema proves it value-preserving.
+    ColumnNameCase(
+        "extract_value_preserving_column_name-alias",
+        expr=pl.col("b").alias("big_b"),
+        expected="b",
+        extractor=extract_value_preserving_column_name,
+        schema=None,
+    ),
+    ColumnNameCase(
+        "extract_value_preserving_column_name-cast_no_schema",
+        expr=pl.col("a").cast(pl.Int32),
+        expected=None,
+        extractor=extract_value_preserving_column_name,
+        schema=None,
+    ),
+    ColumnNameCase(
+        "extract_value_preserving_column_name-narrowing",
+        expr=pl.col("a").cast(pl.Int8, wrap_numerical=True),
+        expected=None,
+        extractor=extract_value_preserving_column_name,
+        schema={"a": pl.Int64},
+    ),
+    ColumnNameCase(
+        "extract_value_preserving_column_name-widening",
+        expr=pl.col("a").cast(pl.Int64),
+        expected="a",
+        extractor=extract_value_preserving_column_name,
+        schema={"a": pl.Int8},
+    ),
+    ColumnNameCase(
+        "extract_value_preserving_column_name-decimal_widening",
+        expr=pl.col("x").cast(pl.Decimal(38, 2)),
+        expected="x",
+        extractor=extract_value_preserving_column_name,
+        schema={"x": pl.Decimal(10, 2)},
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(COLUMN_CASES))
+def test_extract_column(case: ColumnNameCase):
+    node = get_parsed_expr(case.expr)
+    assert (case.extractor(node) if case.schema is None else case.extractor(node, case.schema)) == case.expected
+
+
+@dataclass(frozen=True)
+class OrderPreservingCastCase:
+    """A cast from one dtype to another, and whether it keeps every value and their order."""
+
+    id: str
+    _: KW_ONLY
+    source: pl.DataType | type[pl.DataType]
+    target: pl.DataType | type[pl.DataType]
+    expect: bool
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            OrderPreservingCastCase("identity", source=pl.Int64, target=pl.Int64, expect=True),
+            OrderPreservingCastCase("int_widening", source=pl.Int8, target=pl.Int64, expect=True),
+            OrderPreservingCastCase("int_narrowing", source=pl.Int64, target=pl.Int8, expect=False),
+            OrderPreservingCastCase("unsigned_to_wider_signed", source=pl.UInt8, target=pl.Int16, expect=True),
+            OrderPreservingCastCase("signed_to_unsigned", source=pl.Int8, target=pl.UInt64, expect=False),
+            OrderPreservingCastCase("decimal_widening", source=pl.Decimal(10, 2), target=pl.Decimal(38, 2), expect=True),
+            OrderPreservingCastCase("decimal_rescaling", source=pl.Decimal(10, 2), target=pl.Decimal(38, 4), expect=False),
+            OrderPreservingCastCase("cross_family", source=pl.Int64, target=pl.Float64, expect=False),
+            OrderPreservingCastCase("unparameterized", source=pl.Datetime, target=pl.Datetime("ms"), expect=False),
+        ]
+    ),
+)
+def test_is_value_order_preserving_cast(case: OrderPreservingCastCase):
+    assert is_value_order_preserving_cast(case.source, case.target) is case.expect
+
+
+def test_total_days_parses_to_function_node():
+    node = get_parsed_expr((pl.col("end_dt") - pl.col("start_dt")).dt.total_days())
+    assert isinstance(node, FunctionNode) and node.function_type == TemporalFunctionType.TOTAL_DAYS

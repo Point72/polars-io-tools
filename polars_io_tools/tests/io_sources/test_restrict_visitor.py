@@ -1,700 +1,453 @@
+"""restrict_expr_to_columns: turn a filter into one that reads only some of its columns.
+
+The result may keep extra rows but must never drop a row the original filter keeps. ``None`` means no filter on the
+allowed columns can do that, so every row has to be read.
+"""
+
 from collections import Counter
+from dataclasses import KW_ONLY, dataclass
 
 import polars as pl
 import pytest
-from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.restrict_visitor import RestrictPredicateVisitor, restrict_expr_to_columns
+from polars_io_tools.tests.helpers.assertions import assert_matches_plain_polars
+from polars_io_tools.tests.helpers.cases import as_params
 
 
-def assert_expr_equal(a: pl.Expr | None, b: pl.Expr | None):
-    """Assert that two polars expressions are equal"""
-    if a is None:
-        assert b is None
-    elif b is None:
-        assert a is None
+@dataclass(frozen=True)
+class RestrictCase:
+    """A filter, the columns it may keep, and the filter it becomes."""
+
+    id: str
+    _: KW_ONLY
+    predicate: pl.Expr
+    allowed_columns: list[str]
+    # None: the filter cannot be restricted to the allowed columns
+    expected: pl.Expr | None
+    # hand over the parsed form of the filter instead of the Polars expression
+    pass_parsed_node: bool = False
+    # remove ``.alias`` calls from the result before comparing it
+    compare_without_aliases: bool = False
+
+
+_SYMBOL_AND_PRICE_RULES = ((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol") == "EU") & (pl.col("price") > 200))
+_WHEN_DATE_THEN_PRICE_ELSE_VOLUME = pl.when(pl.col("date") > "2023-01-01").then(pl.col("price") * 1.2).otherwise(pl.col("volume") * 2)
+_ALIASED_PRICE_AND_VOLUME = (pl.col("price").alias("p1").alias("p2") > 100) & (pl.col("volume").alias("v1") > 1000)
+_DATE_AND_VAL_CONDITIONS = (pl.col("date") > "2024-01-01", pl.col("val") > 5)
+_A_NOT_EVEN_OR_NULL = (pl.col("A").mod(2) == 0).not_().fill_null(True)
+
+CASES = [
+    # basics
+    RestrictCase("restrict_predicate-column", predicate=pl.col("p"), allowed_columns=["p"], expected=pl.col("p")),
+    RestrictCase("restrict_predicate-column_with_spare_allowed", predicate=pl.col("p"), allowed_columns=["p", "q"], expected=pl.col("p")),
+    RestrictCase("restrict_predicate-is_in", predicate=pl.col("p").is_in([1, 2]), allowed_columns=["p"], expected=pl.col("p").is_in([1, 2])),
+    RestrictCase("restrict_predicate-and_drops_other_column", predicate=pl.col("p") & pl.col("x"), allowed_columns=["p"], expected=pl.col("p")),
+    RestrictCase(
+        "restrict_predicate-and_keeps_both_allowed",
+        predicate=pl.col("p").is_in([1, 2]) & pl.col("x") & pl.col("p").is_in([4, 5]),
+        allowed_columns=["p"],
+        expected=pl.col("p").is_in([1, 2]) & pl.col("p").is_in([4, 5]),
+    ),
+    RestrictCase("restrict_predicate-or_with_other_column", predicate=pl.col("p") | pl.col("x"), allowed_columns=["p"], expected=None),
+    RestrictCase(
+        "restrict_predicate-and_two_allowed_columns",
+        predicate=pl.col("p") & pl.col("x") & pl.col("q"),
+        allowed_columns=["p", "q"],
+        expected=pl.col("p") & pl.col("q"),
+    ),
+    RestrictCase(
+        "restrict_predicate-or_two_allowed_columns", predicate=pl.col("p") | pl.col("x") | pl.col("q"), allowed_columns=["p", "q"], expected=None
+    ),
+    RestrictCase(
+        "restrict_predicate-arithmetic_on_allowed",
+        predicate=(pl.col("p") * pl.col("q")) < 4,
+        allowed_columns=["p", "q"],
+        expected=(pl.col("p") * pl.col("q")) < 4,
+    ),
+    RestrictCase("restrict_predicate-arithmetic_with_other", predicate=(pl.col("p") + pl.col("x")) < 4, allowed_columns=["p", "q"], expected=None),
+    RestrictCase("restrict_predicate-alias", predicate=pl.col("p").alias("q"), allowed_columns=["p"], expected=pl.col("p").alias("q")),
+    RestrictCase("restrict_predicate-function_with_other", predicate=pl.arctan2(pl.col("q"), pl.col("p")) > 12, allowed_columns=["p"], expected=None),
+    RestrictCase("basic_comparison_restriction", predicate=pl.col("symbol") == "US", allowed_columns={"symbol"}, expected=pl.col("symbol") == "US"),
+    RestrictCase(
+        "simple_and_restriction",
+        predicate=(pl.col("symbol") == "US") & (pl.col("price") > 100),
+        allowed_columns={"symbol"},
+        expected=pl.col("symbol") == "US",
+    ),
+    RestrictCase(
+        "and_multiple_restriction",
+        predicate=(pl.col("symbol") == "US") & (pl.col("price") > 100) & (pl.col("exchange") == "NYSE"),
+        allowed_columns={"symbol", "exchange"},
+        expected=(pl.col("symbol") == "US") & (pl.col("exchange") == "NYSE"),
+    ),
+    RestrictCase("or_no_restriction", predicate=(pl.col("symbol") == "US") | (pl.col("price") > 100), allowed_columns={"symbol"}, expected=None),
+    RestrictCase(
+        "or_with_restriction",
+        predicate=(pl.col("symbol") == "US") | (pl.col("symbol") == "EU"),
+        allowed_columns={"symbol"},
+        expected=(pl.col("symbol") == "US") | (pl.col("symbol") == "EU"),
+    ),
+    RestrictCase(
+        "complex_nested_expression-expr",
+        predicate=_SYMBOL_AND_PRICE_RULES,
+        allowed_columns={"symbol"},
+        expected=(pl.col("symbol") == "US") | (pl.col("symbol") == "EU"),
+    ),
+    RestrictCase(
+        "complex_nested_expression-node",
+        predicate=_SYMBOL_AND_PRICE_RULES,
+        allowed_columns={"symbol"},
+        expected=(pl.col("symbol") == "US") | (pl.col("symbol") == "EU"),
+        pass_parsed_node=True,
+    ),
+    RestrictCase(
+        "complex_nested_expression-all_columns_expr",
+        predicate=_SYMBOL_AND_PRICE_RULES,
+        allowed_columns={"symbol", "price"},
+        expected=_SYMBOL_AND_PRICE_RULES,
+    ),
+    RestrictCase(
+        "complex_nested_expression-all_columns_node",
+        predicate=_SYMBOL_AND_PRICE_RULES,
+        allowed_columns={"symbol", "price"},
+        expected=_SYMBOL_AND_PRICE_RULES,
+        pass_parsed_node=True,
+    ),
+    # ``~(a == b) & c`` is not rewritten as ``(a != b) & c``: Polars already moves ``~`` inward before a source sees the filter.
+    RestrictCase(
+        "not_node_restriction",
+        predicate=~(pl.col("symbol") == "US") & (pl.col("price") > 100),
+        allowed_columns={"symbol"},
+        expected=~(pl.col("symbol") == "US"),
+    ),
+    RestrictCase(
+        "is_null_restriction",
+        predicate=pl.col("symbol").is_null() & (pl.col("price") > 100),
+        allowed_columns={"symbol"},
+        expected=pl.col("symbol").is_null(),
+    ),
+    RestrictCase(
+        "is_in_restriction",
+        predicate=pl.col("symbol").is_in(["US", "EU"]) & (pl.col("price") > 100),
+        allowed_columns={"symbol"},
+        expected=pl.col("symbol").is_in(["US", "EU"]),
+    ),
+    RestrictCase(
+        "string_function_restriction",
+        predicate=pl.col("symbol").str.contains("US") & (pl.col("price") > 100),
+        allowed_columns={"symbol"},
+        expected=pl.col("symbol").str.contains("US"),
+    ),
+    RestrictCase(
+        "is_between_restriction",
+        predicate=pl.col("symbol").is_between(5, 10) & (pl.col("price") > 100),
+        allowed_columns={"symbol"},
+        expected=pl.col("symbol").is_between(5, 10),
+    ),
+    RestrictCase(
+        "nested_and_or_restriction",
+        predicate=(pl.col("symbol") == "US") & ((pl.col("price") > 100) | (pl.col("volume") > 1000)),
+        allowed_columns={"symbol"},
+        expected=pl.col("symbol") == "US",
+    ),
+    RestrictCase("no_valid_restriction", predicate=(pl.col("price") > 100) | (pl.col("volume") > 1000), allowed_columns={"symbol"}, expected=None),
+    # when/then/otherwise
+    RestrictCase(
+        "ternary_truthy_relevant",
+        predicate=pl.when(pl.col("id") == 10).then(pl.col("int_val") > 90).otherwise(pl.col("int_val2") > 100),
+        allowed_columns={"int_val"},
+        expected=None,
+    ),
+    RestrictCase(
+        "ternary_truthy_and_falsy_relevant",
+        predicate=pl.when(pl.col("id") == 10).then(pl.col("int_val") > 90).otherwise(pl.col("int_val") > 100),
+        allowed_columns={"int_val"},
+        expected=(pl.col("int_val") > 90) | (pl.col("int_val") > 100),
+    ),
+    RestrictCase(
+        "ternary_all_relevant",
+        predicate=pl.when(pl.col("int_val").mod(2) == 0).then(pl.col("int_val") > 90).otherwise(pl.col("int_val") > 100),
+        allowed_columns={"int_val"},
+        expected=pl.when(pl.col("int_val").mod(2) == 0).then(pl.col("int_val") > 90).otherwise(pl.col("int_val") > 100),
+    ),
+    RestrictCase(
+        "ternary_complex_predicate",
+        predicate=pl.when((pl.col("symbol") == "AAPL") & (pl.col("price") > 150)).then(pl.col("volume") * 2).otherwise(pl.col("volume")),
+        allowed_columns={"symbol", "volume"},
+        expected=(pl.col("symbol") == "AAPL").and_(pl.col("volume") * 2) | pl.col("volume"),
+    ),
+    RestrictCase(
+        "ternary_nested",
+        predicate=pl.when(pl.col("region") == "US")
+        .then(pl.when(pl.col("sector") == "Tech").then((pl.col("price") * 1.1) > 1).otherwise(pl.col("price") < 12))
+        .otherwise((pl.col("price") * 0.9) > 1),
+        allowed_columns={"region", "price"},
+        expected=((pl.col("region") == "US") & ((pl.col("price") * 1.1 > 1) | (pl.col("price") < 12)))
+        | ((pl.col("region") == "US").not_().fill_null(True) & ((pl.col("price") * 0.9) > 1)),
+    ),
+    RestrictCase(
+        "ternary_with_irrelevant_predicate",
+        predicate=_WHEN_DATE_THEN_PRICE_ELSE_VOLUME,
+        allowed_columns={"price", "volume"},
+        expected=(pl.col("price") * 1.2) | (pl.col("volume") * 2),
+    ),
+    RestrictCase("ternary_only_relevant_truthy", predicate=_WHEN_DATE_THEN_PRICE_ELSE_VOLUME, allowed_columns={"price"}, expected=None),
+    RestrictCase(
+        "ternary_only_relevant_falsy",
+        predicate=pl.when(pl.col("date") > "2023-01-01").then(pl.col("price") * 1.2).otherwise(pl.col("symbol").str.to_uppercase()),
+        allowed_columns={"symbol"},
+        expected=None,
+    ),
+    RestrictCase(
+        "ternary_combined_with_binary_op",
+        predicate=pl.when(pl.col("region") == "US").then(pl.col("price") > 100).otherwise(pl.col("volume") > 1000) & (pl.col("date") > "2023-01-01"),
+        allowed_columns={"region", "price"},
+        expected=((pl.col("region") == "US") & (pl.col("price") > 100)) | (pl.col("region") == "US").not_().fill_null(True),
+    ),
+    # Neither branch can be written with the allowed columns, so the result could only be ``True``: nothing is kept.
+    RestrictCase(
+        "ternary_with_complex_expressions",
+        predicate=pl.when((pl.col("region") == "US") | (pl.col("region") == "EU"))
+        .then((pl.col("price") * pl.col("volume")).alias("value") > 100)
+        .otherwise((pl.col("price") - pl.col("discount")) > 5),
+        allowed_columns={"region", "price"},
+        expected=None,
+    ),
+    RestrictCase("ternary_all_parts_irrelevant", predicate=_WHEN_DATE_THEN_PRICE_ELSE_VOLUME, allowed_columns={"symbol"}, expected=None),
+    RestrictCase(
+        "ternary_predicate_str_function",
+        predicate=pl.when(pl.col("symbol").str.contains("HI").alias("hey")).then(pl.col("price") > 3).otherwise(pl.col("volume") != 13),
+        allowed_columns={"symbol", "price"},
+        expected=(pl.col("symbol").str.contains("HI") & (pl.col("price") > 3)) | pl.col("symbol").str.contains("HI").not_().fill_null(True),
+        compare_without_aliases=True,
+    ),
+    RestrictCase(
+        "ternary_complex_comparison",
+        predicate=pl.when((pl.col("open") <= pl.col("close")) & (pl.col("volume") > 1000))
+        .then(pl.col("symbol").str.contains("UP"))
+        .otherwise(pl.col("open") > 100),
+        allowed_columns={"open", "close"},
+        expected=(pl.col("open") <= pl.col("close")) | (pl.col("open") > 100),
+    ),
+    # An odd A depends on B and C, which are not available, so every odd A is kept.
+    RestrictCase(
+        "not_pred_valid_pred_invalid",
+        predicate=pl.when((pl.col("A").mod(2) == 0) | pl.col("B")).then(pl.col("A") > 15).otherwise(pl.col("C")),
+        allowed_columns={"A"},
+        expected=(pl.col("A") > 15) | _A_NOT_EVEN_OR_NULL,
+    ),
+    RestrictCase(
+        "when_then_otherwise_with_definitive_exclusions",
+        predicate=pl.when(pl.col("B") > 5).then((pl.col("A") < 20) & (pl.col("C") > 0)).otherwise(pl.col("A").mod(3) > 0),
+        allowed_columns={"A"},
+        expected=(pl.col("A") < 20) | (pl.col("A").mod(3) > 0),
+    ),
+    # casts
+    RestrictCase(
+        "simple_cast-boolean", predicate=pl.col("flag").cast(pl.Boolean), allowed_columns={"flag"}, expected=pl.col("flag").cast(pl.Boolean)
+    ),
+    RestrictCase(
+        "simple_cast-non_boolean", predicate=pl.col("value").cast(pl.Int64), allowed_columns={"value"}, expected=pl.col("value").cast(pl.Int64)
+    ),
+    RestrictCase("simple_cast-other_column", predicate=(pl.col("value") + pl.col("other")).cast(pl.Int64), allowed_columns={"value"}, expected=None),
+    # The dtypes are unknown, so ``&`` may be a bitwise AND of integers and cannot be split.
+    RestrictCase(
+        "cast_with_binary_expr-cast_of_and", predicate=(pl.col("flag") & pl.col("active")).cast(pl.Boolean), allowed_columns={"flag"}, expected=None
+    ),
+    RestrictCase(
+        "cast_with_binary_expr-cast_inside_and",
+        predicate=pl.col("flag").cast(pl.Boolean) & pl.col("active"),
+        allowed_columns={"flag"},
+        expected=pl.col("flag").cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_with_binary_expr-cast_inside_or",
+        predicate=pl.col("flag").cast(pl.Boolean) | pl.col("active").cast(pl.Boolean),
+        allowed_columns={"flag", "active"},
+        expected=pl.col("flag").cast(pl.Boolean) | pl.col("active").cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "multiple_casts-nested",
+        predicate=pl.col("value").cast(pl.Int64).cast(pl.Boolean),
+        allowed_columns={"value"},
+        expected=pl.col("value").cast(pl.Int64).cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "multiple_casts-nested_comparison",
+        predicate=(pl.col("value") > 0).cast(pl.Int64).cast(pl.Boolean),
+        allowed_columns={"value"},
+        expected=(pl.col("value") > 0).cast(pl.Int64).cast(pl.Boolean),
+    ),
+    # the outer Boolean cast is stripped
+    RestrictCase(
+        "multiple_casts-and",
+        predicate=((pl.col("value") > 0).cast(pl.Boolean) & (pl.col("other") > 10).cast(pl.Boolean)).cast(pl.Boolean),
+        allowed_columns={"value"},
+        expected=(pl.col("value") > 0).cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_with_not-not_after_cast",
+        predicate=~pl.col("flag").cast(pl.Boolean),
+        allowed_columns={"flag"},
+        expected=~pl.col("flag").cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_with_not-cast_after_not",
+        predicate=(~pl.col("flag")).cast(pl.Boolean),
+        allowed_columns={"flag"},
+        expected=(~pl.col("flag")).cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_with_not-and",
+        predicate=~pl.col("flag").cast(pl.Boolean) & pl.col("value"),
+        allowed_columns={"flag"},
+        expected=~pl.col("flag").cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_in_ternary-predicate",
+        predicate=pl.when(pl.col("flag").cast(pl.Boolean)).then(pl.col("value") > 0).otherwise(pl.col("price") > 100),
+        allowed_columns={"flag", "value"},
+        expected=(pl.col("flag").cast(pl.Boolean) & (pl.col("value") > 0)) | pl.col("flag").cast(pl.Boolean).not_().fill_null(True),
+    ),
+    RestrictCase(
+        "cast_in_ternary-branches",
+        predicate=pl.when(pl.col("flag")).then((pl.col("value") > 0).cast(pl.Boolean)).otherwise((pl.col("price") > 100).cast(pl.Boolean)),
+        allowed_columns={"flag", "value"},
+        expected=(pl.col("flag") & (pl.col("value") > 0).cast(pl.Boolean)) | pl.col("flag").not_().fill_null(True),
+    ),
+    RestrictCase(
+        "cast_boolean_complex_logic-not_or",
+        predicate=~((pl.col("a") > 0).cast(pl.Boolean) | (pl.col("b") < 10).cast(pl.Boolean)),
+        allowed_columns={"a"},
+        expected=~(pl.col("a") > 0).cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_boolean_complex_logic-or_of_ands",
+        predicate=((pl.col("a") > 0).cast(pl.Boolean) & (pl.col("b") < 10).cast(pl.Boolean))
+        | ((pl.col("c") == 5).cast(pl.Boolean) & (pl.col("a") != 0).cast(pl.Boolean)),
+        allowed_columns={"a"},
+        expected=(pl.col("a") > 0).cast(pl.Boolean) | (pl.col("a") != 0).cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_between_operations",
+        predicate=((pl.col("a") > 0).cast(pl.Boolean) & pl.col("b").is_null()).cast(pl.Boolean) | (pl.col("a") < 0).cast(pl.Boolean),
+        allowed_columns={"a"},
+        expected=(pl.col("a") > 0).cast(pl.Boolean) | (pl.col("a") < 0).cast(pl.Boolean),
+    ),
+    RestrictCase(
+        "cast_non_boolean_handling-and",
+        predicate=(pl.col("a").cast(pl.Int32) > 0) & pl.col("b"),
+        allowed_columns={"a"},
+        expected=pl.col("a").cast(pl.Int32) > 0,
+    ),
+    RestrictCase(
+        "cast_non_boolean_handling-other_column", predicate=(pl.col("a") + pl.col("b")).cast(pl.Int32) > 0, allowed_columns={"a"}, expected=None
+    ),
+    # aliases
+    RestrictCase(
+        "nested_alias_handling-nested",
+        predicate=pl.col("price").alias("p1").alias("p2") > 100,
+        allowed_columns={"price"},
+        expected=pl.col("price").alias("p1").alias("p2") > 100,
+    ),
+    RestrictCase(
+        "nested_alias_handling-with_cast",
+        predicate=pl.col("price").cast(pl.Float64).alias("p1").alias("p2") > 100,
+        allowed_columns={"price"},
+        expected=pl.col("price").cast(pl.Float64).alias("p1").alias("p2") > 100,
+    ),
+    RestrictCase(
+        "nested_alias_handling-and_all_columns",
+        predicate=_ALIASED_PRICE_AND_VOLUME,
+        allowed_columns={"price", "volume"},
+        expected=_ALIASED_PRICE_AND_VOLUME,
+    ),
+    RestrictCase(
+        "nested_alias_handling-and_subset",
+        predicate=_ALIASED_PRICE_AND_VOLUME,
+        allowed_columns={"price"},
+        expected=pl.col("price").alias("p1").alias("p2") > 100,
+    ),
+    # horizontal functions
+    RestrictCase(
+        "all_horizontal_restriction-subset",
+        predicate=pl.all_horizontal(*_DATE_AND_VAL_CONDITIONS),
+        allowed_columns={"date"},
+        expected=_DATE_AND_VAL_CONDITIONS[0],
+    ),
+    RestrictCase(
+        "all_horizontal_restriction-all_columns",
+        predicate=pl.all_horizontal(*_DATE_AND_VAL_CONDITIONS),
+        allowed_columns={"date", "val"},
+        expected=pl.all_horizontal(*_DATE_AND_VAL_CONDITIONS),
+    ),
+    RestrictCase("all_horizontal_restriction-none", predicate=pl.all_horizontal(*_DATE_AND_VAL_CONDITIONS), allowed_columns={"other"}, expected=None),
+    RestrictCase(
+        "all_horizontal_all_same_column",
+        predicate=pl.all_horizontal(pl.col("x") > 0, pl.col("x") < 100),
+        allowed_columns={"x"},
+        expected=pl.all_horizontal(pl.col("x") > 0, pl.col("x") < 100),
+    ),
+    RestrictCase(
+        "any_horizontal_restriction-subset", predicate=pl.any_horizontal(*_DATE_AND_VAL_CONDITIONS), allowed_columns={"date"}, expected=None
+    ),
+    RestrictCase(
+        "any_horizontal_restriction-all_columns",
+        predicate=pl.any_horizontal(*_DATE_AND_VAL_CONDITIONS),
+        allowed_columns={"date", "val"},
+        expected=pl.any_horizontal(*_DATE_AND_VAL_CONDITIONS),
+    ),
+    RestrictCase(
+        "any_horizontal_all_same_column",
+        predicate=pl.any_horizontal(pl.col("x") == 1, pl.col("x") == 2),
+        allowed_columns={"x"},
+        expected=pl.any_horizontal(pl.col("x") == 1, pl.col("x") == 2),
+    ),
+    RestrictCase(
+        "all_horizontal_nested",
+        predicate=pl.all_horizontal(pl.all_horizontal(pl.col("a") > 0, pl.col("b") > 0), pl.col("c") > 0),
+        allowed_columns={"a", "b"},
+        expected=pl.all_horizontal(pl.col("a") > 0, pl.col("b") > 0),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(CASES))
+def test_restrict(case: RestrictCase):
+    result = restrict_expr_to_columns(get_parsed_expr(case.predicate) if case.pass_parsed_node else case.predicate, case.allowed_columns)
+    if case.expected is None:
+        assert result is None
     else:
-        assert a.meta.eq(b)
-
-
-def test_restrict_predicate():
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p"), ["p"]), pl.col("p"))
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p"), ["p", "q"]), pl.col("p"))
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p").is_in([1, 2]), ["p"]), pl.col("p").is_in([1, 2]))
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p") & pl.col("x"), ["p"]), pl.col("p"))
-    assert_expr_equal(
-        restrict_expr_to_columns(pl.col("p").is_in([1, 2]) & pl.col("x") & pl.col("p").is_in([4, 5]), ["p"]),
-        pl.col("p").is_in([1, 2]) & pl.col("p").is_in([4, 5]),
-    )
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p") | pl.col("x"), ["p"]), None)
-
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p") & pl.col("x") & pl.col("q"), ["p", "q"]), pl.col("p") & pl.col("q"))
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p") | pl.col("x") | pl.col("q"), ["p", "q"]), None)
-
-    assert_expr_equal(restrict_expr_to_columns((pl.col("p") * pl.col("q")) < 4, ["p", "q"]), (pl.col("p") * pl.col("q")) < 4)
-    assert_expr_equal(restrict_expr_to_columns((pl.col("p") + pl.col("x")) < 4, ["p", "q"]), None)
-
-    assert_expr_equal(restrict_expr_to_columns(pl.col("p").alias("q"), ["p"]), pl.col("p").alias("q"))
-    assert_expr_equal(restrict_expr_to_columns(pl.arctan2(pl.col("q"), pl.col("p")) > 12, ["p"]), None)
+        assert result is not None and (result.meta.undo_aliases() if case.compare_without_aliases else result).meta.eq(case.expected), result
 
 
 def test_restrict_predicate_visitor_direct():
-    """Test using RestrictPredicateVisitor directly."""
-    # Create an expression: (symbol == "US") & (price > 100)
-    expr = (pl.col("symbol") == "US") & (pl.col("price") > 100)
-
-    # Parse the expression
-    node = get_parsed_expr(expr)
-
-    # Apply the visitor, restricting to just "symbol"
     visitor = RestrictPredicateVisitor({"symbol"})
-    visitor.visit(node)
-    result = visitor.process_results()
+    visitor.visit(get_parsed_expr((pl.col("symbol") == "US") & (pl.col("price") > 100)))
+    assert visitor.process_results().meta.eq(pl.col("symbol") == "US")
 
-    # Verify the result is equivalent to (symbol == "US")
-    expected = pl.col("symbol") == "US"
-    assert result.meta.eq(expected)
 
+def test_not_node_restriction_pushed_down(tracked_sample_data):
+    """Polars moves ``~`` inward before a source receives the filter, so the restriction never has to do it."""
 
-def test_basic_comparison_restriction():
-    """Test restricting a simple comparison."""
-    # Original: symbol == "US"
-    expr = pl.col("symbol") == "US"
+    def restricts_to_id_ne_10(original_expr, pushed_expr):
+        # ``meta.eq`` does not compare a pushed predicate reliably, so the parsed node is checked.
+        node = get_parsed_expr(restrict_expr_to_columns(pushed_expr, {"id"}))
+        assert isinstance(node, BinaryExprNode) and node.op == OperatorType.NOT_EQ
+        assert isinstance(node.left, ColumnNode) and node.left.name == "id"
+        assert node.right.can_extract_literal and node.right.value == 10
 
-    # Should return the original expression since it already only uses "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-    assert result.meta.eq(expr)
+    tracked_sample_data.assert_predicate_pushed_down(~((pl.col("id") == 10) | (pl.col("int_val") > 90)), restricts_to_id_ne_10)
 
+    # Pushed as ``(id != 10) | (int_val <= 90)``, which cannot be restricted to ``id``.
+    def cannot_restrict_to_id(original_expr, pushed_expr):
+        assert restrict_expr_to_columns(pushed_expr, {"id"}) is None
 
-def test_simple_and_restriction():
-    """Test restricting an AND expression by dropping irrelevant columns."""
-    # Original: (symbol == "US") & (price > 100)
-    expr = (pl.col("symbol") == "US") & (pl.col("price") > 100)
-
-    # Restrict to just "symbol" - should drop the price condition
-    result = restrict_expr_to_columns(expr, {"symbol"})
-    expected = pl.col("symbol") == "US"
-    assert result.meta.eq(expected)
-
-
-def test_and_multiple_restriction():
-    """Test restricting an AND expression with multiple relevant columns."""
-    # Original: (symbol == "US") & (price > 100) & (exchange == "NYSE")
-    expr = (pl.col("symbol") == "US") & (pl.col("price") > 100) & (pl.col("exchange") == "NYSE")
-
-    # Restrict to "symbol" and "exchange"
-    result = restrict_expr_to_columns(expr, {"symbol", "exchange"})
-
-    # Expected: (symbol == "US") & (exchange == "NYSE") - price condition is dropped
-    expected = (pl.col("symbol") == "US") & (pl.col("exchange") == "NYSE")
-    assert result.meta.eq(expected)
-
-
-def test_or_no_restriction():
-    """Test that OR expressions can't be restricted if any part uses excluded columns."""
-    # Original: (symbol == "US") | (price > 100)
-    expr = (pl.col("symbol") == "US") | (pl.col("price") > 100)
-
-    # Try to restrict to just "symbol" - should be impossible
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: None (can't restrict OR expressions if any part uses excluded columns)
-    assert result is None
-
-
-def test_or_with_restriction():
-    """Test that OR expressions can be restricted if all parts use included columns."""
-    # Original: (symbol == "US") | (symbol == "EU")
-    expr = (pl.col("symbol") == "US") | (pl.col("symbol") == "EU")
-
-    # Restrict to just "symbol" - should be possible since both sides only use "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: Same expression
-    assert result.meta.eq(expr)
-
-
-def test_complex_nested_expression():
-    """Test a complex nested expression with AND and OR operators."""
-    # Original: ((symbol == "US") & (price > 100)) | ((symbol == "EU") & (price > 200))
-    expr = ((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol") == "EU") & (pl.col("price") > 200))
-
-    # Can't restrict to just "symbol" because of OR with mixed columns
-    result = restrict_expr_to_columns(expr, {"symbol"})
-    # Expected: (symbol == "US") | (symbol == "EU")
-    expected = (pl.col("symbol") == "US") | (pl.col("symbol") == "EU")
-    assert result.meta.eq(expected)
-
-    node = get_parsed_expr(expr)
-    result_node = restrict_expr_to_columns(node, {"symbol"})
-    assert result_node.meta.eq(expected)
-
-    # But we can restrict to both "symbol" and "price" - should return original expr
-    result = restrict_expr_to_columns(expr, {"symbol", "price"})
-    assert result.meta.eq(expr)
-    node = get_parsed_expr(expr)
-    result_node = restrict_expr_to_columns(node, {"symbol", "price"})
-    assert result_node.meta.eq(expr)
-
-
-def test_not_node_restriction():
-    """Test restriction of NOT expressions."""
-    # NOTE: The restriction here is not logically sound.
-    # ~(A & B) becomes (~A | ~B) in DNF, but we don't apply DeMorgan's laws here.
-    # This test demonstrates that behavior. The reason we can skip applying
-    # DeMorgan's laws is because the polars optimization process will handle this
-    # for us.
-
-    # Original: ~(symbol == "US") & (price > 100)
-    expr = ~(pl.col("symbol") == "US") & (pl.col("price") > 100)
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: ~(symbol == "US")
-    expected = ~(pl.col("symbol") == "US")
-    assert result.meta.eq(expected)
-
-
-def test_not_node_restriction_pushed_down(tester):
-    """Test restriction of NOT expressions."""
-    # We test that the pushed down predicate is optimized
-    # already, so we do not need to apply DeMorgan's laws
-
-    expr = ~((pl.col("id") == 10) | (pl.col("int_val") > 90))
-
-    def assert_func(original_expr, pushed_expr):
-        # Check that the original expression is equivalent to the pushed expression
-        # expected_pushed = (pl.col("id") != 10) & (pl.col("int_val") <= 90)
-        restricted_expr = restrict_expr_to_columns(pushed_expr, {"id"})
-
-        # We check the expression this way since the .meta.eq
-        # doesnt work properly between pushed down predicates and
-        # not pushed down predicates
-        restricted_node = get_parsed_expr(restricted_expr)
-        assert isinstance(restricted_node, BinaryExprNode)
-        assert restricted_node.op == OperatorType.NOT_EQ
-        assert isinstance(restricted_node.left, ColumnNode)
-        assert restricted_node.left.name == "id"
-        assert restricted_node.right.can_extract_literal
-        assert restricted_node.right.value == 10
-
-    tester.assert_predicate_pushed_down(expr, assert_func)
-
-    # we cannot extract the restriction from the pushed down predicate
-    # since DeMorgan's laws turns this into
-    # expected_pushed = (pl.col("id") != 10) | (pl.col("int_val") <= 90)
-    expr = ~((pl.col("id") == 10) & (pl.col("int_val") > 90))
-
-    def assert_func(original_expr, pushed_expr):
-        # Check that the original expression is equivalent to the pushed expression
-        # expected_pushed = (pl.col("id") != 10) | (pl.col("int_val") <= 90)
-        restricted_expr = restrict_expr_to_columns(pushed_expr, {"id"})
-
-        assert restricted_expr is None
-
-    tester.assert_predicate_pushed_down(expr, assert_func)
-
-
-def test_is_null_restriction():
-    """Test restriction of IS NULL expressions."""
-    # Original: symbol.is_null() & (price > 100)
-    expr = pl.col("symbol").is_null() & (pl.col("price") > 100)
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: symbol.is_null()
-    expected = pl.col("symbol").is_null()
-    assert result.meta.eq(expected)
-
-
-def test_is_in_restriction():
-    """Test restriction of IS IN expressions."""
-    # Original: symbol.is_in(["US", "EU"]) & (price > 100)
-    expr = pl.col("symbol").is_in(["US", "EU"]) & (pl.col("price") > 100)
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: symbol.is_in(["US", "EU"])
-    expected = pl.col("symbol").is_in(["US", "EU"])
-    assert result.meta.eq(expected)
-
-
-def test_string_function_restriction():
-    """Test restriction of string function expressions."""
-    # Original: symbol.str.contains("US") & (price > 100)
-    expr = pl.col("symbol").str.contains("US") & (pl.col("price") > 100)
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: symbol.str.contains("US")
-    expected = pl.col("symbol").str.contains("US")
-    assert result.meta.eq(expected)
-
-
-def test_is_between_restriction():
-    """Test restriction of IS BETWEEN expressions."""
-    # Original: symbol.is_between(5, 10) & (price > 100)
-    expr = pl.col("symbol").is_between(5, 10) & (pl.col("price") > 100)
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: symbol.is_between(5, 10)
-    expected = pl.col("symbol").is_between(5, 10)
-    assert result.meta.eq(expected)
-
-
-def test_nested_and_or_restriction():
-    """Test nested AND/OR expressions with complex structure."""
-    # Original: (symbol == "US") & ((price > 100) | (volume > 1000))
-    expr = (pl.col("symbol") == "US") & ((pl.col("price") > 100) | (pl.col("volume") > 1000))
-
-    # Restrict to "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: symbol == "US" (the OR part is dropped as it doesn't involve "symbol")
-    expected = pl.col("symbol") == "US"
-    assert result.meta.eq(expected)
-
-
-def test_no_valid_restriction():
-    """Test case where the entire expression must be dropped."""
-    # Original: (price > 100) | (volume > 1000)
-    expr = (pl.col("price") > 100) | (pl.col("volume") > 1000)
-
-    # Try to restrict to just "symbol" - no part involves "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: None (nothing can be preserved)
-    assert result is None
-
-
-def test_ternary_truthy_relevant():
-    expr = pl.when(pl.col("id") == 10).then(pl.col("int_val") > 90).otherwise(pl.col("int_val2") > 100)
-    result = restrict_expr_to_columns(expr, {"int_val"})
-    assert result is None  # We cannot restrict
-
-
-def test_ternary_truthy_and_falsy_relevant():
-    expr = pl.when(pl.col("id") == 10).then(pl.col("int_val") > 90).otherwise(pl.col("int_val") > 100)
-    expected = (pl.col("int_val") > 90) | (pl.col("int_val") > 100)
-    result = restrict_expr_to_columns(expr, {"int_val"})
-    assert result.meta.eq(expected)
-
-
-def test_ternary_all_relevant():
-    expr = pl.when(pl.col("int_val").mod(2) == 0).then(pl.col("int_val") > 90).otherwise(pl.col("int_val") > 100)
-    result = restrict_expr_to_columns(expr, {"int_val"})
-    assert result.meta.eq(expr)
-
-
-def test_ternary_complex_predicate():
-    # Ternary with complex predicate involving multiple columns
-    expr = pl.when((pl.col("symbol") == "AAPL") & (pl.col("price") > 150)).then(pl.col("volume") * 2).otherwise(pl.col("volume"))
-
-    # Restrict to just "symbol" and "volume"
-    result = restrict_expr_to_columns(expr, {"symbol", "volume"})
-
-    # Expected: (symbol == "AAPL" & volume * 2) | volume
-    expected = ((pl.col("symbol") == "AAPL").and_(pl.col("volume") * 2)) | pl.col("volume")
-
-    assert result.meta.eq(expected)
-
-
-def test_ternary_nested():
-    # Nested ternary expressions
-    expr = (
-        pl.when(pl.col("region") == "US")
-        .then(pl.when(pl.col("sector") == "Tech").then((pl.col("price") * 1.1) > 1).otherwise(pl.col("price") < 12))
-        .otherwise((pl.col("price") * 0.9) > 1)
-    )
-
-    # Restrict to just "region" and "price"
-    result = restrict_expr_to_columns(expr, {"region", "price"})
-
-    # Expected result when restricting to "region" and "price"
-    #
-    expected_true = (pl.col("region") == "US") & ((pl.col("price") * 1.1 > 1) | (pl.col("price") < 12))
-    expected_false = (pl.col("region") == "US").not_().fill_null(True) & ((pl.col("price") * 0.9) > 1)
-
-    expected = expected_true | expected_false
-
-    assert result.meta.eq(expected)
-
-
-def test_ternary_with_irrelevant_predicate():
-    # Ternary where predicate is completely irrelevant
-    expr = pl.when(pl.col("date") > "2023-01-01").then(pl.col("price") * 1.2).otherwise(pl.col("volume") * 2)
-
-    # Restrict to just "price" and "volume"
-    result = restrict_expr_to_columns(expr, {"price", "volume"})
-
-    # Expected: (price * 1.2) | (volume * 2)
-    # Since predicate is not relevant, both branches remain
-    expected = (pl.col("price") * 1.2) | (pl.col("volume") * 2)
-
-    assert result.meta.eq(expected)
-
-
-def test_ternary_only_relevant_truthy():
-    # Only the truthy branch contains relevant columns
-    expr = pl.when(pl.col("date") > "2023-01-01").then(pl.col("price") * 1.2).otherwise(pl.col("volume") * 2)
-
-    # Restrict to just "price"
-    result = restrict_expr_to_columns(expr, {"price"})
-    # since the predicate and falsy are not relevant,
-    # we cannot just restrict to truthy, so we return None
-    assert result is None
-
-
-def test_ternary_only_relevant_falsy():
-    # Only the falsy branch contains relevant columns
-    expr = pl.when(pl.col("date") > "2023-01-01").then(pl.col("price") * 1.2).otherwise(pl.col("symbol").str.to_uppercase())
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: symbol.str.to_uppercase()
-    # Since the predicate and truthy are not relevant,
-    # we cannot just restrict to Falsy
-    assert result is None
-
-
-def test_ternary_combined_with_binary_op():
-    # Ternary combined with binary operators
-    expr = (pl.when(pl.col("region") == "US").then(pl.col("price") > 100).otherwise(pl.col("volume") > 1000)) & (pl.col("date") > "2023-01-01")
-
-    # Restrict to just "region" and "price"
-    result = restrict_expr_to_columns(expr, {"region", "price"})
-
-    # Ok so, ignore the "date" one, it's just to test that nothing breaks
-
-    # But we restrict to region and price
-    # our filter says, we keep the region == "US" and price > 100
-    # and we keep region != "US" and volume > 1000
-    # Since we ignore volume, we can drop that restriction
-
-    expected = (pl.col("region") == "US") & (pl.col("price") > 100)
-    expected = expected | (pl.col("region") == "US").not_().fill_null(True)
-    assert result.meta.eq(expected)
-
-
-def test_ternary_with_complex_expressions():
-    # Ternary with complex expressions in all parts
-    expr = (
-        pl.when((pl.col("region") == "US") | (pl.col("region") == "EU"))
-        .then((pl.col("price") * pl.col("volume")).alias("value") > 100)
-        .otherwise((pl.col("price") - pl.col("discount")) > 5)
-    )
-
-    # Restrict to just "region" and "price"
-    result = restrict_expr_to_columns(expr, {"region", "price"})
-    # Now, since the true and false paths are both unrepresentable
-    # We would just have the predicate and it's negation, which is trivially true.
-    # Thus, we can't make a less restrictive predicate
-    assert result is None
-
-
-def test_ternary_all_parts_irrelevant():
-    # No part of the ternary is relevant
-    expr = pl.when(pl.col("date") > "2023-01-01").then(pl.col("price") * 1.2).otherwise(pl.col("volume") * 2)
-
-    # Restrict to just "symbol"
-    result = restrict_expr_to_columns(expr, {"symbol"})
-
-    # Expected: None (no part is relevant)
-    assert result is None
-
-
-def test_ternary_predicate_str_function():
-    # No part of the ternary is relevant
-    expr = pl.when(pl.col("symbol").str.contains("HI").alias("hey")).then(pl.col("price") > 3).otherwise(pl.col("volume") != 13)
-
-    result = restrict_expr_to_columns(expr, {"symbol", "price"})
-    expected = (pl.col("symbol").str.contains("HI") & (pl.col("price") > 3)) | pl.col("symbol").str.contains("HI").not_().fill_null(True)
-    # The default parser drops aliases, as they don't affect a filter.
-    assert result.meta.undo_aliases().meta.eq(expected)
-
-
-def test_ternary_complex_comparison():
-    """Test ternary with complex comparisons in predicate."""
-    expr = (
-        pl.when((pl.col("open") <= pl.col("close")) & (pl.col("volume") > 1000))
-        .then(pl.col("symbol").str.contains("UP"))
-        .otherwise(pl.col("open") > 100)
-    )
-
-    # Restrict to "open" and "close"
-    result = restrict_expr_to_columns(expr, {"open", "close"})
-    expected = (pl.col("open") <= pl.col("close")) | (pl.col("open") > 100)
-    assert result.meta.eq(expected)
-
-
-def test_not_pred_valid_pred_invalid():
-    expr = pl.when((pl.col("A").mod(2) == 0) | pl.col("B")).then(pl.col("A") > 15).otherwise(pl.col("C"))
-
-    result = restrict_expr_to_columns(expr, {"A"})
-
-    # We need to create an expression that only uses column "A" but preserves the original logic as much as possible.
-    # In the original expression:
-    # 1. When (A is even OR B is true), we return (A > 15)
-    # 2. Otherwise, we return the value in column C
-    #
-    # Since we can only use column "A":
-    # - For rows where A is even, the condition is definitely true (regardless of B's value),
-    #   so the result is (A > 15)
-    # - For rows where A is odd, the condition depends on column B which we can't access,
-    #   and the result depends on column C, which we also can't access.
-    #   Since we can't determine the result using only A in this case, we must include all rows where A is odd
-    #
-    # Therefore, our restricted expression becomes:
-    # (A > 15) OR (A is odd)
-    # This ensures we include all rows that definitely match the original expression,
-    # even if it means including some rows that might not have matched in the complete expression.
-
-    expected = (pl.col("A") > 15) | (pl.col("A").mod(2) == 0).not_().fill_null(True)
-    assert result.meta.eq(expected)
-
-
-def test_when_then_otherwise_with_definitive_exclusions():
-    expr = pl.when(pl.col("B") > 5).then((pl.col("A") < 20) & (pl.col("C") > 0)).otherwise(pl.col("A").mod(3) > 0)
-
-    result = restrict_expr_to_columns(expr, {"A"})
-
-    expected = (pl.col("A") < 20) | (pl.col("A").mod(3) > 0)
-    assert result.meta.eq(expected)
-
-
-def test_simple_cast():
-    """Test simple cast expressions with column restriction."""
-    # Cast to boolean
-    expr = pl.col("flag").cast(pl.Boolean)
-    result = restrict_expr_to_columns(expr, {"flag"})
-    assert result.meta.eq(expr)
-
-    # Cast to non-boolean
-    expr = pl.col("value").cast(pl.Int64)
-    result = restrict_expr_to_columns(expr, {"value"})
-    assert result.meta.eq(expr)
-
-    # Cast involving columns we're restricting out
-    expr = (pl.col("value") + pl.col("other")).cast(pl.Int64)
-    result = restrict_expr_to_columns(expr, {"value"})
-    # Cannot represent this expression with just "value"
-    assert result is None
-
-
-def test_cast_with_binary_expr():
-    """Test cast with binary expressions."""
-    # Cast AND expression to boolean
-    expr = (pl.col("flag") & pl.col("active")).cast(pl.Boolean)
-
-    # The column dtypes are unknown, so the AND may be bitwise and cannot be restricted
-    result = restrict_expr_to_columns(expr, {"flag"})
-    assert result is None
-
-    # Cast inside AND - this tests the specific functionality you added
-    expr = pl.col("flag").cast(pl.Boolean) & pl.col("active")
-    result = restrict_expr_to_columns(expr, {"flag"})
-    expected = pl.col("flag").cast(pl.Boolean)
-    assert result.meta.eq(expected)
-
-    # Cast inside OR with relevant columns
-    expr = pl.col("flag").cast(pl.Boolean) | pl.col("active").cast(pl.Boolean)
-    result = restrict_expr_to_columns(expr, {"flag", "active"})
-    assert result.meta.eq(expr)
-
-
-def test_multiple_casts():
-    """Test multiple casts in an expression."""
-    # Nested casts (this is a key test for your implementation)
-    expr = pl.col("value").cast(pl.Int64).cast(pl.Boolean)
-    result = restrict_expr_to_columns(expr, {"value"})
-    assert result.meta.eq(expr)
-
-    # More complex nested cast with operation
-    expr = (pl.col("value") > 0).cast(pl.Int64).cast(pl.Boolean)
-    result = restrict_expr_to_columns(expr, {"value"})
-    assert result.meta.eq(expr)
-
-    # Complex nested cast with AND
-    expr = ((pl.col("value") > 0).cast(pl.Boolean) & (pl.col("other") > 10).cast(pl.Boolean)).cast(pl.Boolean)
-    result = restrict_expr_to_columns(expr, {"value"})
-    # We strip the outer level of boolean in the restrict visitor.
-    expected = (pl.col("value") > 0).cast(pl.Boolean)
-    assert result.meta.eq(expected)
-
-
-def test_cast_with_not():
-    """Test casts with NOT operations."""
-    # NOT after cast
-    expr = ~(pl.col("flag").cast(pl.Boolean))
-    result = restrict_expr_to_columns(expr, {"flag"})
-    assert result.meta.eq(expr)
-
-    # Cast after NOT
-    expr = (~pl.col("flag")).cast(pl.Boolean)
-    result = restrict_expr_to_columns(expr, {"flag"})
-    assert result.meta.eq(expr)
-
-    # Combining NOT, cast and AND
-    expr = ~(pl.col("flag").cast(pl.Boolean)) & pl.col("value")
-    result = restrict_expr_to_columns(expr, {"flag"})
-    expected = ~(pl.col("flag").cast(pl.Boolean))
-    assert result.meta.eq(expected)
-
-
-def test_cast_in_ternary():
-    """Test casts in ternary expressions."""
-    # Cast in predicate of ternary
-    expr = pl.when(pl.col("flag").cast(pl.Boolean)).then(pl.col("value") > 0).otherwise(pl.col("price") > 100)
-
-    # Restrict to "flag" and "value"
-    result = restrict_expr_to_columns(expr, {"flag", "value"})
-    # The expected result combines the predicate and truthy branch
-    expected = (pl.col("flag").cast(pl.Boolean) & (pl.col("value") > 0)) | (pl.col("flag").cast(pl.Boolean).not_().fill_null(True))
-    assert result.meta.eq(expected)
-
-    # Cast in both branches of ternary
-    expr = pl.when(pl.col("flag")).then((pl.col("value") > 0).cast(pl.Boolean)).otherwise((pl.col("price") > 100).cast(pl.Boolean))
-
-    # Restrict to "flag" and "value"
-    result = restrict_expr_to_columns(expr, {"flag", "value"})
-    expected = (pl.col("flag") & (pl.col("value") > 0).cast(pl.Boolean)) | (pl.col("flag").not_().fill_null(True))
-    assert result.meta.eq(expected)
-
-
-def test_cast_boolean_complex_logic():
-    """Test complex boolean logic with casts."""
-    # Test for DeMorgan's law with casts
-    expr = ~((pl.col("a") > 0).cast(pl.Boolean) | (pl.col("b") < 10).cast(pl.Boolean))
-
-    # Restrict to just "a"
-    result = restrict_expr_to_columns(expr, {"a"})
-    expected = ~(pl.col("a") > 0).cast(pl.Boolean)
-    assert result.meta.eq(expected)
-
-    # This tests the cast node handling embedded in complex boolean logic
-    expr = ((pl.col("a") > 0).cast(pl.Boolean) & (pl.col("b") < 10).cast(pl.Boolean)) | (
-        (pl.col("c") == 5).cast(pl.Boolean) & (pl.col("a") != 0).cast(pl.Boolean)
-    )
-
-    result = restrict_expr_to_columns(expr, {"a"})
-    expected = (pl.col("a") > 0).cast(pl.Boolean) | (pl.col("a") != 0).cast(pl.Boolean)
-    assert result.meta.eq(expected)
-
-
-def test_cast_between_operations():
-    """Test casting between logical operations."""
-    # This tests that we handle casts correctly when they're between operations
-    expr = ((pl.col("a") > 0).cast(pl.Boolean) & pl.col("b").is_null()).cast(pl.Boolean) | (pl.col("a") < 0).cast(pl.Boolean)
-
-    result = restrict_expr_to_columns(expr, {"a"})
-    expected = (pl.col("a") > 0).cast(pl.Boolean) | (pl.col("a") < 0).cast(pl.Boolean)
-    assert result.meta.eq(expected)
-
-
-def test_cast_non_boolean_handling():
-    """Test that non-boolean casts are properly rejected in complex expressions."""
-    # Cast to non-boolean inside a logical operation
-    expr = (pl.col("a").cast(pl.Int32) > 0) & pl.col("b")
-
-    result = restrict_expr_to_columns(expr, {"a"})
-    expected = pl.col("a").cast(pl.Int32) > 0
-    assert result.meta.eq(expected)
-
-    # Cast to non-boolean that cannot be represented
-    expr = (pl.col("a") + pl.col("b")).cast(pl.Int32) > 0
-
-    result = restrict_expr_to_columns(expr, {"a"})
-    assert result is None
-
-
-def test_nested_alias_handling():
-    """Test that restrict_visitor handles nested aliases correctly."""
-
-    # Test simple nested alias
-    expr1 = pl.col("price").alias("p1").alias("p2") > 100
-    result1 = restrict_expr_to_columns(expr1, {"price"})
-    assert_expr_equal(result1, expr1)  # Should preserve the expression
-
-    # Test nested alias with cast
-    expr2 = pl.col("price").cast(pl.Float64).alias("p1").alias("p2") > 100
-    result2 = restrict_expr_to_columns(expr2, {"price"})
-    assert_expr_equal(result2, expr2)  # Should preserve the expression
-
-    # Test complex expression with nested aliases
-    expr3 = (pl.col("price").alias("p1").alias("p2") > 100) & (pl.col("volume").alias("v1") > 1000)
-    result3 = restrict_expr_to_columns(expr3, {"price", "volume"})
-    assert_expr_equal(result3, expr3)  # Should preserve the entire expression
-
-    # Test restriction to subset of columns
-    result4 = restrict_expr_to_columns(expr3, {"price"})
-    expected4 = pl.col("price").alias("p1").alias("p2") > 100
-    assert_expr_equal(result4, expected4)  # Should only keep price part
-
-
-def test_all_horizontal_restriction():
-    """Test restrict_visitor handles all_horizontal expressions."""
-    pred1 = pl.col("date") > "2024-01-01"
-    pred2 = pl.col("val") > 5
-    combined = pl.all_horizontal(pred1, pred2)
-
-    result = restrict_expr_to_columns(combined, {"date"})
-    expected = pl.col("date") > "2024-01-01"
-    assert_expr_equal(result, expected)
-
-    result_both = restrict_expr_to_columns(combined, {"date", "val"})
-    assert_expr_equal(result_both, combined)
-
-    result_none = restrict_expr_to_columns(combined, {"other"})
-    assert result_none is None
-
-
-def test_all_horizontal_all_same_column():
-    """Test all_horizontal where all inputs reference same column."""
-    combined = pl.all_horizontal(pl.col("x") > 0, pl.col("x") < 100)
-
-    result = restrict_expr_to_columns(combined, {"x"})
-    assert_expr_equal(result, combined)
-
-
-def test_any_horizontal_restriction():
-    """Test restrict_visitor handles any_horizontal expressions."""
-    pred1 = pl.col("date") > "2024-01-01"
-    pred2 = pl.col("val") > 5
-    combined = pl.any_horizontal(pred1, pred2)
-
-    result_partial = restrict_expr_to_columns(combined, {"date"})
-    assert result_partial is None
-
-    result_both = restrict_expr_to_columns(combined, {"date", "val"})
-    assert_expr_equal(result_both, combined)
-
-
-def test_any_horizontal_all_same_column():
-    """Test any_horizontal where all inputs reference same column."""
-    combined = pl.any_horizontal(pl.col("x") == 1, pl.col("x") == 2)
-
-    result = restrict_expr_to_columns(combined, {"x"})
-    assert_expr_equal(result, combined)
-
-
-def test_all_horizontal_nested():
-    """Test nested all_horizontal expressions."""
-    inner = pl.all_horizontal(pl.col("a") > 0, pl.col("b") > 0)
-    outer = pl.all_horizontal(inner, pl.col("c") > 0)
-
-    result = restrict_expr_to_columns(outer, {"a", "b"})
-    expected = pl.all_horizontal(pl.col("a") > 0, pl.col("b") > 0)
-    assert_expr_equal(result, expected)
+    tracked_sample_data.assert_predicate_pushed_down(~((pl.col("id") == 10) & (pl.col("int_val") > 90)), cannot_restrict_to_id)
 
 
 _NULLABLE_DATA = pl.DataFrame(
@@ -703,28 +456,48 @@ _NULLABLE_DATA = pl.DataFrame(
 )
 
 
+@dataclass(frozen=True)
+class RestrictedKeepsRowsCase:
+    """A filter and the columns it is restricted to; the result must keep every row the filter keeps."""
+
+    id: str
+    _: KW_ONLY
+    expr: pl.Expr
+    columns: set[str]
+
+
 @pytest.mark.parametrize(
-    ("expr", "columns"),
-    [
-        (pl.when(pl.col("a") > 1).then(pl.col("b") > 100).otherwise(pl.col("a").fill_null(0) < 3), {"a"}),
-        (~pl.when(pl.col("b") == 1).then(pl.col("a") > 1).otherwise((pl.col("a") > 0) & (pl.col("ab") > 100)), {"a", "b"}),
-        (~pl.all_horizontal(pl.col("a") > 1, pl.col("b") > 0), {"a"}),
-        ((pl.col("a") & pl.col("b")).cast(pl.Boolean), {"a"}),
-        (~((pl.col("a") | pl.col("b")).cast(pl.Boolean)), {"a"}),
-        (pl.when(pl.col("a") > 1).then(pl.col("b") * 2).otherwise(1).cast(pl.Boolean), {"a"}),
-        (pl.any_horizontal(pl.all() > 0), {"a"}),
-        (pl.any_horizontal(pl.col("^a.*$") > 0), {"a"}),
-        (pl.all_horizontal(pl.col("a", "b") > 0), {"a"}),
-        (pl.all_horizontal(pl.col("a"), pl.col("b") > 0), {"a"}),
-    ],
+    "case",
+    as_params(
+        [
+            RestrictedKeepsRowsCase(
+                "ternary_null_condition", expr=pl.when(pl.col("a") > 1).then(pl.col("b") > 100).otherwise(pl.col("a").fill_null(0) < 3), columns={"a"}
+            ),
+            RestrictedKeepsRowsCase(
+                "negated_ternary",
+                expr=~pl.when(pl.col("b") == 1).then(pl.col("a") > 1).otherwise((pl.col("a") > 0) & (pl.col("ab") > 100)),
+                columns={"a", "b"},
+            ),
+            RestrictedKeepsRowsCase("negated_all_horizontal", expr=~pl.all_horizontal(pl.col("a") > 1, pl.col("b") > 0), columns={"a"}),
+            RestrictedKeepsRowsCase("bitwise_and_cast", expr=(pl.col("a") & pl.col("b")).cast(pl.Boolean), columns={"a"}),
+            RestrictedKeepsRowsCase("negated_bitwise_or_cast", expr=~((pl.col("a") | pl.col("b")).cast(pl.Boolean)), columns={"a"}),
+            RestrictedKeepsRowsCase(
+                "numeric_ternary_cast", expr=pl.when(pl.col("a") > 1).then(pl.col("b") * 2).otherwise(1).cast(pl.Boolean), columns={"a"}
+            ),
+            RestrictedKeepsRowsCase("any_horizontal_all", expr=pl.any_horizontal(pl.all() > 0), columns={"a"}),
+            RestrictedKeepsRowsCase("any_horizontal_regex", expr=pl.any_horizontal(pl.col("^a.*$") > 0), columns={"a"}),
+            RestrictedKeepsRowsCase("all_horizontal_multi_column", expr=pl.all_horizontal(pl.col("a", "b") > 0), columns={"a"}),
+            RestrictedKeepsRowsCase("all_horizontal_bare_column", expr=pl.all_horizontal(pl.col("a"), pl.col("b") > 0), columns={"a"}),
+        ]
+    ),
 )
-def test_restricted_predicate_keeps_all_matching_rows(expr, columns):
+def test_restricted_predicate_keeps_all_matching_rows(case: RestrictedKeepsRowsCase):
     """The restricted predicate, evaluated on the kept columns only, must keep every row the original keeps."""
-    visitor = RestrictPredicateVisitor(columns)
-    visitor.visit(get_parsed_expr(expr))
-    cols = sorted(columns)
-    kept = Counter(_NULLABLE_DATA.filter(expr).select(cols).rows())
-    for restricted in (restrict_expr_to_columns(expr, columns), visitor.process_results()):
+    visitor = RestrictPredicateVisitor(case.columns)
+    visitor.visit(get_parsed_expr(case.expr))
+    cols = sorted(case.columns)
+    kept = Counter(_NULLABLE_DATA.filter(case.expr).select(cols).rows())
+    for restricted in (restrict_expr_to_columns(case.expr, case.columns), visitor.process_results()):
         if restricted is not None:
             restricted_kept = Counter(_NULLABLE_DATA.select(cols).filter(restricted).rows())
             assert not kept - restricted_kept
@@ -733,12 +506,11 @@ def test_restricted_predicate_keeps_all_matching_rows(expr, columns):
 def test_ternary_with_null_condition_end_to_end():
     data = pl.DataFrame({"k": [None, None, 5, 0], "x": [1, 2, 300, 4]})
     pred = pl.when(pl.col("k") > 1).then(pl.col("x") > 100).otherwise(pl.col("k").fill_null(0) < 3)
-    result = cpl.cache_memory(lambda: data.lazy(), schema=data.schema, partition_cols="k").filter(pred).collect()
-    assert_frame_equal(result, data.filter(pred), check_row_order=False)
+    assert_matches_plain_polars(cpl.cache_memory(lambda: data.lazy(), schema=data.schema, partition_cols="k"), data.lazy(), pred)
 
 
 def test_negated_ternary_end_to_end():
     frames = {(None, 1): pl.DataFrame({"x": [1, 200]}), (5, 0): pl.DataFrame({"x": [2, 300]})}
     pred = ~pl.when(pl.col("k2") == 1).then(pl.col("k") > 1).otherwise((pl.col("k") > 0) & (pl.col("x") > 100))
     lf = cpl.concat_named({key: df.lazy() for key, df in frames.items()}, [("k", pl.Int64), ("k2", pl.Int64)])
-    assert_frame_equal(lf.filter(pred).collect(), lf.collect().filter(pred), check_row_order=False)
+    assert_matches_plain_polars(lf, lf.collect().lazy(), pred)

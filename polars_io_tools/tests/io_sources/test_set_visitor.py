@@ -1,558 +1,332 @@
+"""convert_expr_to_valid_values: the set of values a filter allows in one column.
+
+``None`` means the filter does not limit the column to a known list of values.
+"""
+
+from dataclasses import KW_ONLY, dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
 
-from polars_io_tools.io_sources.base import get_parsed_expr
+from polars_io_tools.io_sources.base import BinaryExprNode, get_parsed_expr
+from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.set_visitor import SetVisitor, convert_expr_to_valid_values
+from polars_io_tools.tests.helpers.cases import as_params, epoch_ns
 
 
-def test_set_visitor_visitor_direct():
-    """Test using SetVisitor directly."""
-    expr = pl.col("symbol").is_in(["US", "EU", "JP"])
+@dataclass(frozen=True)
+class ValidValuesCase:
+    """A filter, and the set of values it allows in one column."""
 
-    # Parse the expression
-    node = get_parsed_expr(expr)
-
-    # Apply the visitor
-    visitor = SetVisitor("symbol")
-    visitor.visit(node)
-    result = visitor.process_results()
-
-    # Verify the result
-    assert result == {"US", "EU", "JP"}
+    id: str
+    _: KW_ONLY
+    predicate: pl.Expr
+    # None: the filter does not limit the column to a known list of values
+    expected_values: set | None
+    column: str = "symbol"
+    # column dtypes passed along with the filter
+    schema: dict | None = None
 
 
-def test_basic_equality():
-    """Test a simple equality filter."""
-    # Original: filters = [[("symbol", "=", "US")]]
-    # Logic: symbol == "US"
-    expr = pl.col("symbol") == "US"
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US"}
-
-
-def test_multiple_equality_across_conjunctions():
-    """Test DNF filter with multiple equalities in different conjunctions."""
-    # Original: filters = [[("symbol", "=", "US"), ("price", ">", 100)], [("symbol", "=", "EU"), ("volume", ">", 1000)]]
-    # Logic: (symbol == "US" & price > 100) | (symbol == "EU" & volume > 1000)
-    expr = ((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol") == "EU") & (pl.col("volume") > 1000))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU"}
-
-
-def test_basic_in_operator():
-    """Test the 'in' operator with a list of values."""
-    # Original: filters = [[("symbol", "in", ["US", "EU", "JP"])]]
-    # Logic: symbol.is_in(["US", "EU", "JP"])
-    expr = pl.col("symbol").is_in(["US", "EU", "JP"])
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU", "JP"}
-
-
-def test_multiple_in_across_conjunctions():
-    """Test multiple 'in' operators across different conjunctions."""
-    # Original: filters = [[("symbol", "in", ["US", "EU", "JP"]), ("price", ">", 100)], [("symbol", "in", ["EU", "UK", "CN"]), ("volume", ">", 1000)]]
-    # Logic: (symbol.is_in(["US", "EU", "JP"]) & price > 100) | (symbol.is_in(["EU", "UK", "CN"]) & volume > 1000)
-    expr = ((pl.col("symbol").is_in(["US", "EU", "JP"])) & (pl.col("price") > 100)) | (
-        (pl.col("symbol").is_in(["EU", "UK", "CN"])) & (pl.col("volume") > 1000)
-    )
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU", "JP", "UK", "CN"}
-
-
-def test_combination_of_equal_and_in():
-    """Test DNF with a mix of '=' and 'in' operators."""
-    # Original: filters = [[("symbol", "=", "US"), ("price", ">", 100)], [("symbol", "in", ["EU", "UK", "CN"]), ("volume", ">", 1000)]]
-    # Logic: (symbol == "US" & price > 100) | (symbol.is_in(["EU", "UK", "CN"]) & volume > 1000)
-    expr = ((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol").is_in(["EU", "UK", "CN"])) & (pl.col("volume") > 1000))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU", "UK", "CN"}
-
-
-def test_single_conjunction_without_column():
-    """Test when the column isn't present in a single conjunction."""
-    # Original: filters = [[("price", ">", 100), ("volume", ">", 1000)]]
-    # Logic: price > 100 & volume > 1000 (no reference to symbol)
-    expr = (pl.col("price") > 100) & (pl.col("volume") > 1000)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result is None
-
-
-def test_multiple_conjunctions_one_without_column():
-    """Test when the column isn't present in one of multiple conjunctions."""
-    # Original: filters = [[("symbol", "=", "US"), ("price", ">", 100)], [("price", ">", 200), ("volume", ">", 1000)]]
-    # Logic: (symbol == "US" & price > 100) | (price > 200 & volume > 1000)
-    expr = ((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("price") > 200) & (pl.col("volume") > 1000))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result is None
-
-
-def test_contradictions_within_conjunction():
-    """Test when a conjunction contains a contradiction."""
-    # Original: filters = [[("symbol", "=", "US"), ("symbol", "=", "EU")]]
-    # Logic: symbol == "US" & symbol == "EU" (contradiction)
-    expr = (pl.col("symbol") == "US") & (pl.col("symbol") == "EU")
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == set()
-
-
-def test_mixed_data_types():
-    """Test handling of mixed data types in filters."""
-    # Original: filters = [[("value", "=", 10)], [("value", "=", "abc")]]
-    # Logic: value == 10 | value == "abc"
-    expr = (pl.col("value") == 10) | (pl.col("value") == "abc")
-    result = convert_expr_to_valid_values(expr, "value")
-    assert result == {10, "abc"}
-
-
-def test_complex_in_and_equal_combinations():
-    """Test complex combinations of 'in' and '=' operators."""
-    # Original: filters = [[("symbol", "in", ["US", "EU"]), ("symbol", "=", "US")], [("symbol", "in", ["JP", "CN"]), ("price", ">", 100)]]
-    # Logic: (symbol.is_in(["US", "EU"]) & symbol == "US") | (symbol.is_in(["JP", "CN"]) & price > 100)
-    expr = ((pl.col("symbol").is_in(["US", "EU"])) & (pl.col("symbol") == "US")) | ((pl.col("symbol").is_in(["JP", "CN"])) & (pl.col("price") > 100))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "JP", "CN"}
-
-
-def test_in_with_single_string_value():
-    """Test 'in' with a single string value."""
-    # Original: filters = [[("symbol", "in", "US")]]
-    # Logic: symbol.is_in(["US"]) or symbol == "US"
-    # Note: Single string value might need special handling depending on how is_in works in polars
-    expr = pl.col("symbol") == "US"  # or pl.col("symbol").is_in(["US"])
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US"}
-
-
-def test_in_with_empty_list():
-    """Test 'in' with an empty list."""
-    # Original: filters = [[("symbol", "in", [])]]
-    # Logic: symbol.is_in([]) - empty list should always return False
-    expr = pl.col("symbol").is_in([])
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == set()
-
-
-def test_single_equal_filter():
-    """Test passing a single tuple as the filter."""
-    # Original: filters = [[("symbol", "=", "US")]]
-    # Logic: symbol == "US"
-    expr = pl.col("symbol") == "US"
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US"}
-
-
-def test_in_with_single_element_list():
-    """Test 'in' with a list containing a single element."""
-    # Original: filters = [[("symbol", "in", ["US"])]]
-    # Logic: symbol.is_in(["US"])
-    expr = pl.col("symbol").is_in(["US"])
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US"}
-
-
-def test_multiple_complex_rules():
-    """Test with multiple complex rules."""
-    # Original: filters = [
-    #     [("symbol", "in", ["US", "EU", "JP"]), ("price", ">", 100)],
-    #     [("symbol", "=", "UK"), ("volume", ">", 1000)],
-    #     [("symbol", "in", ["CN", "HK"]), ("symbol", "in", ["HK", "TW"])],
-    # ]
-    # Logic: (symbol.is_in(["US", "EU", "JP"]) & price > 100) |
-    #        (symbol == "UK" & volume > 1000) |
-    #        (symbol.is_in(["CN", "HK"]) & symbol.is_in(["HK", "TW"]))
-    expr = (
-        ((pl.col("symbol").is_in(["US", "EU", "JP"])) & (pl.col("price") > 100))
+# Filters on ``symbol`` (and sometimes ``price`` and ``volume``), and the symbols each one allows.
+CASES = [
+    # equality and is_in
+    ValidValuesCase("basic_equality", predicate=pl.col("symbol") == "US", expected_values={"US"}),
+    ValidValuesCase("basic_in_operator", predicate=pl.col("symbol").is_in(["US", "EU", "JP"]), expected_values={"US", "EU", "JP"}),
+    ValidValuesCase("in_with_single_element_list", predicate=pl.col("symbol").is_in(["US"]), expected_values={"US"}),
+    ValidValuesCase("in_with_empty_list", predicate=pl.col("symbol").is_in([]), expected_values=set()),
+    ValidValuesCase("mixed_data_types", predicate=(pl.col("value") == 10) | (pl.col("value") == "abc"), expected_values={10, "abc"}, column="value"),
+    # DNF shapes
+    ValidValuesCase(
+        "multiple_equality_across_conjunctions",
+        predicate=((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol") == "EU") & (pl.col("volume") > 1000)),
+        expected_values={"US", "EU"},
+    ),
+    ValidValuesCase(
+        "multiple_in_across_conjunctions",
+        predicate=(pl.col("symbol").is_in(["US", "EU", "JP"]) & (pl.col("price") > 100))
+        | (pl.col("symbol").is_in(["EU", "UK", "CN"]) & (pl.col("volume") > 1000)),
+        expected_values={"US", "EU", "JP", "UK", "CN"},
+    ),
+    ValidValuesCase(
+        "combination_of_equal_and_in",
+        predicate=((pl.col("symbol") == "US") & (pl.col("price") > 100)) | (pl.col("symbol").is_in(["EU", "UK", "CN"]) & (pl.col("volume") > 1000)),
+        expected_values={"US", "EU", "UK", "CN"},
+    ),
+    ValidValuesCase("single_conjunction_without_column", predicate=(pl.col("price") > 100) & (pl.col("volume") > 1000), expected_values=None),
+    ValidValuesCase(
+        "multiple_conjunctions_one_without_column",
+        predicate=((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("price") > 200) & (pl.col("volume") > 1000)),
+        expected_values=None,
+    ),
+    ValidValuesCase("contradictions_within_conjunction", predicate=(pl.col("symbol") == "US") & (pl.col("symbol") == "EU"), expected_values=set()),
+    ValidValuesCase(
+        "complex_in_and_equal_combinations",
+        predicate=(pl.col("symbol").is_in(["US", "EU"]) & (pl.col("symbol") == "US"))
+        | (pl.col("symbol").is_in(["JP", "CN"]) & (pl.col("price") > 100)),
+        expected_values={"US", "JP", "CN"},
+    ),
+    ValidValuesCase(
+        "multiple_complex_rules",
+        predicate=(pl.col("symbol").is_in(["US", "EU", "JP"]) & (pl.col("price") > 100))
         | ((pl.col("symbol") == "UK") & (pl.col("volume") > 1000))
-        | ((pl.col("symbol").is_in(["CN", "HK"])) & (pl.col("symbol").is_in(["HK", "TW"])))
-    )
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU", "JP", "UK", "HK"}
-
-
-def test_contradiction_in_one_conjunction_but_not_others():
-    """Test when one conjunction has a contradiction but others don't."""
-    # Original: filters = [
-    #     [("symbol", "=", "US"), ("symbol", "=", "EU")],  # Contradiction
-    #     [("symbol", "=", "JP")],  # Valid
-    # ]
-    # Logic: (symbol == "US" & symbol == "EU") | (symbol == "JP")
-    expr = ((pl.col("symbol") == "US") & (pl.col("symbol") == "EU")) | (pl.col("symbol") == "JP")
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"JP"}
-
-
-def test_all_conjunctions_have_contradictions():
-    """Test when all conjunctions have contradictions."""
-    # Original: filters = [
-    #     [("symbol", "=", "US"), ("symbol", "=", "EU")],  # Contradiction
-    #     [("symbol", "in", []), ("price", ">", 100)],  # Empty 'in' is a contradiction
-    # ]
-    # Logic: (symbol == "US" & symbol == "EU") | (symbol.is_in([]) & price > 100)
-    expr = ((pl.col("symbol") == "US") & (pl.col("symbol") == "EU")) | ((pl.col("symbol").is_in([])) & (pl.col("price") > 100))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == set()
-
-
-def test_multiple_in_operators_within_single_conjunction():
-    """Test multiple 'in' operators within a single conjunction."""
-    # Original: filters = [[("symbol", "in", ["US", "EU", "JP"]), ("symbol", "in", ["JP", "CN", "UK"])]]
-    # Logic: symbol.is_in(["US", "EU", "JP"]) & symbol.is_in(["JP", "CN", "UK"])
-    expr = (pl.col("symbol").is_in(["US", "EU", "JP"])) & (pl.col("symbol").is_in(["JP", "CN", "UK"]))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"JP"}
-
-
-def test_is_operator():
-    """Test the 'is' operator for NULL checks."""
-    # Original: filters = [[("symbol", "is", "US")]]
-    # In polars, "is" would normally be is_null() or equality.
-    # Here we're using equality since the test expects "US" to be in the result
-    expr = pl.col("symbol") == "US"
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US"}
-
-
-def test_not_equal_operator():
-    """Test the '~' (not equal) operator."""
-    # Original: filters = [[("symbol", "~", "US"), ("symbol", "in", ["US", "EU", "JP"])]]
-    # Logic: symbol != "US" & symbol.is_in(["US", "EU", "JP"])
-    expr = (pl.col("symbol") != "US") & (pl.col("symbol").is_in(["US", "EU", "JP"]))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"EU", "JP"}
-
-
-def test_not_in_operator():
-    """Test the '!in' (not in) operator."""
-    # Original: filters = [[("symbol", "!in", ["US", "EU"]), ("symbol", "in", ["US", "EU", "JP", "CN"])]]
-    # Logic: ~symbol.is_in(["US", "EU"]) & symbol.is_in(["US", "EU", "JP", "CN"])
-    expr = (~pl.col("symbol").is_in(["US", "EU"])) & (pl.col("symbol").is_in(["US", "EU", "JP", "CN"]))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"JP", "CN"}
-
-
-def test_different_operators_across_conjunctions():
-    """Test different operators across conjunctions."""
-    # Original: filters = [[("symbol", "=", "US")], [("symbol", "is", "AP")], [("symbol", "in", ["JP", "CN"])]]
-    # Logic: (symbol == "US") | (symbol == "AP") | (symbol.is_in(["JP", "CN"]))
-    expr = (pl.col("symbol") == "US") | (pl.col("symbol") == "AP") | (pl.col("symbol").is_in(["JP", "CN"]))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "AP", "JP", "CN"}
-
-
-def test_basic_boolean_cast():
-    """Test that a simple boolean cast is properly traversed."""
-    # Cast a simple equality expression to boolean
-    expr = (pl.col("symbol") == "US").cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # The visitor should extract "US" from inside the cast
-    assert result == {"US"}
-
-
-def test_boolean_cast_in_and_expression():
-    """Test boolean cast in an AND expression."""
-    # Boolean cast on left side of AND
-    expr = ((pl.col("symbol") == "US").cast(pl.Boolean)) & (pl.col("symbol") != "JP")
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should extract "US" from the cast and apply the exclusion of "JP"
-    assert result == {"US"}
-
-
-def test_boolean_cast_in_or_expression():
-    """Test boolean cast in an OR expression."""
-    # Boolean cast on left side of OR
-    expr = ((pl.col("symbol") == "US").cast(pl.Boolean)) | (pl.col("symbol") == "JP")
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should extract values from both sides of OR
-    assert result == {"US", "JP"}
-
-
-def test_multiple_boolean_casts():
-    """Test multiple boolean casts in an expression."""
-    # Boolean casts on both sides of OR
-    expr = ((pl.col("symbol") == "US").cast(pl.Boolean)) | ((pl.col("symbol") == "JP").cast(pl.Boolean))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should extract values from both casts
-    assert result == {"US", "JP"}
-
-
-def test_boolean_cast_with_in():
-    """Test boolean cast with IS_IN function."""
-    # Cast an IS_IN expression to boolean
-    expr = (pl.col("symbol").is_in(["US", "JP"])).cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should extract values from inside the cast
-    assert result == {"US", "JP"}
-
-
-def test_nested_boolean_casts():
-    """Test nested boolean casts."""
-    # Expression with nested boolean casts
-    expr = ((pl.col("symbol") == "US").cast(pl.Boolean)).cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should traverse through both casts
-    assert result == {"US"}
-
-
-def test_boolean_cast_of_complex_expression():
-    """Test boolean cast of a complex expression."""
-    # Cast a complex expression to boolean
-    expr = (((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol") == "JP") & (pl.col("price") > 200))).cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should extract both symbol values from inside the cast
-    assert result == {"US", "JP"}
-
-
-def test_complex_nested_expressions_with_boolean_casts():
-    """Test complex nested expressions with boolean casts."""
-    # Multiple complex expressions with casts
-    expr = (((pl.col("symbol") == "US") & (pl.col("price") > 100)).cast(pl.Boolean)) | (
-        (pl.col("symbol").is_in(["JP", "EU"]) & (pl.col("volume") > 1000)).cast(pl.Boolean)
-    )
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Should extract all valid values from both parts
-    assert result == {"US", "JP", "EU"}
-
-
-def test_boolean_cast_with_contradictions():
-    """Test boolean cast with contradictions in the underlying expression."""
-    # Cast an expression with contradictory requirements
-    expr = ((pl.col("symbol") == "US") & (pl.col("symbol") == "JP")).cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # Contradiction should result in empty set
-    assert result == set()
-
-
-def test_boolean_cast_with_mixed_data_types():
-    """Test boolean cast with mixed data types in the underlying expression."""
-    # Cast an expression with different data types
-    expr = ((pl.col("value") == 10) | (pl.col("value") == "abc")).cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "value")
-    # Should extract both values regardless of type
-    assert result == {10, "abc"}
-
-
-def test_non_boolean_cast():
-    """Test that non-boolean casts are not specially handled."""
-    # Cast to a non-boolean type
-    expr = (pl.col("symbol") == "US").cast(pl.Utf8)
-    # The visitor only handles boolean casts specially
-    # For non-boolean casts, we don't extract valid values
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result is None  # Non-boolean casts should not extract valid values
-
-
-def test_boolean_cast_with_not():
-    """Test boolean cast with NOT function."""
-    # Cast a negated expression to boolean
-    expr = (~(pl.col("symbol") == "US")).cast(pl.Boolean)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # The visitor can handle negation but can't determine a concrete set of values
-    # without knowing the entire universe of possible values
-    assert result is None
-
-
-def test_set_visitor_consistent_set_creation():
-    """Test that SetVisitor creates new sets consistently instead of modifying existing ones."""
-    from polars_io_tools.io_sources.base import get_parsed_expr
-    from polars_io_tools.io_sources.set_visitor import SetVisitor
-
-    # Test multiple equality operations create new sets consistently
-    visitor = SetVisitor("symbol")
-
-    # First equality - creates initial set
-    expr1 = pl.col("symbol") == "US"
-    node1 = get_parsed_expr(expr1)
-    assert node1 is not None
-    visitor.visit(node1)
-    assert visitor.inclusions is not None
-    first_set_id = id(visitor.inclusions)
-    first_set_contents = visitor.inclusions.copy()
-
-    # Second equality - should create new set, not modify existing
-    expr2 = pl.col("symbol") == "EU"
-    node2 = get_parsed_expr(expr2)
-    assert node2 is not None
-    visitor.visit(node2)
-    assert visitor.inclusions is not None
-    second_set_id = id(visitor.inclusions)
-
-    # Verify consistent behavior: new sets are created, not modified in place
-    assert first_set_id != second_set_id, "SetVisitor should create new sets consistently"
-    assert visitor.inclusions == {"US", "EU"}, "Both values should be included in final set"
-    assert first_set_contents == {"US"}, "Original set should remain unchanged"
-
-
-def test_set_visitor_null_handling_consistent():
-    """Test that NULL value handling also follows consistent set creation pattern."""
-    from polars_io_tools.io_sources.base import get_parsed_expr
-    from polars_io_tools.io_sources.set_visitor import SetVisitor
-
-    visitor = SetVisitor("nullable_col")
-
-    # First IS_NULL - creates initial set
-    expr1 = pl.col("nullable_col").is_null()
-    node1 = get_parsed_expr(expr1)
-    assert node1 is not None
-    visitor.visit(node1)
-    first_set_id = id(visitor.inclusions) if visitor.inclusions else None
-
-    # Second equality - should create new set consistently
-    expr2 = pl.col("nullable_col") == "value"
-    node2 = get_parsed_expr(expr2)
-    assert node2 is not None
-    visitor.visit(node2)
-    second_set_id = id(visitor.inclusions) if visitor.inclusions else None
-
-    # Verify consistent set creation behavior
-    if first_set_id and second_set_id:
-        assert first_set_id != second_set_id, "Consistent set creation for NULL handling"
-    assert visitor.inclusions == {None, "value"}, "Both NULL and value should be included"
-
-
-def test_logical_and_operator_handling():
-    """
-    Regression test for LOGICAL_AND vs AND operator bug.
-
-    This test ensures that both LOGICAL_AND and AND operators are handled correctly
-    when extracting valid values from expressions. The bug occurred because
-    is_bitwise() only returned True for AND/OR/XOR but not LOGICAL_AND/LOGICAL_OR.
-
-    Before the fix:
-    - LOGICAL_AND expressions would return None (unhandled operator)
-    - AND expressions would return correct symbol sets
-
-    After the fix:
-    - Both should return the same correct results
-    """
-    from datetime import date
-
-    from polars_io_tools.io_sources.base import BinaryExprNode
-    from polars_io_tools.io_sources.enum import OperatorType
-
-    # Create expressions that should produce LOGICAL_AND
-    # Based on the debug output, the issue occurs with this specific pattern
-    date_expr = pl.col("date_partition") == date(2009, 10, 2)
-    symbol_expr = pl.col("symbol") == "AAPL US"
-
-    # Create the combined filter - this might get LOGICAL_AND operator
-    combined_filter = date_expr & symbol_expr
-
-    # Parse the expression to check what operator we actually get
-    parsed_node = get_parsed_expr(combined_filter)
-
-    # Manually create a BinaryExprNode with LOGICAL_AND to force the bug
-    # This simulates what happens before Polars optimization (collect_schema)
-    if isinstance(parsed_node, BinaryExprNode):
-        # Create a copy but force it to be LOGICAL_AND
-        from polars_io_tools.io_sources.base import BinaryExprNode
-
-        logical_and_node = BinaryExprNode(
-            expr=parsed_node.expr,
-            can_extract_literal=False,
-            left=parsed_node.left,
-            right=parsed_node.right,
-            op=OperatorType.LOGICAL_AND,  # Force this to be LOGICAL_AND
-        )
-
-        # Test symbol extraction with forced LOGICAL_AND
-        result = convert_expr_to_valid_values(logical_and_node, "symbol")
-
-        # This should extract the symbol value even with LOGICAL_AND
-        # If the fix is commented out, this will return None
-        assert result == {"AAPL US"}, f"LOGICAL_AND should extract symbol, got {result}"
-        assert result is not None, "LOGICAL_AND should be handled, not return None"
-
-
-# Test cases for alias expressions
-def test_alias_simple_equality():
-    """Test that aliases in simple equality expressions are handled properly."""
-    expr = pl.col("symbol").alias("symbol_alias") == "US"
-    result = convert_expr_to_valid_values(expr, "symbol")
-    # This should extract the valid values from the aliased column expression
-    assert result == {"US"}
-
-
-def test_alias_in_operator():
-    """Test aliases with is_in operator."""
-    expr = pl.col("symbol").alias("symbol_alias").is_in(["US", "EU", "JP"])
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU", "JP"}
-
-
-def test_alias_logical_operations():
-    """Test aliases in logical operations."""
-    expr = (pl.col("symbol").alias("symbol_alias") == "US") & (pl.col("price").alias("price_alias") > 100)
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US"}
-
-
-def test_alias_with_exclusions():
-    """Test aliases with exclusion operations."""
-    expr = (pl.col("symbol").alias("symbol_alias") != "US") & (pl.col("symbol").is_in(["US", "EU", "JP"]))
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"EU", "JP"}
-
-
-def test_alias_complex_mixed_operations():
-    """Test complex expressions with mixed alias operations."""
-    expr = ((pl.col("symbol").alias("s1") == "US") | (pl.col("symbol").alias("s2").is_in(["EU", "JP", "UK"]))) & (
-        pl.col("symbol").alias("s3") != "UK"
-    )
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU", "JP"}
-
-
-def test_narrowing_cast_on_column_is_not_stripped():
-    """A narrowing/wrapping cast must not resolve to the raw column for valid-value extraction."""
-    expr = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
-    # Without a schema the source dtype is unknown, so the cast is refused (no value set).
-    assert convert_expr_to_valid_values(expr, "a") is None
-    # Int64 -> Int8 is narrowing even with a schema -> still refused (257 would wrap to 1).
-    assert convert_expr_to_valid_values(expr, "a", {"a": pl.Int64}) is None
-
-
-def test_value_preserving_widening_cast_still_extracts_values():
-    """A provably value- and order-preserving widening cast is unwrapped when a schema is supplied."""
-    expr = pl.col("a").cast(pl.Int64) == 1
-    assert convert_expr_to_valid_values(expr, "a") is None  # unknown source dtype -> safe refusal
-    assert convert_expr_to_valid_values(expr, "a", {"a": pl.Int8}) == {1}
-
-
-def test_not_over_relaxed_and_does_not_exclude_values():
-    """NOT must not exclude values when the inner AND ignored a side it could not convert."""
-    x = pl.col("x")
-    # The inner conjunctions can never hold for x == 1 alone, so both rows survive.
-    assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~((x == 1) & (x.cast(pl.Int64) == 2)), "x") == {1, 2}
-    assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~((x == 1) & (pl.col("y") == 2)), "x") == {1, 2}
-    assert convert_expr_to_valid_values(x.is_in([1, 2]) & ~(x == 1), "x") == {2}
-
-
-def test_sub_microsecond_literal_is_not_pushed():
-    ns_literal = pl.lit(1704198600000000500).cast(pl.Datetime("ns"))
-    assert convert_expr_to_valid_values(pl.col("t") == ns_literal, "t", {"t": pl.Datetime("ns")}) is None
-
-
-_EARLY = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+        | (pl.col("symbol").is_in(["CN", "HK"]) & pl.col("symbol").is_in(["HK", "TW"])),
+        expected_values={"US", "EU", "JP", "UK", "HK"},
+    ),
+    ValidValuesCase(
+        "contradiction_in_one_conjunction_but_not_others",
+        predicate=((pl.col("symbol") == "US") & (pl.col("symbol") == "EU")) | (pl.col("symbol") == "JP"),
+        expected_values={"JP"},
+    ),
+    ValidValuesCase(
+        "all_conjunctions_have_contradictions",
+        predicate=((pl.col("symbol") == "US") & (pl.col("symbol") == "EU")) | (pl.col("symbol").is_in([]) & (pl.col("price") > 100)),
+        expected_values=set(),
+    ),
+    ValidValuesCase(
+        "multiple_in_operators_within_single_conjunction",
+        predicate=pl.col("symbol").is_in(["US", "EU", "JP"]) & pl.col("symbol").is_in(["JP", "CN", "UK"]),
+        expected_values={"JP"},
+    ),
+    ValidValuesCase(
+        "not_equal_operator", predicate=(pl.col("symbol") != "US") & pl.col("symbol").is_in(["US", "EU", "JP"]), expected_values={"EU", "JP"}
+    ),
+    ValidValuesCase(
+        "not_in_operator",
+        predicate=~pl.col("symbol").is_in(["US", "EU"]) & pl.col("symbol").is_in(["US", "EU", "JP", "CN"]),
+        expected_values={"JP", "CN"},
+    ),
+    ValidValuesCase(
+        "different_operators_across_conjunctions",
+        predicate=(pl.col("symbol") == "US") | (pl.col("symbol") == "AP") | pl.col("symbol").is_in(["JP", "CN"]),
+        expected_values={"US", "AP", "JP", "CN"},
+    ),
+    # Boolean casts are transparent, other casts are not
+    ValidValuesCase("basic_boolean_cast", predicate=(pl.col("symbol") == "US").cast(pl.Boolean), expected_values={"US"}),
+    ValidValuesCase(
+        "boolean_cast_in_and_expression", predicate=(pl.col("symbol") == "US").cast(pl.Boolean) & (pl.col("symbol") != "JP"), expected_values={"US"}
+    ),
+    ValidValuesCase(
+        "boolean_cast_in_or_expression",
+        predicate=(pl.col("symbol") == "US").cast(pl.Boolean) | (pl.col("symbol") == "JP"),
+        expected_values={"US", "JP"},
+    ),
+    ValidValuesCase(
+        "multiple_boolean_casts",
+        predicate=(pl.col("symbol") == "US").cast(pl.Boolean) | (pl.col("symbol") == "JP").cast(pl.Boolean),
+        expected_values={"US", "JP"},
+    ),
+    ValidValuesCase("boolean_cast_with_in", predicate=pl.col("symbol").is_in(["US", "JP"]).cast(pl.Boolean), expected_values={"US", "JP"}),
+    ValidValuesCase("nested_boolean_casts", predicate=(pl.col("symbol") == "US").cast(pl.Boolean).cast(pl.Boolean), expected_values={"US"}),
+    ValidValuesCase(
+        "boolean_cast_of_complex_expression",
+        predicate=(((pl.col("symbol") == "US") & (pl.col("price") > 100)) | ((pl.col("symbol") == "JP") & (pl.col("price") > 200))).cast(pl.Boolean),
+        expected_values={"US", "JP"},
+    ),
+    ValidValuesCase(
+        "complex_nested_expressions_with_boolean_casts",
+        predicate=((pl.col("symbol") == "US") & (pl.col("price") > 100)).cast(pl.Boolean)
+        | (pl.col("symbol").is_in(["JP", "EU"]) & (pl.col("volume") > 1000)).cast(pl.Boolean),
+        expected_values={"US", "JP", "EU"},
+    ),
+    ValidValuesCase(
+        "boolean_cast_with_contradictions",
+        predicate=((pl.col("symbol") == "US") & (pl.col("symbol") == "JP")).cast(pl.Boolean),
+        expected_values=set(),
+    ),
+    ValidValuesCase(
+        "boolean_cast_with_mixed_data_types",
+        predicate=((pl.col("value") == 10) | (pl.col("value") == "abc")).cast(pl.Boolean),
+        expected_values={10, "abc"},
+        column="value",
+    ),
+    ValidValuesCase("non_boolean_cast", predicate=(pl.col("symbol") == "US").cast(pl.Utf8), expected_values=None),
+    ValidValuesCase("boolean_cast_with_not", predicate=(~(pl.col("symbol") == "US")).cast(pl.Boolean), expected_values=None),
+    # aliases are transparent
+    ValidValuesCase("alias_simple_equality", predicate=pl.col("symbol").alias("symbol_alias") == "US", expected_values={"US"}),
+    ValidValuesCase(
+        "alias_in_operator", predicate=pl.col("symbol").alias("symbol_alias").is_in(["US", "EU", "JP"]), expected_values={"US", "EU", "JP"}
+    ),
+    ValidValuesCase(
+        "alias_logical_operations",
+        predicate=(pl.col("symbol").alias("symbol_alias") == "US") & (pl.col("price").alias("price_alias") > 100),
+        expected_values={"US"},
+    ),
+    ValidValuesCase(
+        "alias_with_exclusions",
+        predicate=(pl.col("symbol").alias("symbol_alias") != "US") & pl.col("symbol").is_in(["US", "EU", "JP"]),
+        expected_values={"EU", "JP"},
+    ),
+    ValidValuesCase(
+        "alias_complex_mixed_operations",
+        predicate=((pl.col("symbol").alias("s1") == "US") | pl.col("symbol").alias("s2").is_in(["EU", "JP", "UK"]))
+        & (pl.col("symbol").alias("s3") != "UK"),
+        expected_values={"US", "EU", "JP"},
+    ),
+    # a cast is unwrapped only when the schema proves it value-preserving
+    ValidValuesCase(
+        "narrowing_cast_on_column_is_not_stripped-no_schema",
+        predicate=pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1,
+        expected_values=None,
+        column="a",
+    ),
+    ValidValuesCase(
+        "narrowing_cast_on_column_is_not_stripped-schema",
+        predicate=pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1,
+        expected_values=None,
+        column="a",
+        schema={"a": pl.Int64},
+    ),
+    ValidValuesCase(
+        "value_preserving_widening_cast_still_extracts_values-no_schema", predicate=pl.col("a").cast(pl.Int64) == 1, expected_values=None, column="a"
+    ),
+    ValidValuesCase(
+        "value_preserving_widening_cast_still_extracts_values-schema",
+        predicate=pl.col("a").cast(pl.Int64) == 1,
+        expected_values={1},
+        column="a",
+        schema={"a": pl.Int8},
+    ),
+    # NOT must not exclude values when the inner AND ignored a side it could not convert
+    ValidValuesCase(
+        "not_over_relaxed_and_does_not_exclude_values-cast",
+        predicate=pl.col("x").is_in([1, 2]) & ~((pl.col("x") == 1) & (pl.col("x").cast(pl.Int64) == 2)),
+        expected_values={1, 2},
+        column="x",
+    ),
+    ValidValuesCase(
+        "not_over_relaxed_and_does_not_exclude_values-other_col",
+        predicate=pl.col("x").is_in([1, 2]) & ~((pl.col("x") == 1) & (pl.col("y") == 2)),
+        expected_values={1, 2},
+        column="x",
+    ),
+    ValidValuesCase(
+        "not_over_relaxed_and_does_not_exclude_values-exact",
+        predicate=pl.col("x").is_in([1, 2]) & ~(pl.col("x") == 1),
+        expected_values={2},
+        column="x",
+    ),
+    ValidValuesCase(
+        "sub_microsecond_literal_is_not_pushed",
+        predicate=pl.col("t") == pl.lit(epoch_ns(datetime(2024, 1, 2, 12, 30)) + 500).cast(pl.Datetime("ns")),
+        expected_values=None,
+        column="t",
+        schema={"t": pl.Datetime("ns")},
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(CASES))
+def test_valid_values(case: ValidValuesCase):
+    assert convert_expr_to_valid_values(case.predicate, case.column, case.schema) == case.expected_values
+
+
+# 01:30 on the day New York's clocks go back, which happens twice; Python's ``fold=1`` picks the second time.
+NEW_YORK_REPEATED_HOUR = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+
+
+@dataclass(frozen=True)
+class ValidValuesCoverRowsCase:
+    """A frame and a filter; the extracted values must cover every row the filter keeps."""
+
+    id: str
+    _: KW_ONLY
+    df: pl.DataFrame
+    pred: pl.Expr
 
 
 @pytest.mark.parametrize(
-    ("df", "pred"),
-    [
-        (pl.DataFrame({"x": [float("nan"), 1.0, 2.0]}), pl.col("x").is_in([float("nan"), 1.0]) & pl.col("x").is_in([float("nan"), 2.0])),
-        (pl.DataFrame({"x": [_EARLY, _EARLY.replace(fold=1)]}), pl.col("x").is_in([_EARLY, _EARLY.replace(fold=1)])),
-        (pl.DataFrame({"x": pl.Series([0.1], dtype=pl.Float32)}), pl.col("x") == 0.1),
-        (pl.DataFrame({"x": [date(2024, 1, 1)]}), (pl.col("x") == date(2024, 1, 1)) & (pl.col("x") == datetime(2024, 1, 1))),
-    ],
-    ids=["nan", "dst_fold", "float32", "date_vs_datetime"],
+    "case",
+    as_params(
+        [
+            ValidValuesCoverRowsCase(
+                "nan",
+                df=pl.DataFrame({"x": [float("nan"), 1.0, 2.0]}),
+                pred=pl.col("x").is_in([float("nan"), 1.0]) & pl.col("x").is_in([float("nan"), 2.0]),
+            ),
+            ValidValuesCoverRowsCase(
+                "dst_fold",
+                df=pl.DataFrame({"x": [NEW_YORK_REPEATED_HOUR, NEW_YORK_REPEATED_HOUR.replace(fold=1)]}),
+                pred=pl.col("x").is_in([NEW_YORK_REPEATED_HOUR, NEW_YORK_REPEATED_HOUR.replace(fold=1)]),
+            ),
+            ValidValuesCoverRowsCase("float32", df=pl.DataFrame({"x": pl.Series([0.1], dtype=pl.Float32)}), pred=pl.col("x") == 0.1),
+            ValidValuesCoverRowsCase(
+                "date_vs_datetime",
+                df=pl.DataFrame({"x": [date(2024, 1, 1)]}),
+                pred=(pl.col("x") == date(2024, 1, 1)) & (pl.col("x") == datetime(2024, 1, 1)),
+            ),
+        ]
+    ),
 )
-def test_valid_values_cover_matching_rows(df, pred):
+def test_valid_values_cover_matching_rows(case: ValidValuesCoverRowsCase):
     """Every kept row's value must be in the extracted set, both by Python and by Polars comparison."""
-    kept = df.filter(pred)["x"]
+    kept = case.df.filter(case.pred)["x"]
     assert not kept.is_empty()
-    values = convert_expr_to_valid_values(pred, "x", df.schema)
+    values = convert_expr_to_valid_values(case.pred, "x", case.df.schema)
     if values is not None:
-        assert all(v in values for v in kept.to_list())
-        assert kept.is_in(pl.Series(list(values), dtype=df.schema["x"])).all()
+        assert all(value in values for value in kept.to_list())
+        assert kept.is_in(pl.Series(list(values), dtype=case.df.schema["x"])).all()
+
+
+def test_set_visitor_visitor_direct():
+    visitor = SetVisitor("symbol")
+    visitor.visit(get_parsed_expr(pl.col("symbol").is_in(["US", "EU", "JP"])))
+    assert visitor.process_results() == {"US", "EU", "JP"}
+
+
+@dataclass(frozen=True)
+class NewSetsCase:
+    """A column and two filters visited in turn, and the values allowed after each."""
+
+    id: str
+    _: KW_ONLY
+    col: str
+    first: pl.Expr
+    second: pl.Expr
+    first_expect: set
+    expect: set
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            NewSetsCase(
+                "consistent_set_creation",
+                col="symbol",
+                first=pl.col("symbol") == "US",
+                second=pl.col("symbol") == "EU",
+                first_expect={"US"},
+                expect={"US", "EU"},
+            ),
+            NewSetsCase(
+                "null_handling",
+                col="nullable_col",
+                first=pl.col("nullable_col").is_null(),
+                second=pl.col("nullable_col") == "value",
+                first_expect={None},
+                expect={None, "value"},
+            ),
+        ]
+    ),
+)
+def test_set_visitor_creates_new_sets(case: NewSetsCase):
+    """Visiting a second node replaces the inclusions set rather than mutating it in place."""
+    visitor = SetVisitor(case.col)
+    visitor.visit(get_parsed_expr(case.first))
+    first_set = visitor.inclusions
+    assert first_set == case.first_expect
+    visitor.visit(get_parsed_expr(case.second))
+    assert visitor.inclusions is not first_set
+    assert visitor.inclusions == case.expect
+    assert first_set == case.first_expect
+
+
+def test_logical_and_operator_handling():
+    """Regression: LOGICAL_AND, the spelling before Polars optimizes a plan, is handled like AND."""
+    node = get_parsed_expr((pl.col("date_partition") == date(2009, 10, 2)) & (pl.col("symbol") == "AAPL US"))
+    assert isinstance(node, BinaryExprNode)
+    forced = BinaryExprNode(expr=node.expr, can_extract_literal=False, left=node.left, right=node.right, op=OperatorType.LOGICAL_AND)
+    assert convert_expr_to_valid_values(forced, "symbol") == {"AAPL US"}

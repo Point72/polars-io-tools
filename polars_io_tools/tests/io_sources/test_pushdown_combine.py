@@ -1,27 +1,31 @@
-"""
-Tests for the pushdown_combine function and FilterSpec class.
+"""pushdown_combine: ``CombineCase`` rows run by one test, and tables for FilterSpec, IntervalFilterSpec and helpers.
 
-This module tests the coordinated filter pushdown capabilities of pushdown_combine,
-including:
-- Basic filter propagation
-- Lookback/lookahead temporal expansion
-- Value mapping (dict and callable)
-- Column name remapping
-- Multiple sources with different specs
-- Edge cases (empty filters, empty results, schema inference)
+A row names its sources (a frame and its filter specs), the combine function and the user's filter. The result must
+equal the combine of the unfiltered sources, filtered by the user's filter, unless the row sets
+``compare_with_polars=False``; with the identity combine this also means the source kept every row the filter keeps.
+A row may also state what a source received. Sources a row inspects, and the source of the identity combine, sit behind
+a ``PredicateTracker``, which records what they receive.
+
+The property tests at the end (using the Hypothesis library) run combines of several shapes with random data and
+filters, and compare them with plain Polars.
 """
 
 import logging
 import sys
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import polars as pl
 import pytest
+from hypothesis import assume, given, strategies as st
 from polars.testing import assert_frame_equal
 
+import polars_io_tools as cpl
 from polars_io_tools.io_sources.base import BinaryExprNode, FunctionNode
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType
 from polars_io_tools.io_sources.pushdown_combine import (
@@ -31,3369 +35,2108 @@ from polars_io_tools.io_sources.pushdown_combine import (
     _compute_output_schema,
     _get_source_col,
     _map_values,
+    _union_discrete_filter,
     pushdown_combine,
 )
 from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker, io_source_assert
+from polars_io_tools.tests.helpers.assertions import assert_matches_plain_polars, assert_pushed_time_bounds, failure_note
+from polars_io_tools.tests.helpers.cases import GROUP_FRAME, as_params, daily_frame, epoch_ns
+from polars_io_tools.tests.helpers.pickling import pickle_round_trip
+from polars_io_tools.tests.helpers.polars_versions import polars_has
+from polars_io_tools.tests.helpers.property_checks import SETTINGS
+
+UTC_ZONE = ZoneInfo("UTC")
+NEW_YORK = ZoneInfo("America/New_York")
+CLOSED_OPTIONS = ["both", "left", "right", "none"]
 
 
-class TestFilterSpecDefaults:
-    """Test FilterSpec default values."""
-
-    def test_defaults(self):
-        """FilterSpec should have sensible defaults."""
-        spec = FilterSpec()
-        assert spec.source_col is None
-        assert spec.lookback == timedelta()
-        assert spec.lookahead == timedelta()
-        assert spec.value_mapping is None
-
-    def test_source_col_override(self):
-        """source_col can be explicitly set."""
-        spec = FilterSpec(source_col="DataDate")
-        assert spec.source_col == "DataDate"
-
-    def test_lookback_override(self):
-        """lookback can be explicitly set."""
-        spec = FilterSpec(lookback=timedelta(days=5))
-        assert spec.lookback == timedelta(days=5)
-
-    def test_lookahead_override(self):
-        """lookahead can be explicitly set."""
-        spec = FilterSpec(lookahead=timedelta(days=3))
-        assert spec.lookahead == timedelta(days=3)
-
-    def test_value_mapping_dict(self):
-        """value_mapping can be a dict."""
-        mapping = {"A": "a", "B": "b"}
-        spec = FilterSpec(value_mapping=mapping)
-        assert spec.value_mapping == mapping
-
-    def test_value_mapping_callable(self):
-        """value_mapping can be a callable."""
-        spec = FilterSpec(value_mapping=str.upper)
-        assert spec.value_mapping == str.upper
-
-    def test_combined_options(self):
-        """All options can be set together."""
-        spec = FilterSpec(
-            source_col="col",
-            lookback=timedelta(days=5),
-            lookahead=timedelta(days=3),
-            value_mapping={"x": "y"},
-        )
-        assert spec.source_col == "col"
-        assert spec.lookback == timedelta(days=5)
-        assert spec.lookahead == timedelta(days=3)
-        assert spec.value_mapping == {"x": "y"}
+def make_date(day: int, month: int = 1, year: int = 2024) -> date:
+    return date(year, month, day)
 
 
-class TestApplyValueMapping:
-    """Test the _apply_value_mapping helper function."""
-
-    def test_none_mapping(self):
-        """None mapping returns values unchanged with empty unmapped set."""
-        values = {"a", "b", "c"}
-        mapped, unmapped = _apply_value_mapping(values, None)
-        assert mapped == values
-        assert unmapped == set()
-
-    def test_dict_mapping_all_keys_present(self):
-        """Dict mapping transforms all values when all keys are present."""
-        values = {"k1", "k2"}
-        mapping = {"k1": "v1", "k2": "v2"}
-        mapped, unmapped = _apply_value_mapping(values, mapping)
-        assert mapped == {"v1", "v2"}
-        assert unmapped == set()
-
-    def test_dict_mapping_partial_keys(self):
-        """Dict mapping returns unmapped values separately (not pushed down)."""
-        values = {"k1", "missing"}
-        mapping = {"k1": "v1"}
-        mapped, unmapped = _apply_value_mapping(values, mapping)
-        assert mapped == {"v1"}
-        assert unmapped == {"missing"}
-
-    def test_dict_mapping_no_keys_present(self):
-        """Dict mapping with no matching keys returns all values as unmapped."""
-        values = {"missing1", "missing2"}
-        mapping = {"k1": "v1"}
-        mapped, unmapped = _apply_value_mapping(values, mapping)
-        assert mapped == set()
-        assert unmapped == {"missing1", "missing2"}
-
-    def test_callable_mapping(self):
-        """Callable mapping applies function to each value."""
-        values = {"foo", "bar"}
-        mapped, unmapped = _apply_value_mapping(values, str.upper)
-        assert mapped == {"FOO", "BAR"}
-        assert unmapped == set()
-
-    def test_callable_mapping_custom_function(self):
-        """Custom callable mapping works correctly."""
-        values = {1, 2, 3}
-        mapped, unmapped = _apply_value_mapping(values, lambda x: x * 2)
-        assert mapped == {2, 4, 6}
-        assert unmapped == set()
-
-    def test_empty_values(self):
-        """Empty input returns empty output."""
-        mapped, unmapped = _apply_value_mapping(set(), {"a": "b"})
-        assert mapped == set()
-        assert unmapped == set()
-
-    def test_dict_set_result_is_flattened(self):
-        """A dict value that is a set/frozenset expands to its members (one-to-many)."""
-        mapped, unmapped = _apply_value_mapping({"A"}, {"A": frozenset({"a1", "a2", "a3"})})
-        assert mapped == {"a1", "a2", "a3"}
-        assert unmapped == set()
-
-    def test_callable_set_result_is_flattened(self):
-        """A callable result that is a set expands to its members."""
-        mapped, unmapped = _apply_value_mapping({"A", "B"}, {"A": {"a1", "a2"}, "B": {"b1"}}.get)
-        assert mapped == {"a1", "a2", "b1"}
-        assert unmapped == set()
-
-    def test_empty_set_result_contributes_no_values(self):
-        """A present key mapped to an empty set is mapped (not unmapped) but contributes no source values."""
-        mapped, unmapped = _apply_value_mapping({"Z"}, {"Z": frozenset()})
-        assert mapped == set()
-        assert unmapped == set()
-
-    def test_list_result_stays_a_single_value(self):
-        """Only set/frozenset are set-valued; a list/tuple is a single (e.g. List-dtype) value, not flattened."""
-        assert _map_values({"A"}, {"A": ["x", "y"]}) == ([["x", "y"]], set())
-        assert _map_values({"A"}, {"A": ("x", "y")}) == ([("x", "y")], set())
+def days(n: float) -> timedelta:
+    return timedelta(days=n)
 
 
-class TestGetSourceCol:
-    """Test the _get_source_col helper function."""
-
-    def test_none_source_col_returns_output_col(self):
-        """When source_col is None, returns the output column name."""
-        spec = FilterSpec()
-        assert _get_source_col("date", spec) == "date"
-
-    def test_explicit_source_col(self):
-        """When source_col is set, returns it."""
-        spec = FilterSpec(source_col="DataDate")
-        assert _get_source_col("date", spec) == "DataDate"
+# Specs, values and combine functions -----------------------------------------------------------------------------------
+REGIONS = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC", "LATAM": "LATIN_AMERICA"}
 
 
-class TestComputeOutputSchema:
-    """Test the _compute_output_schema helper function."""
-
-    def test_simple_join_schema(self):
-        """Schema is computed correctly for a simple join."""
-        left = pl.LazyFrame({"a": [1], "b": [2]})
-        right = pl.LazyFrame({"a": [1], "c": [3]})
-        sources = {"left": (left, {}), "right": (right, {})}
-
-        def combine(s):
-            return s["left"].join(s["right"], on="a")
-
-        schema = _compute_output_schema(sources, combine)
-        assert set(schema.keys()) == {"a", "b", "c"}
-
-    def test_with_columns_schema(self):
-        """Schema includes columns added via with_columns."""
-        left = pl.LazyFrame({"a": [1]})
-        sources = {"left": (left, {})}
-
-        def combine(s):
-            return s["left"].with_columns(pl.lit(42).alias("new_col"))
-
-        schema = _compute_output_schema(sources, combine)
-        assert "new_col" in schema
-        assert schema["new_col"] == pl.Int32
-
-    def test_select_schema(self):
-        """Schema reflects column selection."""
-        left = pl.LazyFrame({"a": [1], "b": [2], "c": [3]})
-        sources = {"left": (left, {})}
-
-        def combine(s):
-            return s["left"].select(["a", "b"])
-
-        schema = _compute_output_schema(sources, combine)
-        assert set(schema.keys()) == {"a", "b"}
+def to_codes(*codes: str) -> dict:
+    return {REGIONS[code]: code for code in codes}
 
 
-class TestPushdownCombineBasic:
-    """Test basic pushdown_combine functionality."""
+def region_frame(*codes: str) -> pl.DataFrame:
+    return pl.DataFrame({"region_code": list(codes), "val": list(range(1, len(codes) + 1))})
 
-    def test_no_filters(self):
-        """pushdown_combine works without any filters applied."""
-        left = pl.LazyFrame({"id": [1, 2], "val": [10, 20]})
-        right = pl.LazyFrame({"id": [1, 2], "other": [100, 200]})
 
-        lf = pushdown_combine(
-            sources={
-                "left": (left, {}),
-                "right": (right, {}),
-            },
-            combine=lambda s: s["left"].join(s["right"], on="id"),
-        )
+def identity(s):
+    return s["data"]
 
-        result = lf.collect()
-        expected = pl.DataFrame({"id": [1, 2], "val": [10, 20], "other": [100, 200]})
-        assert_frame_equal(result, expected, check_row_order=False)
 
-    def test_simple_date_filter(self):
-        """Simple date filter propagates to both sources."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        left = pl.LazyFrame({"date": dates, "val": list(range(10))})
-        right = pl.LazyFrame({"date": dates, "other": list(range(10, 20))})
+def regions(s):
+    return s["data"].with_columns(pl.col("region_code").replace(REGIONS).alias("region")).drop("region_code")
 
-        lf = pushdown_combine(
-            sources={
-                "left": (left, {"date": FilterSpec()}),
-                "right": (right, {"date": FilterSpec()}),
-            },
-            combine=lambda s: s["left"].join(s["right"], on="date", maintain_order="left"),
-        )
 
-        result = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-        expected = pl.DataFrame(
+def lag(n: int):
+    return lambda s: s["data"].with_columns(pl.col("val").shift(n).alias(f"lag{n}"))
+
+
+def lead(n: int):
+    return lambda s: s["data"].with_columns(pl.col("val").shift(-n).alias(f"lead{n}"))
+
+
+def join(on, how: str = "inner", **kw):
+    return lambda s: s["left"].join(s["right"], on=on, how=how, **kw)
+
+
+def single_source(df: pl.DataFrame, **specs) -> dict:
+    """One source named ``data``, serving ``df``, with a FilterSpec per column in ``specs``."""
+    return {"data": (df, specs)}
+
+
+def left_and_right_sources(left: pl.DataFrame, right: pl.DataFrame, left_specs: dict, right_specs: dict | None = None) -> dict:
+    """Sources named ``left`` and ``right``; the right one uses ``left_specs`` unless ``right_specs`` is given."""
+    return {"left": (left, left_specs), "right": (right, left_specs if right_specs is None else right_specs)}
+
+
+@dataclass(frozen=True)
+class CombineCase:
+    """Sources, a combine function and the user's filter, and what the result and the sources should be.
+
+    ``sources`` maps a source name to a frame and its FilterSpecs. ``predicate`` may be a list of filters applied in
+    turn to the same combined frame. ``time_bounds``, ``allowed_values`` and ``allowed_values_node`` are keyed by source
+    name, then column.
+    """
+
+    id: str
+    _: KW_ONLY
+    sources: dict
+    combine: Callable
+    predicate: Any = None
+    compare_with_polars: bool = True
+    # defaults to True for the identity combine, which keeps the source's row order
+    check_row_order: bool | None = None
+    # sources that must receive a filter
+    sources_receiving_filter: tuple[str, ...] = ()
+    # (lower, upper) bounds of the date or time filter a source receives on a column, as in ``assert_pushed_time_bounds``
+    time_bounds: dict[str, dict[str, tuple]] = field(default_factory=dict)
+    # the values the first equality or ``is_in`` filter on a column allows
+    allowed_values: dict[str, dict[str, set]] = field(default_factory=dict)
+    # "eq" or "is_in": the form of that filter
+    allowed_values_node: dict[str, dict[str, str]] = field(default_factory=dict)
+    # columns that must receive no equality or ``is_in`` filter
+    columns_without_value_filter: dict[str, set[str]] = field(default_factory=dict)
+    # receives the result and the trackers by source name, and asserts on them
+    result_check: Callable | None = None
+    # applied to the filtered frame and to the reference
+    post_step: Callable | None = None
+    combine_kwargs: dict | None = None
+    sources_as_kwargs: bool = False
+
+
+# Checks on the result and the trackers
+def pushed_text(source: str, has=(), lacks=()):
+    """A result check: the filter ``source`` received, as text, holds every item of ``has`` and none of ``lacks``."""
+
+    def check(_got, trackers):
+        pushed = str(trackers[source].last_predicate)
+        for text in has:
+            assert text in pushed, pushed
+        for text in lacks:
+            assert text not in pushed, pushed
+
+    return check
+
+
+def assert_discrete(tracker: PredicateTracker, col: str, values: set, node: str | None = None) -> None:
+    """The first equality or ``is_in`` filter on ``col`` allows ``values``; ``node`` (``"eq"`` or ``"is_in"``) also
+    checks its form.
+
+    Only the first filter is read: Polars may push a narrower filter of its own for one side of a self-join.
+    """
+    analyzer = tracker.get_analyzer()
+    found = analyzer.find_discrete_filter(col)
+    assert analyzer.extract_discrete_values(found) == values, tracker.last_predicate
+    if node == "eq":
+        assert isinstance(found, BinaryExprNode) and found.op == OperatorType.EQ, found
+    elif node == "is_in":
+        assert isinstance(found, FunctionNode) and found.function_type == BooleanFunctionType.IS_IN, found
+
+
+# Frames
+TEN_DAYS_FROM_ZERO = daily_frame(10, base=0)
+FOURTEEN_DAYS = daily_frame(14)
+TEN_DAYS_OTHER_COLUMN = TEN_DAYS_FROM_ZERO.rename({"val": "other"}).with_columns(pl.col("other") + 10)
+GROUPS = pl.DataFrame({"date": daily_frame(10)["date"], "group": ["A", "B"] * 5, "val": range(10)})
+GROUP_PAIR = (GROUP_FRAME, GROUP_FRAME.rename({"val": "other"}))
+INTRADAY = pl.DataFrame(
+    {"timestamp": [datetime(2024, 1, day, hour) for day in (1, 2, 3) for hour in (10, 14)], "value": [1, 2, 3, 4, 5, 6]},
+)
+FIVE_DAYS = daily_frame(5)
+
+
+def as_date(s):
+    return s["main"].with_columns(pl.col("timestamp").cast(pl.Date).alias("data_date"))
+
+
+def intraday(pred, **spec):
+    return {"sources": {"main": (INTRADAY, {"data_date": FilterSpec(source_col="timestamp", **spec)})}, "combine": as_date, "predicate": pred}
+
+
+def scaled(sources, multiplier):
+    return sources["data"].with_columns((pl.col("val") * multiplier).alias("scaled_val"))
+
+
+def with_mapping(sources, code_to_region):
+    return sources["data"].with_columns(pl.col("code").replace(code_to_region).alias("region"))
+
+
+def multiple_args(sources, multiplier, suffix, constant):
+    return sources["data"].with_columns((pl.col("val") * multiplier).alias(f"scaled_{suffix}"), pl.lit(constant).alias("const_col"))
+
+
+def join_how(sources, join_how):
+    return sources["left"].join(sources["right"], on="key", how=join_how)
+
+
+def primary_with_reference(sources, category_to_code):
+    primary = sources["primary"].with_columns(pl.col("category").replace(category_to_code).alias("category_code"))
+    return primary.join(sources["reference"], on=["date", "category_code"], how="left")
+
+
+def keyword_sources_join(left, right):
+    return left.join(right, on="date")
+
+
+def keyword_sources_scaled(data, multiplier, suffix):
+    return data.with_columns((pl.col("val") * multiplier).alias(f"scaled_{suffix}"))
+
+
+def keyword_sources_lag(data):
+    return data.with_columns(pl.col("val").shift(3).alias("lag3"))
+
+
+def keyword_sources_three(prices, volumes, metadata):
+    return prices.join(volumes, on="date").join(metadata, on="date")
+
+
+def keyword_sources_regions(data):
+    return regions({"data": data})
+
+
+def keyword_sources_primary_with_reference(primary, reference, category_mapping):
+    return primary_with_reference({"primary": primary, "reference": reference}, category_mapping)
+
+
+KEY_LEFT = pl.DataFrame({"date": FIVE_DAYS["date"], "key": ["A", "B", "C", "D", "E"], "left_val": [1, 2, 3, 4, 5]})
+KEY_RIGHT = pl.DataFrame({"key": ["A", "C", "E"], "right_val": [100, 300, 500]})
+PRIMARY = pl.DataFrame({"date": FIVE_DAYS["date"], "category": ["CATEGORY_A"] * 5, "item_id": range(5)})
+REFERENCE = pl.DataFrame({"date": FIVE_DAYS["date"], "category_code": ["A"] * 5, "value": [0.05 + i * 0.001 for i in range(5)]})
+CATEGORY_TO_CODE = {"CATEGORY_A": "A", "CATEGORY_B": "B"}
+PRIMARY_REFERENCE = {
+    "primary": (PRIMARY, {"date": FilterSpec(), "category": FilterSpec()}),
+    "reference": (
+        REFERENCE,
+        {"date": FilterSpec(lookback=days(2)), "category": FilterSpec(source_col="category_code", value_mapping=CATEGORY_TO_CODE)},
+    ),
+}
+
+
+def three_way(s):
+    primary = s["primary"].join(s["mapping"], on="category", how="left")
+    return primary.join(s["reference"], on=["date", "category_code"], how="left")
+
+
+THREE_WAY = {
+    "primary": (
+        pl.DataFrame({"date": daily_frame(10)["date"], "category": ["CAT_A"] * 10, "item_id": range(10)}),
+        {"date": FilterSpec(), "category": FilterSpec()},
+    ),
+    "reference": (
+        pl.DataFrame(
             {
-                "date": [date(2024, 1, i) for i in range(5, 11)],
-                "val": [4, 5, 6, 7, 8, 9],
-                "other": [14, 15, 16, 17, 18, 19],
-            }
-        )
-        # With maintain_order="left", row order should be preserved
-        assert_frame_equal(result, expected)
-
-    def test_dt_date_filter_prunes_datetime_source(self):
-        """A ``.dt.date()`` window on a Datetime source prunes upstream (no full scan) and stays correct.
-
-        ``.dt.date()`` floors to day granularity (order-preserving, like ``cast(pl.Date)``), so the temporal range
-        must still be extracted and pushed down rather than collapsing to the universe interval.
-        """
-        ts = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(90)]
-        df = pl.DataFrame({"ts": ts, "val": list(range(90))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"ts": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        start, end = date(2024, 1, 1), date(2024, 1, 31)
-        result = lf.filter((pl.col("ts").dt.date() >= start) & (pl.col("ts").dt.date() <= end)).collect()
-
-        # Range was extracted, so the source received a constraining predicate (not a silent full scan).
-        assert tracker.last_predicate is not None
-        assert result.height == 31
-        assert result["ts"].max() == datetime(2024, 1, 31)
-
-    def test_simple_equality_filter(self):
-        """Equality filter propagates correctly."""
-        left = pl.LazyFrame({"id": ["A", "B", "C"], "val": [1, 2, 3]})
-        right = pl.LazyFrame({"id": ["A", "B", "C"], "other": [10, 20, 30]})
-
-        lf = pushdown_combine(
-            sources={
-                "left": (left, {"id": FilterSpec()}),
-                "right": (right, {"id": FilterSpec()}),
-            },
-            combine=lambda s: s["left"].join(s["right"], on="id"),
-        )
-
-        result = lf.filter(pl.col("id") == "B").collect()
-        expected = pl.DataFrame({"id": ["B"], "val": [2], "other": [20]})
-        assert_frame_equal(result, expected)
-
-    def test_is_in_filter(self):
-        """is_in filter propagates correctly."""
-        left = pl.LazyFrame({"id": ["A", "B", "C", "D"], "val": [1, 2, 3, 4]})
-        right = pl.LazyFrame({"id": ["A", "B", "C", "D"], "other": [10, 20, 30, 40]})
-
-        lf = pushdown_combine(
-            sources={
-                "left": (left, {"id": FilterSpec()}),
-                "right": (right, {"id": FilterSpec()}),
-            },
-            combine=lambda s: s["left"].join(s["right"], on="id"),
-        )
-
-        result = lf.filter(pl.col("id").is_in(["A", "C"])).collect()
-        expected = pl.DataFrame({"id": ["A", "C"], "val": [1, 3], "other": [10, 30]})
-        assert_frame_equal(result, expected, check_row_order=False)
-
-    def test_non_temporal_filter_does_not_attempt_datetime_range(self, caplog):
-        """A filter on a non-temporal (string) column is pushed without probing it for a datetime range.
-
-        A datetime-range extraction on a string column can never yield a bound and only makes the range
-        visitor try (and fail) to parse string literals as datetimes, which it logs. The datetime-range
-        extraction must be skipped for non-temporal columns, so no such log is emitted, while the discrete
-        filter is still pushed down.
-        """
-        left = pl.LazyFrame({"id": ["A", "B", "C"], "val": [1, 2, 3]})
-        right = pl.LazyFrame({"id": ["A", "B", "C"], "other": [10, 20, 30]})
-
-        lf = pushdown_combine(
-            sources={
-                "left": (left, {"id": FilterSpec()}),
-                "right": (right, {"id": FilterSpec()}),
-            },
-            combine=lambda s: s["left"].join(s["right"], on="id"),
-        )
-
-        with caplog.at_level(logging.INFO, logger="polars_io_tools.io_sources.range_visitor"):
-            result = lf.filter(pl.col("id") == "B").collect()
-
-        range_visitor_logs = [r for r in caplog.records if r.name == "polars_io_tools.io_sources.range_visitor"]
-        assert range_visitor_logs == [], f"range visitor should not run on a non-temporal column, got: {[r.getMessage() for r in range_visitor_logs]}"
-
-        # The discrete filter is still pushed down and the result is correct.
-        expected = pl.DataFrame({"id": ["B"], "val": [2], "other": [20]})
-        assert_frame_equal(result, expected, check_row_order=False)
-
-
-class TestPushdownCombineLookback:
-    """Test lookback functionality in pushdown_combine."""
-
-    def test_lookback_with_date_equality(self):
-        """Lookback works correctly with date equality filter (date == specific_date)."""
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        values = list(range(1, 15))
-
-        df = pl.DataFrame({"date": dates, "val": values})
-        tracker = PredicateTracker(df)
-
-        # Combine function that computes a lagged value (needs lookback)
-        def combine_with_lag(s):
-            return s["data"].with_columns(pl.col("val").shift(3).alias("val_lag3"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
-            combine=combine_with_lag,
-        )
-
-        # Filter for exactly Jan 5
-        result = lf.filter(pl.col("date") == date(2024, 1, 5)).collect()
-
-        # The lagged value should be available (val on Jan 5 is 5, lag3 should be 2 from Jan 2)
-        expected = pl.DataFrame({"date": [date(2024, 1, 5)], "val": [5], "val_lag3": [2]})
-        assert_frame_equal(result, expected)
-
-    def test_lookahead_with_date_equality(self):
-        """Lookahead works correctly with date equality filter (date == specific_date)."""
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        values = list(range(1, 15))
-
-        df = pl.DataFrame({"date": dates, "val": values})
-        tracker = PredicateTracker(df)
-
-        # Combine function that computes a lead value (needs lookahead)
-        def combine_with_lead(s):
-            return s["data"].with_columns(pl.col("val").shift(-3).alias("val_lead3"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookahead=timedelta(days=4))})},
-            combine=combine_with_lead,
-        )
-
-        # Filter for exactly Jan 5
-        result = lf.filter(pl.col("date") == date(2024, 1, 5)).collect()
-
-        # The lead value should be available (val on Jan 5 is 5, lead3 should be 8 from Jan 8)
-        expected = pl.DataFrame({"date": [date(2024, 1, 5)], "val": [5], "val_lead3": [8]})
-        assert_frame_equal(result, expected)
-
-    def test_lookback_and_lookahead_with_date_equality(self):
-        """Combined lookback and lookahead work correctly with date equality filter."""
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        values = list(range(1, 15))
-
-        df = pl.DataFrame({"date": dates, "val": values})
-        tracker = PredicateTracker(df)
-
-        # Combine function that computes both lag and lead
-        def combine_with_lag_and_lead(s):
-            return s["data"].with_columns(
-                pl.col("val").shift(2).alias("val_lag2"),
-                pl.col("val").shift(-2).alias("val_lead2"),
-            )
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"date": FilterSpec(lookback=timedelta(days=3), lookahead=timedelta(days=3))},
-                )
-            },
-            combine=combine_with_lag_and_lead,
-        )
-
-        # Filter for exactly Jan 7
-        result = lf.filter(pl.col("date") == date(2024, 1, 7)).collect()
-
-        # Both lag and lead should be available
-        expected = pl.DataFrame({"date": [date(2024, 1, 7)], "val": [7], "val_lag2": [5], "val_lead2": [9]})
-        assert_frame_equal(result, expected)
-
-    def test_lookback_expands_date_range(self):
-        """Lookback expands the date range for the source."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        values = list(range(100, 110))
-
-        df = pl.DataFrame({"date": dates, "val": values})
-        left_tracker = PredicateTracker(df)
-
-        right = pl.LazyFrame({"date": dates, "other": list(range(10))})
-
-        lf = pushdown_combine(
-            sources={
-                "left": (left_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))}),
-                "right": (right, {"date": FilterSpec()}),
-            },
-            combine=lambda s: s["left"].join(s["right"], on="date", maintain_order="left"),
-        )
-
-        # Filter for date >= Jan 5, but left source should get date >= Jan 2 (3 days lookback)
-        result = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-
-        # The final result should respect the original filter
-        expected = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(5, 11)],
-                "val": [104, 105, 106, 107, 108, 109],
-                "other": [4, 5, 6, 7, 8, 9],
-            }
-        )
-        # With maintain_order="left", row order should be preserved
-        assert_frame_equal(result, expected)
-
-        # The left source should have received an expanded filter
-        pushed_predicate = left_tracker.last_predicate
-        assert pushed_predicate is not None
-
-    def test_lookback_for_rolling_computation(self):
-        """Lookback enables correct rolling computations."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        values = [float(i) for i in range(1, 11)]
-
-        data = pl.LazyFrame({"date": dates, "val": values})
-
-        def combine_with_rolling(s: dict[str, pl.LazyFrame]) -> pl.LazyFrame:
-            return s["data"].sort("date").with_columns(pl.col("val").rolling_sum(window_size=3, min_samples=1).alias("rolling_sum"))
-
-        lf = pushdown_combine(
-            sources={
-                "data": (data, {"date": FilterSpec(lookback=timedelta(days=3))}),
-            },
-            combine=combine_with_rolling,
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-
-        expected = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(5, 11)],
-                "val": [float(i) for i in range(5, 11)],
-                "rolling_sum": [12.0, 15.0, 18.0, 21.0, 24.0, 27.0],
-            }
-        )
-        assert_frame_equal(result, expected)
-
-
-class TestPushdownCombineLookahead:
-    """Test lookahead functionality in pushdown_combine."""
-
-    def test_lookahead_expands_date_range(self):
-        """Lookahead expands the upper date range for the source."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        values = list(range(100, 110))
-
-        df = pl.DataFrame({"date": dates, "val": values})
-        left_tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "left": (left_tracker.lazy_frame, {"date": FilterSpec(lookahead=timedelta(days=2))}),
-            },
-            combine=lambda s: s["left"],
-        )
-
-        # Filter for date <= Jan 5, left source should get date <= Jan 7 (2 days lookahead)
-        result = lf.filter(pl.col("date") <= date(2024, 1, 5)).collect()
-
-        # The final result should respect the original filter
-        expected = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(1, 6)],
-                "val": [100, 101, 102, 103, 104],
-            }
-        )
-        assert_frame_equal(result, expected)
-
-    def test_combined_lookback_lookahead(self):
-        """Lookback and lookahead can be used together."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        values = list(range(100, 110))
-
-        df = pl.DataFrame({"date": dates, "val": values})
-        left_tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "left": (
-                    left_tracker.lazy_frame,
-                    {"date": FilterSpec(lookback=timedelta(days=2), lookahead=timedelta(days=2))},
-                ),
-            },
-            combine=lambda s: s["left"],
-        )
-
-        # Filter for date between Jan 4 and Jan 7
-        # Source should get Jan 2 to Jan 9
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 4), date(2024, 1, 7))).collect()
-
-        # Final result respects original filter
-        expected = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(4, 8)],
-                "val": [103, 104, 105, 106],
-            }
-        )
-        assert_frame_equal(result, expected)
-
-
-class TestPushdownCombineValueMapping:
-    """Test value mapping functionality in pushdown_combine."""
-
-    def test_dict_value_mapping(self):
-        """Dict value mapping transforms filter values."""
-        # Source uses "region_code" with values like "NA"
-        # Output uses "region" with values like "NORTH_AMERICA"
-        # The combine function must map the source values back to output values
-        source_df = pl.DataFrame(
-            {
-                "date": [date(2024, 1, 1), date(2024, 1, 1)],
-                "region_code": ["NA", "EU"],
-                "val": [100, 200],
-            }
-        )
-        tracker = PredicateTracker(source_df)
-
-        REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE"}  # Reverse mapping for combine
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {
-                        "region": FilterSpec(source_col="region_code", value_mapping=REGION_TO_CODE),
-                    },
-                ),
-            },
-            # The combine function maps region_code back to region
-            combine=lambda s: s["data"].with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code"),
-        )
-
-        result = lf.filter(pl.col("region") == "NORTH_AMERICA").collect()
-        expected = pl.DataFrame({"date": [date(2024, 1, 1)], "val": [100], "region": ["NORTH_AMERICA"]})
-        assert_frame_equal(result, expected)
-
-    def test_callable_value_mapping(self):
-        """Callable value mapping transforms filter values."""
-        source_df = pl.DataFrame(
-            {
-                "name": ["foo", "bar", "baz"],
-                "val": [1, 2, 3],
-            }
-        )
-        tracker = PredicateTracker(source_df)
-
-        # Output uses uppercase names, source uses lowercase
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"name": FilterSpec(value_mapping=str.lower)},
-                ),
-            },
-            combine=lambda s: s["data"].with_columns(pl.col("name").str.to_uppercase().alias("name")),
-        )
-
-        # Filter for uppercase "FOO" should become lowercase "foo" for source
-        result = lf.filter(pl.col("name") == "FOO").collect()
-        expected = pl.DataFrame({"name": ["FOO"], "val": [1]})
-        assert_frame_equal(result, expected)
-
-    def test_is_in_with_value_mapping(self):
-        """Value mapping works with is_in filters."""
-        source_df = pl.DataFrame(
-            {
-                "region_code": ["NA", "EU", "APAC"],
-                "val": [1, 2, 3],
-            }
-        )
-        tracker = PredicateTracker(source_df)
-
-        REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU", "ASIA_PACIFIC": "APAC"}
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC"}
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"region": FilterSpec(source_col="region_code", value_mapping=REGION_TO_CODE)},
-                ),
-            },
-            # Map region_code back to region for the output
-            combine=lambda s: s["data"].with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code"),
-        )
-
-        result = lf.filter(pl.col("region").is_in(["NORTH_AMERICA", "ASIA_PACIFIC"])).collect()
-        expected = pl.DataFrame({"val": [1, 3], "region": ["NORTH_AMERICA", "ASIA_PACIFIC"]})
-        assert_frame_equal(result, expected, check_row_order=False)
-
-    def test_unmapped_value_not_pushed_down(self):
-        """Values not in the mapping dict are NOT pushed down to avoid incorrect filtering.
-
-        This tests the safe behavior: if a user filters on a value that's not in the
-        value_mapping dict, we don't push that filter down. Instead, we let the
-        combine() run on unfiltered data and the final predicate handles the filtering.
-        """
-        # Source uses region codes; we only have partial mapping
-        source_df = pl.DataFrame(
-            {
-                "region_code": ["NA", "EU", "APAC", "LATAM"],
-                "val": [1, 2, 3, 4],
-            }
-        )
-        tracker = PredicateTracker(source_df)
-
-        # Partial mapping - LATAM is not included
-        REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC", "LATAM": "LATIN_AMERICA"}
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"region": FilterSpec(source_col="region_code", value_mapping=REGION_TO_CODE)},
-                ),
-            },
-            # combine() creates region column from region_code
-            combine=lambda s: s["data"].with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code"),
-        )
-
-        # Filter for "LATIN_AMERICA" which is NOT in the value_mapping
-        # The old (buggy) behavior would push down region_code == "LATIN_AMERICA" which would
-        # return no rows. The new (safe) behavior doesn't push down the filter.
-        result = lf.filter(pl.col("region") == "LATIN_AMERICA").collect()
-
-        # Should get the LATAM row because the filter is applied AFTER combine()
-        expected = pl.DataFrame({"val": [4], "region": ["LATIN_AMERICA"]})
-        assert_frame_equal(result, expected)
-
-    def test_mixed_mapped_and_unmapped_values_in_is_in(self):
-        """When is_in includes both mapped and unmapped values, only mapped values are pushed."""
-        source_df = pl.DataFrame(
-            {
-                "region_code": ["NA", "EU", "APAC", "LATAM"],
-                "val": [1, 2, 3, 4],
-            }
-        )
-        tracker = PredicateTracker(source_df)
-
-        # Partial mapping - only NA and EU are mapped
-        REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC", "LATAM": "LATIN_AMERICA"}
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"region": FilterSpec(source_col="region_code", value_mapping=REGION_TO_CODE)},
-                ),
-            },
-            combine=lambda s: s["data"].with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code"),
-        )
-
-        # Filter for both mapped (NORTH_AMERICA) and unmapped (LATIN_AMERICA) values
-        # Only NORTH_AMERICA->NA should be pushed down
-        # LATIN_AMERICA is unmapped, so no filter for it is pushed
-        result = lf.filter(pl.col("region").is_in(["NORTH_AMERICA", "LATIN_AMERICA"])).collect()
-
-        # Should get both rows
-        expected = pl.DataFrame({"val": [1, 4], "region": ["NORTH_AMERICA", "LATIN_AMERICA"]})
-        assert_frame_equal(result, expected, check_row_order=False)
-
-
-class TestPushdownCombineColumnRemapping:
-    """Test source column name remapping."""
-
-    def test_different_source_column_name(self):
-        """Source can use different column name than output."""
-        source_df = pl.DataFrame(
-            {
-                "DataDate": [date(2024, 1, 1), date(2024, 1, 2)],
-                "val": [100, 200],
-            }
-        )
-        tracker = PredicateTracker(source_df)
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"date": FilterSpec(source_col="DataDate")},
-                ),
-            },
-            combine=lambda s: s["data"].rename({"DataDate": "date"}),
-        )
-
-        result = lf.filter(pl.col("date") == date(2024, 1, 1)).collect()
-        expected = pl.DataFrame({"date": [date(2024, 1, 1)], "val": [100]})
-        assert_frame_equal(result, expected)
-
-
-class TestPushdownCombineMultipleSources:
-    """Test pushdown_combine with multiple sources having different specs."""
-
-    def test_different_lookback_per_source(self):
-        """Different sources can have different lookback values."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-
-        df1 = pl.DataFrame({"date": dates, "val1": list(range(10))})
-        df2 = pl.DataFrame({"date": dates, "val2": list(range(10, 20))})
-
-        source1_tracker = PredicateTracker(df1)
-        source2_tracker = PredicateTracker(df2)
-
-        lf = pushdown_combine(
-            sources={
-                "source1": (source1_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=5))}),
-                "source2": (source2_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=2))}),
-            },
-            combine=lambda s: s["source1"].join(s["source2"], on="date", maintain_order="right"),
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 7)).collect()
-
-        # Final result respects original filter, ordered by right (source2)
-        expected = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(7, 11)],
-                "val1": [6, 7, 8, 9],
-                "val2": [16, 17, 18, 19],
-            }
-        )
-        # With maintain_order="right", row order should follow source2
-        assert_frame_equal(result, expected)
-
-    def test_mixed_filter_types_per_source(self):
-        """Different sources can specify specs for different columns."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-
-        df1 = pl.DataFrame(
-            {
-                "date": dates,
-                "group": ["A", "B", "A", "B", "A"],
-                "val1": [1, 2, 3, 4, 5],
-            }
-        )
-        df2 = pl.DataFrame(
-            {
-                "date": dates,
-                "group": ["A", "B", "A", "B", "A"],  # Same values as source1
-                "val2": [10, 20, 30, 40, 50],
-            }
-        )
-
-        source1_tracker = PredicateTracker(df1)
-        source2_tracker = PredicateTracker(df2)
-
-        lf = pushdown_combine(
-            sources={
-                "source1": (
-                    source1_tracker.lazy_frame,
-                    {
-                        "date": FilterSpec(lookback=timedelta(days=2)),
-                        "group": FilterSpec(),
-                    },
-                ),
-                "source2": (
-                    source2_tracker.lazy_frame,
-                    {
-                        "date": FilterSpec(),
-                        "group": FilterSpec(),
-                    },
-                ),
-            },
-            combine=lambda s: s["source1"].join(
-                s["source2"],
-                on=["date", "group"],
-                maintain_order="left",
-            ),
-        )
-
-        result = lf.filter((pl.col("date") >= date(2024, 1, 3)) & (pl.col("group") == "A")).collect()
-
-        expected = pl.DataFrame(
-            {
-                "date": [date(2024, 1, 3), date(2024, 1, 5)],
-                "group": ["A", "A"],
-                "val1": [3, 5],
-                "val2": [30, 50],
-            }
-        )
-        # With maintain_order="left", row order follows source1
-        assert_frame_equal(result, expected)
-
-
-class TestPushdownCombineEdgeCases:
-    """Test edge cases and error handling."""
-
-    def test_empty_result(self):
-        """pushdown_combine handles filters that result in empty output."""
-        left = pl.LazyFrame({"date": [date(2024, 1, 1)], "val": [1]})
-
-        lf = pushdown_combine(
-            sources={"left": (left, {"date": FilterSpec()})},
-            combine=lambda s: s["left"],
-        )
-
-        # Filter for a date not in the data
-        result = lf.filter(pl.col("date") == date(2024, 12, 31)).collect()
-        assert len(result) == 0
-
-    def test_no_filter_specs(self):
-        """pushdown_combine works when no FilterSpecs are provided."""
-        left = pl.LazyFrame({"id": [1, 2], "val": [10, 20]})
-
-        lf = pushdown_combine(
-            sources={"left": (left, {})},
-            combine=lambda s: s["left"],
-        )
-
-        result = lf.filter(pl.col("id") == 1).collect()
-        assert len(result) == 1
-
-    def test_source_col_not_in_schema(self):
-        """Gracefully handle when source_col doesn't exist in source schema."""
-        left = pl.LazyFrame({"id": [1, 2], "val": [10, 20]})
-
-        lf = pushdown_combine(
-            sources={
-                "left": (
-                    left,
-                    {"nonexistent": FilterSpec(source_col="also_nonexistent")},
-                )
-            },
-            combine=lambda s: s["left"],
-        )
-
-        # Should work without errors, just no filter pushdown for that spec
-        result = lf.collect()
-        assert len(result) == 2
-
-    def test_multiple_filters_combined(self):
-        """Multiple filter conditions work together."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        left = pl.LazyFrame(
-            {
-                "date": dates,
-                "group": ["A", "B"] * 5,
-                "val": list(range(10)),
-            }
-        )
-
-        lf = pushdown_combine(
-            sources={
-                "left": (
-                    left,
-                    {
-                        "date": FilterSpec(),
-                        "group": FilterSpec(),
-                    },
-                )
-            },
-            combine=lambda s: s["left"],
-        )
-
-        result = lf.filter((pl.col("date") >= date(2024, 1, 5)) & (pl.col("group") == "A")).collect()
-
-        assert len(result) == 3
-        assert all(r == "A" for r in result["group"].to_list())
-        assert result["date"].min() == date(2024, 1, 5)
-
-    def test_datetime_column(self):
-        """Works with datetime columns, not just date."""
-        datetimes = [datetime(2024, 1, 1, i) for i in range(24)]
-        left = pl.LazyFrame({"ts": datetimes, "val": list(range(24))})
-
-        lf = pushdown_combine(
-            sources={"left": (left, {"ts": FilterSpec(lookback=timedelta(hours=3))})},
-            combine=lambda s: s["left"],
-        )
-
-        result = lf.filter(pl.col("ts") >= datetime(2024, 1, 1, 12)).collect()
-        assert len(result) == 12
-        assert result["ts"].min() == datetime(2024, 1, 1, 12)
-
-    def test_column_selection_with_columns(self):
-        """with_columns parameter is respected."""
-        left = pl.LazyFrame(
-            {
-                "date": [date(2024, 1, 1), date(2024, 1, 2)],
-                "a": [1, 2],
-                "b": [10, 20],
-                "c": [100, 200],
-            }
-        )
-
-        lf = pushdown_combine(
-            sources={"left": (left, {"date": FilterSpec()})},
-            combine=lambda s: s["left"],
-        )
-
-        # Select only specific columns
-        result = lf.select(["date", "a"]).collect()
-        assert set(result.columns) == {"date", "a"}
-
-    def test_row_limit(self):
-        """n_rows limit is respected."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        left = pl.LazyFrame({"date": dates, "val": list(range(10))})
-
-        lf = pushdown_combine(
-            sources={"left": (left, {"date": FilterSpec()})},
-            combine=lambda s: s["left"],
-        )
-
-        result = lf.head(3).collect()
-        assert len(result) == 3
-
-
-class TestPushdownCombineComplexJoinUseCase:
-    """Test pushdown_combine with a complex multi-source join scenario."""
-
-    def test_pushdown_combine_join_with_mapping_and_lookback(self):
-        """
-        Test a complex join pattern where:
-        - Multiple sources are joined
-        - Some sources need lookback for calculations
-        - Category values need mapping (category -> category_code)
-        """
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-
-        # Primary data: uses "category" directly
-        primary_data = pl.LazyFrame(
-            {
-                "date": dates,
-                "category": ["CAT_A"] * 10,
-                "item_id": list(range(10)),
-            }
-        )
-
-        # Reference data: uses "category_code", needs 4-day lookback
-        # Create dates from Dec 27 through Jan 14
-        ref_dates = [date(2023, 12, 27) + timedelta(days=i) for i in range(19)]
-        reference_data = pl.LazyFrame(
-            {
-                "date": ref_dates,
+                "date": daily_frame(19, start=make_date(27, 12, 2023))["date"],
                 "category_code": ["A"] * 19,
                 "value": [0.05 + i * 0.001 for i in range(19)],
             }
-        )
+        ),
+        {"date": FilterSpec(lookback=days(4)), "category": FilterSpec(source_col="category_code", value_mapping={"CAT_A": "A", "CAT_B": "B"})},
+    ),
+    "mapping": (pl.DataFrame({"category": ["CAT_A", "CAT_B"], "category_code": ["A", "B"]}), {"category": FilterSpec()}),
+}
 
-        # Category mapping table
-        category_mapping = pl.LazyFrame(
-            {
-                "category": ["CAT_A", "CAT_B"],
-                "category_code": ["A", "B"],
-            }
-        )
 
-        CATEGORY_TO_CODE = {"CAT_A": "A", "CAT_B": "B"}
+# IntervalFilterSpec: a schedule of [start, end] windows joined to a spine that carries the requested ``date``.
+def schedule(starts, ends, vals=None, roots=None) -> pl.DataFrame:
+    return pl.DataFrame({"root": roots or ["A"] * len(starts), "start": starts, "end": ends, "val": vals or list(range(1, len(starts) + 1))})
 
-        def combine(s: dict[str, pl.LazyFrame]) -> pl.LazyFrame:
-            # Join primary_data with category_mapping
-            df_primary = s["primary"].join(s["mapping"], on="category", how="left")
 
-            # Join with reference data
-            df = df_primary.join(s["reference"], on=["date", "category_code"], how="left")
+def spine(*dates, roots=None) -> pl.DataFrame:
+    return pl.DataFrame({"root": roots or ["A"] * len(dates), "date": list(dates)})
 
-            return df
 
-        lf = pushdown_combine(
-            sources={
-                "primary": (
-                    primary_data,
-                    {
-                        "date": FilterSpec(),
-                        "category": FilterSpec(),
-                    },
-                ),
-                "reference": (
-                    reference_data,
-                    {
-                        "date": FilterSpec(lookback=timedelta(days=4)),
-                        "category": FilterSpec(source_col="category_code", value_mapping=CATEGORY_TO_CODE),
-                    },
-                ),
-                "mapping": (
-                    category_mapping,
-                    {
-                        "category": FilterSpec(),
-                    },
-                ),
-            },
-            combine=combine,
-        )
+def windows(sched, spine_df, **spec):
+    return {"sched": (sched, {"date": IntervalFilterSpec(start_col="start", end_col="end", **spec)}), "spine": (spine_df, {"date": FilterSpec()})}
 
-        # Filter for a specific date range and category
-        result = lf.filter((pl.col("date").is_between(date(2024, 1, 5), date(2024, 1, 7))) & (pl.col("category") == "CAT_A")).collect()
 
-        assert len(result) == 3
-        assert result["date"].min() == date(2024, 1, 5)
-        assert result["date"].max() == date(2024, 1, 7)
-        assert result["category"].to_list() == ["CAT_A"] * 3
-        # Reference values should be joined correctly
-        assert "value" in result.columns
-        assert all(r is not None for r in result["value"].to_list())
+IN_WINDOW = (pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end"))
 
 
-class TestFilterPushdownVerification:
-    """Tests that verify filters are actually being pushed down to sources with correct structure."""
-
-    def test_date_gte_filter_structure(self):
-        """Verify date >= filter is pushed with correct structure."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        df = pl.DataFrame({"date": dates, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-
-        # Verify result is correct
-        assert len(result) == 6
-        assert result["date"].min() == date(2024, 1, 5)
-
-        # Verify predicate structure - find the temporal filter on 'date'
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        analyzer = PredicateAnalyzer(pushed)
-        temporal_filter = analyzer.find_temporal_filter("date")
-        assert temporal_filter is not None, "Should find a temporal filter on 'date'"
-
-        lower, _upper = analyzer.extract_temporal_bounds(temporal_filter)
-        assert lower == date(2024, 1, 5), f"Lower bound should be Jan 5, got {lower}"
-
-    def test_date_between_filter_structure(self):
-        """Verify date is_between filter is pushed with correct structure."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        df = pl.DataFrame({"date": dates, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 3), date(2024, 1, 7))).collect()
-
-        # Verify result is correct
-        assert len(result) == 5
-        assert result["date"].min() == date(2024, 1, 3)
-        assert result["date"].max() == date(2024, 1, 7)
-
-        # Verify predicate structure
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        analyzer = PredicateAnalyzer(pushed)
-        temporal_filter = analyzer.find_temporal_filter("date")
-        assert temporal_filter is not None
-
-        lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
-        assert lower == date(2024, 1, 3)
-        assert upper == date(2024, 1, 7)
-
-    def test_lookback_expands_date_range_correctly(self):
-        """Verify lookback correctly expands the pushed date range."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        df = pl.DataFrame({"date": dates, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=3))})},
-            combine=lambda s: s["data"],
-        )
-
-        # Filter for >= Jan 5, but source should get >= Jan 2 (3-day lookback)
-        result = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-
-        # Final result respects original filter
-        assert len(result) == 6
-        assert result["date"].min() == date(2024, 1, 5)
-
-        # Verify the pushed predicate has expanded range
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        # Find the temporal filter - should have lookback applied
-        analyzer = PredicateAnalyzer(pushed)
-        temporal_filter = analyzer.find_temporal_filter("date")
-        assert temporal_filter is not None
-
-        lower, _upper = analyzer.extract_temporal_bounds(temporal_filter)
-        # The pushed value should be Jan 2 (3-day lookback from Jan 5)
-        assert lower == date(2024, 1, 2), f"Expected Jan 2 (with lookback), got {lower}"
-
-    def test_lookback_with_between_allows_rolling_computation(self):
-        """Verify lookback allows accessing historical data for rolling computations."""
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        # Values: 1, 2, 3, ... 14
-        df = pl.DataFrame({"date": dates, "val": list(range(1, 15))})
-        tracker = PredicateTracker(df)
-
-        # Combine function that computes a lagged value (needs lookback)
-        def combine_with_lag(s):
-            # Add a column that shows the value from 3 days ago
-            return s["data"].with_columns(pl.col("val").shift(3).alias("val_lag3"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
-            combine=combine_with_lag,
-        )
-
-        # Filter for between Jan 5 and Jan 10
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 5), date(2024, 1, 10))).collect()
-
-        # Final result respects original filter
-        assert len(result) == 6
-        assert result["date"].min() == date(2024, 1, 5)
-        assert result["date"].max() == date(2024, 1, 10)
-
-        # Verify the lagged value is available (requires lookback to work)
-        # On Jan 5 (val=5), val_lag3 should be 2 (from Jan 2)
-        jan5_row = result.filter(pl.col("date") == date(2024, 1, 5))
-        assert jan5_row["val_lag3"][0] == 2, "Lookback should make historical data available for lag"
-
-        # On Jan 10 (val=10), val_lag3 should be 7 (from Jan 7)
-        jan10_row = result.filter(pl.col("date") == date(2024, 1, 10))
-        assert jan10_row["val_lag3"][0] == 7
-
-    def test_lookback_with_is_between_and_complex_combine(self):
-        """Verify lookback expands is_between bounds when combine uses historical data.
-
-        This test documents an important behavior: Polars' query optimizer may combine
-        filters when the combine function is simple (e.g., identity). When this happens,
-        only the tighter filter (the original) is pushed to the source.
-
-        However, when the combine function contains operations that prevent filter
-        pushdown optimization (like .shift(), .rolling(), etc.), the expanded filter
-        IS pushed to the source, allowing lookback/lookahead to work correctly.
-
-        This is correct behavior - if the combine function doesn't use the extra rows
-        fetched by lookback, there's no point in fetching them.
-        """
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        df = pl.DataFrame({"date": dates, "val": list(range(1, 15))})
-        tracker = PredicateTracker(df)
-
-        # Combine function with shift - prevents Polars from optimizing through it
-        def combine_with_lag(s):
-            return s["data"].with_columns(pl.col("val").shift(3).alias("val_lag3"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
-            combine=combine_with_lag,
-        )
-
-        # Filter with is_between - lookback should expand the lower bound
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 5), date(2024, 1, 10))).collect()
-
-        # Verify result is correct
-        assert len(result) == 6
-        assert result["date"].min() == date(2024, 1, 5)
-        assert result["date"].max() == date(2024, 1, 10)
-
-        # Verify lag values are correct (proves lookback worked)
-        jan5_row = result.filter(pl.col("date") == date(2024, 1, 5))
-        assert jan5_row["val_lag3"][0] == 2, "Jan 5 lag should be 2 (from Jan 2)"
-
-        # Verify the pushed predicate has expanded bounds
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        analyzer = PredicateAnalyzer(pushed)
-        temporal_filter = analyzer.find_temporal_filter("date")
-        assert temporal_filter is not None
-
-        lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
-        # Lower should be Jan 1 (4-day lookback from Jan 5)
-        assert lower == date(2024, 1, 1), f"Expected Jan 1 (with lookback), got {lower}"
-        # Upper should remain Jan 10 (no lookahead)
-        assert upper == date(2024, 1, 10), f"Expected Jan 10, got {upper}"
-
-    def test_lookback_optimization_with_identity_combine(self):
-        """Document that Polars may optimize away lookback when combine is identity.
-
-        When the combine function is simple (like identity: lambda s: s["data"]),
-        Polars' query optimizer can see that the expanded filter and final filter
-        can be combined. In this case, only the tighter filter is pushed to the source.
-
-        This is NOT a bug - it's correct optimization behavior. The lookback is only
-        useful when the combine function actually uses historical data.
-        """
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        df = pl.DataFrame({"date": dates, "val": list(range(1, 15))})
-        tracker = PredicateTracker(df)
-
-        # Identity combine - Polars can optimize through this
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 5), date(2024, 1, 10))).collect()
-
-        # Result is still correct
-        assert len(result) == 6
-        assert result["date"].min() == date(2024, 1, 5)
-
-        # The pushed predicate may be the original (tighter) filter due to optimization
-        # This is expected behavior - Polars optimizes redundant lookback fetches
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        analyzer = PredicateAnalyzer(pushed)
-        temporal_filter = analyzer.find_temporal_filter("date")
-        assert temporal_filter is not None
-
-        lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
-        # Note: Due to Polars optimization, lower may be Jan 5 (original) not Jan 1 (expanded)
-        # Both are valid - the key is that results are correct
-        assert lower in (date(2024, 1, 1), date(2024, 1, 5)), f"Lower should be Jan 1 or Jan 5, got {lower}"
-        assert upper == date(2024, 1, 10)
-
-    def test_lookahead_expands_upper_bound(self):
-        """Verify lookahead expands upper bound of filter."""
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        df = pl.DataFrame({"date": dates, "val": list(range(14))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookahead=timedelta(days=3))})},
-            combine=lambda s: s["data"],
-        )
-
-        # Filter for <= Jan 7, source should get <= Jan 10 (3-day lookahead)
-        result = lf.filter(pl.col("date") <= date(2024, 1, 7)).collect()
-
-        # Final result respects original filter
-        assert len(result) == 7
-        assert result["date"].max() == date(2024, 1, 7)
-
-        # Verify the pushed predicate has expanded upper bound
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        analyzer = PredicateAnalyzer(pushed)
-        temporal_filter = analyzer.find_temporal_filter("date")
-        assert temporal_filter is not None
-
-        _lower, upper = analyzer.extract_temporal_bounds(temporal_filter)
-        # The pushed value should be Jan 10 (3-day lookahead from Jan 7)
-        assert upper == date(2024, 1, 10), f"Expected Jan 10 (with lookahead), got {upper}"
-
-    def test_discrete_equality_filter_structure(self):
-        """Verify discrete equality filter is pushed with correct structure."""
-        df = pl.DataFrame({"group": ["A", "B", "C"], "val": [1, 2, 3]})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"group": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("group") == "B").collect()
-
-        # Verify result
-        assert len(result) == 1
-        assert result["group"][0] == "B"
-
-        # Verify predicate structure
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        # Find the discrete filter on 'group'
-        analyzer = PredicateAnalyzer(pushed)
-        discrete_filter = analyzer.find_discrete_filter("group")
-        assert discrete_filter is not None, "Should find a discrete filter on 'group'"
-        assert isinstance(discrete_filter, BinaryExprNode)
-        assert discrete_filter.op == OperatorType.EQ
-        assert discrete_filter.right.value == "B"
-
-    def test_discrete_is_in_filter_structure(self):
-        """Verify discrete is_in filter is pushed with correct structure."""
-        df = pl.DataFrame({"group": ["A", "B", "C", "D"], "val": [1, 2, 3, 4]})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"group": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("group").is_in(["A", "C"])).collect()
-
-        # Verify result
-        assert len(result) == 2
-        assert set(result["group"].to_list()) == {"A", "C"}
-
-        # Verify predicate structure
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        # Find the discrete filter
-        analyzer = PredicateAnalyzer(pushed)
-        discrete_filter = analyzer.find_discrete_filter("group")
-        assert discrete_filter is not None
-        assert isinstance(discrete_filter, FunctionNode)
-        assert discrete_filter.function_type == BooleanFunctionType.IS_IN
-        assert set(discrete_filter.inputs[1].value) == {"A", "C"}
-
-    def test_value_mapping_transforms_pushed_value(self):
-        """Verify value mapping transforms the value in the pushed filter."""
-        df = pl.DataFrame(
-            {
-                "region_code": ["NA", "EU"],
-                "val": [1, 2],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE"}
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {
-                        "region": FilterSpec(
-                            source_col="region_code",
-                            value_mapping={"NORTH_AMERICA": "NA", "EUROPE": "EU"},
-                        )
-                    },
-                )
-            },
-            combine=lambda s: s["data"].with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code"),
-        )
-
-        result = lf.filter(pl.col("region") == "NORTH_AMERICA").collect()
-
-        # Verify result
-        assert len(result) == 1
-        assert result["region"][0] == "NORTH_AMERICA"
-
-        # Verify the pushed predicate uses the MAPPED value and SOURCE column
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        # Find the discrete filter on 'region_code' (source column)
-        analyzer = PredicateAnalyzer(pushed)
-        discrete_filter = analyzer.find_discrete_filter("region_code")
-        assert discrete_filter is not None, "Should find a filter on 'region_code'"
-        assert isinstance(discrete_filter, BinaryExprNode)
-        assert discrete_filter.op == OperatorType.EQ
-        # Should use mapped value "NA", not original "NORTH_AMERICA"
-        assert discrete_filter.right.value == "NA"
-
-    def test_value_mapping_with_is_in(self):
-        """Verify value mapping works correctly with is_in filters."""
-        df = pl.DataFrame(
-            {
-                "region_code": ["NA", "EU", "APAC"],
-                "val": [1, 2, 3],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE", "APAC": "ASIA_PACIFIC"}
-        REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU", "ASIA_PACIFIC": "APAC"}
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {
-                        "region": FilterSpec(
-                            source_col="region_code",
-                            value_mapping=REGION_TO_CODE,
-                        )
-                    },
-                )
-            },
-            combine=lambda s: s["data"].with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code"),
-        )
-
-        result = lf.filter(pl.col("region").is_in(["NORTH_AMERICA", "ASIA_PACIFIC"])).collect()
-
-        # Verify result
-        assert len(result) == 2
-        assert set(result["region"].to_list()) == {"NORTH_AMERICA", "ASIA_PACIFIC"}
-
-        # Verify the pushed predicate uses mapped values
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        # Find the discrete filter on source column
-        analyzer = PredicateAnalyzer(pushed)
-        discrete_filter = analyzer.find_discrete_filter("region_code")
-        assert discrete_filter is not None
-        assert isinstance(discrete_filter, FunctionNode)
-        assert discrete_filter.function_type == BooleanFunctionType.IS_IN
-        # Values should be mapped: NORTH_AMERICA->NA, ASIA_PACIFIC->APAC
-        assert set(discrete_filter.inputs[1].value) == {"NA", "APAC"}
-
-    def test_column_remapping_in_pushed_filter(self):
-        """Verify column remapping works in pushed filter."""
-        df = pl.DataFrame(
-            {
-                "DataDate": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
-                "val": [1, 2, 3],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"date": FilterSpec(source_col="DataDate")},
-                )
-            },
-            combine=lambda s: s["data"].rename({"DataDate": "date"}),
-        )
-
-        result = lf.filter(pl.col("date") == date(2024, 1, 2)).collect()
-
-        # Verify result
-        assert len(result) == 1
-        assert result["date"][0] == date(2024, 1, 2)
-
-        # Verify the pushed predicate uses source column name 'DataDate'
-        pushed = tracker.last_predicate
-        assert pushed is not None
-
-        # For equality on a date column, it's extracted as a discrete filter (EQ)
-        analyzer = PredicateAnalyzer(pushed)
-        discrete_filter = analyzer.find_discrete_filter("DataDate")
-        assert discrete_filter is not None, "Should find an equality filter on 'DataDate'"
-        assert isinstance(discrete_filter, BinaryExprNode)
-        assert discrete_filter.op == OperatorType.EQ
-        assert discrete_filter.right.value == date(2024, 1, 2)
-
-    def test_multiple_sources_get_different_predicates(self):
-        """Verify different sources receive different predicates based on their specs."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-
-        df1 = pl.DataFrame({"date": dates, "val1": list(range(10))})
-        df2 = pl.DataFrame({"date": dates, "val2": list(range(10, 20))})
-
-        source1_tracker = PredicateTracker(df1)
-        source2_tracker = PredicateTracker(df2)
-
-        lf = pushdown_combine(
-            sources={
-                "source1": (source1_tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=5))}),
-                "source2": (source2_tracker.lazy_frame, {"date": FilterSpec()}),  # No lookback
-            },
-            combine=lambda s: s["source1"].join(s["source2"], on="date"),
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 7)).collect()
-
-        # Verify result
-        assert len(result) == 4
-        assert result["date"].min() == date(2024, 1, 7)
-
-        # Source1 should have lookback (date >= Jan 2)
-        pushed1 = source1_tracker.last_predicate
-        assert pushed1 is not None
-        analyzer1 = PredicateAnalyzer(pushed1)
-        temporal1 = analyzer1.find_temporal_filter("date")
-        assert temporal1 is not None
-        lower1, _ = analyzer1.extract_temporal_bounds(temporal1)
-        assert lower1 == date(2024, 1, 2), f"Source1 should have lookback to Jan 2, got {lower1}"
-
-        # Source2 should have no lookback (date >= Jan 7)
-        pushed2 = source2_tracker.last_predicate
-        assert pushed2 is not None
-        analyzer2 = PredicateAnalyzer(pushed2)
-        temporal2 = analyzer2.find_temporal_filter("date")
-        assert temporal2 is not None
-        lower2, _ = analyzer2.extract_temporal_bounds(temporal2)
-        assert lower2 == date(2024, 1, 7), f"Source2 should have no lookback (Jan 7), got {lower2}"
-
-
-class TestPushdownCombineRobustness:
-    """Additional tests for edge cases and robustness."""
-
-    def test_filter_on_column_without_spec(self):
-        """Filtering on a column without a FilterSpec still works (no pushdown optimization)."""
-        df = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(1, 6)],
-                "unspecified_col": ["A", "B", "C", "D", "E"],
-                "val": [1, 2, 3, 4, 5],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},  # Only date has FilterSpec
-            combine=lambda s: s["data"],
-        )
-
-        # Filter on a column that has no FilterSpec
-        result = lf.filter(pl.col("unspecified_col") == "C").collect()
-
-        # Should still work, just without optimization
-        assert len(result) == 1
-        assert result["val"][0] == 3
-
-    def test_complex_predicate_with_or(self):
-        """Complex predicates with OR are handled correctly."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        df = pl.DataFrame({"date": dates, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        # Complex OR filter
-        result = lf.filter((pl.col("date") == date(2024, 1, 3)) | (pl.col("date") == date(2024, 1, 7))).collect()
-
-        assert len(result) == 2
-        assert set(result["date"].to_list()) == {date(2024, 1, 3), date(2024, 1, 7)}
-
-    def test_nested_filters_with_and(self):
-        """Nested AND filters work correctly."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        groups = ["A", "B"] * 5
-        df = pl.DataFrame({"date": dates, "group": groups, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {
-                        "date": FilterSpec(lookback=timedelta(days=2)),
-                        "group": FilterSpec(),
-                    },
-                )
-            },
-            combine=lambda s: s["data"],
-        )
-
-        # Nested AND filter
-        result = lf.filter((pl.col("date") >= date(2024, 1, 5)) & (pl.col("group") == "A")).collect()
-
-        assert len(result) == 3
-        assert all(m == "A" for m in result["group"].to_list())
-        assert result["date"].min() == date(2024, 1, 5)
-
-    def test_filter_with_null_values(self):
-        """Handles data with null values correctly."""
-        df = pl.DataFrame(
-            {
-                "date": [date(2024, 1, 1), date(2024, 1, 2), None, date(2024, 1, 4)],
-                "val": [1, 2, 3, 4],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 2)).collect()
-
-        # Should filter out the null and dates before Jan 2
-        assert len(result) == 2
-        assert date(2024, 1, 2) in result["date"].to_list()
-        assert date(2024, 1, 4) in result["date"].to_list()
-
-    def test_multiple_collects(self):
-        """LazyFrame can be collected multiple times with different filters."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        df = pl.DataFrame({"date": dates, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        # First collect
-        result1 = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-        assert len(result1) == 6
-
-        # Second collect with different filter
-        result2 = lf.filter(pl.col("date") <= date(2024, 1, 3)).collect()
-        assert len(result2) == 3
-
-        # Both should work correctly
-        assert result1["date"].min() == date(2024, 1, 5)
-        assert result2["date"].max() == date(2024, 1, 3)
-
-    def test_empty_source(self):
-        """Handles empty source data correctly."""
-        df = pl.DataFrame({"date": [], "val": []}, schema={"date": pl.Date, "val": pl.Int64})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 1)).collect()
-        assert len(result) == 0
-
-    def test_very_large_lookback(self):
-        """Large lookback values work correctly."""
-        dates = [date(2024, 1, i) for i in range(1, 11)]
-        df = pl.DataFrame({"date": dates, "val": list(range(10))})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=365))})  # 1 year
-            },
-            combine=lambda s: s["data"],
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 5)).collect()
-
-        # Should still work - lookback expands to before our data
-        assert len(result) == 6
-        assert result["date"].min() == date(2024, 1, 5)
-
-    def test_combine_with_additional_columns(self):
-        """Combine function can add computed columns."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [10, 20, 30, 40, 50]})
-        tracker = PredicateTracker(df)
-
-        def combine_with_computed(s):
-            return s["data"].with_columns(
-                (pl.col("val") * 2).alias("val_doubled"),
-                pl.lit("constant").alias("const_col"),
-            )
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=combine_with_computed,
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 3)).collect()
-
-        assert len(result) == 3
-        assert "val_doubled" in result.columns
-        assert "const_col" in result.columns
-        assert result.filter(pl.col("date") == date(2024, 1, 3))["val_doubled"][0] == 60
-
-    def test_combine_drops_columns(self):
-        """Combine function can drop columns."""
-        df = pl.DataFrame(
-            {
-                "date": [date(2024, 1, i) for i in range(1, 6)],
-                "keep_col": [1, 2, 3, 4, 5],
-                "drop_col": ["a", "b", "c", "d", "e"],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"].drop("drop_col"),
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 3)).collect()
-
-        assert len(result) == 3
-        assert "keep_col" in result.columns
-        assert "drop_col" not in result.columns
-
-
-class TestCombineKwargs:
-    """Tests for the combine_kwargs parameter."""
-
-    def test_combine_kwargs_basic(self):
-        """combine_kwargs are passed to the combine function."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
-        tracker = PredicateTracker(df)
-
-        def combine_with_multiplier(sources, multiplier):
-            return sources["data"].with_columns((pl.col("val") * multiplier).alias("scaled_val"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=combine_with_multiplier,
-            combine_kwargs={"multiplier": 10},
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 3)).collect()
-
-        assert len(result) == 3
-        assert "scaled_val" in result.columns
-        # val=3 on Jan 3 -> scaled_val=30
-        assert result.filter(pl.col("date") == date(2024, 1, 3))["scaled_val"][0] == 30
-
-    def test_combine_kwargs_with_mapping_dict(self):
-        """combine_kwargs can include mapping dictionaries."""
-        df = pl.DataFrame(
-            {
-                "date": [date(2024, 1, 1), date(2024, 1, 2)],
-                "code": ["US", "CN"],
-                "val": [100, 200],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        CODE_TO_REGION = {"US": "North America", "CN": "Asia"}
-
-        def combine_with_mapping(sources, code_to_region):
-            return sources["data"].with_columns(pl.col("code").replace(code_to_region).alias("region"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=combine_with_mapping,
-            combine_kwargs={"code_to_region": CODE_TO_REGION},
-        )
-
-        result = lf.collect()
-
-        assert len(result) == 2
-        assert "region" in result.columns
-        assert result.filter(pl.col("code") == "US")["region"][0] == "North America"
-        assert result.filter(pl.col("code") == "CN")["region"][0] == "Asia"
-
-    def test_combine_kwargs_multiple_args(self):
-        """combine_kwargs can include multiple arguments."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
-        tracker = PredicateTracker(df)
-
-        def combine_with_multiple_args(sources, multiplier, suffix, constant):
-            return sources["data"].with_columns(
-                (pl.col("val") * multiplier).alias(f"scaled_{suffix}"),
-                pl.lit(constant).alias("const_col"),
-            )
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=combine_with_multiple_args,
-            combine_kwargs={"multiplier": 2, "suffix": "doubled", "constant": "hello"},
-        )
-
-        result = lf.collect()
-
-        assert "scaled_doubled" in result.columns
-        assert "const_col" in result.columns
-        assert result["scaled_doubled"].to_list() == [2, 4, 6, 8, 10]
-        assert all(v == "hello" for v in result["const_col"].to_list())
-
-    def test_combine_kwargs_with_none(self):
-        """combine_kwargs=None works correctly (default behavior)."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
-        tracker = PredicateTracker(df)
-
-        # Lambda that takes only sources dict (no kwargs)
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-            combine_kwargs=None,  # Explicit None
-        )
-
-        result = lf.collect()
-        assert len(result) == 5
-
-    def test_combine_kwargs_empty_dict(self):
-        """combine_kwargs={} works correctly."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=lambda s: s["data"],
-            combine_kwargs={},  # Empty dict
-        )
-
-        result = lf.collect()
-        assert len(result) == 5
-
-    def test_combine_kwargs_with_join_parameters(self):
-        """combine_kwargs can parameterize join logic."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-
-        left_df = pl.DataFrame({"date": dates, "key": ["A", "B", "C", "D", "E"], "left_val": [1, 2, 3, 4, 5]})
-        right_df = pl.DataFrame({"key": ["A", "C", "E"], "right_val": [100, 300, 500]})
-
-        left_tracker = PredicateTracker(left_df)
-        right_tracker = PredicateTracker(right_df)
-
-        def combine_with_join_type(sources, join_how):
-            return sources["left"].join(sources["right"], on="key", how=join_how)
-
-        # Test with inner join
-        lf_inner = pushdown_combine(
-            sources={
-                "left": (left_tracker.lazy_frame, {"date": FilterSpec()}),
-                "right": (right_tracker.lazy_frame, {}),
-            },
-            combine=combine_with_join_type,
-            combine_kwargs={"join_how": "inner"},
-        )
-
-        result_inner = lf_inner.collect()
-        assert len(result_inner) == 3  # Only A, C, E match
-
-        # Test with left join
-        lf_left = pushdown_combine(
-            sources={
-                "left": (left_tracker.lazy_frame, {"date": FilterSpec()}),
-                "right": (right_tracker.lazy_frame, {}),
-            },
-            combine=combine_with_join_type,
-            combine_kwargs={"join_how": "left"},
-        )
-
-        result_left = lf_left.collect()
-        assert len(result_left) == 5  # All left rows preserved
-
-    def test_combine_kwargs_complex_join_pattern(self):
-        """Complex pattern: parameterized category mapping with lookback."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-
-        # Primary data uses full category names
-        primary_data = pl.DataFrame(
-            {
-                "date": dates,
-                "category": ["CATEGORY_A"] * 5,
-                "item_id": list(range(5)),
-            }
-        )
-
-        # Reference data uses category codes
-        reference_data = pl.DataFrame(
-            {
-                "date": dates,
-                "category_code": ["A"] * 5,
-                "value": [0.05 + i * 0.001 for i in range(5)],
-            }
-        )
-
-        primary_tracker = PredicateTracker(primary_data)
-        reference_tracker = PredicateTracker(reference_data)
-
-        # The mapping is passed via kwargs, not hardcoded in combine
-        CATEGORY_TO_CODE = {"CATEGORY_A": "A", "CATEGORY_B": "B"}
-
-        def combine_primary_and_reference(sources, category_to_code):
-            # Add category_code column to primary based on category mapping
-            primary_with_code = sources["primary"].with_columns(pl.col("category").replace(category_to_code).alias("category_code"))
-
-            # Join with reference on date and category_code
-            return primary_with_code.join(sources["reference"], on=["date", "category_code"], how="left")
-
-        lf = pushdown_combine(
-            sources={
-                "primary": (
-                    primary_tracker.lazy_frame,
-                    {
-                        "date": FilterSpec(),
-                        "category": FilterSpec(),
-                    },
-                ),
-                "reference": (
-                    reference_tracker.lazy_frame,
-                    {
-                        "date": FilterSpec(lookback=timedelta(days=2)),
-                        "category": FilterSpec(source_col="category_code", value_mapping=CATEGORY_TO_CODE),
-                    },
-                ),
-            },
-            combine=combine_primary_and_reference,
-            combine_kwargs={"category_to_code": CATEGORY_TO_CODE},
-        )
-
-        result = lf.filter((pl.col("date") >= date(2024, 1, 2)) & (pl.col("category") == "CATEGORY_A")).collect()
-
-        assert len(result) == 4
-        assert "value" in result.columns
-        # Verify reference data joined correctly
-        assert all(r is not None for r in result["value"].to_list())
-
-
-class TestSourcesAsKwargs:
-    """Tests for the sources_as_kwargs parameter."""
-
-    def test_sources_as_kwargs_basic(self):
-        """sources_as_kwargs=True passes sources as keyword arguments."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-
-        left_df = pl.DataFrame({"date": dates, "left_val": [1, 2, 3, 4, 5]})
-        right_df = pl.DataFrame({"date": dates, "right_val": [10, 20, 30, 40, 50]})
-
-        left_tracker = PredicateTracker(left_df)
-        right_tracker = PredicateTracker(right_df)
-
-        # Combine function takes sources as keyword arguments
-        def combine(left, right):
-            return left.join(right, on="date")
-
-        lf = pushdown_combine(
-            sources={
-                "left": (left_tracker.lazy_frame, {"date": FilterSpec()}),
-                "right": (right_tracker.lazy_frame, {"date": FilterSpec()}),
-            },
-            combine=combine,
-            sources_as_kwargs=True,
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 3)).collect()
-
-        assert len(result) == 3
-        assert "left_val" in result.columns
-        assert "right_val" in result.columns
-
-    def test_sources_as_kwargs_with_combine_kwargs(self):
-        """sources_as_kwargs=True works with combine_kwargs."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
-        tracker = PredicateTracker(df)
-
-        # Combine function takes source as kwarg plus additional kwargs
-        def combine(data, multiplier, suffix):
-            return data.with_columns((pl.col("val") * multiplier).alias(f"scaled_{suffix}"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=combine,
-            combine_kwargs={"multiplier": 10, "suffix": "x10"},
-            sources_as_kwargs=True,
-        )
-
-        result = lf.collect()
-
-        assert len(result) == 5
-        assert "scaled_x10" in result.columns
-        assert result["scaled_x10"].to_list() == [10, 20, 30, 40, 50]
-
-    def test_sources_as_kwargs_with_lookback(self):
-        """sources_as_kwargs=True works with lookback."""
-        dates = [date(2024, 1, i) for i in range(1, 15)]
-        values = list(range(1, 15))
-        df = pl.DataFrame({"date": dates, "val": values})
-        tracker = PredicateTracker(df)
-
-        def combine(data):
-            return data.with_columns(pl.col("val").shift(3).alias("val_lag3"))
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec(lookback=timedelta(days=4))})},
-            combine=combine,
-            sources_as_kwargs=True,
-        )
-
-        result = lf.filter(pl.col("date") == date(2024, 1, 5)).collect()
-
-        assert len(result) == 1
-        assert result["val_lag3"][0] == 2  # Lag should work due to lookback
-
-    def test_sources_as_kwargs_multiple_sources(self):
-        """sources_as_kwargs=True works with multiple sources."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-
-        prices_df = pl.DataFrame({"date": dates, "price": [100.0, 101.0, 102.0, 103.0, 104.0]})
-        volumes_df = pl.DataFrame({"date": dates, "volume": [1000, 1100, 1200, 1300, 1400]})
-        metadata_df = pl.DataFrame({"date": dates, "category": ["A", "A", "B", "B", "A"]})
-
-        prices_tracker = PredicateTracker(prices_df)
-        volumes_tracker = PredicateTracker(volumes_df)
-        metadata_tracker = PredicateTracker(metadata_df)
-
-        def combine(prices, volumes, metadata):
-            return prices.join(volumes, on="date").join(metadata, on="date")
-
-        lf = pushdown_combine(
-            sources={
-                "prices": (prices_tracker.lazy_frame, {"date": FilterSpec()}),
-                "volumes": (volumes_tracker.lazy_frame, {"date": FilterSpec()}),
-                "metadata": (metadata_tracker.lazy_frame, {"date": FilterSpec()}),
-            },
-            combine=combine,
-            sources_as_kwargs=True,
-        )
-
-        result = lf.filter(pl.col("date") >= date(2024, 1, 3)).collect()
-
-        assert len(result) == 3
-        assert set(result.columns) == {"date", "price", "volume", "category"}
-
-    def test_sources_as_kwargs_false_is_default(self):
-        """Verify sources_as_kwargs=False is the default (dict style)."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-        df = pl.DataFrame({"date": dates, "val": [1, 2, 3, 4, 5]})
-        tracker = PredicateTracker(df)
-
-        # This combine function expects a dict (default behavior)
-        def combine(sources):
-            return sources["data"]
-
-        lf = pushdown_combine(
-            sources={"data": (tracker.lazy_frame, {"date": FilterSpec()})},
-            combine=combine,
-            # sources_as_kwargs not specified, should default to False
-        )
-
-        result = lf.collect()
-        assert len(result) == 5
-
-    def test_sources_as_kwargs_with_value_mapping(self):
-        """sources_as_kwargs=True works with value mapping."""
-        df = pl.DataFrame(
-            {
-                "date": [date(2024, 1, 1), date(2024, 1, 2)],
-                "region_code": ["NA", "EU"],
-                "val": [100, 200],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        REGION_TO_CODE = {"NORTH_AMERICA": "NA", "EUROPE": "EU"}
-        CODE_TO_REGION = {"NA": "NORTH_AMERICA", "EU": "EUROPE"}
-
-        def combine(data):
-            return data.with_columns(pl.col("region_code").replace(CODE_TO_REGION).alias("region")).drop("region_code")
-
-        lf = pushdown_combine(
-            sources={
-                "data": (
-                    tracker.lazy_frame,
-                    {"region": FilterSpec(source_col="region_code", value_mapping=REGION_TO_CODE)},
-                )
-            },
-            combine=combine,
-            sources_as_kwargs=True,
-        )
-
-        result = lf.filter(pl.col("region") == "NORTH_AMERICA").collect()
-
-        assert len(result) == 1
-        assert result["region"][0] == "NORTH_AMERICA"
-
-    def test_sources_as_kwargs_complex_join_pattern(self):
-        """sources_as_kwargs=True with complex join and kwargs."""
-        dates = [date(2024, 1, i) for i in range(1, 6)]
-
-        primary_df = pl.DataFrame({"date": dates, "category": ["A"] * 5, "item_id": list(range(5))})
-        reference_df = pl.DataFrame({"date": dates, "category_code": ["A"] * 5, "value": [0.1, 0.2, 0.3, 0.4, 0.5]})
-
-        primary_tracker = PredicateTracker(primary_df)
-        reference_tracker = PredicateTracker(reference_df)
-
-        CATEGORY_TO_CODE = {"A": "A", "B": "B"}
-
-        def combine(primary, reference, category_mapping):
-            # Add category_code to primary using mapping
-            primary_with_code = primary.with_columns(pl.col("category").replace(category_mapping).alias("category_code"))
-            return primary_with_code.join(reference, on=["date", "category_code"], how="left")
-
-        lf = pushdown_combine(
-            sources={
-                "primary": (primary_tracker.lazy_frame, {"date": FilterSpec(), "category": FilterSpec()}),
-                "reference": (
-                    reference_tracker.lazy_frame,
-                    {
-                        "date": FilterSpec(lookback=timedelta(days=2)),
-                        "category": FilterSpec(source_col="category_code", value_mapping=CATEGORY_TO_CODE),
-                    },
-                ),
-            },
-            combine=combine,
-            combine_kwargs={"category_mapping": CATEGORY_TO_CODE},
-            sources_as_kwargs=True,
-        )
-
-        result = lf.filter((pl.col("date") >= date(2024, 1, 2)) & (pl.col("category") == "A")).collect()
-
-        assert len(result) == 4
-        assert "value" in result.columns
-
-
-class TestDateFilterOnDatetimeSource:
-    """Regression tests for the bug where a Date-typed user filter linked to a
-    Datetime source column silently dropped intraday rows.
-
-    Without the fix, the upper bound of the pushed predicate collapses to
-    midnight of the bound day (because Polars promotes a Date literal to a
-    midnight Datetime when comparing against a Datetime column), excluding
-    every intraday row on that day.
-    """
-
-    @staticmethod
-    def _make_intraday_df():
-        return pl.DataFrame(
-            {
-                "timestamp": [
-                    datetime(2024, 1, 1, 10),
-                    datetime(2024, 1, 1, 14),
-                    datetime(2024, 1, 2, 10),
-                    datetime(2024, 1, 2, 14),
-                    datetime(2024, 1, 3, 10),
-                    datetime(2024, 1, 3, 14),
-                ],
-                "value": [1, 2, 3, 4, 5, 6],
-            }
-        )
-
-    @staticmethod
-    def _combine(s):
-        return s["main"].with_columns(pl.col("timestamp").cast(pl.Date).alias("data_date"))
-
-    def test_eq_covers_full_day(self):
-        """`data_date == d` against a Datetime source must include all intraday rows on day d."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date") == date(2024, 1, 2)).collect()
-        assert len(result) == 2
-        assert sorted(result["value"].to_list()) == [3, 4]
-
-    def test_eq_with_lookback_covers_full_day(self):
-        """`data_date == d` plus lookback against a Datetime source still includes all intraday rows on day d."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "main": (
-                    tracker.lazy_frame,
-                    {"data_date": FilterSpec(source_col="timestamp", lookback=timedelta(days=1))},
-                )
-            },
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date") == date(2024, 1, 2)).collect()
-        assert len(result) == 2
-        assert sorted(result["value"].to_list()) == [3, 4]
-
-    def test_eq_with_subday_lookback_fetches_prior_evening(self):
-        """Sub-day ``lookback`` must shift bounds across day boundaries even when
-        the user filter literal is a Date (not a Datetime).
-
-        Regression for: ``date - timedelta(hours=18)`` returns ``date`` unchanged
-        in Python (truncates the timedelta to whole days), so if extension to
-        full-day datetimes happens *after* lookback the sub-day shift is
-        silently dropped and the prior-evening rows are not pulled.
-        """
-        df = pl.DataFrame(
-            {
-                "timestamp": [
-                    datetime(2024, 1, 1, 20),  # prior evening — should be fetched by 18h lookback
-                    datetime(2024, 1, 2, 4),
-                    datetime(2024, 1, 2, 10),
-                    datetime(2024, 1, 3, 4),
-                ],
-                "value": [10, 20, 30, 40],
-            }
-        )
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={
-                "main": (
-                    tracker.lazy_frame,
-                    {"data_date": FilterSpec(source_col="timestamp", lookback=timedelta(hours=18))},
-                )
-            },
-            combine=self._combine,
-        )
-        # Filter the *combined* frame to day 2; the source must have pulled
-        # the prior evening so the post-combine output (which keeps timestamps
-        # in the prior evening that match data_date == d - 1) has the right rows.
-        # The user-visible contract is that the underlying source predicate
-        # spans [2024-01-01 06:00, 2024-01-03 00:00) — i.e., sub-day lookback
-        # crosses the day boundary AND the upper bound still covers the full
-        # day so intraday rows on day d are kept.
-        result = lf.filter(pl.col("data_date") == date(2024, 1, 2)).collect()
-        pushed = str(tracker.last_predicate)
-        assert "2024-01-01 06:00:00" in pushed, f"sub-day lookback was truncated; pushed predicate: {pushed}"
-        assert "2024-01-03 00:00:00" in pushed, f"upper bound did not cover full day; pushed predicate: {pushed}"
-        # And the actual intraday rows on day 2 must survive (full-day widening).
-        assert sorted(result["value"].to_list()) == [20, 30]
-
-    def test_le_covers_full_day(self):
-        """`data_date <= d` against a Datetime source must include all intraday rows on day d."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date") <= date(2024, 1, 2)).collect()
-        assert len(result) == 4
-        assert sorted(result["value"].to_list()) == [1, 2, 3, 4]
-
-    def test_ge_starts_at_midnight(self):
-        """`data_date >= d` against a Datetime source starts at midnight of d (inclusive)."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date") >= date(2024, 1, 2)).collect()
-        assert len(result) == 4
-        assert sorted(result["value"].to_list()) == [3, 4, 5, 6]
-
-    def test_lt_excludes_full_day(self):
-        """`data_date < d` against a Datetime source excludes all intraday rows on day d."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date") < date(2024, 1, 2)).collect()
-        assert len(result) == 2
-        assert sorted(result["value"].to_list()) == [1, 2]
-
-    def test_gt_starts_next_day(self):
-        """`data_date > d` against a Datetime source includes only rows strictly after day d."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date") > date(2024, 1, 2)).collect()
-        assert len(result) == 2
-        assert sorted(result["value"].to_list()) == [5, 6]
-
-    def test_is_in_covers_full_days(self):
-        """`data_date in [d1, d2]` against a Datetime source covers all intraday rows on both days."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"data_date": FilterSpec(source_col="timestamp")})},
-            combine=self._combine,
-        )
-        result = lf.filter(pl.col("data_date").is_in([date(2024, 1, 2), date(2024, 1, 3)])).collect()
-        assert len(result) == 4
-        assert sorted(result["value"].to_list()) == [3, 4, 5, 6]
-
-    def test_datetime_filter_on_datetime_source_unchanged(self):
-        """A Datetime filter on a Datetime source preserves sub-day precision."""
-        df = self._make_intraday_df()
-        tracker = PredicateTracker(df)
-
-        lf = pushdown_combine(
-            sources={"main": (tracker.lazy_frame, {"timestamp": FilterSpec()})},
-            combine=lambda s: s["main"],
-        )
-        result = lf.filter(pl.col("timestamp") >= datetime(2024, 1, 2, 12, 0)).collect()
-        assert len(result) == 3
-        assert result["value"].to_list() == [4, 5, 6]
-
-
-# --- IntervalFilterSpec --------------------------------------------------------------------------
-#
-# An interval "schedule" source ([start, end] per row) is joined in combine to a "spine" source that
-# supplies the real request column ("date"). IntervalFilterSpec pushes the range-overlap
-# (start<=hi AND end>=lo, adjusted for `closed`) onto the schedule; per-row membership is combine's.
-
-
-class TestIntervalFilterSpecDefaults:
-    def test_defaults(self):
-        spec = IntervalFilterSpec(start_col="s", end_col="e")
-        assert spec.start_col == "s"
-        assert spec.end_col == "e"
-        assert spec.closed == "both"
-        assert spec.value_mapping is None
-
-    @pytest.mark.parametrize("closed", ["both", "left", "right", "none"])
-    def test_valid_closed_accepted(self, closed):
-        assert IntervalFilterSpec(start_col="s", end_col="e", closed=closed).closed == closed
-
-    def test_invalid_closed_raises(self):
-        with pytest.raises(ValueError, match="closed must be one of"):
-            IntervalFilterSpec(start_col="s", end_col="e", closed="closed")
-
-
-def _interval_lf(sched_df, spine_df, *, closed="both", value_mapping=None, membership=None):
-    """Join an interval schedule (IntervalFilterSpec) to a spine carrying `date` through pushdown_combine."""
-    spec = IntervalFilterSpec(start_col="start", end_col="end", closed=closed, value_mapping=value_mapping)
+def interval_join(membership=IN_WINDOW):
+    """Join the spine to the schedule and keep the rows ``membership`` keeps; ``None`` keeps every pair."""
 
     def combine(s):
         joined = s["spine"].join(s["sched"], on="root")
-        if membership is None:
-            return joined.filter((pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end")))
-        return joined.filter(membership)
+        return joined if membership is None else joined.filter(membership)
 
-    return pushdown_combine(
+    return combine
+
+
+def previous_weekday(day):
+    return day - days(3 if day.weekday() == 0 else 1)
+
+
+SCHEDULE_JAN_11_TO_20 = schedule([make_date(11)], [make_date(20)], [2])
+SCHEDULE_JAN_11_TO_20_DATETIME = SCHEDULE_JAN_11_TO_20.with_columns(pl.col("start", "end").cast(pl.Datetime("us")))
+SCHEDULE_AUG_AND_SEP = schedule([make_date(1, 8), make_date(31, 8)], [make_date(30, 8), make_date(30, 9)])
+SPINE_SEP_1_2_3 = spine(make_date(1, 9), make_date(2, 9), make_date(3, 9))
+SEP_MEMBERSHIP = pl.col("date").map_elements(previous_weekday, return_dtype=pl.Date).is_between(pl.col("start"), pl.col("end"))
+INTRADAY_SCHEDULE = schedule(
+    [datetime(2024, 1, 1, 9), datetime(2024, 1, 15, 15)], [datetime(2024, 1, 15, 9), datetime(2024, 1, 20, 9)], roots=["A", "B"]
+)
+
+
+# Two or more output columns from one source column union their discrete filters.
+THREE_GROUPS = pl.DataFrame({"data_date": [make_date(1)] * 3, "group": ["A", "B", "C"], "val": [1.0, 2.0, 3.0]})
+PAIR_SPECS = {"data_date": FilterSpec(), "group1": FilterSpec(source_col="group"), "group2": FilterSpec(source_col="group")}
+
+
+def group_pairs(s):
+    left = s["data"].rename({"group": "group1", "val": "val1"})
+    right = s["data"].select("data_date", pl.col("group").alias("group2"), pl.col("val").alias("val2"))
+    return left.join(right, on="data_date").filter(pl.col("group1") != pl.col("group2"))
+
+
+def cross_aliases(col: str, *names: str, keep: tuple = ()):
+    """Cross-join one source with itself, ``col`` renamed to each of ``names``; ``keep`` columns stay on the first side."""
+
+    def combine(s):
+        out = s["data"].select(pl.col(col).alias(names[0]), *keep)
+        for name in names[1:]:
+            out = out.join(s["data"].select(pl.col(col).alias(name)), how="cross")
+        return out
+
+    return combine
+
+
+def mapped_cross(s):
+    code_to_name = {"a": "A", "b": "B", "c": "C"}
+    left = s["data"].with_columns(pl.col("code").replace(code_to_name).alias("name1")).drop("code")
+    right = s["data"].with_columns(pl.col("code").replace(code_to_name).alias("name2")).drop("code")
+    return left.join(right, how="cross")
+
+
+GROUP_OTHER = pl.DataFrame({"group": ["A", "B", "C"], "other": ["x", "y", "z"]})
+GROUP_OTHER_SPECS = {"group1": FilterSpec(source_col="group"), "group2": FilterSpec(source_col="group"), "other": FilterSpec()}
+GROUP_OTHER_PRED = (pl.col("group1") == "A") & (pl.col("group2") == "B") & (pl.col("other") == "x")
+THREE_SPECS = {f"group{i}": FilterSpec(source_col="group") for i in (1, 2, 3)}
+NAME_MAPPING = {"A": "a", "B": "b", "C": "c"}
+CODES = pl.DataFrame({"code": ["a", "b", "c"]})
+THREE_DATES = pl.DataFrame({"d": [make_date(1), make_date(2), make_date(3)], "val": [1, 2, 3]})
+
+# Rows a pushed predicate could drop through a cast, a time zone, a unit or a null.
+_TIMESTAMPS_AROUND_NEW_YEAR = pl.DataFrame(
+    {"t": [datetime(2023, 12, 31, 23), datetime(2024, 1, 1), datetime(2024, 1, 1, 0, 0, 0, 500), datetime(2024, 1, 1, 13), None]}
+)
+_DEC_31_JAN_1_JAN_2 = pl.DataFrame({"t": [make_date(31, 12, 2023), make_date(1), make_date(2)]})
+_THREE_DECIMALS = pl.DataFrame({"t": pl.Series([Decimal("1.25"), Decimal("2.50"), Decimal("3.75")], dtype=pl.Decimal(10, 2))})
+_TIMESTAMPS_IN_NEW_YORK = _TIMESTAMPS_AROUND_NEW_YEAR.with_columns(pl.col("t").dt.replace_time_zone("UTC").dt.convert_time_zone("America/New_York"))
+# A name, a frame, a filter on its column ``t`` and the column's FilterSpec; the combined result must keep every
+# matching row.
+MATCHES_FILTER = [
+    ("date_cast_lt_noon", _TIMESTAMPS_AROUND_NEW_YEAR, pl.col("t").cast(pl.Date) < datetime(2024, 1, 1, 12), FilterSpec()),
+    ("dt_date_lt_noon", _TIMESTAMPS_AROUND_NEW_YEAR, pl.col("t").dt.date() < datetime(2024, 1, 1, 12), FilterSpec()),
+    ("ms_cast_le_midnight", _TIMESTAMPS_AROUND_NEW_YEAR, pl.col("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1), FilterSpec()),
+    ("is_in_with_null_nulls_equal", _TIMESTAMPS_AROUND_NEW_YEAR, pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True), FilterSpec()),
+    ("is_in_only_null_nulls_equal", _TIMESTAMPS_AROUND_NEW_YEAR, pl.col("t").is_in([None], nulls_equal=True), FilterSpec()),
+    ("date_lt_noon", _DEC_31_JAN_1_JAN_2, pl.col("t") < datetime(2024, 1, 1, 12), FilterSpec()),
+    ("date_lt_noon_with_lookback", _DEC_31_JAN_1_JAN_2, pl.col("t") < datetime(2024, 1, 1, 12), FilterSpec(lookback=days(1))),
+    (
+        "date_between_closed_left",
+        _DEC_31_JAN_1_JAN_2,
+        pl.col("t").is_between(datetime(2023, 12, 1), datetime(2024, 1, 1, 12), closed="left"),
+        FilterSpec(),
+    ),
+    ("new_york_ge_midnight", _TIMESTAMPS_IN_NEW_YORK, pl.col("t") >= datetime(2024, 1, 1, tzinfo=NEW_YORK), FilterSpec()),
+    ("new_york_lt_midnight", _TIMESTAMPS_IN_NEW_YORK, pl.col("t") < datetime(2024, 1, 1, tzinfo=NEW_YORK), FilterSpec()),
+    (
+        "new_york_between_days",
+        _TIMESTAMPS_IN_NEW_YORK,
+        pl.col("t").is_between(datetime(2023, 12, 31, tzinfo=NEW_YORK), datetime(2024, 1, 1, tzinfo=NEW_YORK)),
+        FilterSpec(),
+    ),
+    ("new_york_eq_utc_midnight", _TIMESTAMPS_IN_NEW_YORK, pl.col("t") == datetime(2023, 12, 31, 19, tzinfo=NEW_YORK), FilterSpec()),
+    ("new_york_is_in_utc_midnight", _TIMESTAMPS_IN_NEW_YORK, pl.col("t").is_in([datetime(2023, 12, 31, 19, tzinfo=NEW_YORK)]), FilterSpec()),
+    ("new_york_date_cast_le_dec_31", _TIMESTAMPS_IN_NEW_YORK, pl.col("t").cast(pl.Date) <= make_date(31, 12, 2023), FilterSpec()),
+    ("new_york_dt_date_eq_jan_1", _TIMESTAMPS_IN_NEW_YORK, pl.col("t").dt.date() == make_date(1), FilterSpec()),
+    (
+        "decimal_is_in_list",
+        _THREE_DECIMALS,
+        pl.col("t").is_in(pl.lit([Decimal("1.25"), Decimal("2.50")], dtype=pl.List(pl.Decimal(10, 2)))),
+        FilterSpec(),
+    ),
+]
+# A name, a filter on a float column, and the float dtype the column is cast to.
+FLOAT_CASTS = [
+    ("float32_eq_2_pow_24", pl.col("x") == 2.0**24, pl.Float32),
+    ("float32_eq_2_pow_24_or_5", (pl.col("x") == 2.0**24) | (pl.col("x") == 5.0), pl.Float32),
+    ("float32_eq_1e300", pl.col("x") == 1e300, pl.Float32),
+    ("float64_eq_2_pow_24", pl.col("x") == 2.0**24, pl.Float64),
+    ("float64_eq_1e300", pl.col("x") == 1e300, pl.Float64),
+    ("float32_eq_float_max", pl.col("x") == sys.float_info.max, pl.Float32),
+    ("float64_eq_float_max", pl.col("x") == sys.float_info.max, pl.Float64),
+    ("float64_eq_2_pow_24_or_5", (pl.col("x") == 2.0**24) | (pl.col("x") == 5.0), pl.Float64),
+]
+NULL_PREDICATES = {
+    "is_null": pl.col("a").is_null(),
+    "eq_missing": pl.col("a").eq_missing(None),
+    "is_in_nulls_equal": pl.col("a").is_in([1, None], nulls_equal=True),
+}
+NULLABLE = pl.DataFrame({"a": [1, None, 3], "b": [1, None, 3]})
+
+
+def cast_to(dtype):
+    return lambda s: s["data"].with_columns(pl.col("x").cast(dtype))
+
+
+# A value_mapping with a window must push a window around the mapped values, never only the exact mapped value.
+TWENTY_DAYS = pl.DataFrame({"data_date": daily_frame(20)["date"], "v": list(range(20))})
+
+
+def next_day_rolling(s):
+    return s["data"].with_columns(pl.col("v").rolling_sum(3).alias("rolling_sum"), (pl.col("data_date") + pl.duration(days=1)).alias("date"))
+
+
+def same_day_rolling(s):
+    return s["data"].with_columns(pl.col("v").rolling_sum(2).alias("rolling_sum"), pl.col("data_date").alias("date"))
+
+
+def mapped_self_join(s):
+    side = s["data"].with_columns(pl.col("v").rolling_sum(2).alias("rolling_sum"), (pl.col("data_date") + pl.duration(days=1)).alias("d"))
+    return side.select(pl.col("d").alias("d1"), pl.col("rolling_sum").alias("rolling_sum_1")).join(
+        side.select(pl.col("d").alias("d2"), pl.col("rolling_sum").alias("rolling_sum_2")), how="cross"
+    )
+
+
+def window(**kw) -> FilterSpec:
+    return FilterSpec(source_col="data_date", **kw)
+
+
+def weekday_window(lookback: int) -> FilterSpec:
+    return window(lookback=days(lookback), value_mapping=previous_weekday)
+
+
+def day_of_month_key(s):
+    return s["data"].with_columns(pl.col("v").rolling_sum(2).alias("rolling_sum"), pl.col("data_date").dt.day().cast(pl.Int64).add(1).alias("k"))
+
+
+def unbounded_sharer(s):
+    return s["data"].select(pl.col("d").alias("a"), pl.col("v").cum_sum().alias("c")).join(s["data"].select(pl.col("d").alias("b")), how="cross")
+
+
+TEN_DAYS = pl.DataFrame({"d": daily_frame(10)["date"], "v": list(range(10))})
+# 01:30 on the day New York's clocks go back, before and after they go back.
+NEW_YORK_REPEATED_HOUR = [datetime(2024, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=0), datetime(2024, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=1)]
+NEAR_MAX = [
+    datetime(9999, 12, 31, 23, 59, 59, 999998, tzinfo=timezone(timedelta(hours=-5))),
+    datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone(timedelta(hours=-5))),
+]
+US_MEMBERS = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2)], dtype=pl.Datetime("us", "UTC"))
+
+
+def five_seconds(unit: str, time_zone: str | None) -> pl.Series:
+    """Datetimes one second apart from 2024-01-01 00:00:00, in ``unit`` and ``time_zone``."""
+    tz = ZoneInfo(time_zone) if time_zone else None
+    return pl.Series([datetime(2024, 1, 1, 0, 0, s, tzinfo=tz) for s in range(5)], dtype=pl.Datetime(unit, time_zone))
+
+
+def result_values_are(values: set):
+    """A result check: the ``val`` column of the result holds exactly ``values``."""
+
+    def check(got, _trackers):
+        assert set(got["val"]) == values, got
+
+    return check
+
+
+SCENARIOS = [
+    # Propagation through a join
+    CombineCase(
+        "no_filters",
+        sources=left_and_right_sources(pl.DataFrame({"id": [1, 2], "val": [10, 20]}), pl.DataFrame({"id": [1, 2], "other": [100, 200]}), {}),
+        combine=join("id"),
+    ),
+    CombineCase(
+        "simple_date_filter",
+        sources=left_and_right_sources(TEN_DAYS_FROM_ZERO, TEN_DAYS_OTHER_COLUMN, {"date": FilterSpec()}),
+        combine=join("date", maintain_order="left"),
+        predicate=pl.col("date") >= make_date(5),
+        check_row_order=True,
+    ),
+    CombineCase(
+        "dt_date_filter_prunes_datetime_source",
+        sources=single_source(daily_frame(90, dtype=pl.Datetime("us")), date=FilterSpec()),
+        combine=identity,
+        predicate=(pl.col("date").dt.date() >= make_date(1)) & (pl.col("date").dt.date() <= make_date(31)),
+        sources_receiving_filter=("data",),
+    ),
+    CombineCase(
+        "simple_equality_filter",
+        sources=left_and_right_sources(*GROUP_PAIR, {"group": FilterSpec()}),
+        combine=join("group"),
+        predicate=pl.col("group") == "B",
+    ),
+    CombineCase(
+        "is_in_filter",
+        sources=left_and_right_sources(*GROUP_PAIR, {"group": FilterSpec()}),
+        combine=join("group"),
+        predicate=pl.col("group").is_in(["A", "C"]),
+    ),
+    # Lookback and lookahead
+    CombineCase(
+        "lookback_with_date_equality",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookback=days(4))),
+        combine=lag(3),
+        predicate=pl.col("date") == make_date(5),
+    ),
+    CombineCase(
+        "lookahead_with_date_equality",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookahead=days(4))),
+        combine=lead(3),
+        predicate=pl.col("date") == make_date(5),
+    ),
+    CombineCase(
+        "lookback_and_lookahead_with_date_equality",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookback=days(3), lookahead=days(3))),
+        combine=lambda s: s["data"].with_columns(pl.col("val").shift(2).alias("lag2"), pl.col("val").shift(-2).alias("lead2")),
+        predicate=pl.col("date") == make_date(7),
+    ),
+    CombineCase(
+        "lookback_expands_date_range",
+        sources=left_and_right_sources(
+            daily_frame(10, base=100), TEN_DAYS_OTHER_COLUMN, {"date": FilterSpec(lookback=days(3))}, {"date": FilterSpec()}
+        ),
+        combine=join("date", maintain_order="left"),
+        predicate=pl.col("date") >= make_date(5),
+        check_row_order=True,
+        sources_receiving_filter=("left",),
+    ),
+    CombineCase(
+        "lookback_for_rolling_computation",
+        sources=single_source(TEN_DAYS_FROM_ZERO.with_columns(pl.col("val").cast(pl.Float64)), date=FilterSpec(lookback=days(3))),
+        combine=lambda s: s["data"].sort("date").with_columns(pl.col("val").rolling_sum(window_size=3, min_samples=1).alias("rolling_sum")),
+        predicate=pl.col("date") >= make_date(5),
+    ),
+    CombineCase(
+        "lookahead_expands_date_range",
+        sources=single_source(daily_frame(10, base=100), date=FilterSpec(lookahead=days(2))),
+        combine=identity,
+        predicate=pl.col("date") <= make_date(5),
+    ),
+    CombineCase(
+        "combined_lookback_lookahead",
+        sources=single_source(daily_frame(10, base=100), date=FilterSpec(lookback=days(2), lookahead=days(2))),
+        combine=identity,
+        predicate=pl.col("date").is_between(make_date(4), make_date(7)),
+    ),
+    # Pushed bounds and values
+    CombineCase(
+        "date_gte_filter_structure",
+        sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("date") >= make_date(5),
+        time_bounds={"data": {"date": (make_date(5), ...)}},
+    ),
+    CombineCase(
+        "date_between_filter_structure",
+        sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("date").is_between(make_date(3), make_date(7)),
+        time_bounds={"data": {"date": (make_date(3), make_date(7))}},
+    ),
+    CombineCase(
+        "lookback_expands_date_range_correctly",
+        sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec(lookback=days(3))),
+        combine=identity,
+        predicate=pl.col("date") >= make_date(5),
+        time_bounds={"data": {"date": (make_date(2), ...)}},
+    ),
+    CombineCase(
+        "lookback_with_is_between_and_complex_combine",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookback=days(4))),
+        combine=lag(3),
+        predicate=pl.col("date").is_between(make_date(5), make_date(10)),
+        time_bounds={"data": {"date": (make_date(1), make_date(10))}},
+    ),
+    # Polars may merge the widened filter into the user's one when the combine is the identity.
+    CombineCase(
+        "lookback_optimization_with_identity_combine",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookback=days(4))),
+        combine=identity,
+        predicate=pl.col("date").is_between(make_date(5), make_date(10)),
+        time_bounds={"data": {"date": ((make_date(1), make_date(5)), make_date(10))}},
+    ),
+    CombineCase(
+        "lookahead_expands_upper_bound",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookahead=days(3))),
+        combine=identity,
+        predicate=pl.col("date") <= make_date(7),
+        time_bounds={"data": {"date": (..., make_date(10))}},
+    ),
+    CombineCase(
+        "discrete_equality_filter_structure",
+        sources=single_source(GROUP_FRAME, group=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("group") == "B",
+        allowed_values={"data": {"group": {"B"}}},
+        allowed_values_node={"data": {"group": "eq"}},
+    ),
+    CombineCase(
+        "discrete_is_in_filter_structure",
+        sources=single_source(GROUP_FRAME, group=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("group").is_in(["A", "C"]),
+        allowed_values={"data": {"group": {"A", "C"}}},
+        allowed_values_node={"data": {"group": "is_in"}},
+    ),
+    # Value mapping and source column renames
+    CombineCase(
+        "dict_value_mapping",
+        sources=single_source(region_frame("NA", "EU"), region=FilterSpec(source_col="region_code", value_mapping=to_codes("NA", "EU"))),
+        combine=regions,
+        predicate=pl.col("region") == "NORTH_AMERICA",
+        allowed_values={"data": {"region_code": {"NA"}}},
+        allowed_values_node={"data": {"region_code": "eq"}},
+    ),
+    CombineCase(
+        "callable_value_mapping",
+        sources=single_source(pl.DataFrame({"name": ["foo", "bar", "baz"], "val": [1, 2, 3]}), name=FilterSpec(value_mapping=str.lower)),
+        combine=lambda s: s["data"].with_columns(pl.col("name").str.to_uppercase()),
+        predicate=pl.col("name") == "FOO",
+    ),
+    CombineCase(
+        "is_in_with_value_mapping",
+        sources=single_source(
+            region_frame("NA", "EU", "APAC"), region=FilterSpec(source_col="region_code", value_mapping=to_codes("NA", "EU", "APAC"))
+        ),
+        combine=regions,
+        predicate=pl.col("region").is_in(["NORTH_AMERICA", "ASIA_PACIFIC"]),
+        allowed_values={"data": {"region_code": {"NA", "APAC"}}},
+        allowed_values_node={"data": {"region_code": "is_in"}},
+    ),
+    # An unmapped value is not pushed: the source supplies every row and the user's filter decides.
+    CombineCase(
+        "unmapped_value_not_pushed_down",
+        sources=single_source(
+            region_frame("NA", "EU", "APAC", "LATAM"), region=FilterSpec(source_col="region_code", value_mapping=to_codes("NA", "EU"))
+        ),
+        combine=regions,
+        predicate=pl.col("region") == "LATIN_AMERICA",
+    ),
+    CombineCase(
+        "mixed_mapped_and_unmapped_values_in_is_in",
+        sources=single_source(
+            region_frame("NA", "EU", "APAC", "LATAM"), region=FilterSpec(source_col="region_code", value_mapping=to_codes("NA", "EU"))
+        ),
+        combine=regions,
+        predicate=pl.col("region").is_in(["NORTH_AMERICA", "LATIN_AMERICA"]),
+    ),
+    CombineCase(
+        "different_source_column_name",
+        sources=single_source(TEN_DAYS_FROM_ZERO.rename({"date": "DataDate"}), date=FilterSpec(source_col="DataDate")),
+        combine=lambda s: s["data"].rename({"DataDate": "date"}),
+        predicate=pl.col("date") == make_date(2),
+        allowed_values={"data": {"DataDate": {make_date(2)}}},
+        allowed_values_node={"data": {"DataDate": "eq"}},
+    ),
+    # Several sources with their own specs
+    CombineCase(
+        "different_lookback_per_source",
         sources={
-            "sched": (sched_df.lazy(), {"date": spec}),
-            "spine": (spine_df.lazy(), {"date": FilterSpec()}),
+            "source1": (TEN_DAYS_FROM_ZERO.rename({"val": "val1"}), {"date": FilterSpec(lookback=days(5))}),
+            "source2": (TEN_DAYS_OTHER_COLUMN, {"date": FilterSpec(lookback=days(2))}),
         },
-        combine=combine,
-    )
-
-
-class TestIntervalFilterSpecOverlap:
-    def test_selects_covering_windows(self):
-        sched = pl.DataFrame(
-            {
-                "root": ["A", "A", "A"],
-                "start": [date(2024, 1, 1), date(2024, 1, 11), date(2024, 1, 21)],
-                "end": [date(2024, 1, 10), date(2024, 1, 20), date(2024, 1, 30)],
-                "val": [1, 2, 3],
-            }
-        )
-        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 15)]})
-        lf = _interval_lf(sched, spine)
-        result = lf.filter(pl.col("date") == date(2024, 1, 15)).collect()
-        assert result["val"].to_list() == [2]  # only [11,20] covers Jan 15
-
-    def test_long_window_kept(self):
-        sched = pl.DataFrame({"root": ["A"], "start": [date(2020, 1, 1)], "end": [date(2030, 1, 1)], "val": [1]})
-        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 15)]})
-        lf = _interval_lf(sched, spine)
-        assert lf.filter(pl.col("date") == date(2024, 1, 15)).collect()["val"].to_list() == [1]
-
-    def test_bounds_pushed_to_source(self):
-        sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
-        tracker = PredicateTracker(sched)
-        spine = pl.DataFrame({"root": ["A", "A"], "date": [date(2024, 1, 12), date(2024, 1, 15)]})
-        spec = IntervalFilterSpec(start_col="start", end_col="end")
-        lf = pushdown_combine(
-            sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
-            combine=lambda s: s["spine"].join(s["sched"], on="root").filter((pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end"))),
-        )
-        lf.filter(pl.col("date").is_between(date(2024, 1, 12), date(2024, 1, 15))).collect()
-
-        analyzer = PredicateAnalyzer(tracker.last_predicate)
-        end_lower, _ = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("end"))
-        _, start_upper = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("start"))
-        assert end_lower == date(2024, 1, 12)  # end >= lo
-        assert start_upper == date(2024, 1, 15)  # start <= hi
-
-
-@pytest.mark.parametrize(
-    ("pred", "end_lower", "start_upper"),
-    [
-        (pl.col("date") >= date(2024, 1, 12), date(2024, 1, 11), None),
-        (pl.col("date").is_between(date(1990, 1, 1), date(2024, 1, 15)), date(1989, 12, 31), date(2024, 1, 14)),
-        (pl.col("date").is_between(datetime(2024, 1, 12, 6), datetime(2024, 1, 15, 6)), datetime(2024, 1, 11, 6), datetime(2024, 1, 14, 6)),
-    ],
-    ids=["open", "over_cap", "datetime"],
-)
-def test_interval_timedelta_mapping_shifts_bounds(pred, end_lower, start_upper):
-    is_datetime = isinstance(end_lower, datetime)
-    sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
-    if is_datetime:
-        sched = sched.with_columns(pl.col("start", "end").cast(pl.Datetime("us")))
-    tracker = PredicateTracker(sched)
-    spine = pl.DataFrame({"root": ["A"], "date": [datetime(2024, 1, 13) if is_datetime else date(2024, 1, 13)]})
-    spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=timedelta(days=-1))
-    lf = pushdown_combine(
-        sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
-        combine=lambda s: s["spine"].join(s["sched"], on="root"),
-    )
-    assert lf.filter(pred).collect()["val"].to_list() == [2]
-    pushed = str(tracker.last_predicate)
-    assert f'(col("end")) >= ({end_lower})' in pushed
-    assert f'(col("start")) <= ({start_upper})' in pushed if start_upper is not None else 'col("start")' not in pushed
-
-
-@pytest.mark.parametrize(
-    ("hours", "end_lower", "start_upper"),
-    [(12, date(2024, 1, 13), date(2024, 1, 14)), (-12, date(2024, 1, 12), date(2024, 1, 13))],
-)
-def test_interval_timedelta_mapping_rounds_dates_outward(hours, end_lower, start_upper):
-    """A partial day shifts a Date request outward to whole days."""
-    sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
-    tracker = PredicateTracker(sched)
-    spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 13)]})
-    spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=timedelta(hours=hours))
-    lf = pushdown_combine(
-        sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
-        combine=lambda s: s["spine"].join(s["sched"], on="root"),
-    )
-    assert lf.filter(pl.col("date") == date(2024, 1, 13)).collect()["val"].to_list() == [2]
-    pushed = str(tracker.last_predicate)
-    assert f'(col("end")) >= ({end_lower})' in pushed
-    assert f'(col("start")) <= ({start_upper})' in pushed
-
-
-@pytest.mark.parametrize("shift", [timedelta.max, timedelta.min], ids=["max", "min"])
-def test_interval_timedelta_mapping_out_of_range_leaves_the_bound_unbounded(shift):
-    # Rounding a shift of nearly the whole timedelta range out to whole days overflows.
-    sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
-    lf = _interval_lf(sched, pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 13)]}), value_mapping=shift)
-    assert lf.filter(pl.col("date") == date(2024, 1, 13)).collect()["val"].to_list() == [2]
-
-
-class TestIntervalFilterSpecClosed:
-    """closed x {Date, Datetime}: half-open modes flip only the exact-endpoint boundary, and a
-    Date request against a Datetime column keeps intraday boundary-day windows for every mode."""
-
-    @pytest.mark.parametrize(
-        ("closed", "keep_start_eq_hi", "keep_end_eq_lo"),
-        [("both", True, True), ("left", True, False), ("right", False, True), ("none", False, False)],
-    )
-    def test_date_endpoints(self, closed, keep_start_eq_hi, keep_end_eq_lo):
-        # Window starting exactly at hi (Jan 15): kept iff start endpoint is closed (both/left).
-        sched_start = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 15)], "end": [date(2024, 1, 20)], "val": [1]})
-        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 15)]})
-        lf = _interval_lf(sched_start, spine, closed=closed, membership=pl.lit(True))
-        got = bool(lf.filter(pl.col("date") == date(2024, 1, 15)).collect().height)
-        assert got == keep_start_eq_hi
-
-        # Window ending exactly at lo (Jan 15): kept iff end endpoint is closed (both/right).
-        sched_end = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 1)], "end": [date(2024, 1, 15)], "val": [1]})
-        lf = _interval_lf(sched_end, spine, closed=closed, membership=pl.lit(True))
-        got = bool(lf.filter(pl.col("date") == date(2024, 1, 15)).collect().height)
-        assert got == keep_end_eq_lo
-
-    @pytest.mark.parametrize("closed", ["both", "left", "right", "none"])
-    def test_datetime_intraday_boundary_not_pruned(self, closed):
-        # Datetime columns; a Date request on Jan 15 must not prune a window active intraday on Jan 15,
-        # under any closed mode (regression: half-open modes previously shifted the bound a full day and
-        # dropped the row at the source). Assert survival at the source via the tracked schedule.
-        # A ends 09:00 Jan 15 (exercises end>=lo widening); B starts 15:00 Jan 15 (exercises start<=hi).
-        sched = pl.DataFrame(
-            {
-                "root": ["A", "B"],
-                "start": [datetime(2024, 1, 1, 9, 0), datetime(2024, 1, 15, 15, 0)],
-                "end": [datetime(2024, 1, 15, 9, 0), datetime(2024, 1, 20, 9, 0)],
-                "val": [1, 2],
-            }
-        )
-        tracker = PredicateTracker(sched)
-        spine = pl.DataFrame({"root": ["A", "B"], "date": [date(2024, 1, 15), date(2024, 1, 15)]})
-        spec = IntervalFilterSpec(start_col="start", end_col="end", closed=closed)
-        lf = pushdown_combine(
-            sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
-            # No membership filter: the interval pushdown alone must retain both boundary-day windows.
-            combine=lambda s: s["spine"].join(s["sched"], on="root"),
-        )
-        result = lf.filter(pl.col("date") == date(2024, 1, 15)).collect()
-        assert sorted(set(result["val"].to_list())) == [1, 2]
-
-
-class TestIntervalFilterSpecConservative:
-    def test_disjoint_request_collapses_to_hull(self):
-        # A window in the gap between two disjoint request ranges survives the (hull) pushdown; documented
-        # conservative behavior. The consumer's per-row membership still trims the final output.
-        sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 20)], "end": [date(2024, 1, 25)], "val": [1]})
-        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 22)]})
-        tracker = PredicateTracker(sched)
-        spec = IntervalFilterSpec(start_col="start", end_col="end")
-        lf = pushdown_combine(
-            sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
-            combine=lambda s: s["spine"].join(s["sched"], on="root"),
-        )
-        # Disjoint request: Jan 1-5 OR Jan 30-31; the Jan 20-25 window lies in the gap.
-        lf.filter(
-            pl.col("date").is_between(date(2024, 1, 1), date(2024, 1, 5)) | pl.col("date").is_between(date(2024, 1, 30), date(2024, 1, 31))
-        ).collect()
-        # Pushed end>=lo uses the hull lower bound Jan 1 (not Jan 30), confirming hull collapse.
-        analyzer = PredicateAnalyzer(tracker.last_predicate)
-        end_lower, _ = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("end"))
-        assert end_lower == date(2024, 1, 1)
-
-    def test_non_monotone_value_mapping_keeps_interior_days(self):
-        # Monday maps to the previous Friday, other days to the day before: Sun 1 Sep maps after Mon 2 Sep.
-        def offset(d):
-            return d - timedelta(days=3 if d.weekday() == 0 else 1)
-
-        sched = pl.DataFrame(
-            {"root": ["A", "A"], "start": [date(2024, 8, 1), date(2024, 8, 31)], "end": [date(2024, 8, 30), date(2024, 9, 30)], "val": [1, 2]}
-        )
-        spine = pl.DataFrame({"root": ["A"] * 3, "date": [date(2024, 9, 1), date(2024, 9, 2), date(2024, 9, 3)]})
-        mapped = pl.col("date").map_elements(offset, return_dtype=pl.Date)
-        lf = _interval_lf(sched, spine, value_mapping=offset, membership=mapped.is_between(pl.col("start"), pl.col("end")))
-        result = lf.filter(pl.col("date").is_between(date(2024, 9, 1), date(2024, 9, 3))).sort("date").collect()
-        assert result["val"].to_list() == [2, 1, 2]
-
-    def test_value_mapping_to_none_pushes_nothing(self):
-        sched = pl.DataFrame(
-            {"root": ["A", "A"], "start": [date(2024, 1, 1), date(2024, 1, 3)], "end": [date(2024, 1, 1), date(2024, 1, 3)], "val": [1, 3]}
-        )
-        spine = pl.DataFrame({"root": ["A"] * 3, "date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)]})
-        lf = _interval_lf(sched, spine, value_mapping=lambda d: None if d == date(2024, 1, 2) else d)
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 1), date(2024, 1, 3))).sort("date").collect()
-        assert result["val"].to_list() == [1, 3]
-
-    def test_value_mapping_that_raises_pushes_nothing(self):
-        sched = pl.DataFrame(
-            {"root": ["A", "A"], "start": [date(2024, 1, 1), date(2024, 1, 3)], "end": [date(2024, 1, 1), date(2024, 1, 3)], "val": [1, 3]}
-        )
-        spine = pl.DataFrame({"root": ["A"] * 3, "date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)]})
-        lf = _interval_lf(sched, spine, value_mapping={date(2024, 1, 1): date(2024, 1, 1), date(2024, 1, 3): date(2024, 1, 3)}.__getitem__)
-        result = lf.filter(pl.col("date").is_between(date(2024, 1, 1), date(2024, 1, 3))).sort("date").collect()
-        assert result["val"].to_list() == [1, 3]
-
-
-class TestSharedSourceColUnion:
-    """Two or more output columns mapping to the same source column union their discrete filters.
-
-    A self-join over one source builds every pair of ``group`` values, exposing ``group1``/``group2``
-    output columns that both derive from the source's single ``group`` column. A filter constrains the
-    output *pair*; a source row is relevant if it can serve *any* output column mapped to that source
-    column, so the correct source predicate is the union across those columns (not the intersection).
-    """
-
-    @staticmethod
-    def _three_group_source():
-        return pl.DataFrame(
-            {
-                "data_date": [date(2024, 1, 1)] * 3,
-                "group": ["A", "B", "C"],
-                "val": [1.0, 2.0, 3.0],
-            }
-        )
-
-    @staticmethod
-    def _combine(s):
-        # Self-join to build cross-group pairs, exposing group1/group2 from source `group`.
-        left = s["src"].rename({"group": "group1", "val": "val1"})
-        right = s["src"].select(
-            "data_date",
-            pl.col("group").alias("group2"),
-            pl.col("val").alias("val2"),
-        )
-        return left.join(right, on="data_date").filter(pl.col("group1") != pl.col("group2"))
-
-    @classmethod
-    def _build(cls, source_lf):
-        return pushdown_combine(
-            sources={
-                "src": (
-                    source_lf,
+        combine=lambda s: s["source1"].join(s["source2"], on="date", maintain_order="right"),
+        predicate=pl.col("date") >= make_date(7),
+        check_row_order=True,
+        time_bounds={"source1": {"date": (make_date(2), ...)}, "source2": {"date": (make_date(5), ...)}},
+    ),
+    CombineCase(
+        "mixed_filter_types_per_source",
+        sources={
+            "left": (GROUPS.head(5), {"date": FilterSpec(lookback=days(2)), "group": FilterSpec()}),
+            "right": (GROUPS.head(5).rename({"val": "val2"}), {"date": FilterSpec(), "group": FilterSpec()}),
+        },
+        combine=join(["date", "group"], maintain_order="left"),
+        predicate=(pl.col("date") >= make_date(3)) & (pl.col("group") == "A"),
+        check_row_order=True,
+    ),
+    CombineCase(
+        "pushdown_combine_join_with_mapping_and_lookback",
+        sources=THREE_WAY,
+        combine=three_way,
+        predicate=pl.col("date").is_between(make_date(5), make_date(7)) & (pl.col("category") == "CAT_A"),
+    ),
+    # Edge cases
+    CombineCase(
+        "empty_result", sources=single_source(daily_frame(1), date=FilterSpec()), combine=identity, predicate=pl.col("date") == make_date(31, 12)
+    ),
+    CombineCase(
+        "no_filter_specs", sources=single_source(pl.DataFrame({"id": [1, 2], "val": [10, 20]})), combine=identity, predicate=pl.col("id") == 1
+    ),
+    CombineCase(
+        "source_col_not_in_schema",
+        sources=single_source(pl.DataFrame({"id": [1, 2], "val": [10, 20]}), nonexistent=FilterSpec(source_col="also_nonexistent")),
+        combine=identity,
+    ),
+    CombineCase(
+        "multiple_filters_combined",
+        sources=single_source(GROUPS, date=FilterSpec(), group=FilterSpec()),
+        combine=identity,
+        predicate=(pl.col("date") >= make_date(5)) & (pl.col("group") == "A"),
+    ),
+    CombineCase(
+        "datetime_column",
+        sources=single_source(
+            pl.DataFrame({"ts": [datetime(2024, 1, 1, h) for h in range(24)], "val": range(24)}), ts=FilterSpec(lookback=timedelta(hours=3))
+        ),
+        combine=identity,
+        predicate=pl.col("ts") >= datetime(2024, 1, 1, 12),
+    ),
+    CombineCase(
+        "column_selection_with_columns",
+        sources=single_source(pl.DataFrame({"date": [make_date(1), make_date(2)], "a": [1, 2], "b": [10, 20], "c": [100, 200]}), date=FilterSpec()),
+        combine=identity,
+        post_step=lambda lf: lf.select("date", "a"),
+    ),
+    CombineCase("row_limit", sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec()), combine=identity, post_step=lambda lf: lf.head(3)),
+    CombineCase(
+        "filter_on_column_without_spec",
+        sources=single_source(FIVE_DAYS.with_columns(unspecified_col=pl.Series(list("ABCDE"))), date=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("unspecified_col") == "C",
+    ),
+    CombineCase(
+        "complex_predicate_with_or",
+        sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec()),
+        combine=identity,
+        predicate=(pl.col("date") == make_date(3)) | (pl.col("date") == make_date(7)),
+    ),
+    CombineCase(
+        "nested_filters_with_and",
+        sources=single_source(GROUPS, date=FilterSpec(lookback=days(2)), group=FilterSpec()),
+        combine=identity,
+        predicate=(pl.col("date") >= make_date(5)) & (pl.col("group") == "A"),
+    ),
+    CombineCase(
+        "filter_with_null_values",
+        sources=single_source(pl.DataFrame({"date": [make_date(1), make_date(2), None, make_date(4)], "val": [1, 2, 3, 4]}), date=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("date") >= make_date(2),
+    ),
+    CombineCase(
+        "multiple_collects",
+        sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec()),
+        combine=identity,
+        predicate=[pl.col("date") >= make_date(5), pl.col("date") <= make_date(3)],
+    ),
+    CombineCase("empty_source", sources=single_source(daily_frame(0), date=FilterSpec()), combine=identity, predicate=pl.col("date") >= make_date(1)),
+    CombineCase(
+        "very_large_lookback",
+        sources=single_source(TEN_DAYS_FROM_ZERO, date=FilterSpec(lookback=days(365))),
+        combine=identity,
+        predicate=pl.col("date") >= make_date(5),
+    ),
+    CombineCase(
+        "combine_with_additional_columns",
+        sources=single_source(FIVE_DAYS, date=FilterSpec()),
+        combine=lambda s: s["data"].with_columns((pl.col("val") * 2).alias("val_doubled"), pl.lit("constant").alias("const_col")),
+        predicate=pl.col("date") >= make_date(3),
+    ),
+    CombineCase(
+        "combine_drops_columns",
+        sources=single_source(FIVE_DAYS.with_columns(drop_col=pl.Series(list("abcde"))), date=FilterSpec()),
+        combine=lambda s: s["data"].drop("drop_col"),
+        predicate=pl.col("date") >= make_date(3),
+    ),
+    # combine_kwargs and sources_as_kwargs
+    CombineCase(
+        "combine_kwargs_basic",
+        sources=single_source(FIVE_DAYS, date=FilterSpec()),
+        combine=scaled,
+        predicate=pl.col("date") >= make_date(3),
+        combine_kwargs={"multiplier": 10},
+    ),
+    CombineCase(
+        "combine_kwargs_with_mapping_dict",
+        sources=single_source(pl.DataFrame({"date": [make_date(1), make_date(2)], "code": ["US", "CN"], "val": [100, 200]}), date=FilterSpec()),
+        combine=with_mapping,
+        combine_kwargs={"code_to_region": {"US": "North America", "CN": "Asia"}},
+    ),
+    CombineCase(
+        "combine_kwargs_multiple_args",
+        sources=single_source(FIVE_DAYS, date=FilterSpec()),
+        combine=multiple_args,
+        combine_kwargs={"multiplier": 2, "suffix": "doubled", "constant": "hello"},
+        check_row_order=True,
+    ),
+    CombineCase("combine_kwargs_with_none", sources=single_source(FIVE_DAYS, date=FilterSpec()), combine=identity, combine_kwargs=None),
+    CombineCase("combine_kwargs_empty_dict", sources=single_source(FIVE_DAYS, date=FilterSpec()), combine=identity, combine_kwargs={}),
+    CombineCase(
+        "combine_kwargs_complex_join_pattern",
+        sources=PRIMARY_REFERENCE,
+        combine=primary_with_reference,
+        predicate=(pl.col("date") >= make_date(2)) & (pl.col("category") == "CATEGORY_A"),
+        combine_kwargs={"category_to_code": CATEGORY_TO_CODE},
+    ),
+    CombineCase(
+        "sources_as_kwargs_basic",
+        sources=left_and_right_sources(FIVE_DAYS.rename({"val": "left_val"}), FIVE_DAYS.rename({"val": "right_val"}), {"date": FilterSpec()}),
+        combine=keyword_sources_join,
+        predicate=pl.col("date") >= make_date(3),
+        sources_as_kwargs=True,
+    ),
+    CombineCase(
+        "sources_as_kwargs_with_combine_kwargs",
+        sources=single_source(FIVE_DAYS, date=FilterSpec()),
+        combine=keyword_sources_scaled,
+        combine_kwargs={"multiplier": 10, "suffix": "x10"},
+        sources_as_kwargs=True,
+        check_row_order=True,
+    ),
+    CombineCase(
+        "sources_as_kwargs_with_lookback",
+        sources=single_source(FOURTEEN_DAYS, date=FilterSpec(lookback=days(4))),
+        combine=keyword_sources_lag,
+        predicate=pl.col("date") == make_date(5),
+        sources_as_kwargs=True,
+    ),
+    CombineCase(
+        "sources_as_kwargs_multiple_sources",
+        sources={
+            "prices": (FIVE_DAYS.rename({"val": "price"}), {"date": FilterSpec()}),
+            "volumes": (FIVE_DAYS.rename({"val": "volume"}), {"date": FilterSpec()}),
+            "metadata": (FIVE_DAYS.with_columns(category=pl.Series(list("AABBA"))).drop("val"), {"date": FilterSpec()}),
+        },
+        combine=keyword_sources_three,
+        predicate=pl.col("date") >= make_date(3),
+        sources_as_kwargs=True,
+    ),
+    CombineCase("sources_as_kwargs_false_is_default", sources=single_source(FIVE_DAYS, date=FilterSpec()), combine=identity),
+    CombineCase(
+        "sources_as_kwargs_with_value_mapping",
+        sources=single_source(region_frame("NA", "EU"), region=FilterSpec(source_col="region_code", value_mapping=to_codes("NA", "EU"))),
+        combine=keyword_sources_regions,
+        predicate=pl.col("region") == "NORTH_AMERICA",
+        sources_as_kwargs=True,
+    ),
+    CombineCase(
+        "sources_as_kwargs_complex_join_pattern",
+        sources={
+            "primary": (PRIMARY.with_columns(category=pl.lit("A")), {"date": FilterSpec(), "category": FilterSpec()}),
+            "reference": (
+                REFERENCE,
+                {"date": FilterSpec(lookback=days(2)), "category": FilterSpec(source_col="category_code", value_mapping={"A": "A", "B": "B"})},
+            ),
+        },
+        combine=keyword_sources_primary_with_reference,
+        predicate=(pl.col("date") >= make_date(2)) & (pl.col("category") == "A"),
+        combine_kwargs={"category_mapping": {"A": "A", "B": "B"}},
+        sources_as_kwargs=True,
+    ),
+    # A Date filter linked to a Datetime source keeps every intraday row of the requested days.
+    CombineCase("eq_covers_full_day", **intraday(pl.col("data_date") == make_date(2))),
+    CombineCase("eq_with_lookback_covers_full_day", **intraday(pl.col("data_date") == make_date(2), lookback=days(1))),
+    # A sub-day lookback from a Date literal still crosses the day boundary, and the upper bound covers the whole day.
+    CombineCase(
+        "eq_with_subday_lookback_fetches_prior_evening",
+        sources={
+            "main": (
+                pl.DataFrame(
                     {
-                        "data_date": FilterSpec(),
-                        "group1": FilterSpec(source_col="group"),
-                        "group2": FilterSpec(source_col="group"),
-                    },
-                )
-            },
-            combine=cls._combine,
-        )
-
-    def test_lone_side_filter_returns_all_partners(self):
-        out = self._build(self._three_group_source().lazy()).filter(pl.col("group1") == "A").collect()
-        # A paired with all other groups, not empty.
-        assert set(out["group2"]) == {"B", "C"}
-
-    def test_both_sides_filter_unions_to_is_in(self):
-        out = self._build(self._three_group_source().lazy()).filter((pl.col("group1") == "A") & (pl.col("group2") == "B")).collect()
-        assert out.height == 1
-        assert out["group1"][0] == "A"
-        assert out["group2"][0] == "B"
-
-    def test_both_sides_pushes_union_is_in(self):
-        tracker = PredicateTracker(self._three_group_source())
-        self._build(tracker.lazy_frame).filter((pl.col("group1") == "A") & (pl.col("group2") == "B")).collect()
-        analyzer = tracker.get_analyzer()
-        f = analyzer.find_discrete_filter("group")
-        assert f is not None
-        assert analyzer.extract_discrete_values(f) == {"A", "B"}  # union pushed to the scan
-
-    def test_lone_side_pushes_no_group_predicate(self):
-        predicates = []
-        source = io_source_assert(self._three_group_source(), predicates.append)
-        out = self._build(source).filter(pl.col("group1") == "A").collect()
-        assert set(out["group2"]) == {"B", "C"}
-        assert predicates
-        assert any(predicate is None or PredicateAnalyzer(predicate).find_discrete_filter("group") is None for predicate in predicates)
-
-    def test_is_in_both_sides_unions(self):
-        tracker = PredicateTracker(self._three_group_source())
-        self._build(tracker.lazy_frame).filter(pl.col("group1").is_in(["A", "B"]) & pl.col("group2").is_in(["B", "C"])).collect()
-        analyzer = tracker.get_analyzer()
-        f = analyzer.find_discrete_filter("group")
-        assert f is not None
-        assert analyzer.extract_discrete_values(f) == {"A", "B", "C"}
-
-    def test_three_shared_columns_union(self):
-        # Three output columns sharing one source column: the generalization holds.
-        df = pl.DataFrame({"group": ["A", "B", "C"]})
-
-        def combine(s):
-            base = s["src"]
-            return (
-                base.rename({"group": "group1"})
-                .join(base.select(pl.col("group").alias("group2")), how="cross")
-                .join(base.select(pl.col("group").alias("group3")), how="cross")
+                        "timestamp": [datetime(2024, 1, 1, 20), datetime(2024, 1, 2, 4), datetime(2024, 1, 2, 10), datetime(2024, 1, 3, 4)],
+                        "value": [10, 20, 30, 40],
+                    }
+                ),
+                {"data_date": FilterSpec(source_col="timestamp", lookback=timedelta(hours=18))},
             )
-
-        three_specs = {
-            "group1": FilterSpec(source_col="group"),
-            "group2": FilterSpec(source_col="group"),
-            "group3": FilterSpec(source_col="group"),
-        }
-
-        # All three constrained -> union of the three values pushed.
-        tracker = PredicateTracker(df)
-        pushdown_combine(sources={"src": (tracker.lazy_frame, three_specs)}, combine=combine).filter(
-            (pl.col("group1") == "A") & (pl.col("group2") == "B") & (pl.col("group3") == "C")
-        ).collect()
-        analyzer = tracker.get_analyzer()
-        f = analyzer.find_discrete_filter("group")
-        assert f is not None
-        assert analyzer.extract_discrete_values(f) == {"A", "B", "C"}
-
-        # One of the three unconstrained -> push nothing for `group`.
-        tracker2 = PredicateTracker(df)
-        pushdown_combine(sources={"src": (tracker2.lazy_frame, three_specs)}, combine=combine).filter(
-            (pl.col("group1") == "A") & (pl.col("group2") == "B")
-        ).collect()
-        if tracker2.last_predicate is not None:
-            assert tracker2.get_analyzer().find_discrete_filter("group") is None
-
-    def test_value_mapping_union_of_mapped_values(self):
-        # Two shared-source specs each with a value_mapping -> union of the MAPPED values.
-        df = pl.DataFrame({"code": ["a", "b", "c"]})
-
-        def combine(s):
-            return s["src"].rename({"code": "name1"}).join(s["src"].select(pl.col("code").alias("name2")), how="cross")
-
-        specs = {
-            "name1": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
-            "name2": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
-        }
-        tracker = PredicateTracker(df)
-        pushdown_combine(
-            sources={"src": (tracker.lazy_frame, specs)},
-            combine=combine,
-        ).filter((pl.col("name1") == "A") & (pl.col("name2") == "B")).collect()
-        analyzer = tracker.get_analyzer()
-        f = analyzer.find_discrete_filter("code")
-        assert f is not None
-        assert analyzer.extract_discrete_values(f) == {"a", "b"}  # mapped values, unioned
-
-    def test_value_mapping_unmapped_member_still_correct(self):
-        # One member yields an unmapped value -> the shared group's union pushdown is skipped, so the
-        # source supplies all rows and the post-combine predicate decides the result. Assert on the
-        # result (correctness) rather than the pushed predicate: Polars may still push the renamed
-        # post-combine predicate natively, which is independent of pushdown_combine's own pushdown.
-        df = pl.DataFrame({"code": ["a", "b", "c"]})
-
-        def combine(s):
-            # Map source `code` back to output names on BOTH sides so the output columns exist.
-            code_to_name = {"a": "A", "b": "B", "c": "C"}
-            left = s["src"].with_columns(pl.col("code").replace(code_to_name).alias("name1")).drop("code")
-            right = s["src"].with_columns(pl.col("code").replace(code_to_name).alias("name2")).drop("code")
-            return left.join(right, how="cross")
-
-        specs = {
-            "name1": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
-            # Partial mapping for name2: "C" is intentionally absent.
-            "name2": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b"}),
-        }
-        # name2 == "C" is unmapped for name2 -> group skipped, but the result must still be correct.
-        out = (
-            pushdown_combine(sources={"src": (df.lazy(), specs)}, combine=combine)
-            .filter((pl.col("name1") == "A") & (pl.col("name2") == "C"))
-            .collect()
+        },
+        combine=as_date,
+        predicate=pl.col("data_date") == make_date(2),
+        result_check=pushed_text("main", has=("2024-01-01 06:00:00", "2024-01-03 00:00:00")),
+    ),
+    CombineCase("le_covers_full_day", **intraday(pl.col("data_date") <= make_date(2))),
+    CombineCase("ge_starts_at_midnight", **intraday(pl.col("data_date") >= make_date(2))),
+    CombineCase("lt_excludes_full_day", **intraday(pl.col("data_date") < make_date(2))),
+    CombineCase("gt_starts_next_day", **intraday(pl.col("data_date") > make_date(2))),
+    CombineCase("is_in_covers_full_days", **intraday(pl.col("data_date").is_in([make_date(2), make_date(3)]))),
+    CombineCase(
+        "datetime_filter_on_datetime_source_unchanged",
+        sources={"main": (INTRADAY, {"timestamp": FilterSpec()})},
+        combine=lambda s: s["main"],
+        predicate=pl.col("timestamp") >= datetime(2024, 1, 2, 12),
+        check_row_order=True,
+    ),
+    # IntervalFilterSpec pushes start <= hi and end >= lo onto the schedule; membership is the combine's.
+    CombineCase(
+        "selects_covering_windows",
+        sources=windows(schedule([make_date(1), make_date(11), make_date(21)], [make_date(10), make_date(20), make_date(30)]), spine(make_date(15))),
+        combine=interval_join(),
+        predicate=pl.col("date") == make_date(15),
+    ),
+    CombineCase(
+        "long_window_kept",
+        sources=windows(schedule([make_date(1, 1, 2020)], [make_date(1, 1, 2030)]), spine(make_date(15))),
+        combine=interval_join(),
+        predicate=pl.col("date") == make_date(15),
+    ),
+    CombineCase(
+        "bounds_pushed_to_source",
+        sources=windows(SCHEDULE_JAN_11_TO_20, spine(make_date(12), make_date(15))),
+        combine=interval_join(),
+        predicate=pl.col("date").is_between(make_date(12), make_date(15)),
+        time_bounds={"sched": {"end": (make_date(12), ...), "start": (..., make_date(15))}},
+    ),
+    # A one-day timedelta value_mapping moves both bounds the schedule source receives back by a day.
+    CombineCase(
+        "interval_timedelta_mapping_shifts_bounds-open",
+        sources=windows(SCHEDULE_JAN_11_TO_20, spine(make_date(13)), value_mapping=days(-1)),
+        combine=interval_join(None),
+        predicate=pl.col("date") >= make_date(12),
+        result_check=pushed_text("sched", has=('(col("end")) >= (2024-01-11)',), lacks=('col("start")',)),
+    ),
+    CombineCase(
+        "interval_timedelta_mapping_shifts_bounds-over_cap",
+        sources=windows(SCHEDULE_JAN_11_TO_20, spine(make_date(13)), value_mapping=days(-1)),
+        combine=interval_join(None),
+        predicate=pl.col("date").is_between(make_date(1, 1, 1990), make_date(15)),
+        result_check=pushed_text("sched", has=('(col("end")) >= (1989-12-31)', '(col("start")) <= (2024-01-14)')),
+    ),
+    CombineCase(
+        "interval_timedelta_mapping_shifts_bounds-datetime",
+        sources=windows(SCHEDULE_JAN_11_TO_20_DATETIME, spine(datetime(2024, 1, 13)), value_mapping=days(-1)),
+        combine=interval_join(None),
+        predicate=pl.col("date").is_between(datetime(2024, 1, 12, 6), datetime(2024, 1, 15, 6)),
+        result_check=pushed_text("sched", has=('(col("end")) >= (2024-01-11 06:00:00)', '(col("start")) <= (2024-01-14 06:00:00)')),
+    ),
+    # A partial day shifts a Date request outward to whole days.
+    *[
+        CombineCase(
+            f"interval_timedelta_mapping_rounds_dates_outward-{hours}h",
+            sources=windows(SCHEDULE_JAN_11_TO_20, spine(make_date(13)), value_mapping=timedelta(hours=hours)),
+            combine=interval_join(),
+            predicate=pl.col("date") == make_date(13),
+            result_check=pushed_text("sched", has=(f'(col("end")) >= ({end_lower})', f'(col("start")) <= ({start_upper})')),
         )
-        assert out.height == 1
-        assert out["name1"][0] == "A"
-        assert out["name2"][0] == "C"
-
-    def test_non_shared_column_in_same_source_unaffected(self):
-        # A column that does NOT share a source col still pushes its own discrete filter.
-        df = pl.DataFrame({"group": ["A", "B", "C"], "other": ["x", "y", "z"]})
-
-        def combine(s):
-            return s["src"].rename({"group": "group1"}).join(s["src"].select(pl.col("group").alias("group2")), how="cross")
-
-        specs = {
-            "group1": FilterSpec(source_col="group"),
-            "group2": FilterSpec(source_col="group"),
-            "other": FilterSpec(),
-        }
-        tracker = PredicateTracker(df)
-        pushdown_combine(
-            sources={"src": (tracker.lazy_frame, specs)},
-            combine=combine,
-        ).filter((pl.col("group1") == "A") & (pl.col("group2") == "B") & (pl.col("other") == "x")).collect()
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("group")) == {"A", "B"}
-        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("other")) == {"x"}
-
-    def test_temporal_suppressed_column_excluded_from_union(self):
-        # A lookback spec on a source col suppresses that column's discrete membership; a second discrete
-        # spec on the SAME source col is then the only union member and pushes on its own.
-        df = pl.DataFrame(
-            {
-                "d": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
-                "val": [1, 2, 3],
-            }
-        )
-
-        def combine(s):
-            return s["src"].rename({"d": "d1"}).join(s["src"].select(pl.col("d").alias("d2")), how="cross")
-
-        specs = {
-            "d1": FilterSpec(source_col="d", lookback=timedelta(days=2)),
-            "d2": FilterSpec(source_col="d"),
-        }
-        tracker = PredicateTracker(df)
-        # NOTE: this test only asserts the pushed predicates (the suppression mechanism), not the
-        # end-to-end result. End-to-end this filter currently returns 0 rows but should return 1
-        # (d1=Jan3, d2=Jan2): the lookback range and the discrete d==Jan2 predicate AND on the shared
-        # source col `d`, starving the d1==Jan3 side of the cross-join. Mixed temporal+discrete sharing
-        # of one source_col still intersects rather than unions -- the documented limitation; see the
-        # pushdown_combine docstring Notes block.
-        pushdown_combine(
-            sources={"src": (tracker.lazy_frame, specs)},
-            combine=combine,
-        ).filter((pl.col("d1") == date(2024, 1, 3)) & (pl.col("d2") == date(2024, 1, 2))).collect()
-        analyzer = tracker.get_analyzer()
-        # d1 is temporally suppressed (has lookback), so the discrete group for `d` has only d2 as a
-        # constrained member; a lone constrained member is unioned to itself -> pushes d == d2's value.
-        # The temporal (lookback) range filter for d1 is applied separately.
-        temporal = analyzer.find_temporal_filter("d")
-        assert temporal is not None  # lookback range was pushed
-        # d2's discrete equality is pushed as the single-member union.
-        f = analyzer.find_discrete_filter("d")
-        assert f is not None
-        assert analyzer.extract_discrete_values(f) == {date(2024, 1, 2)}
-
-    def test_union_with_unorderable_values_does_not_crash(self):
-        # The union may contain unorderable values (e.g. None mixed with strings). The pushed is_in must
-        # not sort them, or collect() would raise TypeError. A lone (non-shared) column already tolerates
-        # this via list(...); a shared source col must behave the same.
-        df = pl.DataFrame({"group": ["A", "B", None]})
-
-        def combine(s):
-            return s["src"].rename({"group": "group1"}).join(s["src"].select(pl.col("group").alias("group2")), how="cross")
-
-        specs = {
-            "group1": FilterSpec(source_col="group"),
-            "group2": FilterSpec(source_col="group"),
-        }
-        # group1 in {None, "A"} unions with group2 == "B" -> {None, "A", "B"} (unorderable set).
-        pred = (pl.col("group1").is_null() | (pl.col("group1") == "A")) & (pl.col("group2") == "B")
-        result = pushdown_combine(sources={"src": (df.lazy(), specs)}, combine=combine).filter(pred).collect()
-        assert_frame_equal(result, combine({"src": df.lazy()}).filter(pred).collect(), check_row_order=False)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
-class TestPushdownCombineCastSafety:
-    """A narrowing cast on a filter column must not drop rows during pushdown."""
-
-    def test_narrowing_cast_does_not_drop_rows(self):
-        src = pl.DataFrame({"a": [1, 2, 257]}).lazy()
-        lf = pushdown_combine({"s": (src, {"a": FilterSpec()})}, lambda s: s["s"])
-        pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
-        # 257 wraps to 1 under Int8, so both 1 and 257 match; pushdown must keep them.
-        assert lf.filter(pred).collect().height == src.filter(pred).collect().height == 2
-
-    @pytest.mark.parametrize(
-        ("pred", "dtype"),
-        [
-            (pl.col("x") == 16777216.0, pl.Float32),
-            ((pl.col("x") == 16777216.0) | (pl.col("x") == 5.0), pl.Float32),
-            (pl.col("x") == 1e300, pl.Float32),
-            (pl.col("x") == 16777216.0, pl.Float64),
-            (pl.col("x") == 1e300, pl.Float64),
-            (pl.col("x") == sys.float_info.max, pl.Float32),
-            (pl.col("x") == sys.float_info.max, pl.Float64),
-            ((pl.col("x") == 16777216.0) | (pl.col("x") == 5.0), pl.Float64),
-        ],
-    )
-    def test_float_cast_in_combine_keeps_rounded_rows(self, pred, dtype):
-        # 16777217 rounds to 16777216.0 under Float32, so the cast row matches.
-        src = pl.LazyFrame({"x": [16777217, 5, None]})
-        combine = lambda s: s["s"].with_columns(pl.col("x").cast(dtype))
-        lf = pushdown_combine({"s": (src, {"x": FilterSpec()})}, combine)
-        assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect(), check_row_order=False)
-
-    def test_integral_float_without_float32_consumer_pushes_equality(self):
-        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
-
-        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {16777216.0}}, pl.Int64)
-        # Neither the integer next to the value nor nulls are kept.
-        assert pl.DataFrame({"x": [16777216, 16777217, None]}).filter(expr)["x"].to_list() == [16777216]
-
-    @pytest.mark.parametrize("pred", [pl.col("x") == 2.0**24, pl.col("x") == float(np.float32(0.1)), pl.col("x").is_in([2.0**24, -1.0])])
-    def test_float32_cast_of_float64_keeps_rounded_rows(self, pred):
-        # A Float64 value next to a Float32 value rounds to it under the cast.
-        src = pl.LazyFrame({"x": [2.0**24 + 1, 0.1, None]})
-        combine = lambda s: s["s"].with_columns(pl.col("x").cast(pl.Float32))
-        lf = pushdown_combine({"s": (src, {"x": FilterSpec()})}, combine)
-        assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect(), check_row_order=False)
-
-    def test_many_float32_values_push_one_membership(self):
-        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
-
-        values = {float(2**30 + 64 * i) for i in range(10_000)}
-        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": values}, pl.Int64, lambda: frozenset({"x"}))
-        assert len(str(expr)) < 1_000
-        rows = [2**30 + 64, 2**30 + 65, 2**30 + 64 * 10_000, 2**30 + 64 * 10_001, 5]
-        targets = {np.float32(v) for v in values}
-        assert pl.DataFrame({"x": rows}).filter(expr)["x"].to_list() == [x for x in rows if np.float32(x) in targets]
-
-    def test_non_numeric_source_does_not_resolve_float32_outputs(self):
-        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
-
-        def float32_outputs():
-            raise AssertionError("output schema resolved")
-
-        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {"a"}}, pl.String, float32_outputs)
-        assert pl.DataFrame({"x": ["a", "b"]}).filter(expr)["x"].to_list() == ["a"]
-
-
-@pytest.mark.parametrize(
-    "pred",
-    [
-        pl.col("a").is_null(),
-        pl.col("a").eq_missing(None),
-        pl.col("a").is_in([1, None], nulls_equal=True),
+        for hours, end_lower, start_upper in [(12, make_date(13), make_date(14)), (-12, make_date(12), make_date(13))]
     ],
-)
-def test_discrete_filter_keeps_null_rows(pred):
-    """A value set containing ``None`` must keep null rows, including when two output columns share a source column."""
-    src = pl.DataFrame({"a": [1, None, 3], "b": [1, None, 3]}).lazy()
-    single = pushdown_combine({"s": (src, {"a": FilterSpec()})}, lambda s: s["s"])
-    shared = pushdown_combine({"s": (src, {"a": FilterSpec(), "b": FilterSpec(source_col="a")})}, lambda s: s["s"])
-    expected = src.filter(pred).collect()
-    assert_frame_equal(single.filter(pred).collect(), expected, check_row_order=False)
-    assert_frame_equal(shared.filter(pred).collect(), expected, check_row_order=False)
+    # Rounding a shift of nearly the whole timedelta range out to whole days overflows; the bound is left unbounded.
+    *[
+        CombineCase(
+            f"interval_timedelta_mapping_out_of_range-{name}",
+            sources=windows(SCHEDULE_JAN_11_TO_20, spine(make_date(13)), value_mapping=shift),
+            combine=interval_join(),
+            predicate=pl.col("date") == make_date(13),
+        )
+        for name, shift in [("max", timedelta.max), ("min", timedelta.min)]
+    ],
+    # Windows closed on ``closed`` sides, joined to a requested day: the window starting that day (val 1) is kept if its
+    # start is closed, and the window ending that day (val 2) if its end is closed.
+    *[
+        CombineCase(
+            f"date_endpoints-{closed}",
+            sources=windows(
+                schedule([make_date(15), make_date(1)], [make_date(20), make_date(15)], roots=["A", "B"]),
+                spine(make_date(15), make_date(15), roots=["A", "B"]),
+                closed=closed,
+            ),
+            combine=interval_join(pl.lit(True)),
+            predicate=pl.col("date") == make_date(15),
+            compare_with_polars=False,
+            result_check=result_values_are(kept),
+        )
+        for closed, kept in [("both", {1, 2}), ("left", {1}), ("right", {2}), ("none", set())]
+    ],
+    # A Date request on the 15th keeps windows that end or start intraday on the 15th, under every closed mode.
+    *[
+        CombineCase(
+            f"datetime_intraday_boundary_not_pruned-{closed}",
+            sources=windows(INTRADAY_SCHEDULE, spine(make_date(15), make_date(15), roots=["A", "B"]), closed=closed),
+            combine=interval_join(None),
+            predicate=pl.col("date") == make_date(15),
+        )
+        for closed in CLOSED_OPTIONS
+    ],
+    # Disjoint requested ranges collapse to their hull: a window in the gap survives the pushdown.
+    CombineCase(
+        "disjoint_request_collapses_to_hull",
+        sources=windows(schedule([make_date(20)], [make_date(25)]), spine(make_date(22))),
+        combine=interval_join(None),
+        predicate=pl.col("date").is_between(make_date(1), make_date(5)) | pl.col("date").is_between(make_date(30), make_date(31)),
+        time_bounds={"sched": {"end": (make_date(1), ...)}},
+    ),
+    # Monday maps to the previous Friday, other days to the day before: Sun 1 Sep maps after Mon 2 Sep.
+    CombineCase(
+        "non_monotone_value_mapping_keeps_interior_days",
+        sources=windows(SCHEDULE_AUG_AND_SEP, SPINE_SEP_1_2_3, value_mapping=previous_weekday),
+        combine=interval_join(SEP_MEMBERSHIP),
+        predicate=pl.col("date").is_between(make_date(1, 9), make_date(3, 9)),
+    ),
+    # An interior day mapped to date.max leaves the upper bound on Datetime starts open.
+    CombineCase(
+        "value_mapping_to_last_date_leaves_datetime_start_unbounded",
+        sources=windows(
+            pl.DataFrame({"root": ["A"], "start": [datetime(2024, 1, 1)], "end": [datetime(9999, 12, 31)], "val": [1]}),
+            spine(make_date(1), make_date(2), make_date(3)),
+            value_mapping=lambda day: date.max if day == make_date(2) else make_date(1),
+        ),
+        combine=interval_join(None),
+        predicate=pl.col("date").is_between(make_date(1), make_date(3)),
+        result_check=pushed_text("sched", has=('col("end")',), lacks=('col("start")',)),
+    ),
+    CombineCase(
+        "value_mapping_to_none_pushes_nothing",
+        sources=windows(
+            schedule([make_date(1), make_date(3)], [make_date(1), make_date(3)], [1, 3]),
+            spine(make_date(1), make_date(2), make_date(3)),
+            value_mapping=lambda day: None if day == make_date(2) else day,
+        ),
+        combine=interval_join(),
+        predicate=pl.col("date").is_between(make_date(1), make_date(3)),
+    ),
+    CombineCase(
+        "value_mapping_that_raises_pushes_nothing",
+        sources=windows(
+            schedule([make_date(1), make_date(3)], [make_date(1), make_date(3)], [1, 3]),
+            spine(make_date(1), make_date(2), make_date(3)),
+            value_mapping={make_date(1): make_date(1), make_date(3): make_date(3)}.__getitem__,
+        ),
+        combine=interval_join(),
+        predicate=pl.col("date").is_between(make_date(1), make_date(3)),
+    ),
+    CombineCase(
+        "interval_filter_with_tz_aware_endpoints",
+        sources={
+            "spine": (pl.DataFrame({"d": [datetime(2024, 1, 2, tzinfo=UTC_ZONE)]}), {"d": FilterSpec()}),
+            "sched": (
+                pl.DataFrame({"start": [datetime(2024, 1, 1, tzinfo=UTC_ZONE)], "end": [datetime(2024, 1, 3, tzinfo=UTC_ZONE)], "x": [1]}),
+                {"d": IntervalFilterSpec("start", "end")},
+            ),
+        },
+        combine=lambda s: s["spine"].join_where(s["sched"], pl.col("d") >= pl.col("start"), pl.col("d") <= pl.col("end")).select("d", "x"),
+        predicate=pl.col("d") == datetime(2024, 1, 2, tzinfo=UTC_ZONE),
+    ),
+    # Shared source columns: a source row may serve any output column mapped to it, so the pushed values are the union.
+    CombineCase(
+        "lone_side_filter_returns_all_partners",
+        sources=single_source(THREE_GROUPS, **PAIR_SPECS),
+        combine=group_pairs,
+        predicate=pl.col("group1") == "A",
+    ),
+    CombineCase(
+        "both_sides_filter_unions_to_is_in",
+        sources=single_source(THREE_GROUPS, **PAIR_SPECS),
+        combine=group_pairs,
+        predicate=(pl.col("group1") == "A") & (pl.col("group2") == "B"),
+        allowed_values={"data": {"group": {"A", "B"}}},
+    ),
+    CombineCase(
+        "is_in_both_sides_unions",
+        sources=single_source(THREE_GROUPS, **PAIR_SPECS),
+        combine=group_pairs,
+        predicate=pl.col("group1").is_in(["A", "B"]) & pl.col("group2").is_in(["B", "C"]),
+        allowed_values={"data": {"group": {"A", "B", "C"}}},
+    ),
+    CombineCase(
+        "three_shared_columns_union-all_constrained",
+        sources=single_source(THREE_GROUPS.select("group"), **THREE_SPECS),
+        combine=cross_aliases("group", "group1", "group2", "group3"),
+        predicate=(pl.col("group1") == "A") & (pl.col("group2") == "B") & (pl.col("group3") == "C"),
+        allowed_values={"data": {"group": {"A", "B", "C"}}},
+    ),
+    CombineCase(
+        "three_shared_columns_union-one_unconstrained",
+        sources=single_source(THREE_GROUPS.select("group"), **THREE_SPECS),
+        combine=cross_aliases("group", "group1", "group2", "group3"),
+        predicate=(pl.col("group1") == "A") & (pl.col("group2") == "B"),
+        columns_without_value_filter={"data": {"group"}},
+    ),
+    CombineCase(
+        "value_mapping_union_of_mapped_values",
+        sources=single_source(
+            CODES, name1=FilterSpec(source_col="code", value_mapping=NAME_MAPPING), name2=FilterSpec(source_col="code", value_mapping=NAME_MAPPING)
+        ),
+        combine=cross_aliases("code", "name1", "name2"),
+        predicate=(pl.col("name1") == "A") & (pl.col("name2") == "B"),
+        allowed_values={"data": {"code": {"a", "b"}}},
+    ),
+    # name2 has no mapping for "C", so the union is skipped and the user's filter decides.
+    CombineCase(
+        "value_mapping_unmapped_member_still_correct",
+        sources=single_source(
+            CODES,
+            name1=FilterSpec(source_col="code", value_mapping=NAME_MAPPING),
+            name2=FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b"}),
+        ),
+        combine=mapped_cross,
+        predicate=(pl.col("name1") == "A") & (pl.col("name2") == "C"),
+    ),
+    # Only the pushed filters are checked: the filter on ``other`` reaches the whole source, so the group2 side loses "B"
+    # and the result is empty where plain Polars returns one row.
+    CombineCase(
+        "non_shared_column_in_same_source_unaffected",
+        sources=single_source(GROUP_OTHER, **GROUP_OTHER_SPECS),
+        combine=cross_aliases("group", "group1", "group2", keep=("other",)),
+        predicate=GROUP_OTHER_PRED,
+        compare_with_polars=False,
+        allowed_values={"data": {"group": {"A", "B"}, "other": {"x"}}},
+    ),
+    # A lookback on d1 suppresses its discrete membership, so d2 is the lone member of the union on d. The result is not
+    # checked: the lookback range and d == Jan 2 intersect on the shared column and starve d1 == Jan 3 (a documented
+    # limitation of mixing temporal and discrete specs on one source column).
+    CombineCase(
+        "temporal_suppressed_column_excluded_from_union",
+        sources=single_source(THREE_DATES, d1=FilterSpec(source_col="d", lookback=days(2)), d2=FilterSpec(source_col="d")),
+        combine=cross_aliases("d", "d1", "d2"),
+        predicate=(pl.col("d1") == make_date(3)) & (pl.col("d2") == make_date(2)),
+        compare_with_polars=False,
+        time_bounds={"data": {"d": (..., ...)}},
+        allowed_values={"data": {"d": {make_date(2)}}},
+    ),
+    # Unorderable members (None and strings) must not be sorted into the pushed is_in.
+    CombineCase(
+        "union_with_unorderable_values_does_not_crash",
+        sources=single_source(
+            pl.DataFrame({"group": ["A", "B", None]}), group1=FilterSpec(source_col="group"), group2=FilterSpec(source_col="group")
+        ),
+        combine=cross_aliases("group", "group1", "group2"),
+        predicate=(pl.col("group1").is_null() | (pl.col("group1") == "A")) & (pl.col("group2") == "B"),
+    ),
+    # Casts: 257 wraps to 1 under Int8, and 2**24 + 1 rounds to 2.0**24 under Float32.
+    CombineCase(
+        "narrowing_cast_does_not_drop_rows",
+        sources=single_source(pl.DataFrame({"a": [1, 2, 257]}), a=FilterSpec()),
+        combine=identity,
+        predicate=pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1,
+    ),
+    *[
+        CombineCase(
+            f"float_cast_in_combine_keeps_rounded_rows-{name}",
+            sources=single_source(pl.DataFrame({"x": [2**24 + 1, 5, None]}), x=FilterSpec()),
+            combine=cast_to(dtype),
+            predicate=pred,
+        )
+        for name, pred, dtype in FLOAT_CASTS
+    ],
+    # A Float64 value next to a Float32 value rounds to it under the cast.
+    *[
+        CombineCase(
+            f"float32_cast_of_float64_keeps_rounded_rows-{name}",
+            sources=single_source(pl.DataFrame({"x": [2.0**24 + 1, 0.1, None]}), x=FilterSpec()),
+            combine=cast_to(pl.Float32),
+            predicate=pred,
+        )
+        for name, pred in [
+            ("eq_2_pow_24", pl.col("x") == 2.0**24),
+            ("eq_float32_of_0_1", pl.col("x") == float(np.float32(0.1))),
+            ("is_in_2_pow_24", pl.col("x").is_in([2.0**24, -1.0])),
+        ]
+    ],
+    # A value set containing None keeps null rows, also when two output columns share a source column.
+    *[
+        CombineCase(
+            f"discrete_filter_keeps_null_rows-{name}",
+            sources={"single": (NULLABLE, {"a": FilterSpec()}), "shared": (NULLABLE, {"a": FilterSpec(), "b": FilterSpec(source_col="a")})},
+            combine=lambda s: pl.concat([s["single"], s["shared"]]),
+            predicate=pred,
+        )
+        for name, pred in NULL_PREDICATES.items()
+    ],
+    *[
+        CombineCase(f"matches_filter-{name}", sources=single_source(df, t=spec), combine=identity, predicate=pred)
+        for name, df, pred, spec in MATCHES_FILTER
+    ],
+    *[
+        CombineCase(
+            f"temporal_filter_applies_value_mapping-{name}",
+            sources=single_source(pl.DataFrame({"d": [make_date(1), make_date(2)]}), d=FilterSpec(value_mapping=mapping)),
+            combine=lambda s: s["data"].with_columns(pl.col("d") + days(1)),
+            predicate=pl.col("d") == make_date(2),
+            check_row_order=True,
+        )
+        for name, mapping in [("dict", {make_date(2): make_date(1)}), ("callable", lambda day: day - days(1))]
+    ],
+    # Filtering the right side of a left join would null-extend rows that then satisfy the predicate.
+    *[
+        CombineCase(
+            f"null_accepting_filter_not_pushed_below_left_join-{name}",
+            sources=left_and_right_sources(pl.DataFrame({"id": [1, 2]}), pl.DataFrame({"id": [1, 2], "v": [10, None]}), {}, {"v": FilterSpec()}),
+            combine=join("id", how="left"),
+            predicate=pred,
+        )
+        for name, pred in [("is_null", pl.col("v").is_null()), ("is_null_or_eq", pl.col("v").is_null() | (pl.col("v") == 5))]
+    ],
+    # A value_mapping with a window pushes a window around the mapped values.
+    *[
+        CombineCase(
+            f"window_pushed_around_mapped_values-{name}",
+            sources=single_source(TWENTY_DAYS, date=weekday_window(7)),
+            combine=next_day_rolling,
+            predicate=pred,
+            time_bounds={"data": {"data_date": (..., ...)}},
+        )
+        for name, pred in [
+            ("eq", pl.col("date") == make_date(8)),
+            ("is_in", pl.col("date").is_in([make_date(8), make_date(15)])),
+            ("between", pl.col("date").is_between(make_date(8), make_date(10))),
+        ]
+    ],
+    CombineCase(
+        "open_range_through_callable_pushes_window_around_requested_range",
+        sources=single_source(TWENTY_DAYS, date=weekday_window(7)),
+        combine=next_day_rolling,
+        predicate=pl.col("date") >= make_date(8),
+        time_bounds={"data": {"data_date": (make_date(1), None)}},
+    ),
+    *[
+        CombineCase(
+            f"incomplete_or_failing_mapping_keeps_rows-{name}",
+            sources=single_source(TWENTY_DAYS, date=window(lookback=days(2), value_mapping=mapping)),
+            combine=next_day_rolling,
+            predicate=pl.col("date") == make_date(8),
+        )
+        for name, mapping in [("dict", {make_date(9): make_date(8)}), ("none", lambda day: None), ("raises", lambda day: 1 / 0)]
+    ],
+    CombineCase(
+        "unconstrained_identity_sibling_does_not_block_the_window",
+        sources=single_source(TWENTY_DAYS, data_date=FilterSpec(), date=weekday_window(2)),
+        combine=next_day_rolling,
+        predicate=pl.col("date") == make_date(8),
+        time_bounds={"data": {"data_date": (..., ...)}},
+    ),
+    CombineCase(
+        "mapped_aliases_in_a_self_join_union",
+        sources=single_source(TWENTY_DAYS, **{n: window(lookback=days(1), value_mapping=lambda day: day - days(1)) for n in ("d1", "d2")}),
+        combine=mapped_self_join,
+        predicate=(pl.col("d1") == make_date(3)) & (pl.col("d2") == make_date(12)),
+    ),
+    CombineCase(
+        "integer_output_key_is_not_used_as_a_date",
+        sources=single_source(TWENTY_DAYS, k=window(lookback=days(2), value_mapping={8: make_date(7)})),
+        combine=day_of_month_key,
+        predicate=pl.col("k") == 8,
+    ),
+    CombineCase(
+        "dict_covering_the_range_is_enumerated",
+        sources=single_source(TWENTY_DAYS, date=window(lookback=days(1), value_mapping={make_date(8): make_date(8), make_date(9): make_date(9)})),
+        combine=same_day_rolling,
+        predicate=pl.col("date").is_between(make_date(8), make_date(9)),
+        time_bounds={"data": {"data_date": (make_date(7), make_date(9))}},
+    ),
+    CombineCase(
+        "lookahead_around_mapped_values",
+        sources=single_source(TWENTY_DAYS, date=window(lookahead=days(2), value_mapping=lambda day: day)),
+        combine=lambda s: s["data"].with_columns(pl.col("v").shift(-2).alias("lead"), pl.col("data_date").alias("date")),
+        predicate=pl.col("date") == make_date(10),
+    ),
+    CombineCase(
+        "range_beyond_the_enumeration_cap_gets_the_window_around_the_range",
+        sources=single_source(TWENTY_DAYS, date=window(lookback=days(1), value_mapping=lambda day: day)),
+        combine=same_day_rolling,
+        predicate=pl.col("date").is_between(make_date(1, 1, 1990), make_date(10)),
+        time_bounds={"data": {"data_date": (make_date(31, 12, 1989), make_date(10))}},
+    ),
+    # A window that cannot be applied pushes nothing rather than the unwidened value.
+    CombineCase(
+        "time_zone_aware_column",
+        sources=single_source(
+            pl.DataFrame({"t": [datetime(2024, 1, day, tzinfo=UTC_ZONE) for day in range(1, 11)], "v": range(10)}), t=FilterSpec(lookback=days(3))
+        ),
+        combine=lambda s: s["data"].with_columns(pl.col("v").shift(1).alias("lag")),
+        predicate=pl.col("t") == datetime(2024, 1, 5, tzinfo=UTC_ZONE),
+    ),
+    CombineCase(
+        "unbounded_window",
+        sources=single_source(TEN_DAYS, d=FilterSpec(lookback=timedelta.max)),
+        combine=lambda s: s["data"].with_columns(pl.col("v").cum_sum().alias("c")),
+        predicate=pl.col("d") == make_date(5),
+    ),
+    CombineCase(
+        "unbounded_window_sharer_keeps_the_whole_source_column",
+        sources=single_source(
+            TEN_DAYS.with_columns(pl.col("v") + 1),
+            a=FilterSpec(source_col="d", lookback=timedelta.max),
+            b=FilterSpec(source_col="d", value_mapping=lambda x: x),
+        ),
+        combine=unbounded_sharer,
+        predicate=(pl.col("a") >= make_date(5)) & (pl.col("b") == make_date(8)),
+    ),
+    # Temporal values and units
+    CombineCase(
+        "mapped_values_keep_both_readings_of_a_repeated_hour",
+        sources=single_source(
+            pl.DataFrame({"t": NEW_YORK_REPEATED_HOUR}, schema={"t": pl.Datetime("us", "America/New_York")}),
+            a=FilterSpec(source_col="t", value_mapping=lambda a: a.astimezone(NEW_YORK)),
+        ),
+        combine=lambda s: s["data"].with_columns(pl.col("t").dt.convert_time_zone("UTC").alias("a")),
+        predicate=pl.col("a").is_in([datetime(2024, 11, 3, 5, 30, tzinfo=UTC_ZONE), datetime(2024, 11, 3, 6, 30, tzinfo=UTC_ZONE)]),
+    ),
+    # The collection has the column's own dtype: Polars rejects a microsecond list against a millisecond column.
+    *[
+        CombineCase(
+            f"is_in_on_any_datetime_unit-{time_zone}-{unit}",
+            sources=single_source(five_seconds(unit, time_zone).to_frame("t"), t=FilterSpec()),
+            combine=identity,
+            predicate=pl.col("t").is_in(five_seconds(unit, time_zone).gather([1, 3]).implode()),
+        )
+        for time_zone in (None, "UTC")
+        for unit in ("ms", "us", "ns")
+    ],
+    CombineCase(
+        "value_set_keys_do_not_overflow_near_the_date_limit",
+        sources=single_source(
+            pl.DataFrame({"t": NEAR_MAX, "k": [1, 2]}), k=FilterSpec(source_col="t", value_mapping={1: NEAR_MAX[0], 2: NEAR_MAX[1]})
+        ),
+        combine=identity,
+        predicate=pl.col("k").is_in([1, 2]),
+    ),
+    CombineCase(
+        "pushed_equality_keeps_the_predicates_comparison_unit",
+        sources=single_source(
+            pl.Series("t", [epoch_ns(datetime(2024, 1, 1)), epoch_ns(datetime(2024, 1, 1)) + 1]).cast(pl.Datetime("ns", "UTC")).to_frame(),
+            a=FilterSpec(source_col="t"),
+        ),
+        combine=lambda s: s["data"].with_columns(pl.col("t").dt.cast_time_unit("us").alias("a")),
+        predicate=pl.col("a") == datetime(2024, 1, 1, tzinfo=UTC),
+    ),
+    CombineCase(
+        "membership_with_another_unit_keeps_native_rows",
+        sources=single_source(US_MEMBERS.to_physical().cast(pl.Datetime("ns", "UTC")).to_frame("t"), t=FilterSpec()),
+        combine=lambda s: s["data"].collect().lazy(),
+        predicate=pl.col("t").is_in(US_MEMBERS.implode()),
+    ),
+]
 
 
-_TS = pl.DataFrame({"t": [datetime(2023, 12, 31, 23), datetime(2024, 1, 1), datetime(2024, 1, 1, 0, 0, 0, 500), datetime(2024, 1, 1, 13), None]})
-_DATES = pl.DataFrame({"t": [date(2023, 12, 31), date(2024, 1, 1), date(2024, 1, 2)]})
-_DEC = pl.DataFrame({"t": pl.Series([Decimal("1.25"), Decimal("2.50"), Decimal("3.75")], dtype=pl.Decimal(10, 2))})
-_NY = ZoneInfo("America/New_York")
-_TS_NY = _TS.with_columns(pl.col("t").dt.replace_time_zone("UTC").dt.convert_time_zone("America/New_York"))
+def _filter(lf: pl.LazyFrame, pred) -> pl.LazyFrame:
+    return lf if pred is None else lf.filter(pred)
 
 
-class TestPushdownCombineMatchesFilter:
-    """Pushdown must keep every row the predicate keeps."""
+def _matches_plain_polars(actual: pl.LazyFrame, reference: pl.LazyFrame, row_order: bool) -> pl.DataFrame | None:
+    """``assert_matches_plain_polars``; without ``row_order``, the cheaper ordered comparison is tried first."""
+    if not row_order:
+        try:
+            return assert_matches_plain_polars(actual, reference, None, check_row_order=True)
+        except AssertionError:
+            pass
+    return assert_matches_plain_polars(actual, reference, None, check_row_order=row_order)
 
-    @pytest.mark.parametrize(
-        ("df", "pred", "spec"),
-        [
-            (_TS, pl.col("t").cast(pl.Date) < datetime(2024, 1, 1, 12), FilterSpec()),
-            (_TS, pl.col("t").dt.date() < datetime(2024, 1, 1, 12), FilterSpec()),
-            (_TS, pl.col("t").cast(pl.Datetime("ms")) <= datetime(2024, 1, 1), FilterSpec()),
-            (_TS, pl.col("t").is_in([datetime(2024, 1, 1), None], nulls_equal=True), FilterSpec()),
-            (_TS, pl.col("t").is_in([None], nulls_equal=True), FilterSpec()),
-            (_DATES, pl.col("t") < datetime(2024, 1, 1, 12), FilterSpec()),
-            (_DATES, pl.col("t") < datetime(2024, 1, 1, 12), FilterSpec(lookback=timedelta(days=1))),
-            (_DATES, pl.col("t").is_between(datetime(2023, 12, 1), datetime(2024, 1, 1, 12), closed="left"), FilterSpec()),
-            (_TS_NY, pl.col("t") >= datetime(2024, 1, 1, tzinfo=_NY), FilterSpec()),
-            (_TS_NY, pl.col("t") < datetime(2024, 1, 1, tzinfo=_NY), FilterSpec()),
-            (_TS_NY, pl.col("t").is_between(datetime(2023, 12, 31, tzinfo=_NY), datetime(2024, 1, 1, tzinfo=_NY)), FilterSpec()),
-            (_TS_NY, pl.col("t") == datetime(2023, 12, 31, 19, tzinfo=_NY), FilterSpec()),
-            (_TS_NY, pl.col("t").is_in([datetime(2023, 12, 31, 19, tzinfo=_NY)]), FilterSpec()),
-            (_TS_NY, pl.col("t").cast(pl.Date) <= date(2023, 12, 31), FilterSpec()),
-            (_TS_NY, pl.col("t").dt.date() == date(2024, 1, 1), FilterSpec()),
-            (_DEC, pl.col("t").is_in(pl.lit([Decimal("1.25"), Decimal("2.50")], dtype=pl.List(pl.Decimal(10, 2)))), FilterSpec()),
-        ],
+
+@pytest.mark.parametrize("case", as_params(SCENARIOS))
+def test_pushdown_combine(case: CombineCase):
+    sources, is_identity = case.sources, case.combine is identity
+    inspected = {*case.sources_receiving_filter, *case.time_bounds, *case.allowed_values, *case.columns_without_value_filter}
+    if is_identity or case.result_check is not None:
+        inspected |= set(sources)
+    trackers = {name: PredicateTracker(df) for name, (df, _) in sources.items() if name in inspected}
+    frames = {name: trackers[name].lazy_frame if name in trackers else df.lazy() for name, (df, _) in sources.items()}
+    lf = pushdown_combine(
+        {name: (frames[name], specs) for name, (_, specs) in sources.items()},
+        case.combine,
+        combine_kwargs=case.combine_kwargs,
+        sources_as_kwargs=case.sources_as_kwargs,
     )
-    def test_matches_filter(self, df, pred, spec):
-        lf = pushdown_combine({"s": (df.lazy(), {"t": spec})}, lambda s: s["s"])
-        assert_frame_equal(lf.filter(pred).collect(), df.filter(pred), check_row_order=False)
+    unfiltered = {name: df.lazy() for name, (df, _) in sources.items()}
+    combine_kwargs = case.combine_kwargs or {}
+    reference = case.combine(**unfiltered, **combine_kwargs) if case.sources_as_kwargs else case.combine(unfiltered, **combine_kwargs)
+    post = case.post_step or (lambda frame: frame)
+    row_order = is_identity if case.check_row_order is None else case.check_row_order
+    preds = case.predicate if isinstance(case.predicate, list) else [case.predicate]
+    for p in preds:
+        actual = post(_filter(lf, p))
+        if case.compare_with_polars:
+            with failure_note(f"filtered by {p}"):
+                got = _matches_plain_polars(actual, post(_filter(reference, p)), row_order)
+        else:
+            got = actual.collect()
+    for name in case.sources_receiving_filter:
+        assert trackers[name].last_predicate is not None, f"nothing pushed to {name}"
+    for name, columns in case.time_bounds.items():
+        for col, (lower, upper) in columns.items():
+            assert_pushed_time_bounds(trackers[name], col, lower, upper)
+    for name, columns in case.allowed_values.items():
+        for col, values in columns.items():
+            assert_discrete(trackers[name], col, values, case.allowed_values_node.get(name, {}).get(col))
+    for name, columns in case.columns_without_value_filter.items():
+        pushed = trackers[name].last_predicate
+        for col in columns:
+            assert pushed is None or PredicateAnalyzer(pushed).find_discrete_filter(col) is None, pushed
+    if case.result_check is not None:
+        case.result_check(got, trackers)
 
 
-@pytest.mark.parametrize("value_mapping", [{date(2024, 1, 2): date(2024, 1, 1)}, lambda d: d - timedelta(days=1)])
-def test_temporal_filter_applies_value_mapping(value_mapping):
-    src = pl.LazyFrame({"d": [date(2024, 1, 1), date(2024, 1, 2)]})
-
-    def combine(s):
-        return s["s"].with_columns(pl.col("d") + timedelta(days=1))
-
-    pred = pl.col("d") == date(2024, 1, 2)
-    lf = pushdown_combine({"s": (src, {"d": FilterSpec(value_mapping=value_mapping)})}, combine)
-    assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect())
+def test_combine_kwargs_with_join_parameters():
+    """Two frames built over the same sources, each with its own combine_kwargs."""
+    left, right = PredicateTracker(KEY_LEFT), PredicateTracker(KEY_RIGHT)
+    for how in ("inner", "left"):
+        lf = pushdown_combine(
+            {"left": (left.lazy_frame, {"date": FilterSpec()}), "right": (right.lazy_frame, {})}, join_how, combine_kwargs={"join_how": how}
+        )
+        assert_matches_plain_polars(lf, KEY_LEFT.lazy().join(KEY_RIGHT.lazy(), on="key", how=how), None)
 
 
-def test_interval_filter_with_tz_aware_endpoints():
-    t = datetime(2024, 1, 2, tzinfo=ZoneInfo("UTC"))
-    spine = pl.LazyFrame({"d": [t]})
-    sched = pl.LazyFrame({"start": [t - timedelta(days=1)], "end": [t + timedelta(days=1)], "x": [1]})
-
-    def combine(s):
-        return s["spine"].join_where(s["sched"], pl.col("d") >= pl.col("start"), pl.col("d") <= pl.col("end")).select("d", "x")
-
-    sources = {"spine": (spine, {"d": FilterSpec()}), "sched": (sched, {"d": IntervalFilterSpec("start", "end")})}
-    pred = pl.col("d") == t
-    assert_frame_equal(pushdown_combine(sources, combine).filter(pred).collect(), combine({"spine": spine, "sched": sched}).filter(pred).collect())
-
-
-@pytest.mark.parametrize("pred", [pl.col("v").is_null(), pl.col("v").is_null() | (pl.col("v") == 5)])
-def test_null_accepting_filter_not_pushed_below_left_join(pred):
-    """Filtering the right side of a left join would null-extend rows that then satisfy the predicate."""
-    left = pl.LazyFrame({"id": [1, 2]})
-    right = pl.LazyFrame({"id": [1, 2], "v": [10, None]})
-
-    def combine(s):
-        return s["l"].join(s["r"], on="id", how="left")
-
-    lf = pushdown_combine({"l": (left, {}), "r": (right, {"v": FilterSpec()})}, combine)
-    assert_frame_equal(lf.filter(pred).collect(), combine({"l": left, "r": right}).filter(pred).collect(), check_row_order=False)
-
-
-def _assert_matches_native(sources, combine, pred):
-    raw = {name: lf for name, (lf, _) in sources.items()}
-    expected = combine(raw).filter(pred).collect()
-    result = pushdown_combine(sources, combine).filter(pred).collect()
-    assert_frame_equal(result, expected, check_row_order=False)
-    return result
-
-
-class TestMappedWindow:
-    """A ``value_mapping`` with a lookback must push a window, never only the exact mapped value."""
-
-    DAYS = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 21)], "v": list(range(20))})
-
-    @staticmethod
-    def _previous_weekday(d):
-        return d - timedelta(days=3 if d.weekday() == 0 else 1)
-
-    @staticmethod
-    def _combine(s):
-        # The output date is the next day; the rolling sum needs the preceding source rows.
-        return s["s"].with_columns(pl.col("v").rolling_sum(3).alias("r"), (pl.col("data_date") + pl.duration(days=1)).alias("date"))
-
-    def _sources(self, lf, **specs):
-        return {"s": (lf, specs)}
-
-    @pytest.mark.parametrize(
-        "pred",
-        [
-            pl.col("date") == date(2024, 1, 8),
-            pl.col("date").is_in([date(2024, 1, 8), date(2024, 1, 15)]),
-            pl.col("date").is_between(date(2024, 1, 8), date(2024, 1, 10)),
-        ],
+def test_string_filter_is_pushed_without_a_datetime_range_attempt(caplog):
+    """The range visitor logs each literal it cannot read as a datetime; a filter on a string column must not reach it."""
+    left, right = pl.LazyFrame({"id": ["A", "B", "C"], "val": [1, 2, 3]}), pl.LazyFrame({"id": ["A", "B", "C"], "other": [10, 20, 30]})
+    lf = pushdown_combine(
+        {"left": (left, {"id": FilterSpec()}), "right": (right, {"id": FilterSpec()})}, lambda s: s["left"].join(s["right"], on="id")
     )
-    def test_window_pushed_around_mapped_values(self, pred):
-        tracker = PredicateTracker(self.DAYS)
-        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=7), value_mapping=self._previous_weekday)
-        _assert_matches_native(self._sources(tracker.lazy_frame, date=spec), self._combine, pred)
-        assert tracker.get_analyzer().find_temporal_filter("data_date") is not None
-
-    def test_open_range_through_callable_pushes_window_around_requested_range(self):
-        tracker = PredicateTracker(self.DAYS)
-        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=7), value_mapping=self._previous_weekday)
-        _assert_matches_native(self._sources(tracker.lazy_frame, date=spec), self._combine, pl.col("date") >= date(2024, 1, 8))
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(2024, 1, 1), None)
-
-    @pytest.mark.parametrize("mapping", [{date(2024, 1, 9): date(2024, 1, 8)}, lambda d: None, lambda d: 1 / 0])
-    def test_incomplete_or_failing_mapping_keeps_rows(self, mapping):
-        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=mapping)
-        _assert_matches_native(self._sources(self.DAYS.lazy(), date=spec), self._combine, pl.col("date") == date(2024, 1, 8))
-
-    def test_unconstrained_identity_sibling_does_not_block_the_window(self):
-        tracker = PredicateTracker(self.DAYS)
-        specs = {
-            "data_date": FilterSpec(),
-            "date": FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=self._previous_weekday),
-        }
-        _assert_matches_native({"s": (tracker.lazy_frame, specs)}, self._combine, pl.col("date") == date(2024, 1, 8))
-        assert tracker.get_analyzer().find_temporal_filter("data_date") is not None
-
-    def test_mapped_aliases_in_a_self_join_union(self):
-        specs = {
-            "d1": FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=lambda d: d - timedelta(days=1)),
-            "d2": FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=lambda d: d - timedelta(days=1)),
-        }
-
-        def combine(s):
-            side = s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), (pl.col("data_date") + pl.duration(days=1)).alias("d"))
-            return side.select(pl.col("d").alias("d1"), pl.col("r").alias("r1")).join(
-                side.select(pl.col("d").alias("d2"), pl.col("r").alias("r2")), how="cross"
-            )
-
-        pred = (pl.col("d1") == date(2024, 1, 3)) & (pl.col("d2") == date(2024, 1, 12))
-        assert _assert_matches_native({"s": (self.DAYS.lazy(), specs)}, combine, pred).height == 1
-
-    def test_integer_output_key_is_not_used_as_a_date(self):
-        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping={8: date(2024, 1, 7)})
-
-        def combine(s):
-            return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").dt.day().cast(pl.Int64).add(1).alias("k"))
-
-        _assert_matches_native({"s": (self.DAYS.lazy(), {"k": spec})}, combine, pl.col("k") == 8)
+    with caplog.at_level(logging.INFO, logger="polars_io_tools.io_sources.range_visitor"):
+        result = lf.filter(pl.col("id") == "B").collect()
+    assert [r.getMessage() for r in caplog.records if r.name == "polars_io_tools.io_sources.range_visitor"] == []
+    assert_frame_equal(result, pl.DataFrame({"id": ["B"], "val": [2], "other": [20]}))
 
 
-class TestUnappliedWindow:
-    """A window that cannot be applied pushes nothing rather than the unwidened value."""
-
-    def test_time_zone_aware_column(self):
-        src = pl.LazyFrame({"t": [datetime(2024, 1, d, tzinfo=ZoneInfo("UTC")) for d in range(1, 11)], "v": list(range(10))})
-
-        def combine(s):
-            return s["s"].with_columns(pl.col("v").shift(1).alias("lag"))
-
-        pred = pl.col("t") == datetime(2024, 1, 5, tzinfo=ZoneInfo("UTC"))
-        result = _assert_matches_native({"s": (src, {"t": FilterSpec(lookback=timedelta(days=3))})}, combine, pred)
-        assert result["lag"].to_list() == [3]
-
-    def test_unbounded_window(self):
-        src = pl.LazyFrame({"d": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(10))})
-
-        def combine(s):
-            return s["s"].with_columns(pl.col("v").cum_sum().alias("c"))
-
-        _assert_matches_native({"s": (src, {"d": FilterSpec(lookback=timedelta.max)})}, combine, pl.col("d") == date(2024, 1, 5))
+def test_lone_side_pushes_no_group_predicate():
+    """With one side of a shared pair unconstrained, at least one scan carries no discrete filter on the shared column."""
+    predicates = []
+    source = io_source_assert(THREE_GROUPS, predicates.append)
+    lf = pushdown_combine({"data": (source, PAIR_SPECS)}, group_pairs)
+    assert_matches_plain_polars(lf, group_pairs({"data": THREE_GROUPS.lazy()}), pl.col("group1") == "A")
+    assert predicates
+    assert any(p is None or PredicateAnalyzer(p).find_discrete_filter("group") is None for p in predicates)
 
 
-@pytest.mark.parametrize("pred", [pl.lit(False), pl.lit(None, dtype=pl.Boolean)])
+def test_many_float32_values_push_one_membership():
+    values = {float(2**30 + 64 * i) for i in range(10_000)}
+    expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": values}, pl.Int64, lambda: frozenset({"x"}))
+    assert len(str(expr)) < 1_000
+    rows = [2**30 + 64, 2**30 + 65, 2**30 + 64 * 10_000, 2**30 + 64 * 10_001, 5]
+    targets = {np.float32(v) for v in values}
+    assert pl.DataFrame({"x": rows}).filter(expr)["x"].to_list() == [x for x in rows if np.float32(x) in targets]
+
+
+def test_non_numeric_source_does_not_resolve_float32_outputs():
+    def float32_outputs():
+        raise AssertionError("output schema resolved")
+
+    expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {"a"}}, pl.String, float32_outputs)
+    assert pl.DataFrame({"x": ["a", "b"]}).filter(expr)["x"].to_list() == ["a"]
+
+
+def test_integral_float_without_float32_consumer_pushes_equality():
+    expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {2.0**24}}, pl.Int64)
+    # Neither the integer next to the value nor nulls are kept.
+    assert pl.DataFrame({"x": [2**24, 2**24 + 1, None]}).filter(expr)["x"].to_list() == [2**24]
+
+
+@pytest.mark.parametrize("pred", [pl.lit(False), pl.lit(None, dtype=pl.Boolean)], ids=["false", "null"])
 def test_constant_false_predicate_reads_nothing(pred):
     from polars.io.plugins import register_io_source
 
-    df = pl.DataFrame({"d": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(10))})
     rows_read = []
 
     def generator(with_columns, predicate, n_rows, batch_size):
-        out = df if n_rows is None else df.head(n_rows)
+        out = TEN_DAYS if n_rows is None else TEN_DAYS.head(n_rows)
         rows_read.append(out.height)
         yield out
 
-    source = register_io_source(generator, schema=df.schema)
-
-    def combine(s):
-        return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"))
-
-    result = pushdown_combine({"s": (source, {"d": FilterSpec(lookback=timedelta(days=1))})}, combine).filter(pred).collect()
-    assert result.height == 0
+    source = register_io_source(generator, schema=TEN_DAYS.schema)
+    assert (
+        pushdown_combine(
+            {"s": (source, {"d": FilterSpec(lookback=days(1))})}, lambda s: s["s"].with_columns(pl.col("v").rolling_sum(2).alias("rolling_sum"))
+        )
+        .filter(pred)
+        .collect()
+        .height
+        == 0
+    )
     assert sum(rows_read) == 0
 
 
-def test_mapped_values_keep_both_readings_of_a_repeated_hour():
-    ny = ZoneInfo("America/New_York")
-    src = pl.LazyFrame(
-        {"t": [datetime(2024, 11, 3, 1, 30, tzinfo=ny, fold=0), datetime(2024, 11, 3, 1, 30, tzinfo=ny, fold=1)]},
-        schema={"t": pl.Datetime("us", "America/New_York")},
+# Specs and helpers ------------------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SpecFieldsCase:
+    """A filter spec and the values some of its fields hold."""
+
+    id: str
+    _: KW_ONLY
+    spec: FilterSpec | IntervalFilterSpec
+    # field name -> value
+    fields: dict
+
+
+SPEC_FIELDS = [
+    SpecFieldsCase(
+        "filter_spec-defaults",
+        spec=FilterSpec(),
+        fields={"source_col": None, "lookback": timedelta(), "lookahead": timedelta(), "value_mapping": None},
+    ),
+    SpecFieldsCase("source_col_override", spec=FilterSpec(source_col="DataDate"), fields={"source_col": "DataDate"}),
+    SpecFieldsCase("lookback_override", spec=FilterSpec(lookback=days(5)), fields={"lookback": days(5)}),
+    SpecFieldsCase("lookahead_override", spec=FilterSpec(lookahead=days(3)), fields={"lookahead": days(3)}),
+    SpecFieldsCase("value_mapping_dict", spec=FilterSpec(value_mapping={"A": "a", "B": "b"}), fields={"value_mapping": {"A": "a", "B": "b"}}),
+    SpecFieldsCase("value_mapping_callable", spec=FilterSpec(value_mapping=str.upper), fields={"value_mapping": str.upper}),
+    SpecFieldsCase(
+        "combined_options",
+        spec=FilterSpec(source_col="col", lookback=days(5), lookahead=days(3), value_mapping={"x": "y"}),
+        fields={"source_col": "col", "lookback": days(5), "lookahead": days(3), "value_mapping": {"x": "y"}},
+    ),
+    SpecFieldsCase(
+        "interval_spec-defaults",
+        spec=IntervalFilterSpec(start_col="s", end_col="e"),
+        fields={"start_col": "s", "end_col": "e", "closed": "both", "value_mapping": None},
+    ),
+    *[
+        SpecFieldsCase(
+            f"valid_closed_accepted-{closed}", spec=IntervalFilterSpec(start_col="s", end_col="e", closed=closed), fields={"closed": closed}
+        )
+        for closed in CLOSED_OPTIONS
+    ],
+]
+
+
+@pytest.mark.parametrize("case", as_params(SPEC_FIELDS))
+def test_spec_fields(case: SpecFieldsCase):
+    assert {name: getattr(case.spec, name) for name in case.fields} == case.fields
+
+
+def test_invalid_closed_raises():
+    with pytest.raises(ValueError, match="closed must be one of"):
+        IntervalFilterSpec(start_col="s", end_col="e", closed="closed")
+
+
+@dataclass(frozen=True)
+class ValueMappingCase:
+    """Values and a value mapping, and what ``_apply_value_mapping`` makes of them."""
+
+    id: str
+    _: KW_ONLY
+    values: set
+    mapping: dict | Callable | None
+    mapped: set
+    # the values the mapping leaves out, which are not pushed
+    unmapped: set
+
+
+VALUE_MAPPINGS = [
+    ValueMappingCase("none_mapping", values={"a", "b", "c"}, mapping=None, mapped={"a", "b", "c"}, unmapped=set()),
+    ValueMappingCase(
+        "dict_mapping_all_keys_present",
+        values={"k1", "k2"},
+        mapping={"k1": "v1", "k2": "v2"},
+        mapped={"v1", "v2"},
+        unmapped=set(),
+    ),
+    ValueMappingCase("dict_mapping_partial_keys", values={"k1", "missing"}, mapping={"k1": "v1"}, mapped={"v1"}, unmapped={"missing"}),
+    ValueMappingCase(
+        "dict_mapping_no_keys_present", values={"missing1", "missing2"}, mapping={"k1": "v1"}, mapped=set(), unmapped={"missing1", "missing2"}
+    ),
+    ValueMappingCase("callable_mapping", values={"foo", "bar"}, mapping=str.upper, mapped={"FOO", "BAR"}, unmapped=set()),
+    ValueMappingCase("callable_mapping_custom_function", values={1, 2, 3}, mapping=lambda x: x * 2, mapped={2, 4, 6}, unmapped=set()),
+    ValueMappingCase("empty_values", values=set(), mapping={"a": "b"}, mapped=set(), unmapped=set()),
+    # A set or frozenset result is one-to-many: it stands for each of its members.
+    ValueMappingCase(
+        "dict_set_result_is_flattened", values={"A"}, mapping={"A": frozenset({"a1", "a2", "a3"})}, mapped={"a1", "a2", "a3"}, unmapped=set()
+    ),
+    ValueMappingCase(
+        "callable_set_result_is_flattened", values={"A", "B"}, mapping={"A": {"a1", "a2"}, "B": {"b1"}}.get, mapped={"a1", "a2", "b1"}, unmapped=set()
+    ),
+    ValueMappingCase("empty_set_result_is_mapped_to_nothing", values={"Z"}, mapping={"Z": frozenset()}, mapped=set(), unmapped=set()),
+]
+
+
+@pytest.mark.parametrize("case", as_params(VALUE_MAPPINGS))
+def test_apply_value_mapping(case: ValueMappingCase):
+    assert _apply_value_mapping(case.values, case.mapping) == (case.mapped, case.unmapped)
+
+
+def test_list_and_tuple_results_stay_single_values():
+    """Only a set or frozenset is one-to-many; a list or tuple is one (for example List-dtype) value."""
+    assert _map_values({"A"}, {"A": ["x", "y"]}) == ([["x", "y"]], set())
+    assert _map_values({"A"}, {"A": ("x", "y")}) == ([("x", "y")], set())
+
+
+# One-to-many value mappings: a set or frozenset result stands for any of its members. Group "A" is derived from
+# members a1, a2 and a3, "B" from b1 and b2, and "Z" from none.
+MEMBERS_FRAME = pl.DataFrame({"member": ["a1", "a2", "a3", "b1", "b2"], "v": [1, 2, 3, 4, 5]})
+MEMBERS_OF_GROUP = {"A": frozenset({"a1", "a2", "a3"}), "B": frozenset({"b1", "b2"}), "Z": frozenset()}
+GROUP_OF_MEMBER = {"a1": "A", "a2": "A", "a3": "A", "b1": "B", "b2": "B"}
+
+
+def _with_group(s):
+    return s["src"].with_columns(pl.col("member").replace_strict(GROUP_OF_MEMBER, default=None).alias("group"))
+
+
+def _combined_matches_plain(sources: dict, combine, pred) -> pl.DataFrame | None:
+    reference = combine({name: lf for name, (lf, _) in sources.items()})
+    return assert_matches_plain_polars(pushdown_combine(sources, combine), reference, pred)
+
+
+def _discrete_values_pushed(tracker: PredicateTracker, column: str) -> set:
+    analyzer = tracker.get_analyzer()
+    return analyzer.extract_discrete_values(analyzer.find_discrete_filter(column))
+
+
+@pytest.mark.parametrize("mapping", [MEMBERS_OF_GROUP, MEMBERS_OF_GROUP.__getitem__], ids=["dict", "callable"])
+def test_set_valued_mapping_pushes_is_in_over_the_members(mapping):
+    tracker = PredicateTracker(MEMBERS_FRAME)
+    lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": FilterSpec(source_col="member", value_mapping=mapping)})}, _with_group)
+    assert set(lf.filter(pl.col("group") == "A").collect()["member"]) == {"a1", "a2", "a3"}
+    assert _discrete_values_pushed(tracker, "member") == {"a1", "a2", "a3"}
+    assert tracker.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "pred", [pl.col("group") == "A", pl.col("group").is_in(["A", "B"]), pl.col("group") == "Z"], ids=["eq", "is_in", "empty_set"]
+)
+def test_set_valued_mapping_matches_plain_polars(pred):
+    _combined_matches_plain(
+        {"src": (MEMBERS_FRAME.lazy(), {"group": FilterSpec(source_col="member", value_mapping=MEMBERS_OF_GROUP)})}, _with_group, pred
     )
 
+
+def test_empty_set_pushes_a_filter_that_keeps_nothing():
+    tracker = PredicateTracker(MEMBERS_FRAME)
+    lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": FilterSpec(source_col="member", value_mapping=MEMBERS_OF_GROUP)})}, _with_group)
+    assert lf.filter(pl.col("group") == "Z").collect().height == 0
+    assert tracker.call_count == 1
+    assert tracker.last_predicate is not None and tracker.last_predicate.meta.eq(pl.lit(False))
+
+
+def _member_with_alias(s):
+    left = s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group1"))
+    return left.join(s["src"].select(pl.col("member").alias("member2")), how="cross")
+
+
+def test_set_valued_mapping_unions_with_an_identity_sibling():
+    specs = {"group1": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2"})}), "member2": FilterSpec(source_col="member")}
+    tracker = PredicateTracker(pl.DataFrame({"member": ["a1", "a2", "b1"]}))
+    pushdown_combine({"src": (tracker.lazy_frame, specs)}, _member_with_alias).filter(
+        (pl.col("group1") == "A") & (pl.col("member2") == "b1")
+    ).collect()
+    assert _discrete_values_pushed(tracker, "member") == {"a1", "a2", "b1"}
+
+
+def test_empty_set_with_an_unconstrained_sibling_pushes_nothing():
+    specs = {"group1": FilterSpec(source_col="member", value_mapping={"A": frozenset()}), "member2": FilterSpec(source_col="member")}
+    tracker = PredicateTracker(pl.DataFrame({"member": ["a1", "a2", "b1"]}))
+    pushdown_combine({"src": (tracker.lazy_frame, specs)}, _member_with_alias).filter(pl.col("group1") == "A").collect()
+    assert tracker.last_predicate is None
+
+
+def test_set_valued_mapping_and_a_filter_on_another_column_are_both_pushed():
     def combine(s):
-        return s["s"].with_columns(pl.col("t").dt.convert_time_zone("UTC").alias("a"))
+        return s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group"))
 
-    spec = FilterSpec(source_col="t", value_mapping=lambda a: a.astimezone(ny))
-    pred = pl.col("a").is_in([datetime(2024, 11, 3, 5, 30, tzinfo=ZoneInfo("UTC")), datetime(2024, 11, 3, 6, 30, tzinfo=ZoneInfo("UTC"))])
-    assert _assert_matches_native({"s": (src, {"a": spec})}, combine, pred).height == 2
-
-
-@pytest.mark.parametrize("unit", ["ms", "us", "ns"])
-@pytest.mark.parametrize("time_zone", [None, "UTC"])
-def test_is_in_on_any_datetime_unit(unit, time_zone):
-    tz = ZoneInfo(time_zone) if time_zone else None
-    values = [datetime(2024, 1, 1, 0, 0, s, tzinfo=tz) for s in range(5)]
-    src = pl.LazyFrame({"t": values}, schema={"t": pl.Datetime(unit, time_zone)})
-    # The collection has the column's own dtype: Polars rejects a microsecond list against a millisecond column.
-    members = pl.Series([values[1], values[3]], dtype=pl.Datetime(unit, time_zone))
-    pred = pl.col("t").is_in(members.implode())
-    assert _assert_matches_native({"s": (src, {"t": FilterSpec()})}, lambda s: s["s"], pred).height == 2
+    specs = {"group": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2"})}), "region": FilterSpec()}
+    tracker = PredicateTracker(pl.DataFrame({"member": ["a1", "a2", "b1"], "region": ["x", "y", "x"]}))
+    pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter((pl.col("group") == "A") & (pl.col("region") == "x")).collect()
+    assert _discrete_values_pushed(tracker, "member") == {"a1", "a2"}
+    assert _discrete_values_pushed(tracker, "region") == {"x"}
 
 
-def test_value_set_keys_do_not_overflow_near_the_date_limit():
-    minus5 = timezone(timedelta(hours=-5))
-    values = [datetime(9999, 12, 31, 23, 59, 59, 999998, tzinfo=minus5), datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=minus5)]
-    src = pl.LazyFrame({"t": values, "k": [1, 2]})
-    spec = FilterSpec(source_col="t", value_mapping={1: values[0], 2: values[1]})
-    assert _assert_matches_native({"s": (src, {"k": spec})}, lambda s: s["s"], pl.col("k").is_in([1, 2])).height == 2
-
-
-def test_pushed_equality_keeps_the_predicates_comparison_unit():
-    src = pl.LazyFrame({"t": pl.Series([1704067200000000000, 1704067200000000001]).cast(pl.Datetime("ns", "UTC"))})
-
+def test_none_in_a_set_also_matches_null():
     def combine(s):
-        return s["s"].with_columns(pl.col("t").dt.cast_time_unit("us").alias("a"))
-
-    pred = pl.col("a") == datetime(2024, 1, 1, tzinfo=UTC)
-    assert _assert_matches_native({"s": (src, {"a": FilterSpec(source_col="t")})}, combine, pred).height == 2
-
-
-def test_membership_with_another_unit_keeps_native_rows():
-    members = pl.Series([datetime(2024, 1, 1), datetime(2024, 1, 2)], dtype=pl.Datetime("us", "UTC"))
-    src = pl.LazyFrame({"t": members.to_physical().cast(pl.Datetime("ns", "UTC"))})
-    pred = pl.col("t").is_in(members.implode())
-    _assert_matches_native({"s": (src, {"t": FilterSpec()})}, lambda s: s["s"].collect().lazy(), pred)
-
-
-class TestMappedWindowRanges:
-    DAYS = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 21)], "v": list(range(20))})
-
-    @staticmethod
-    def _combine(s):
-        return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").alias("date"))
-
-    def _run(self, spec, pred):
-        tracker = PredicateTracker(self.DAYS)
-        _assert_matches_native({"s": (tracker.lazy_frame, {"date": spec})}, self._combine, pred)
-        return tracker
-
-    def test_dict_covering_the_range_is_enumerated(self):
-        mapping = {date(2024, 1, 8): date(2024, 1, 8), date(2024, 1, 9): date(2024, 1, 9)}
-        tracker = self._run(
-            FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=mapping),
-            pl.col("date").is_between(date(2024, 1, 8), date(2024, 1, 9)),
-        )
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(2024, 1, 7), date(2024, 1, 9))
-
-    def test_lookahead_around_mapped_values(self):
-        def combine(s):
-            return s["s"].with_columns(pl.col("v").shift(-2).alias("lead"), pl.col("data_date").alias("date"))
-
-        spec = FilterSpec(source_col="data_date", lookahead=timedelta(days=2), value_mapping=lambda d: d)
-        _assert_matches_native({"s": (self.DAYS.lazy(), {"date": spec})}, combine, pl.col("date") == date(2024, 1, 10))
-
-    def test_range_beyond_the_enumeration_cap_gets_the_window_around_the_range(self):
-        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=1), value_mapping=lambda d: d)
-        tracker = self._run(spec, pl.col("date").is_between(date(1990, 1, 1), date(2024, 1, 10)))
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("data_date")) == (date(1989, 12, 31), date(2024, 1, 10))
-
-
-def test_unbounded_window_sharer_keeps_the_whole_source_column():
-    src = pl.LazyFrame({"d": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(1, 11))})
-
-    def combine(s):
-        return s["s"].select(pl.col("d").alias("a"), pl.col("v").cum_sum().alias("c")).join(s["s"].select(pl.col("d").alias("b")), how="cross")
-
-    specs = {"a": FilterSpec(source_col="d", lookback=timedelta.max), "b": FilterSpec(source_col="d", value_mapping=lambda x: x)}
-    pred = (pl.col("a") >= date(2024, 1, 5)) & (pl.col("b") == date(2024, 1, 8))
-    assert _assert_matches_native({"s": (src, specs)}, combine, pred)["c"].sort().to_list() == [15, 21, 28, 36, 45, 55]
-
-
-class TestOneToManyValueMapping:
-    """A ``value_mapping`` whose result is a set/frozenset expands one requested value to several source values."""
-
-    # One group is derived from several members; "Z" has no members.
-    DF = pl.DataFrame({"member": ["a1", "a2", "a3", "b1", "b2"], "v": [1, 2, 3, 4, 5]})
-    MEMBERS = {"A": frozenset({"a1", "a2", "a3"}), "B": frozenset({"b1", "b2"}), "Z": frozenset()}
-
-    @staticmethod
-    def _combine(s):
-        group = (
-            pl.when(pl.col("member").is_in(["a1", "a2", "a3"]))
-            .then(pl.lit("A"))
-            .when(pl.col("member").is_in(["b1", "b2"]))
-            .then(pl.lit("B"))
-            .otherwise(pl.lit(None))
-            .alias("group")
-        )
+        group = pl.when((pl.col("member") == "a1") | pl.col("member").is_null()).then(pl.lit("A")).otherwise(pl.lit("B")).alias("group")
         return s["src"].with_columns(group)
 
-    def test_dict_frozenset_pushes_is_in(self):
-        tracker = PredicateTracker(self.DF)
-        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
-        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
-        result = lf.filter(pl.col("group") == "A").collect()
+    frame = pl.DataFrame({"member": ["a1", "a2", None], "v": [1, 2, 3]})
+    spec = FilterSpec(source_col="member", value_mapping={"A": frozenset({None, "a1"})})
+    result = _combined_matches_plain({"src": (frame.lazy(), {"group": spec})}, combine, pl.col("group") == "A")
+    assert sorted(result["v"].to_list()) == [1, 3]
 
-        analyzer = tracker.get_analyzer()
-        pushed = analyzer.find_discrete_filter("member")
-        assert pushed is not None
-        assert analyzer.extract_discrete_values(pushed) == {"a1", "a2", "a3"}
-        assert set(result["member"]) == {"a1", "a2", "a3"}
-        # The source is scanned exactly once.
-        assert tracker.call_count == 1
 
-    def test_callable_returning_set_pushes_is_in(self):
-        tracker = PredicateTracker(self.DF)
-        spec = FilterSpec(source_col="member", value_mapping=lambda g: self.MEMBERS[g])
-        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
-        lf.filter(pl.col("group") == "A").collect()
+def test_a_missing_key_next_to_an_empty_set_pushes_nothing():
+    tracker = PredicateTracker(MEMBERS_FRAME)
+    lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": FilterSpec(source_col="member", value_mapping=MEMBERS_OF_GROUP)})}, _with_group)
+    lf.filter(pl.col("group").is_in(["Z", "MISSING"])).collect()
+    assert tracker.last_predicate is None
 
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("member")) == {"a1", "a2", "a3"}
 
-    def test_union_with_one_to_one_sibling(self):
-        # ``group1`` (one-to-many) and ``member2`` (identity) share source column ``member``: the pushed
-        # predicate is the UNION of both members' source values.
-        df = pl.DataFrame({"member": ["a1", "a2", "b1"]})
+def test_set_valued_mapping_on_a_windowed_column_pushes_nothing():
+    def combine(s):
+        return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").alias("date"))
 
-        def combine(s):
-            left = s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group1"))
-            right = s["src"].select(pl.col("member").alias("member2"))
-            return left.join(right, how="cross")
+    tracker = PredicateTracker(pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(1, 11))}))
+    spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=lambda d: {d})
+    _combined_matches_plain({"s": (tracker.lazy_frame, {"date": spec})}, combine, pl.col("date") == date(2024, 1, 8))
+    assert tracker.last_predicate is None
 
-        specs = {
-            "group1": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2"})}),
-            "member2": FilterSpec(source_col="member"),
-        }
-        tracker = PredicateTracker(df)
-        pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter((pl.col("group1") == "A") & (pl.col("member2") == "b1")).collect()
 
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("member")) == {"a1", "a2", "b1"}
+# An IntervalFilterSpec mapping that maps a requested day to a set has no single day to compare against, so nothing is
+# pushed for the interval.
+SET_BOUND_SCHEDULE = pl.DataFrame(
+    {"root": ["A", "A"], "start": [date(2024, 1, 1), date(2024, 1, 20)], "end": [date(2024, 1, 10), date(2024, 1, 30)], "val": [1, 2]}
+)
 
-    def test_set_mapped_and_direct_source_filter_both_pushed(self):
-        # A set-mapped output column and a plain filter on a different source column both reach the source.
-        df = pl.DataFrame({"member": ["a1", "a2", "b1"], "region": ["x", "y", "x"]})
 
-        def combine(s):
-            return s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group"))
+@pytest.mark.parametrize(
+    ("mapping", "pred"),
+    [
+        (lambda day: {day}, pl.col("date") == date(2024, 1, 5)),
+        (
+            {date(2024, 1, 4): frozenset({date(2024, 1, 4)}), date(2024, 1, 5): date(2024, 1, 5), date(2024, 1, 6): date(2024, 1, 6)},
+            pl.col("date").is_between(date(2024, 1, 4), date(2024, 1, 6)),
+        ),
+    ],
+    ids=["every_day", "one_day"],
+)
+def test_interval_mapping_to_a_set_pushes_nothing(mapping, pred):
+    tracker = PredicateTracker(SET_BOUND_SCHEDULE)
+    spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 5)]})
+    sources = {
+        "sched": (tracker.lazy_frame, {"date": IntervalFilterSpec(start_col="start", end_col="end", value_mapping=mapping)}),
+        "spine": (spine.lazy(), {"date": FilterSpec()}),
+    }
+    _combined_matches_plain(sources, interval_join(), pred)
+    assert tracker.last_predicate is None
 
-        specs = {
-            "group": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2"})}),
-            "region": FilterSpec(),
-        }
-        tracker = PredicateTracker(df)
-        pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter((pl.col("group") == "A") & (pl.col("region") == "x")).collect()
 
-        analyzer = tracker.get_analyzer()
-        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("member")) == {"a1", "a2"}
-        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("region")) == {"x"}
+@dataclass(frozen=True)
+class SourceColCase:
+    """A filter spec, and the source column of the output column ``date``."""
 
-    @pytest.mark.parametrize(
-        "pred",
+    id: str
+    _: KW_ONLY
+    spec: FilterSpec
+    expected: str
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
         [
-            pl.col("group") == "A",
-            pl.col("group").is_in(["A", "B"]),
-            pl.col("group") == "Z",  # empty set
-        ],
-    )
-    def test_result_matches_unfiltered_then_filtered(self, pred):
-        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
-        _assert_matches_native({"src": (self.DF.lazy(), {"group": spec})}, self._combine, pred)
-
-    def test_empty_set_keeps_no_source_rows(self):
-        # "Z" maps to an empty set, so no source row can serve it: the source is scanned but yields nothing.
-        tracker = PredicateTracker(self.DF)
-        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
-        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
-        assert lf.filter(pl.col("group") == "Z").collect().height == 0
-        assert tracker.call_count == 1
-        # The empty set must push a keep-nothing predicate, not merely defer to the post-combine filter.
-        assert tracker.last_predicate is not None and tracker.last_predicate.meta.eq(pl.lit(False))
-
-    def test_none_inside_a_set_also_matches_null(self):
-        # A ``None`` member in the mapped set keeps the "also match null" handling.
-        df = pl.DataFrame({"member": ["a1", "a2", None], "v": [1, 2, 3]})
-
-        def combine(s):
-            group = pl.when(pl.col("member").is_in(["a1"]) | pl.col("member").is_null()).then(pl.lit("A")).otherwise(pl.lit("B")).alias("group")
-            return s["src"].with_columns(group)
-
-        spec = FilterSpec(source_col="member", value_mapping={"A": frozenset({None, "a1"})})
-        result = _assert_matches_native({"src": (df.lazy(), {"group": spec})}, combine, pl.col("group") == "A")
-        assert sorted(result["v"].to_list()) == [1, 3]
-
-    def test_missing_key_alongside_empty_set_disables_pushdown(self):
-        # is_in over the empty-set key "Z" and an absent key "MISSING": the unmapped "MISSING" defers the
-        # whole predicate to post-combine, so nothing is pushed for ``member`` (result still correct).
-        tracker = PredicateTracker(self.DF)
-        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
-        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
-        lf.filter(pl.col("group").is_in(["Z", "MISSING"])).collect()
-        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
-
-    def test_empty_set_member_with_unconstrained_sharer_pushes_nothing(self):
-        # Two sharers of ``member``; one maps to an empty set, the other is unconstrained by the query. An
-        # unconstrained sharer means the union is the whole universe, so nothing is pushed for ``member``.
-        df = pl.DataFrame({"member": ["a1", "a2", "b1"]})
-
-        def combine(s):
-            left = s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group1"))
-            right = s["src"].select(pl.col("member").alias("member2"))
-            return left.join(right, how="cross")
-
-        specs = {
-            "group1": FilterSpec(source_col="member", value_mapping={"A": frozenset()}),
-            "member2": FilterSpec(source_col="member"),
-        }
-        tracker = PredicateTracker(df)
-        # Only ``group1`` is constrained; ``member2`` is unconstrained.
-        pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter(pl.col("group1") == "A").collect()
-        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
-
-    def test_windowed_set_mapping_pushes_nothing(self):
-        # A set-valued mapping on a windowed (lookback) temporal column is not honored: nothing is pushed
-        # for that source column, but the result stays correct.
-        days = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(1, 11))})
-
-        def combine(s):
-            return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").alias("date"))
-
-        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=lambda d: {d})
-        tracker = PredicateTracker(days)
-        _assert_matches_native({"s": (tracker.lazy_frame, {"date": spec})}, combine, pl.col("date") == date(2024, 1, 8))
-        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
+            SourceColCase("none_source_col_returns_output_col", spec=FilterSpec(), expected="date"),
+            SourceColCase("explicit_source_col", spec=FilterSpec(source_col="DataDate"), expected="DataDate"),
+        ]
+    ),
+)
+def test_get_source_col(case: SourceColCase):
+    assert _get_source_col("date", case.spec) == case.expected
 
 
-class TestIntervalFilterSpecSetBound:
-    """A set-valued ``IntervalFilterSpec.value_mapping`` result leaves that bound unpushed, never raising."""
+@dataclass(frozen=True)
+class OutputSchemaCase:
+    """A combine function and the schema of its output."""
 
-    SCHED = pl.DataFrame(
+    id: str
+    _: KW_ONLY
+    combine: Callable
+    expected_schema: dict[str, pl.DataType]
+
+
+OUTPUT_SCHEMAS = [
+    OutputSchemaCase(
+        "simple_join_schema", combine=lambda s: s["left"].join(s["right"], on="a"), expected_schema={"a": pl.Int64, "b": pl.Int64, "c": pl.Int64}
+    ),
+    OutputSchemaCase(
+        "with_columns_schema",
+        combine=lambda s: s["left"].select("a").with_columns(pl.lit(42).alias("new_col")),
+        expected_schema={"a": pl.Int64, "new_col": pl.Int32},
+    ),
+    OutputSchemaCase("select_schema", combine=lambda s: s["left"].select("a", "b"), expected_schema={"a": pl.Int64, "b": pl.Int64}),
+]
+
+
+@pytest.mark.parametrize("case", as_params(OUTPUT_SCHEMAS))
+def test_compute_output_schema(case: OutputSchemaCase):
+    sources = {"left": (pl.LazyFrame({"a": [1], "b": [2]}), {}), "right": (pl.LazyFrame({"a": [1], "c": [3]}), {})}
+    assert dict(_compute_output_schema(sources, case.combine)) == case.expected_schema
+
+
+@pytest.mark.xfail(strict=True, raises=pl.exceptions.PanicException, reason="a Polars panic on an out-of-range literal breaks the parser")
+def test_out_of_range_datetime_literal_does_not_crash_pushdown_combine():
+    frame = pl.DataFrame({"t": pl.Series([1, None]).cast(pl.Datetime("us"))})
+    huge = pl.lit(-(2**63), dtype=pl.Int64).cast(pl.Datetime("ms"))
+    pred = (pl.col("t").cast(pl.Datetime("ms"), strict=False) < huge) | (pl.col("t") > 0)
+    combined = pushdown_combine({"s": (frame.lazy(), {"t": FilterSpec()})}, lambda s: s["s"])
+    assert_frame_equal(combined.filter(pred).collect(), frame.filter(pred))
+
+
+_JAN_1_2024 = date(2024, 1, 1)
+
+
+_NAMES = {0: "zero", 1: "one", 2: "two", 3: "three"}
+
+
+def _previous_business_day(d):
+    return d - timedelta(days={0: 3, 6: 2}.get(d.weekday(), 1))
+
+
+def _offset_monday(d):
+    """Not monotone: Sunday maps to Saturday, after Monday's Friday."""
+    return d - timedelta(days=3 if d.weekday() == 0 else 1)
+
+
+def _offset_monday_expr(e: pl.Expr) -> pl.Expr:
+    return pl.when(e.dt.weekday() == 1).then(e.dt.offset_by("-3d")).otherwise(e.dt.offset_by("-1d"))
+
+
+def _last_day_on_sunday(d):
+    """Sunday maps to the last representable day, the others to themselves."""
+    return date.max if d.weekday() == 6 else d
+
+
+def _last_day_on_sunday_expr(e: pl.Expr) -> pl.Expr:
+    return pl.when(e.dt.weekday() == 7).then(pl.lit(date.max)).otherwise(e)
+
+
+def _rolling(frame):
+    return frame.sort("key", "data_date").with_columns(pl.col("v").rolling_sum_by("data_date", window_size="3d").over("key").alias("rolling_sum"))
+
+
+def _overlapping(s, mapped: pl.Expr) -> pl.LazyFrame:
+    """Calendar days joined with the windows holding each day's mapped day."""
+    days = s["c"].with_columns(mapped.alias("m"))
+    return days.join(s["w"], how="cross").filter((pl.col("start") <= pl.col("m")) & (pl.col("m") <= pl.col("end"))).drop("m")
+
+
+# Each shape: specs per source (source name -> (frame, specs)) and a combine whose output rows depend only on the source
+# rows the specs declare (the source rows matching the output value, widened by any lookback, lookahead or value
+# mapping). Output columns: date (Date), key (Int64) and, for the lookup shape, name (String).
+_SHAPES = {
+    "rowwise": (
+        {"s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()})},
+        lambda s: s["s"].rename({"data_date": "date"}),
+    ),
+    "rolling": (
+        {"s": ("src", {"date": FilterSpec(source_col="data_date", lookback=timedelta(days=3)), "key": FilterSpec()})},
+        lambda s: _rolling(s["s"]).rename({"data_date": "date"}),
+    ),
+    "business_day_mapped": (
+        # FilterSpec: an open range's window must also cover the mapping's offset, so lookback = offset (3d) + rolling window (3d).
+        {"s": ("src", {"date": FilterSpec(source_col="data_date", lookback=timedelta(days=3 + 3), value_mapping=_previous_business_day)})},
+        lambda s: _rolling(s["s"]).with_columns(pl.col("data_date").dt.add_business_days(1, roll="backward").alias("date")),
+    ),
+    "inner_join": (
         {
-            "root": ["A", "A"],
-            "start": [date(2024, 1, 1), date(2024, 1, 20)],
-            "end": [date(2024, 1, 10), date(2024, 1, 30)],
-            "val": [1, 2],
-        }
-    )
-    SPINE = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 5)]})
+            "s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()}),
+            "o": ("other", {"date": FilterSpec(), "key": FilterSpec()}),
+        },
+        lambda s: s["s"].rename({"data_date": "date"}).join(s["o"], on=["date", "key"]),
+    ),
+    "left_join": (
+        {
+            "s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()}),
+            "o": ("other", {"date": FilterSpec(), "key": FilterSpec()}),
+        },
+        lambda s: s["s"].rename({"data_date": "date"}).join(s["o"], on=["date", "key"], how="left"),
+    ),
+    "asof_join": (
+        {
+            "s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()}),
+            "o": ("other", {"date": FilterSpec(lookback=timedelta(days=2)), "key": FilterSpec()}),
+        },
+        lambda s: (
+            s["s"]
+            .rename({"data_date": "date"})
+            .sort("date")
+            # An unstable sort orders rows of equal date by the other rows present, so ties are broken by w.
+            .join_asof(s["o"].sort("date", "w"), on="date", by="key", strategy="backward", tolerance=timedelta(days=2))
+        ),
+    ),
+    "group_by": (
+        {"s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()})},
+        lambda s: s["s"].group_by(pl.col("data_date").alias("date"), "key").agg(pl.col("v").sum(), pl.len()),
+    ),
+    "explode": (
+        {"s": ("src", {"date": FilterSpec(source_col="data_date"), "key": FilterSpec()})},
+        lambda s: s["s"].rename({"data_date": "date"}).explode("tags"),
+    ),
+    "inner_filter": (
+        {"s": ("src", {"date": FilterSpec(source_col="data_date", lookback=timedelta(days=3)), "key": FilterSpec()})},
+        lambda s: _rolling(s["s"]).filter(pl.col("v") % 2 == 0).rename({"data_date": "date"}),
+    ),
+    "self_join_two_entries": (
+        {"a": ("src", {"date": FilterSpec(source_col="data_date")}), "b": ("src", {"key": FilterSpec()})},
+        lambda s: s["a"].select(pl.col("data_date").alias("date"), "v").join(s["b"].select("key", pl.col("v").alias("w")), how="cross"),
+    ),
+    "lookup": (
+        {
+            "s": (
+                "src",
+                {"date": FilterSpec(source_col="data_date"), "name": FilterSpec(source_col="key", value_mapping={v: k for k, v in _NAMES.items()})},
+            )
+        },
+        lambda s: s["s"].rename({"data_date": "date"}).with_columns(pl.col("key").replace_strict(_NAMES, default=None).alias("name")),
+    ),
+    "interval": (
+        {"c": ("calendar", {"date": FilterSpec()}), "w": ("windows", {"date": IntervalFilterSpec("start", "end"), "key": FilterSpec()})},
+        lambda s: _overlapping(s, pl.col("date")),
+    ),
+    "interval_offset": (
+        {
+            "c": ("calendar", {"date": FilterSpec()}),
+            "w": ("windows", {"date": IntervalFilterSpec("start", "end", value_mapping=timedelta(days=-1)), "key": FilterSpec()}),
+        },
+        lambda s: _overlapping(s, pl.col("date").dt.offset_by("-1d")),
+    ),
+    "interval_mapped": (
+        {
+            "c": ("calendar", {"date": FilterSpec()}),
+            "w": ("windows", {"date": IntervalFilterSpec("start", "end", value_mapping=_offset_monday), "key": FilterSpec()}),
+        },
+        lambda s: _overlapping(s, _offset_monday_expr(pl.col("date"))),
+    ),
+    "interval_mapped_to_last_day": (
+        {
+            "c": ("calendar", {"date": FilterSpec()}),
+            "w": ("windows", {"date": IntervalFilterSpec("start", "end", value_mapping=_last_day_on_sunday), "key": FilterSpec()}),
+        },
+        lambda s: _overlapping(s, _last_day_on_sunday_expr(pl.col("date"))),
+    ),
+}
 
-    @staticmethod
-    def _combine(s):
-        joined = s["spine"].join(s["sched"], on="root")
-        return joined.filter((pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end")))
 
-    def test_set_both_bounds_pushes_nothing_and_stays_correct(self):
-        spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=lambda b: {b})
-        sources = {"sched": (self.SCHED.lazy(), {"date": spec}), "spine": (self.SPINE.lazy(), {"date": FilterSpec()})}
-        pred = pl.col("date") == date(2024, 1, 5)
-        result = pushdown_combine(sources, self._combine).filter(pred).collect()
-        expected = self._combine({"sched": self.SCHED.lazy(), "spine": self.SPINE.lazy()}).filter(pred).collect()
+def _old_polars_null_key_bug(shape, frames):
+    """Polars 1.37 matches a null ``by`` key in ``join_asof``, and returns wrong rows for a cross join of two IO
+    sources filtered on a null key; such inputs are skipped there."""
+    nulls = frames["src"]["key"].null_count() or frames["other"]["key"].null_count()
+    if not nulls:
+        return False
+    if shape == "asof_join":
+        return not polars_has("join_asof_null_by_unmatched")
+    return shape == "self_join_two_entries" and not polars_has("cross_joins_filtered_sources")
+
+
+@st.composite
+def _frames(draw):
+    def rows(n_max):
+        return draw(st.lists(st.tuples(st.integers(0, 20), st.one_of(st.none(), st.integers(0, 3)), st.integers(-5, 5)), max_size=n_max))
+
+    def frame(n_max):
+        drawn = rows(n_max)
+        return pl.DataFrame(
+            {
+                "data_date": [_JAN_1_2024 + timedelta(days=d) for d, _, _ in drawn],
+                "key": [k for _, k, _ in drawn],
+                "v": [v for _, _, v in drawn],
+                "tags": [[v, v + 1][: 1 + abs(v) % 2] for _, _, v in drawn],
+            },
+            schema={"data_date": pl.Date, "key": pl.Int64, "v": pl.Int64, "tags": pl.List(pl.Int64)},
+        )
+
+    src, other = frame(10), frame(8)
+    windows = rows(6)
+    # Window endpoints are Dates or midnight Datetimes; a Date request on Datetime endpoints covers the whole day.
+    endpoint = draw(st.sampled_from([pl.Date, pl.Datetime("us")]))
+    return {
+        "src": src,
+        "other": other.select(pl.col("data_date").alias("date"), "key", pl.col("v").alias("w")),
+        "calendar": pl.DataFrame({"date": [_JAN_1_2024 + timedelta(days=d) for d in range(-2, 24)]}),
+        "windows": pl.DataFrame(
+            {
+                "start": [_JAN_1_2024 + timedelta(days=d) for d, _, _ in windows],
+                "end": [_JAN_1_2024 + timedelta(days=d + abs(w)) for d, _, w in windows],
+                "key": [k for _, k, _ in windows],
+            },
+            schema={"start": pl.Date, "end": pl.Date, "key": pl.Int64},
+        ).with_columns(pl.col("start", "end").cast(endpoint)),
+    }
+
+
+def _day(draw):
+    return _JAN_1_2024 + timedelta(days=draw(st.integers(-2, 23)))
+
+
+@st.composite
+def _combine_predicates(draw, columns):
+    def atom():
+        col = draw(st.sampled_from(sorted(columns)))
+        if col == "date":
+            d = _day(draw)
+            return draw(
+                st.sampled_from(
+                    [
+                        pl.col("date") == d,
+                        pl.col("date").is_in([d, d + timedelta(days=draw(st.integers(1, 9)))]),
+                        pl.col("date") >= d,
+                        pl.col("date") < d,
+                        pl.col("date").is_between(d, d + timedelta(days=draw(st.integers(0, 5)))),
+                        pl.col("date").is_null() | (pl.col("date") == d),
+                    ]
+                )
+            )
+        if col == "key":
+            k = draw(st.integers(0, 3))
+            return draw(st.sampled_from([pl.col("key") == k, pl.col("key").is_in([k, 3 - k]), pl.col("key") > k, pl.col("key").is_null()]))
+        return pl.col("name") == _NAMES[draw(st.integers(0, 3))]
+
+    pred = atom()
+    for _ in range(draw(st.integers(0, 2))):
+        pred = pred & atom() if draw(st.booleans()) else pred | atom()
+    return pred
+
+
+def _combine_without_pushdown(entries, combine, frames):
+    return combine({entry: frames[frame].lazy() for entry, (frame, _) in entries.items()})
+
+
+@SETTINGS
+@given(data=st.data(), shape=st.sampled_from(sorted(_SHAPES)))
+def test_generated_combine_matches_native(data, shape):
+    entries, combine = _SHAPES[shape]
+    frames = data.draw(_frames())
+    assume(not _old_polars_null_key_bug(shape, frames))
+    output = _combine_without_pushdown(entries, combine, frames).collect_schema()
+    pred = data.draw(_combine_predicates({"date", "key", "name"} & set(output.names())))
+    sources = {entry: (PredicateTracker(frames[frame]).lazy_frame, specs) for entry, (frame, specs) in entries.items()}
+    result = pushdown_combine(sources, combine).filter(pred).collect()
+    assert_frame_equal(result, _combine_without_pushdown(entries, combine, frames).filter(pred).collect(), check_row_order=False)
+
+
+def _source_rows_needed_for(spec, value):
+    """The source rows an output value depends on under ``spec``, as a predicate on a source row."""
+    if isinstance(spec, IntervalFilterSpec):
+        mapping = spec.value_mapping
+        m = value + mapping if isinstance(mapping, timedelta) else mapping(value) if callable(mapping) else value
+
+        def inside(w):
+            start, end = w[spec.start_col], w[spec.end_col]
+            if start is None or end is None:
+                return False
+            # Polars compares a Date with a Datetime at midnight.
+            at = datetime(m.year, m.month, m.day) if isinstance(start, datetime) and not isinstance(m, datetime) else m
+            return start <= at <= end
+
+        return inside
+    mapping = spec.value_mapping
+    if mapping is None:
+        anchors = [value]
+    elif callable(mapping):
+        anchors = [mapping(value)] + ([value] if spec.lookback or spec.lookahead else [])
+    else:
+        anchors = [mapping[value]] if value in mapping else []
+    if not (spec.lookback or spec.lookahead):
+        return lambda w: w is not None and w in anchors
+    return lambda w: w is not None and any(a - spec.lookback <= w <= a + spec.lookahead for a in anchors)
+
+
+@SETTINGS
+@given(data=st.data(), shape=st.sampled_from(sorted(_SHAPES)))
+def test_generated_combine_depends_only_on_declared_source_rows(data, shape):
+    """Deleting source rows that an output row's specs do not declare keeps the number of copies of that row.
+
+    This checks the shapes above declare their specs correctly, so that the comparison with plain Polars tests the
+    pushdown rather than the shapes."""
+    entries, combine = _SHAPES[shape]
+    frames = data.draw(_frames())
+    assume(not _old_polars_null_key_bug(shape, frames))
+    output = _combine_without_pushdown(entries, combine, frames).collect()
+    if output.is_empty():
+        return
+    # Joins and group_by emit rows in any order; the draws below must not depend on it.
+    output = output.sort([c for c, d in output.schema.items() if not d.is_nested()], nulls_last=True, maintain_order=True)
+    row = output.row(data.draw(st.integers(0, output.height - 1)), named=True)
+    if data.draw(st.booleans()):
+        # A tuple that may be absent: the same keys with another date.
+        row = {**row, "date": _day(data.draw)} if "date" in row else row
+    deleted = {}
+    for entry, (frame, specs) in entries.items():
+        df = frames[frame]
+        # A null output value constrains nothing: a filter accepting null pushes nothing for that column.
+        inside = [
+            all(
+                row.get(o) is None
+                or (
+                    _source_rows_needed_for(sp, row[o])(w)
+                    if isinstance(sp, IntervalFilterSpec)
+                    else _source_rows_needed_for(sp, row[o])(w[sp.source_col or o])
+                )
+                for o, sp in specs.items()
+            )
+            for w in df.iter_rows(named=True)
+        ]
+        keep = [i or data.draw(st.booleans()) for i in inside]
+        deleted[entry] = df.filter(pl.Series(keep, dtype=pl.Boolean)) if keep else df
+    after = combine({entry: deleted[entry].lazy() for entry in entries}).collect()
+
+    def count(frame):
+        return frame.filter(pl.all_horizontal([pl.col(c).eq_missing(pl.lit(v, dtype=frame.schema[c])) for c, v in row.items()])).height
+
+    assert count(after) == count(output)
+
+
+@dataclass(frozen=True)
+class ExpansionPastExtremesCase:
+    """A value at the edge of its dtype's range, a filter, and a spec that widens the filter past that edge."""
+
+    id: str
+    _: KW_ONLY
+    value: object
+    pred: pl.Expr
+    spec: FilterSpec
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            ExpansionPastExtremesCase(
+                "le_date_max_lookahead", value=date.max, pred=pl.col("d") <= date.max, spec=FilterSpec(lookahead=timedelta(days=1))
+            ),
+            ExpansionPastExtremesCase(
+                "eq_date_max_lookahead", value=date.max, pred=pl.col("d") == date.max, spec=FilterSpec(lookahead=timedelta(days=1))
+            ),
+            ExpansionPastExtremesCase(
+                "ge_date_min_lookback", value=date.min, pred=pl.col("d") >= date.min, spec=FilterSpec(lookback=timedelta(days=1))
+            ),
+            ExpansionPastExtremesCase(
+                "eq_datetime_max_lookahead",
+                value=datetime(9999, 12, 31),
+                pred=pl.col("d") == datetime(9999, 12, 31),
+                spec=FilterSpec(lookahead=timedelta(days=1)),
+            ),
+        ]
+    ),
+)
+def test_pushdown_combine_expansion_past_extremes(case: ExpansionPastExtremesCase):
+    df = pl.DataFrame({"d": [case.value], "v": [1]})
+    lf = pushdown_combine(sources={"data": (df.lazy(), {"d": case.spec})}, combine=lambda s: s["data"])
+    assert_matches_plain_polars(lf, df.lazy(), case.pred, check_row_order=True)
+
+
+class TestPushdownCombinePickle:
+    """Tests for pushdown_combine pickle support."""
+
+    def test_pushdown_combine_pickle_basic(self):
+        """pushdown_combine LazyFrames can be pickled and unpickled."""
+        left_df = pl.DataFrame(
+            {
+                "date": [date(2025, 1, 1), date(2025, 1, 2)],
+                "id": [1, 2],
+                "value_left": [10, 20],
+            }
+        )
+        right_df = pl.DataFrame(
+            {
+                "date": [date(2025, 1, 1), date(2025, 1, 2)],
+                "id": [1, 2],
+                "value_right": [100, 200],
+            }
+        )
+
+        lf = cpl.pushdown_combine(
+            sources={
+                "left": (left_df.lazy(), {"date": cpl.FilterSpec(), "id": cpl.FilterSpec()}),
+                "right": (right_df.lazy(), {"date": cpl.FilterSpec(), "id": cpl.FilterSpec()}),
+            },
+            combine=lambda s: s["left"].join(s["right"], on=["date", "id"]),
+        )
+        lf_unpickled = pickle_round_trip(lf)
+
+        expected = left_df.join(right_df, on=["date", "id"])
+        result = lf_unpickled.collect()
         assert_frame_equal(result, expected, check_row_order=False)
-
-    def test_a_day_mapped_to_a_set_pushes_nothing(self):
-        # Every requested day is mapped; a day mapped to a set has no single day to compare against, so nothing is
-        # pushed for the interval.
-        mapping = {date(2024, 1, 4): frozenset({date(2024, 1, 4)}), date(2024, 1, 5): date(2024, 1, 5), date(2024, 1, 6): date(2024, 1, 6)}
-        spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=mapping)
-        tracker = PredicateTracker(self.SCHED)
-        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 5)]})
-        sources = {"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})}
-        pred = pl.col("date").is_between(date(2024, 1, 4), date(2024, 1, 6))
-
-        result = pushdown_combine(sources, self._combine).filter(pred).collect()
-        expected = self._combine({"sched": self.SCHED.lazy(), "spine": spine.lazy()}).filter(pred).collect()
-        assert_frame_equal(result, expected, check_row_order=False)
-        assert tracker.last_predicate is None

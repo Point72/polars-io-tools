@@ -243,7 +243,7 @@ def collect_lf_in_io_source(
     ``LazyFrame.collect_batches`` whenever the polars thread pool only has a single worker, because calling ``collect_batches`` from inside an io_source
     callback under ``POLARS_MAX_THREADS=1`` deadlocked polars' Rayon scheduler when the outer plan involved a join with a pushed-down predicate. That
     deadlock is fixed on verified runtimes (``POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN``, polars >= 1.43.2), where ``collect_batches`` is used
-    regardless of thread count. See ``polars_io_tools/tests/io_sources/test_single_thread_deadlock.py`` for the regression test that pins this behavior.
+    regardless of thread count. See ``test_iosource_collect_batches_does_not_deadlock_at_threads_one`` in ``polars_io_tools/tests/io_sources/test_util.py`` for the regression test.
 
     When the fallback path is taken, ``LazyFrame.collect`` materializes the whole frame and ``DataFrame.iter_slices`` yields zero-copy views. Callers
     that need each yielded DataFrame to be a single contiguous chunk should apply ``.rechunk()`` themselves on the yielded values.

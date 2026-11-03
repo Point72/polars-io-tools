@@ -1,456 +1,537 @@
+"""sink_delta and scan_delta: logical dtypes stored as integers, their mapping in the table description, and predicates
+translated to the stored values and pruned to Delta partitions.
+
+Tables: frames written and read back, which must come back unchanged with the expected dtype mapping stored in the
+table description; and filters on Delta tables, where scan_delta must return what Polars returns when it filters the
+written frame, with optional checks of the query plan and of which partitions are listed.
+
+The property test at the end (using the Hypothesis library) checks that partition pruning keeps every row a random
+filter keeps.
+"""
+
 import base64
-import os
-from datetime import date, datetime, timedelta
+import math
+import shutil
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass, field
+from datetime import date, datetime, time, timedelta
+from unittest.mock import patch
 
 import polars as pl
 import pytest
+from hypothesis import given, note, strategies as st
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
 from polars_io_tools._compat import POLARS_HAS_COLLECT_BATCHES
+from polars_io_tools.io_sources import delta_io
 from polars_io_tools.io_sources.delta_io import (
     _MAPPING_BLOCK_TAG,
     _get_partition_uris,
     build_delta_write_exprs,
     infer_logical_mapping,
     metadata_to_mapping,
+    scan_delta,
+    sink_delta,
 )
-from polars_io_tools.io_sources.util import _storage_options_for, extract_description_block, inject_description_block
+from polars_io_tools.io_sources.util import _storage_options_for, extract_description_block
+from polars_io_tools.tests.helpers.assertions import assert_matches_plain_polars, assert_translated_text
+from polars_io_tools.tests.helpers.cases import as_params, epoch_ns
+from polars_io_tools.tests.helpers.pickling import pickle_round_trip
+from polars_io_tools.tests.helpers.property_checks import SETTINGS, show
+from polars_io_tools.tests.helpers.strategies import (
+    POLARS_ERRORS,
+    random_filter,
+    series_from_raw,
+)
 
-DeltaTable = pytest.importorskip("deltalake").DeltaTable
-write_deltalake = pytest.importorskip("deltalake").write_deltalake
+deltalake = pytest.importorskip("deltalake")
+DeltaTable, write_deltalake = deltalake.DeltaTable, deltalake.write_deltalake
 
-
-def _build_sample_df() -> pl.DataFrame:
-    ts = [datetime(2025, 1, 1, 0, 0, 0) + timedelta(hours=i) for i in range(5)]
-    ts_s = pl.Series("ts", ts).cast(pl.Datetime("ns"))
-    dur = [0, 500, 1500, 2500, 4000]
-    dur_s = pl.Series("dur_ms", dur, dtype=pl.Duration("ms"))
-    val_s = pl.Series("value", [10, 20, 30, 40, 50], dtype=pl.Int64)
-    return pl.DataFrame([ts_s, dur_s, val_s])
-
-
-def test_infer_logical_mapping_from_schema_basic():
-    df = _build_sample_df()
-    schema = df.lazy().collect_schema()
-    mapping = infer_logical_mapping(schema)
-    assert mapping == {"ts": pl.Datetime("ns"), "dur_ms": pl.Duration("ms")}
+NANOSECOND_DATETIME, MILLISECOND_DURATION, MICROSECOND_DATETIME = pl.Datetime("ns"), pl.Duration("ms"), pl.Datetime("us")
 
 
-def test_infer_logical_mapping_ignores_non_temporal():
-    df = pl.DataFrame({"x": [1, 2], "y": ["a", "b"]})
-    schema = df.lazy().collect_schema()
-    mapping = infer_logical_mapping(schema)
-    assert mapping == {}
+def _consecutive_seconds(n: int, dtype=NANOSECOND_DATETIME, start=datetime(2025, 1, 1)) -> pl.Series:
+    return pl.Series([start + timedelta(seconds=i) for i in range(n)]).cast(dtype)
+
+
+SAMPLE = pl.DataFrame(
+    {
+        "ts": pl.Series([datetime(2025, 1, 1) + timedelta(hours=i) for i in range(5)]).cast(NANOSECOND_DATETIME),
+        "dur_ms": pl.Series([0, 500, 1500, 2500, 4000], dtype=MILLISECOND_DURATION),
+        "value": pl.Series([10, 20, 30, 40, 50], dtype=pl.Int64),
+    }
+)
+SAMPLE_MAPPING = {"ts": NANOSECOND_DATETIME, "dur_ms": MILLISECOND_DURATION}
+
+
+@dataclass(frozen=True)
+class LogicalMappingCase:
+    """A frame, and the dtype mapping ``infer_logical_mapping`` infers from its schema."""
+
+    id: str
+    _: KW_ONLY
+    df: pl.DataFrame
+    mapping: dict | None
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            LogicalMappingCase("infer_logical_mapping_from_schema_basic", df=SAMPLE, mapping=SAMPLE_MAPPING),
+            LogicalMappingCase("infer_logical_mapping_ignores_non_temporal", df=pl.DataFrame({"x": [1, 2], "y": ["a", "b"]}), mapping={}),
+        ]
+    ),
+)
+def test_infer_logical_mapping(case: LogicalMappingCase):
+    assert infer_logical_mapping(case.df.lazy().collect_schema()) == case.mapping
 
 
 def test_build_delta_write_exprs_shapes_temporal():
-    df = _build_sample_df()
-    lf = df.lazy()
-    schema = lf.collect_schema()
-    mapping = infer_logical_mapping(schema)
-    exprs = build_delta_write_exprs(schema, mapping)
-    out = lf.select(exprs).collect()
-    # Temporal types cast to Int64; plain value stays Int64
-    assert out.schema["ts"] == pl.Int64
-    assert out.schema["dur_ms"] == pl.Int64
-    assert out.schema["value"] == pl.Int64
+    schema = SAMPLE.lazy().collect_schema()
+    out = SAMPLE.lazy().select(build_delta_write_exprs(schema, infer_logical_mapping(schema))).collect()
+    assert dict(out.schema) == {"ts": pl.Int64, "dur_ms": pl.Int64, "value": pl.Int64}
 
 
-@pytest.mark.parametrize("rechunk", [None, False, True])
-@pytest.mark.parametrize("pushdown_predicate_deltalake", [False, True])
-def test_delta_roundtrip_schema_and_values(tmp_path, rechunk, pushdown_predicate_deltalake):
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, "delta_table")
-    # Namespace API should work
-    df.lazy().piot.sink_delta(table_path, mode="overwrite")
-
-    lf = cpl.scan_delta(table_path, rechunk=rechunk, pushdown_predicate_deltalake=pushdown_predicate_deltalake)
-    out = lf.collect()
-
-    # Schema types should match target logical types
-    schema = out.schema
-    assert schema["ts"] == pl.Datetime("ns")
-    assert schema["dur_ms"] == pl.Duration("ms")
-
-    # Values round-trip
-    assert_frame_equal(out.select(["ts", "dur_ms", "value"]), df.select(["ts", "dur_ms", "value"]))
+def _description_mapping(path: str) -> dict | None:
+    """The logical mapping in the table description, or None without a mapping block."""
+    desc = DeltaTable(path).metadata().description
+    payload = extract_description_block(desc, _MAPPING_BLOCK_TAG) if desc else None
+    if payload is not None:
+        assert_translated_text(desc, [f"[{_MAPPING_BLOCK_TAG}:begin]", f"[{_MAPPING_BLOCK_TAG}:end]"])
+    return None if payload is None else metadata_to_mapping(base64.b64decode(payload))
 
 
-def test_delta_microseconds_passthrough(tmp_path):
-    # Datetime/us should be written natively without mapping; durations are mapped to ints
-    ts_us = pl.datetime_range(start=pl.datetime(2025, 1, 1), end=pl.datetime(2025, 1, 1, 0, 0, 2), interval="1s", eager=True).cast(pl.Datetime("us"))
-    dur_us_counts = pl.Series([100_000, 200_000], dtype=pl.Int64)
-    df = pl.DataFrame({"ts": ts_us.head(2), "dur": dur_us_counts, "x": [1, 2]})
-    table_path = os.path.join(tmp_path, "delta_us_passthrough")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
+@dataclass(frozen=True)
+class DeltaRoundtripCase:
+    """A frame written to a Delta table and read back, which must give the frame again."""
 
-    # scan_delta should expose native types without casting
-    out = cpl.scan_delta(table_path).collect()
-    assert out.schema["ts"] == pl.Datetime("us")
-    assert out.schema["dur"] == pl.Int64
-
-    # And the mapping should not include these columns
-    from deltalake import DeltaTable
-
-    dt = DeltaTable(table_path)
-    meta = dt.metadata()
-    desc = getattr(meta, "description", None)
-    if desc:
-        payload = extract_description_block(desc, _MAPPING_BLOCK_TAG)
-        if payload:
-            mapping = metadata_to_mapping(base64.b64decode(payload))
-            # ts (us) should not be mapped
-            assert "ts" not in mapping
+    id: str
+    _: KW_ONLY
+    frame: pl.DataFrame
+    # the dtype each stored column is read as, which the table description must hold; None: no mapping is stored
+    expected_mapping: dict | None
+    # called as ``sink(lazy_frame, path, **sink_options)``
+    sink: Callable = cpl.sink_delta
+    sink_options: dict = field(default_factory=dict)
+    # keyword arguments for ``scan_delta``
+    scan_options: dict = field(default_factory=dict)
 
 
-def test_datetime_unit_fidelity_roundtrip(tmp_path):
-    # Build microsecond-precision datetimes, add a nanosecond duration delta
-    base = pl.Series("ts", [datetime(2025, 1, 1, 0, 0, 0), datetime(2025, 1, 1, 0, 0, 1)]).cast(pl.Datetime("us"))
-    # Add 500 nanoseconds to each timestamp via arithmetic on ns cast
-    df = pl.DataFrame({"ts": base})
-    df = df.with_columns(pl.col("ts").cast(pl.Datetime("ns")).dt.offset_by("500ns").cast(pl.Datetime("us")).alias("ts"))
-    table_path = os.path.join(tmp_path, "delta_unit_fidelity")
-    # Write and read back through our pipeline
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-    out = cpl.scan_delta(table_path).collect()
-    # Expect the microsecond precision retained without losing fidelity
-    assert out.schema["ts"] == pl.Datetime("us")
-    assert_frame_equal(out.select(["ts"]), df.select(["ts"]))
+_RECHUNK_IDS = {None: "default_rechunk", False: "no_rechunk", True: "rechunk"}
+ROUNDTRIPS = [
+    *[
+        DeltaRoundtripCase(
+            f"delta_roundtrip_schema_and_values-{_RECHUNK_IDS[rechunk]}-{'deltalake_pushdown' if pushdown else 'no_deltalake_pushdown'}",
+            frame=SAMPLE,
+            expected_mapping=SAMPLE_MAPPING,
+            sink=lambda lf, path, **kw: lf.piot.sink_delta(path, **kw),
+            scan_options={"rechunk": rechunk, "pushdown_predicate_deltalake": pushdown},
+        )
+        for rechunk in (None, False, True)
+        for pushdown in (False, True)
+    ],
+    DeltaRoundtripCase("delta_roundtrip_infer_mapping", frame=SAMPLE, expected_mapping=SAMPLE_MAPPING),
+    # microsecond datetimes are stored natively, without a mapping
+    DeltaRoundtripCase(
+        "delta_microseconds_passthrough",
+        frame=pl.DataFrame({"ts": _consecutive_seconds(2, MICROSECOND_DATETIME), "dur": pl.Series([100_000, 200_000], dtype=pl.Int64), "x": [1, 2]}),
+        expected_mapping=None,
+    ),
+    DeltaRoundtripCase(
+        "datetime_unit_fidelity_roundtrip",
+        frame=pl.DataFrame({"ts": pl.Series([datetime(2025, 1, 1, 0, 0, s) for s in (0, 1)]).cast(MICROSECOND_DATETIME)}),
+        expected_mapping=None,
+    ),
+    DeltaRoundtripCase(
+        "delta_metadata_us_precision_has_no_block",
+        frame=pl.DataFrame({"ts": _consecutive_seconds(5, MICROSECOND_DATETIME), "x": [1, 2, 3, 4, 5]}),
+        expected_mapping=None,
+    ),
+    DeltaRoundtripCase(
+        "mixed_datetime_us_and_ns_roundtrip",
+        frame=pl.DataFrame({"ts_us": _consecutive_seconds(2, MICROSECOND_DATETIME), "ts_ns": _consecutive_seconds(2), "value": [10, 20]}),
+        expected_mapping={"ts_ns": NANOSECOND_DATETIME},
+    ),
+    DeltaRoundtripCase("delta_streaming_write_batches", frame=SAMPLE, expected_mapping=SAMPLE_MAPPING, sink_options={"chunk_size": 2}),
+    DeltaRoundtripCase(
+        "scan_delta_reads_description_mapping", frame=pl.DataFrame({"ts": _consecutive_seconds(5)}), expected_mapping={"ts": NANOSECOND_DATETIME}
+    ),
+    DeltaRoundtripCase(
+        "scan_delta_propagates_storage_options_passthrough",
+        frame=pl.DataFrame({"ts": _consecutive_seconds(3)}),
+        expected_mapping={"ts": NANOSECOND_DATETIME},
+        scan_options={"storage_options": {"endpoint_url": "http://localhost:9000", "unused_key": "value"}},
+    ),
+    DeltaRoundtripCase(
+        "delta_metadata_ms_precision_includes_block",
+        frame=pl.DataFrame({"dur_ms": pl.Series([0, 500, 1500, 2500, 4000], dtype=MILLISECOND_DURATION), "x": [1, 2, 3, 4, 5]}),
+        expected_mapping={"dur_ms": MILLISECOND_DURATION},
+    ),
+    # a table written by Polars has no mapping and reads back as stored
+    DeltaRoundtripCase(
+        "scan_delta_without_mapping_returns_plain",
+        frame=pl.DataFrame({"x": [1, 2, 3]}),
+        expected_mapping=None,
+        sink=lambda lf, path, **kw: lf.collect().write_delta(path, **kw),
+    ),
+]
 
 
-def test_mixed_datetime_us_and_ns_roundtrip(tmp_path):
-    """Test that Datetime[us] columns are preserved when written alongside Datetime[ns] columns."""
-    df = pl.DataFrame(
-        {
-            "ts_us": pl.Series([datetime(2025, 1, 1, 0, 0, 0), datetime(2025, 1, 1, 0, 0, 1)]).cast(pl.Datetime("us")),
-            "ts_ns": pl.Series([datetime(2025, 1, 1, 0, 0, 0), datetime(2025, 1, 1, 0, 0, 1)]).cast(pl.Datetime("ns")),
-            "value": [10, 20],
-        }
-    )
-    table_path = os.path.join(tmp_path, "delta_mixed_datetime")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    out = cpl.scan_delta(table_path).collect()
-
-    # Both datetime columns should preserve their original time units
-    assert out.schema["ts_us"] == pl.Datetime("us")
-    assert out.schema["ts_ns"] == pl.Datetime("ns")
-    assert_frame_equal(out, df)
-
-    # Verify mapping only includes ns column, not us column
-    dt = DeltaTable(table_path)
-    meta = dt.metadata()
-    desc = getattr(meta, "description", None)
-    assert isinstance(desc, str) and f"[{_MAPPING_BLOCK_TAG}:begin]" in desc
-    payload = extract_description_block(desc, _MAPPING_BLOCK_TAG)
-    mapping = metadata_to_mapping(base64.b64decode(payload))
-    assert "ts_ns" in mapping
-    assert "ts_us" not in mapping
+@pytest.mark.parametrize("case", as_params(ROUNDTRIPS))
+def test_roundtrip(tmp_path, case: DeltaRoundtripCase):
+    path = str(tmp_path / "t")
+    case.sink(case.frame.lazy(), path, mode="overwrite", **case.sink_options)
+    assert_frame_equal(cpl.scan_delta(path, **case.scan_options).collect(), case.frame)
+    assert _description_mapping(path) == case.expected_mapping
 
 
-def test_delta_streaming_write_batches(tmp_path):
-    # Force streaming path even if collect_batches exists, by setting chunk_size
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, "delta_streaming")
-    # Write with chunking to exercise collect_batches path
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite", chunk_size=2)
+@dataclass(frozen=True)
+class ChunkSizeCase:
+    """A ``chunk_size`` for an append, and whether the append streams batches."""
 
-    lf = cpl.scan_delta(table_path)
-    out = lf.collect()
-    assert_frame_equal(out.select(["ts", "dur_ms", "value"]), df.select(["ts", "dur_ms", "value"]))
-    # Description mapping should be present and valid in the Delta table
-    dt = DeltaTable(table_path)
-    meta = dt.metadata()
-    desc = getattr(meta, "description", None)
-    assert isinstance(desc, str) and f"[{_MAPPING_BLOCK_TAG}:begin]" in desc and f"[{_MAPPING_BLOCK_TAG}:end]" in desc
+    id: str
+    _: KW_ONLY
+    chunk_size: int | None
+    expect_batches: bool
 
 
 @pytest.mark.skipif(not POLARS_HAS_COLLECT_BATCHES, reason="collect_batches requires Polars >= 1.34.0")
 @pytest.mark.parametrize(
-    "chunk_size,expect_batches",
-    [
-        (-1, False),  # chunk_size=-1 should use single collect(), not collect_batches
-        (2, True),  # chunk_size=2 should use collect_batches for chunked writes
-        (None, True),  # chunk_size=None (default) should use collect_batches
-    ],
+    "case",
+    as_params(
+        [
+            ChunkSizeCase("minus_one_writes_at_once", chunk_size=-1, expect_batches=False),
+            ChunkSizeCase("two_streams_batches", chunk_size=2, expect_batches=True),
+            ChunkSizeCase("default_streams_batches", chunk_size=None, expect_batches=True),
+        ]
+    ),
 )
-def test_delta_chunk_size_controls_collect_batches(tmp_path, chunk_size, expect_batches):
-    """Verify chunk_size controls whether collect_batches is used.
+def test_delta_chunk_size_controls_collect_batches(tmp_path, case: ChunkSizeCase):
+    """An append streams batches unless chunk_size is -1, for writers that need one atomic write."""
+    path = str(tmp_path / "t")
+    cpl.sink_delta(SAMPLE.lazy(), path, mode="overwrite")
+    original = pl.LazyFrame.collect_batches
+    called = []
 
-    This is important for users who need atomic/consistent writes where
-    multiple write operations would break consistency guarantees. The code logic is:
+    def detecting(self, *args, **kwargs):
+        called.append(True)
+        return original(self, *args, **kwargs)
 
-        if POLARS_HAS_COLLECT_BATCHES and chunk_size != -1:
-            for batch_df in lf.collect_batches(...):  # chunked path
-                ...
+    # chunking only applies to append/error/ignore modes
+    with patch.object(pl.LazyFrame, "collect_batches", detecting):
+        cpl.sink_delta(SAMPLE.lazy(), path, mode="append", chunk_size=case.chunk_size)
+    assert bool(called) == case.expect_batches
+    assert_frame_equal(cpl.scan_delta(path).collect(), pl.concat([SAMPLE, SAMPLE]), check_row_order=False)
+
+
+def test_scan_delta_invalid_block_raises(tmp_path):
+    path = str(tmp_path / "t")
+    pl.DataFrame({"x": [1, 2, 3]}).write_delta(
+        path, mode="overwrite", delta_write_options={"description": f"\n[{_MAPPING_BLOCK_TAG}:begin]\nnot-base64\n[{_MAPPING_BLOCK_TAG}:end]"}
+    )
+    with pytest.raises(ValueError):
+        cpl.scan_delta(path).collect()
+
+
+# Tables the predicate rows read: name -> (frame, how it is written).
+_JAN_2_2024_12_30 = datetime(2024, 1, 2, 12, 30)
+_JAN_2_2024_12_30_NS = epoch_ns(_JAN_2_2024_12_30)
+_MAPPED_PREDICATES = {
+    "arithmetic": (pl.col("d") * 2) < timedelta(minutes=5),
+    "column_difference": (pl.col("t") - pl.col("tm")) <= timedelta(0),
+    "cast_to_string": pl.col("t").cast(pl.String).str.starts_with("2024-01-02"),
+    "epoch": pl.col("t").dt.epoch("s") <= 1704198600,
+    "year": pl.col("t").dt.year() == 2024,
+    "time_hour": pl.col("tt").dt.hour() == 12,
+    "total_seconds": pl.col("d").dt.total_seconds() >= 60,
+    "truncate": pl.col("t").dt.truncate("1h") == datetime(2024, 1, 2, 12),
+    "offset_by": pl.col("t").dt.offset_by("1h") > _JAN_2_2024_12_30,
+    "strftime": pl.col("t").dt.strftime("%Y") == "2024",
+    "replace_time_zone": pl.col("t").dt.replace_time_zone("UTC") >= datetime(2024, 1, 1).astimezone(),
+    "subtract_literal": (pl.col("tm") - _JAN_2_2024_12_30) >= timedelta(0),
+    "date_is_in": pl.col("t").dt.date().is_in([date(2024, 1, 2)]),
+    "date_is_between": pl.col("t").dt.date().is_between(date(2024, 1, 1), date(2024, 1, 3)),
+    "date_eq": pl.col("t").dt.date() == date(2024, 1, 2),
+    "cast_date_le": pl.col("t").cast(pl.Date) <= date(2024, 1, 2),
+    "cast_ms_eq": pl.col("t").cast(pl.Datetime("ms")) == _JAN_2_2024_12_30,
+    "cast_duration_us_eq": pl.col("d").cast(pl.Duration("us")) == timedelta(minutes=1),
+    "cast_time_to_duration": pl.col("tt").cast(pl.Duration("ns")) <= timedelta(hours=13),
+    "ns_upper_bound": pl.col("t") <= _JAN_2_2024_12_30,
+    "ns_literal_eq": pl.col("t") == pl.lit(_JAN_2_2024_12_30_NS + 500).cast(pl.Datetime("ns")),
+    "ns_is_in": pl.col("t").is_in(pl.Series([_JAN_2_2024_12_30_NS + 500]).cast(pl.Datetime("ns")).implode()),
+    "duration_upper_bound": pl.col("d") <= timedelta(minutes=1),
+    "ne_missing": pl.col("x").ne_missing(1),
+    "not_eq_missing": ~pl.col("x").eq_missing(1),
+    "eq_missing_column": pl.col("x").eq_missing(pl.col("x")),
+    "is_in_nulls_equal": pl.col("x").is_in([1, None], nulls_equal=True),
+    "is_between_string_literals": pl.col("s").is_between(pl.lit("a"), pl.lit("b")),
+    "is_between_string_not_columns": pl.col("s").is_between(pl.lit("q"), pl.lit("r")),
+    "is_null_non_strict_cast": pl.col("ss").cast(pl.Int64, strict=False).is_null(),
+    "and_untranslatable_side": (pl.col("t").dt.hour() == 12) & (pl.col("x") > 1),
+    "or_untranslatable_side": (pl.col("t").dt.hour() == 12) | (pl.col("x") > 1),
+    "not_untranslatable": ~((pl.col("t").dt.hour() == 12) & (pl.col("x") > 1)),
+}
+
+# Columns of many dtypes that are stored as plain values and read back through the mapping.
+_MAPPED = pl.DataFrame(
+    {
+        "t": pl.Series([_JAN_2_2024_12_30_NS, _JAN_2_2024_12_30_NS + 500, _JAN_2_2024_12_30_NS + 1500, None]).cast(NANOSECOND_DATETIME),
+        "tm": pl.Series(
+            [_JAN_2_2024_12_30_NS // 10**6, _JAN_2_2024_12_30_NS // 10**6 - 1, _JAN_2_2024_12_30_NS // 10**6 + 1, _JAN_2_2024_12_30_NS // 10**6]
+        ).cast(pl.Datetime("ms")),
+        "d": pl.Series([60 * 10**9, 60 * 10**9 + 500, 30 * 10**9, None]).cast(pl.Duration("ns")),
+        "tt": pl.Series([45000 * 10**9, 45000 * 10**9 + 500, 46800 * 10**9, None]).cast(pl.Time),
+        "x": [1, 2, None, 3],
+        "s": ["a", "ab", "b", "c"],
+        "ss": ["1", "x", None, "2"],
+        "a": ["zz"] * 4,
+        "b": ["zzz"] * 4,
+    }
+)
+_JAN_1_2025 = datetime(2025, 1, 1)
+_JAN_1_2025_NS = epoch_ns(_JAN_1_2025)
+TABLES = {
+    "sample": (SAMPLE, None),
+    "mapped": (_MAPPED, None),
+    # p in {"A", "B", None}, partitioned by p
+    "partitioned": (pl.DataFrame({"x": [1, 2, 10, 20, 100], "p": ["A", "A", "B", "B", None]}), ["p"]),
+    "int_partitioned": (
+        pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]}, schema={"a": pl.Int64, "b": pl.String}),
+        ["a"],
+    ),
+    # Delta stores timestamps in microseconds
+    "ts_partitioned": (pl.DataFrame({"ts": _consecutive_seconds(2, MICROSECOND_DATETIME), "x": [1, 2]}), ["ts"]),
+    # timestamps one nanosecond apart
+    "ns": (
+        pl.DataFrame({"ts": pl.Series([_JAN_1_2025_NS, _JAN_1_2025_NS + 1, _JAN_1_2025_NS + 2]).cast(NANOSECOND_DATETIME), "id": [10, 20, 30]}),
+        None,
+    ),
+    "readme": (
+        pl.DataFrame(
+            {
+                "ts": _consecutive_seconds(4),
+                "dur_ns": pl.Series([0, 500, 1500, 2500], dtype=pl.Duration("ns")),
+                "t": pl.Series([time(0, 0, s) for s in range(4)], dtype=pl.Time),
+            }
+        ),
+        None,
+    ),
+    **{
+        f"mapping_{u}": (
+            pl.DataFrame({"ts": [datetime(2024, 1, 1), datetime(2024, 1, 2)], "val": [10, 20]}, schema_overrides={"ts": pl.Datetime(u)}),
+            None,
+        )
+        for u in ("us", "ns")
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def delta_tables(tmp_path_factory):
+    """Each table of TABLES written once: by sink_delta, or by deltalake partitioned by the given columns."""
+    root = tmp_path_factory.mktemp("delta")
+    paths = {}
+    for name, (df, partition_by) in TABLES.items():
+        paths[name] = str(root / name)
+        if partition_by is None:
+            cpl.sink_delta(df.lazy(), paths[name], mode="overwrite")
         else:
-            df = lf.collect()  # single-write path
-            df.write_delta(...)
-
-    Note: chunking only applies to append/error/ignore modes, not overwrite/merge.
-    By verifying collect_batches is/isn't called based on chunk_size, we ensure
-    the correct code path is taken regardless of how polars implements things internally.
-    """
-    from unittest.mock import patch
-
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, f"delta_chunk_{chunk_size}")
-
-    # First create the table so we can append to it
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    collect_batches_called = {"called": False}
-    original_collect_batches = pl.LazyFrame.collect_batches
-
-    def detecting_collect_batches(self, *args, **kwargs):
-        collect_batches_called["called"] = True
-        return original_collect_batches(self, *args, **kwargs)
-
-    # Use mode="append" because chunking only applies to append/error/ignore modes
-    with patch.object(pl.LazyFrame, "collect_batches", detecting_collect_batches):
-        cpl.sink_delta(df.lazy(), table_path, mode="append", chunk_size=chunk_size)
-
-    if expect_batches:
-        assert collect_batches_called["called"], (
-            f"collect_batches SHOULD be called when chunk_size={chunk_size}; the chunked write code path should use collect_batches"
-        )
-    else:
-        assert not collect_batches_called["called"], (
-            f"collect_batches should NOT be called when chunk_size={chunk_size}; the single-write code path should use collect() instead"
-        )
-
-    # Verify data was written correctly (should have 2x rows after append)
-    out = cpl.scan_delta(table_path).collect()
-    assert out.shape[0] == df.shape[0] * 2
+            write_deltalake(paths[name], df.to_arrow(), mode="overwrite", partition_by=partition_by)
+    return paths
 
 
-def test_delta_predicate_rewrite_datetime(tmp_path):
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, "delta_table_pred_dt")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    lf = cpl.scan_delta(table_path)
-    threshold = datetime(2025, 1, 1, 2, 0, 0)
-    # Validate end-to-end through the translated source
-    res = lf.filter(pl.col("ts") >= threshold).collect()
-    exp = df.filter(pl.col("ts") >= threshold)
-    # Results should match
-    assert_frame_equal(res, exp)
-    # Verify pushdown happened: explain should show SELECTION not FILTER at top
-    plan = lf.filter(pl.col("ts") >= threshold).explain()
-    assert "SELECTION" in plan
-    assert "FILTER" not in plan
-    # Ensure the translated schema is still exposed
-    assert lf.collect().schema["ts"] == pl.Datetime("ns")
+def _nanosecond_literal(ns: int) -> pl.Expr:
+    """A nanosecond datetime literal built without passing through a Python datetime."""
+    return pl.lit(0, dtype=NANOSECOND_DATETIME) + pl.duration(nanoseconds=ns)
 
 
-def test_delta_predicate_rewrite_duration(tmp_path):
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, "delta_table_pred_dur")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
+@dataclass(frozen=True)
+class DeltaScanCase:
+    """A filter on a Delta table read with ``scan_delta``; the result must equal plain Polars filtering the written
+    frame."""
 
-    lf = cpl.scan_delta(table_path)
-    res = lf.filter(pl.col("dur_ms") < timedelta(milliseconds=2000)).collect()
-    exp = df.filter(pl.col("dur_ms") < timedelta(milliseconds=2000))
-    assert_frame_equal(res, exp)
-    # Verify pushdown happened: explain should show SELECTION not FILTER
-    plan = lf.filter(pl.col("dur_ms") < timedelta(milliseconds=2000)).explain()
-    assert "SELECTION" in plan
-    assert "FILTER" not in plan
-
-
-def test_delta_roundtrip_infer_mapping(tmp_path):
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, "delta_table_infer")
-    # No mapping provided: infer
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    lf = cpl.scan_delta(table_path)
-    out = lf.collect()
-
-    # Schema types should match target logical types (inferred)
-    schema = out.schema
-    assert schema["ts"] == pl.Datetime("ns")
-    assert schema["dur_ms"] == pl.Duration("ms")
-    assert_frame_equal(out.select(["ts", "dur_ms", "value"]), df.select(["ts", "dur_ms", "value"]))
+    id: str
+    _: KW_ONLY
+    # the name of a table in ``TABLES``
+    table: str
+    predicate: pl.Expr
+    # applied after the filter
+    query: Callable[[pl.LazyFrame], pl.LazyFrame] | None = None
+    # the filter must reach the scan (``SELECTION`` and no ``FILTER`` in the plan)
+    check_plan: bool = False
+    # how the partitions were used: "not_attempted" (no partition pruning), "attempted", or "without_partition_filters"
+    # (files were listed with no partition filter)
+    partition_listing: str | None = None
+    # a filter for rows the scan may return as well, depending on the Polars version
+    may_also_return: pl.Expr | None = None
+    # keyword arguments for ``scan_delta``
+    scan_options: dict = field(default_factory=dict)
 
 
-def test_delta_metadata_us_precision_has_no_block(tmp_path):
-    # For microsecond precision datetime, no mapping block is required
-    df = pl.DataFrame(
-        {
-            "ts": pl.datetime_range(start=pl.datetime(2025, 1, 1), end=pl.datetime(2025, 1, 1, 0, 0, 4), interval="1s", eager=True).cast(
-                pl.Datetime("us")
-            ),
-            "x": [1, 2, 3, 4, 5],
-        }
-    )
-    table_path = os.path.join(tmp_path, "delta_meta_us")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    dt = DeltaTable(table_path)
-    meta = dt.metadata()
-    desc = getattr(meta, "description", None)
-    # No mapping description expected for us-precision datetime
-    assert desc is None or f"[{_MAPPING_BLOCK_TAG}:begin]" not in desc
-
-
-def test_delta_metadata_ms_precision_includes_block(tmp_path):
-    # For non-us precision temporal types, mapping block should be present
-    df = pl.DataFrame(
-        {
-            "dur_ms": pl.Series([0, 500, 1500, 2500, 4000], dtype=pl.Duration("ms")),
-            "x": [1, 2, 3, 4, 5],
-        }
-    )
-    table_path = os.path.join(tmp_path, "delta_meta_ms")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    dt = DeltaTable(table_path)
-    meta = dt.metadata()
-    desc = getattr(meta, "description", None)
-    assert isinstance(desc, str)
-    assert f"[{_MAPPING_BLOCK_TAG}:begin]" in desc and f"[{_MAPPING_BLOCK_TAG}:end]" in desc
-    payload = extract_description_block(desc, _MAPPING_BLOCK_TAG)
-    mapping = metadata_to_mapping(base64.b64decode(payload))
-    assert mapping.get("dur_ms") == pl.Duration("ms")
-
-
-@pytest.fixture()
-def _partitioned_delta_table(tmp_path):
-    # Create a small partitioned Delta table with p in {"A", "B", None}
-    table_path = os.path.join(tmp_path, "delta_partition_pushdown")
-    df = pl.DataFrame(
-        {
-            "x": [1, 2, 10, 20, 100],
-            "p": ["A", "A", "B", "B", None],
-        }
-    )
-    # Write via Deltalake with partitioning on column 'p'
-    write_deltalake(table_path, df.to_arrow(), mode="overwrite", partition_by=["p"])
-    return table_path
-
-
-def test_scan_delta_no_pushdown_calls_file_uris(_partitioned_delta_table, monkeypatch):
-    # Ensure that when pushdown is disabled, _get_partition_uris is not called
-    calls = {"count": 0}
-
-    # Monkeypatch _get_partition_uris to increment count if called
-    import polars_io_tools.io_sources.delta_io as dio
-
-    orig_get = dio._get_partition_uris
-
-    def _spy(*args, **kwargs):
-        calls["count"] += 1
-        return orig_get(*args, **kwargs)
-
-    monkeypatch.setattr(dio, "_get_partition_uris", _spy)
-
-    # Build a simple filtered scan with pushdown disabled
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None, pushdown_predicate_deltalake=False)
-    out = lf.filter(pl.col("p") == "A").collect()
-    assert out.shape == (2, 2)
-    # Verify _get_partition_uris was never called
-    assert calls["count"] == 0
-
-
-def test_scan_delta_pushdown_calls_file_uris(_partitioned_delta_table, monkeypatch):
-    # Ensure that when pushdown is enabled, _get_partition_uris is called
-    calls = {"count": 0}
-
-    import polars_io_tools.io_sources.delta_io as dio
-
-    orig_get = dio._get_partition_uris
-
-    def _spy(*args, **kwargs):
-        calls["count"] += 1
-        return orig_get(*args, **kwargs)
-
-    monkeypatch.setattr(dio, "_get_partition_uris", _spy)
-
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None, pushdown_predicate_deltalake=True)
-    out = lf.filter(pl.col("p") == "A").collect()
-    assert out.shape == (2, 2)
-    # Verify _get_partition_uris was called at least once
-    assert calls["count"] >= 1
-
-
-def test_delta_partition_pushdown_eq(_partitioned_delta_table):
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
-    out = lf.filter(pl.col("p") == "A").sort("x").collect()
-    assert out.shape == (2, 2)
-    assert set(out["x"].to_list()) == {1, 2}
-    assert set(out["p"].to_list()) == {"A"}
-
-    # Literal cast to ensure proper encoding for equality
-    out2 = cpl.scan_delta(_partitioned_delta_table, credential_provider=None).filter(pl.col("p") == pl.lit("A").cast(pl.Utf8)).sort("x").collect()
-    assert out2.shape == (2, 2)
-
-
-def test_delta_partition_pushdown_in(_partitioned_delta_table):
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
-    out = lf.filter(pl.col("p").is_in(["B"]))
-    df = out.sort("x").collect()
-    assert df.shape == (2, 2)
-    assert set(df["x"].to_list()) == {10, 20}
-    assert set(df["p"].to_list()) == {"B"}
-
-
-def test_delta_partition_pushdown_all_unsupported_ops_fallback(_partitioned_delta_table, monkeypatch):
-    """If all DNF clauses have only unsupported ops, ensure we fall back to dt.file_uris() (pf None)."""
-    calls = {"filters": []}
-
-    import deltalake
-
-    orig = deltalake.DeltaTable.file_uris
-
-    def _spy(self, *args, **kwargs):
-        calls["filters"].append(kwargs.get("partition_filters", None))
-        return orig(self, *args, **kwargs)
-
-    monkeypatch.setattr(deltalake.DeltaTable, "file_uris", _spy, raising=True)
-
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None, pushdown_predicate_deltalake=True)
-    # Use a range operator on partition column 'p' (unsupported for pruning)
-    out = lf.filter(pl.col("p") < "B").sort("x").collect()
-    # Expect only 'A' rows; no 'B' rows
-    assert out.filter(pl.col("p") == "A").shape == (2, 2)
-    assert out.filter(pl.col("p") == "B").is_empty()
-
-    # Verify that file_uris was called without partition_filters at least once (pf None)
-    assert any(f is None for f in calls["filters"]) and len(calls["filters"]) >= 1
-
-
-def test_delta_partition_pushdown_not_in(_partitioned_delta_table):
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
-    out = lf.filter(~pl.col("p").is_in(["A"]) | pl.col("p").is_null())
-    df = out.sort(["p", "x"]).collect()
-    # Expect B rows and the null partition row
-    assert df.shape == (3, 2)
-    assert set(df["p"].to_list()) == {"B", None}
-    assert set(df["x"].to_list()) == {10, 20, 100}
-
-
-@pytest.mark.parametrize(
-    "pred",
-    [~pl.col("p").is_in([""]), ~pl.col("p").is_in(["", "B"]), (pl.col("p") == "A") | ~pl.col("p").is_in([""])],
-    ids=["empty", "empty-and-value", "or-empty"],
-)
-def test_delta_partition_pushdown_not_in_empty_string(_partitioned_delta_table, pred):
+PREDICATES = [
+    DeltaScanCase("delta_predicate_rewrite_datetime", table="sample", predicate=pl.col("ts") >= datetime(2025, 1, 1, 2), check_plan=True),
+    DeltaScanCase("delta_predicate_rewrite_duration", table="sample", predicate=pl.col("dur_ms") < timedelta(milliseconds=2000), check_plan=True),
+    DeltaScanCase(
+        "scan_delta_no_pushdown_calls_file_uris",
+        table="partitioned",
+        predicate=pl.col("p") == "A",
+        partition_listing="not_attempted",
+        scan_options={"pushdown_predicate_deltalake": False},
+    ),
+    DeltaScanCase(
+        "scan_delta_pushdown_calls_file_uris",
+        table="partitioned",
+        predicate=pl.col("p") == "A",
+        partition_listing="attempted",
+        scan_options={"pushdown_predicate_deltalake": True},
+    ),
+    DeltaScanCase("delta_partition_pushdown_eq", table="partitioned", predicate=pl.col("p") == "A"),
+    DeltaScanCase("delta_partition_pushdown_eq-cast_literal", table="partitioned", predicate=pl.col("p") == pl.lit("A").cast(pl.Utf8)),
+    DeltaScanCase("delta_partition_pushdown_in", table="partitioned", predicate=pl.col("p").is_in(["B"])),
+    # a range on a partition column cannot prune
+    # the null partition may come back too
+    DeltaScanCase(
+        "delta_partition_pushdown_all_unsupported_ops_fallback",
+        table="partitioned",
+        predicate=pl.col("p") < "B",
+        partition_listing="without_partition_filters",
+        may_also_return=pl.col("p").is_null(),
+        scan_options={"pushdown_predicate_deltalake": True},
+    ),
+    DeltaScanCase(
+        "delta_partition_pushdown_mixed_or_clause_unsafe_prune",
+        table="partitioned",
+        predicate=(pl.col("p") < "B") | (pl.col("p") == "B") | pl.col("p").is_null(),
+        partition_listing="without_partition_filters",
+        scan_options={"pushdown_predicate_deltalake": True},
+    ),
+    DeltaScanCase("delta_partition_pushdown_not_in", table="partitioned", predicate=~pl.col("p").is_in(["A"]) | pl.col("p").is_null()),
     # "" is Delta's null partition token, so it must not reach file_uris inside a "not in"
-    expected = pl.DataFrame({"x": [1, 2, 10, 20, 100], "p": ["A", "A", "B", "B", None]}).filter(pred)
-    out = cpl.scan_delta(_partitioned_delta_table, credential_provider=None).filter(pred).collect()
-    assert set(expected["x"]) <= set(out["x"])
+    *[
+        DeltaScanCase(f"delta_partition_pushdown_not_in_empty_string-{n}", table="partitioned", predicate=q)
+        for n, q in [
+            ("empty", ~pl.col("p").is_in([""])),
+            ("empty-and-value", ~pl.col("p").is_in(["", "B"])),
+            ("or-empty", (pl.col("p") == "A") | ~pl.col("p").is_in([""])),
+        ]
+    ],
+    DeltaScanCase("delta_partition_pushdown_is_null", table="partitioned", predicate=pl.col("p").is_null()),
+    DeltaScanCase("scan_delta_ne_missing_keeps_null_partition", table="int_partitioned", predicate=pl.col("a").ne_missing(1)),
+    # 257 wraps to 1, so its partition must stay
+    DeltaScanCase(
+        "scan_delta_narrowing_cast_does_not_prune_wrapped_partition",
+        table="int_partitioned",
+        predicate=pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1,
+    ),
+    DeltaScanCase(
+        "delta_partition_pushdown_datetime_mapped_eq",
+        table="ts_partitioned",
+        predicate=pl.col("ts") == pl.lit(_JAN_1_2025 + timedelta(seconds=1)).cast(NANOSECOND_DATETIME),
+    ),
+    *[
+        DeltaScanCase(
+            f"delta_ns_precision_unit-{n}",
+            table="ns",
+            predicate=q,
+            check_plan=plan,
+            scan_options={"storage_options": _storage_options_for("unused", aws_profile=None).polars, "aws_profile": None},
+        )
+        for n, q, plan in [
+            ("ge", pl.col("ts") >= _nanosecond_literal(_JAN_1_2025_NS + 1), True),
+            ("le", pl.col("ts") <= _nanosecond_literal(_JAN_1_2025_NS + 1), True),
+            ("gt", pl.col("ts") > _nanosecond_literal(_JAN_1_2025_NS + 1), False),
+            ("lt", pl.col("ts") < _nanosecond_literal(_JAN_1_2025_NS + 2), False),
+            *[
+                (
+                    f"between_{c}",
+                    pl.col("ts").is_between(_nanosecond_literal(_JAN_1_2025_NS + 1), _nanosecond_literal(_JAN_1_2025_NS + 2), closed=c),
+                    True,
+                )
+                for c in ("both", "left", "right", "none")
+            ],
+        ]
+    ],
+    DeltaScanCase(
+        "readme_delta_example",
+        table="readme",
+        predicate=(pl.col("ts") >= datetime(2025, 1, 1, 0, 0, 2))
+        & (pl.col("dur_ns") >= pl.duration(nanoseconds=1500))
+        & (pl.col("t") >= time(0, 0, 1)),
+    ),
+    *[
+        DeltaScanCase(
+            f"scan_delta_mapping_filter_then_select-{u}",
+            table=f"mapping_{u}",
+            predicate=pl.col("ts") == datetime(2024, 1, 2),
+            query=lambda lf: lf.select("val"),
+        )
+        for u in ("us", "ns")
+    ],
+    # file pruning off: only the translated predicate pushed to the Parquet scan is exercised
+    *[
+        DeltaScanCase(
+            f"scan_delta_mapped_predicate_matches_eager-{n}", table="mapped", predicate=q, scan_options={"pushdown_predicate_deltalake": False}
+        )
+        for n, q in _MAPPED_PREDICATES.items()
+    ],
+]
+
+
+@pytest.mark.parametrize("case", as_params(PREDICATES))
+def test_scan_delta_matches_polars(delta_tables, monkeypatch, case: DeltaScanCase):
+    calls = {"partition_uris": 0, "file_uris_filters": []}
+    get_uris, file_uris = delta_io._get_partition_uris, DeltaTable.file_uris
+
+    def spy_uris(*args, **kwargs):
+        calls["partition_uris"] += 1
+        return get_uris(*args, **kwargs)
+
+    def spy_file_uris(self, *args, **kwargs):
+        calls["file_uris_filters"].append(kwargs.get("partition_filters"))
+        return file_uris(self, *args, **kwargs)
+
+    monkeypatch.setattr(delta_io, "_get_partition_uris", spy_uris)
+    monkeypatch.setattr(DeltaTable, "file_uris", spy_file_uris)
+    op = case.query or (lambda lf: lf)
+    lf = cpl.scan_delta(delta_tables[case.table], credential_provider=None, **case.scan_options)
+    native = TABLES[case.table][0].lazy()
+    if case.may_also_return is None:
+        assert assert_matches_plain_polars(op(lf.filter(case.predicate)), op(native.filter(case.predicate)), None) is not None
+    else:
+
+        def rows(lf):
+            df = lf.collect()
+            return set(df.select(sorted(df.columns)).rows())
+
+        assert (
+            rows(op(native.filter(case.predicate)))
+            <= rows(op(lf.filter(case.predicate)))
+            <= rows(op(native.filter(case.predicate | case.may_also_return)))
+        )
+    if case.check_plan:
+        assert_translated_text(lf.filter(case.predicate).explain(), "SELECTION", omits="FILTER")
+    if case.partition_listing == "not_attempted":
+        assert calls["partition_uris"] == 0
+    elif case.partition_listing == "attempted":
+        assert calls["partition_uris"] >= 1
+    elif case.partition_listing == "without_partition_filters":
+        assert None in calls["file_uris_filters"]
+
+
+def test_delta_partition_pushdown_datetime_mapped_eq_prunes_uris(delta_tables):
+    """An equality on a datetime partition column lists only the matching partition's files."""
+    dt = DeltaTable(delta_tables["ts_partitioned"])
+    pruned = _get_partition_uris(dt, pl.col("ts") == pl.lit(_JAN_1_2025 + timedelta(seconds=1)).cast(NANOSECOND_DATETIME), mapping=None)
+    assert 1 <= len(pruned) < len(dt.file_uris())
 
 
 def test_delta_partition_pushdown_ne_keeps_empty_string(tmp_path):
-    # delta-rs reads the "" partition as null, so "!=" must not prune it
-    table_path = os.path.join(tmp_path, "t")
-    df = pl.DataFrame({"c": ["a", "", "b"], "i": [0, 1, 2]})
-    write_deltalake(table_path, df.to_arrow(), mode="overwrite", partition_by=["c"])
-    out = cpl.scan_delta(table_path, credential_provider=None).filter(pl.col("c") != "a").collect()
-    assert sorted(out["i"]) == [1, 2]
+    """delta-rs reads the "" partition as null, so "!=" must not prune it; the source returns it."""
+    path = str(tmp_path / "t")
+    write_deltalake(path, pl.DataFrame({"c": ["a", "", "b"], "i": [0, 1, 2]}).to_arrow(), mode="overwrite", partition_by=["c"])
+    assert sorted(cpl.scan_delta(path, credential_provider=None).filter(pl.col("c") != "a").collect()["i"]) == [1, 2]
 
 
 _NAN = float("nan")
@@ -479,485 +560,178 @@ def test_delta_partition_pushdown_on_signed_zero_and_nan_float_partitions(tmp_pa
     Pruning keeps every row the predicate keeps, and only rows a lazy filter of every file keeps (before Polars 2 that
     also keeps the null partition for some predicates).
     """
-    table_path = os.path.join(tmp_path, "t")
+    path = str(tmp_path / "t")
     df = pl.DataFrame({"c0": [0.0, -0.0, _NAN, 1.5, None], "v": range(5)})
-    df.write_delta(table_path, delta_write_options={"partition_by": ["c0"]})
-    unpruned = cpl.scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False)
-    out = set(cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()["v"])
+    df.write_delta(path, delta_write_options={"partition_by": ["c0"]})
+    unpruned = cpl.scan_delta(path, credential_provider=None, pushdown_predicate_deltalake=False)
+    out = set(cpl.scan_delta(path, credential_provider=None).filter(pred).collect()["v"])
     assert set(df.filter(pred)["v"]) <= out <= set(unpruned.filter(pred).collect()["v"])
 
 
 def test_delta_partition_pushdown_ne_keeps_the_rows_of_a_native_scan_of_a_null_integer_partition(tmp_path):
-    table_path = os.path.join(tmp_path, "t")
-    pl.DataFrame({"q": [1, 2, None], "i": [0, 1, 2]}).write_delta(table_path, delta_write_options={"partition_by": ["q"]})
+    path = str(tmp_path / "t")
+    pl.DataFrame({"q": [1, 2, None], "i": [0, 1, 2]}).write_delta(path, delta_write_options={"partition_by": ["q"]})
     pred = pl.col("q") != 1
-    out = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
-    assert sorted(out["i"]) == sorted(pl.scan_delta(table_path).filter(pred).collect()["i"])
+    out = cpl.scan_delta(path, credential_provider=None).filter(pred).collect()
+    assert sorted(out["i"]) == sorted(pl.scan_delta(path).filter(pred).collect()["i"])
 
 
 def test_scan_delta_collects_the_columns_of_its_schema_in_order(tmp_path):
-    table_path = os.path.join(tmp_path, "t")
-    write_deltalake(table_path, pl.DataFrame({"p": ["a", "b"], "v": [1, 2]}).to_arrow(), mode="overwrite", partition_by=["p"])
-    lf = cpl.scan_delta(table_path, credential_provider=None)
+    path = str(tmp_path / "t")
+    write_deltalake(path, pl.DataFrame({"p": ["a", "b"], "v": [1, 2]}).to_arrow(), mode="overwrite", partition_by=["p"])
+    lf = cpl.scan_delta(path, credential_provider=None)
     assert lf.collect().columns == lf.collect_schema().names() == ["p", "v"]
 
 
-def test_delta_partition_pushdown_is_null(_partitioned_delta_table):
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
-    # Match the null partition using is_null, and equality against None
-    out = lf.filter(pl.col("p").is_null())
-    df = out.collect()
-    assert df.shape == (1, 2)
-    assert df["p"].to_list() == [None]
-    assert df["x"].to_list() == [100]
+def _run_delta_io_roundtrip(path: str, aws_profile: str | None) -> None:
+    """Overwrite, append through the streaming path, and filter like a native scan of the stored integers.
 
-
-def test_scan_delta_reads_description_mapping(tmp_path):
-    # Build a table and rely on Delta metadata description
-    ts = pl.datetime_range(start=pl.datetime(2025, 1, 1), end=pl.datetime(2025, 1, 1, 0, 0, 4), interval="1s", eager=True).cast(pl.Datetime("ns"))
-    df = pl.DataFrame({"ts": ts})
-    table_path = os.path.join(tmp_path, "delta_desc")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-    out = cpl.scan_delta(table_path).collect()
-    assert out.schema["ts"] == pl.Datetime("ns")
-
-
-def test_scan_delta_without_mapping_returns_plain(tmp_path):
-    # Create a delta table via polars, but without our configuration block
-    df = pl.DataFrame({"x": [1, 2, 3]})
-    table_path = os.path.join(tmp_path, "delta_no_mapping")
-    df.write_delta(table_path, mode="overwrite")
-
-    # scan_delta should fall back to plain scan (no translated types)
-    lf = cpl.scan_delta(table_path)
-    out = lf.collect()
-    assert out.schema["x"] == pl.Int64
-
-
-def test_scan_delta_reads_block_mapping_when_present(tmp_path):
-    df = _build_sample_df()
-    table_path = os.path.join(tmp_path, "delta_desc_fallback")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-    out = cpl.scan_delta(table_path).collect()
-    assert out.schema["ts"] == pl.Datetime("ns")
-
-
-def test_delta_partition_pushdown_datetime_mapped_eq(tmp_path):
-    # Create a Delta table partitioned by a Datetime column and verify
-    # that an equality filter is pushed down to deltalake (via URIs pruning).
-    ts_vals = [
-        datetime(2025, 1, 1, 0, 0, 0),
-        datetime(2025, 1, 1, 0, 0, 1),
-    ]
+    Also run against S3 by the integration tests.
+    """
+    cred = None if aws_profile is None else pl.CredentialProviderAWS(profile_name=aws_profile)
     df = pl.DataFrame(
         {
-            "ts": pl.Series(ts_vals).cast(pl.Datetime("ns")),
-            "x": [1, 2],
-        }
-    )
-    table_path = os.path.join(tmp_path, "delta_partition_ts")
-    write_deltalake(table_path, df.to_arrow(), mode="overwrite", partition_by=["ts"])
-
-    # Build a predicate that includes an explicit cast to the mapped dtype
-    target = datetime(2025, 1, 1, 0, 0, 1)
-    pred = pl.col("ts") == pl.lit(target).cast(pl.Datetime("ns"))
-
-    # Verify pruning via file_uris returns only the matching partition URIs
-    dt = DeltaTable(table_path)
-    all_uris = dt.file_uris()
-    pruned_uris = _get_partition_uris(dt, pred, mapping=None)
-    assert len(pruned_uris) < len(all_uris)
-    assert len(pruned_uris) >= 1
-
-    # Ensure the scan returns the correct single row
-    out = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
-    assert out.shape == (1, 2)
-    assert out["ts"].to_list() == [target]
-    assert out["x"].to_list() == [2]
-    # No other mapped columns present in this test
-
-
-def test_scan_delta_propagates_storage_options_passthrough(tmp_path):
-    # Create a small table with mapping embedded
-    ts = pl.datetime_range(start=pl.datetime(2025, 1, 1), end=pl.datetime(2025, 1, 1, 0, 0, 2), interval="1s", eager=True).cast(pl.Datetime("ns"))
-    df = pl.DataFrame({"ts": ts})
-    table_path = os.path.join(tmp_path, "delta_opts")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    # Pass user storage_options and ensure scan_delta still exposes mapped schema
-    user_opts = {"endpoint_url": "http://localhost:9000", "unused_key": "value"}
-    out = cpl.scan_delta(table_path, storage_options=user_opts).collect()
-    assert out.schema["ts"] == pl.Datetime("ns")
-
-
-def test_delta_mapping_uses_ns_not_us(tmp_path):
-    # Create a simple frame with datetime[ns]
-    df = pl.DataFrame(
-        {
-            "ts": pl.datetime_range(start=pl.datetime(2025, 1, 1), end=pl.datetime(2025, 1, 1, 0, 0, 2), interval="1s", eager=True).cast(
-                pl.Datetime("ns")
-            ),
-        }
-    )
-    table_path = os.path.join(tmp_path, "delta_mapping_units")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-
-    # Read via scan_delta and verify schema exposes ns
-    out = cpl.scan_delta(table_path).collect()
-    assert out.schema["ts"] == pl.Datetime("ns")
-
-    # Also assert that the embedded mapping metadata decodes to ns
-    dt = DeltaTable(table_path)
-    meta = dt.metadata()
-    desc = getattr(meta, "description", None)
-    assert isinstance(desc, str) and f"[{_MAPPING_BLOCK_TAG}:begin]" in desc
-    payload = extract_description_block(desc, _MAPPING_BLOCK_TAG)
-
-    mapping = metadata_to_mapping(base64.b64decode(payload))
-    assert mapping["ts"] == pl.Datetime("ns")
-
-
-def test_scan_delta_invalid_block_raises(tmp_path):
-    # Create a delta table with an invalid mapping description block
-    df = pl.DataFrame({"x": [1, 2, 3]})
-    table_path = os.path.join(tmp_path, "delta_bad_desc")
-    df.write_delta(
-        table_path, mode="overwrite", delta_write_options={"description": f"\n[{_MAPPING_BLOCK_TAG}:begin]\nnot-base64\n[{_MAPPING_BLOCK_TAG}:end]"}
-    )
-
-    # No sidecar present, fallback reads description and should raise on invalid base64
-    with pytest.raises(ValueError):
-        cpl.scan_delta(table_path).collect()
-
-
-def test_inject_and_extract_roundtrip_block_helpers():
-    desc = None
-    payload = base64.b64encode(b"hello").decode("ascii")
-    desc = inject_description_block(desc, "foo.block", payload)
-    assert "[foo.block:begin]" in desc and "[foo.block:end]" in desc
-    out = extract_description_block(desc, "foo.block")
-    assert out == payload
-
-
-def test_extract_missing_returns_none_block_helpers():
-    assert extract_description_block("some text without blocks", "foo") is None
-    assert extract_description_block(None, "foo") is None
-
-
-def test_extract_ignores_whitespace_and_takes_first_line_block_helpers():
-    desc = "\n[foo:begin]\n  abc\n  def\n[foo:end]"
-    out = extract_description_block(desc, "foo")
-    assert out == "abc"
-
-
-def _run_delta_ns_precision_common(cache_root: str, aws_profile: str | None) -> None:
-    # Build underlying data as Datetime[ns] with nanosecond offsets around a base timestamp
-    import datetime as _dt
-
-    base_dt = _dt.datetime(2025, 1, 1, tzinfo=_dt.UTC)
-    base_ns = int(base_dt.timestamp() * 1_000_000_000)
-
-    df_inner = (
-        pl.DataFrame({"id": [10, 20, 30], "offset_ns": [0, 1, 2]})
-        .with_columns(ts=(pl.lit(base_dt).cast(pl.Datetime("ns")) + pl.col("offset_ns").cast(pl.Duration("ns"))))
-        .select(["ts", "id"])
-    )
-
-    # Write via sink_delta
-    cp = pl.CredentialProviderAWS(profile_name=aws_profile) if aws_profile else None
-    cpl.sink_delta(df_inner.lazy(), cache_root, mode="overwrite", credential_provider=cp)
-
-    # Read via scan_delta
-    polars_opts = _storage_options_for(cache_root, aws_profile=aws_profile).polars
-    lf = cpl.scan_delta(cache_root, storage_options=polars_opts, aws_profile=aws_profile)
-    out = lf.collect()
-    assert out.schema["ts"] == pl.Datetime("ns")
-
-    # Build ns-precision datetime literals without losing precision using durations
-    def lit_ns(ns: int) -> pl.Expr:
-        return pl.lit(0, dtype=pl.Datetime("ns")) + pl.duration(nanoseconds=ns)
-
-    # Lower bound: >= base+1ns should match ids [20, 30]
-    lf_ge = lf.filter(pl.col("ts") >= lit_ns(base_ns + 1))
-    plan_ge = lf_ge.explain()
-    assert "SELECTION" in plan_ge and "FILTER" not in plan_ge
-    out_ge = lf_ge.collect()
-    assert out_ge["id"].to_list() == [20, 30]
-
-    # Upper bound: <= base+1ns should match ids [10, 20]
-    lf_le = lf.filter(pl.col("ts") <= lit_ns(base_ns + 1))
-    plan_le = lf_le.explain()
-    assert "SELECTION" in plan_le and "FILTER" not in plan_le
-    out_le = lf_le.collect()
-    assert out_le["id"].to_list() == [10, 20]
-
-    # Strict bounds: > base+1ns should match [30]; < base+2ns should match [10, 20]
-    out_gt = lf.filter(pl.col("ts") > lit_ns(base_ns + 1)).collect()
-    assert out_gt["id"].to_list() == [30]
-    out_lt = lf.filter(pl.col("ts") < lit_ns(base_ns + 2)).collect()
-    assert out_lt["id"].to_list() == [10, 20]
-
-    # Between tests on [base+1ns, base+2ns]
-    lf_both = lf.filter(pl.col("ts").is_between(lit_ns(base_ns + 1), lit_ns(base_ns + 2), closed="both"))
-    assert "SELECTION" in lf_both.explain()
-    assert lf_both.collect()["id"].to_list() == [20, 30]
-
-    lf_left = lf.filter(pl.col("ts").is_between(lit_ns(base_ns + 1), lit_ns(base_ns + 2), closed="left"))
-    assert "SELECTION" in lf_left.explain()
-    assert lf_left.collect()["id"].to_list() == [20]
-
-    lf_right = lf.filter(pl.col("ts").is_between(lit_ns(base_ns + 1), lit_ns(base_ns + 2), closed="right"))
-    assert "SELECTION" in lf_right.explain()
-    assert lf_right.collect()["id"].to_list() == [30]
-
-    lf_none = lf.filter(pl.col("ts").is_between(lit_ns(base_ns + 1), lit_ns(base_ns + 2), closed="none"))
-    assert "SELECTION" in lf_none.explain()
-    assert lf_none.collect()["id"].to_list() == []
-
-
-def _run_delta_io_roundtrip(cache_root, aws_profile):
-    table_root = cache_root
-
-    # Sample data with logical types
-    lf = pl.DataFrame(
-        {
-            "ts": pl.datetime_range(start=pl.datetime(2024, 6, 1), end=pl.datetime(2024, 6, 1, 0, 0, 2), interval="1s", eager=True).cast(
-                pl.Datetime("ns")
-            ),
-            "dur_ms": pl.Series([0, 500, 1500], dtype=pl.Duration("ms")),
+            "ts": _consecutive_seconds(3, start=datetime(2024, 6, 1)),
+            "dur_ms": pl.Series([0, 500, 1500], dtype=MILLISECOND_DURATION),
             "value": [11, 22, 33],
         }
-    ).lazy()
-
-    cred_prov = None if aws_profile is None else pl.CredentialProviderAWS(profile_name=aws_profile)
-
-    # Overwrite table
-    lf.piot.sink_delta(
-        table_root,
-        mode="overwrite",
-        credential_provider=cred_prov,
     )
-
-    # Append a row via streaming write path
-    lf_append = pl.LazyFrame(
-        {
-            "ts": [datetime(2024, 6, 1, 0, 0, 3)],
-            "dur_ms": pl.Series([2000], dtype=pl.Duration("ms")),
-            "value": [44],
-        },
-        schema_overrides={"ts": pl.Datetime(time_unit="ns")},
+    df.lazy().piot.sink_delta(path, mode="overwrite", credential_provider=cred)
+    more = pl.DataFrame(
+        {"ts": _consecutive_seconds(1, start=datetime(2024, 6, 1, 0, 0, 3)), "dur_ms": pl.Series([2000], dtype=MILLISECOND_DURATION), "value": [44]}
     )
+    more.lazy().piot.sink_delta(path, mode="append", credential_provider=cred, chunk_size=2)
+    assert_frame_equal(cpl.scan_delta(path, credential_provider=cred).sort("ts").collect(), pl.concat([df, more]))
 
-    lf_append.piot.sink_delta(
-        table_root,
-        mode="append",
-        credential_provider=cred_prov,
-        chunk_size=2,
-    )
-
-    # Scan with translation applied
-    out = (
-        cpl.scan_delta(
-            table_root,
-            credential_provider=cred_prov,
-        )
-        .sort("ts")
-        .collect()
-    )
-
-    assert out.shape[0] == 4
-    assert out["ts"].dtype == pl.Datetime("ns")
-    assert out["dur_ms"].dtype == pl.Duration("ms")
-    assert out["value"].to_list() == [11, 22, 33, 44]
-
-    # Verify predicate pushdown via equivalence to underlying int-domain filters
-    # For native pl.scan_delta, we need storage_options with allow_http for on-prem S3
-    polars_opts = _storage_options_for(table_root, aws_profile=aws_profile).polars
-    native = pl.scan_delta(
-        table_root,
-        storage_options=polars_opts,
-        credential_provider=cred_prov,
-    )
-    # 1) Datetime >= threshold
     threshold = datetime(2024, 6, 1, 0, 0, 2)
-    threshold_ns = int(pl.Series([threshold], dtype=pl.Datetime("ns")).dt.timestamp("ns").to_list()[0])
-    filtered_logical = cpl.scan_delta(table_root, credential_provider=cred_prov).filter(pl.col("ts") >= threshold).sort("ts").collect()
-    filtered_native = native.filter(pl.col("ts") >= threshold_ns).sort("ts").collect()
-    assert filtered_logical["value"].to_list() == filtered_native["value"].to_list() == [33, 44]
-
-
-def test_delta_ns_precision_unit(tmp_path):
-    _run_delta_ns_precision_common(str(tmp_path / "delta_ns"), aws_profile=None)
+    storage_options = _storage_options_for(path, aws_profile=aws_profile).polars
+    native = pl.scan_delta(path, storage_options=storage_options, credential_provider=cred).filter(
+        pl.col("ts") >= pl.Series([threshold], dtype=NANOSECOND_DATETIME).dt.timestamp("ns").item()
+    )
+    logical = cpl.scan_delta(path, credential_provider=cred).filter(pl.col("ts") >= threshold)
+    assert logical.sort("ts").collect()["value"].to_list() == native.sort("ts").collect()["value"].to_list() == [33, 44]
 
 
 def test_delta_io_roundtrip(tmp_path):
-    _run_delta_io_roundtrip(str(tmp_path / "delta_ns"), aws_profile=None)
+    _run_delta_io_roundtrip(str(tmp_path / "t"), aws_profile=None)
 
 
-def test_readme_delta_example():
-    # EXACT example from README: write ns datetime, ns duration, time; then scan and filter
-    import tempfile
-    from datetime import datetime, time as dtime
-
-    lf = pl.DataFrame(
-        {
-            "ts": pl.datetime_range(datetime(2025, 1, 1), datetime(2025, 1, 1, 0, 0, 3), interval="1s", eager=True).cast(pl.Datetime("ns")),
-            "dur_ns": pl.Series([0, 500, 1500, 2500], dtype=pl.Duration("ns")),
-            "t": pl.Series([dtime(0, 0, 0), dtime(0, 0, 1), dtime(0, 0, 2), dtime(0, 0, 3)], dtype=pl.Time),
-        }
-    ).lazy()
-
-    root = tempfile.mkdtemp(prefix="cpl_delta_")
-    table_path = os.path.join(root, "delta_table")
-    cpl.sink_delta(lf, table_path, mode="overwrite")
-
-    out = (
-        cpl.scan_delta(table_path)
-        .filter(pl.col("ts") >= datetime(2025, 1, 1, 0, 0, 2))
-        .filter(pl.col("dur_ns") >= pl.duration(nanoseconds=1500))
-        .filter(pl.col("t") >= dtime(0, 0, 1))
-        .collect()
-    )
-
-    # Expect the last two rows only
-    assert out.shape == (2, 3)
-    assert out["ts"].to_list() == [datetime(2025, 1, 1, 0, 0, 2), datetime(2025, 1, 1, 0, 0, 3)]
-    assert out["t"].to_list() == [dtime(0, 0, 2), dtime(0, 0, 3)]
-    # Duration(ns) should compare as integer nanosecond counts when cast
-    assert out["dur_ns"].dtype == pl.Duration("ns")
-    assert out.select(pl.col("dur_ns").cast(pl.Int64))["dur_ns"].to_list() == [1500, 2500]
+_HOUR_US = 3_600 * 10**6
 
 
-@pytest.mark.parametrize("time_unit", ["us", "ns"])
-def test_scan_delta_mapping_filter_then_select(tmp_path, time_unit):
-    df = pl.DataFrame(
-        {"ts": [datetime(2024, 1, 1), datetime(2024, 1, 2)], "val": [10, 20]}, schema_overrides={"ts": pl.Datetime(time_unit=time_unit)}
-    ).lazy()
-    table_path = os.path.join(tmp_path, "mapping_filter_select")
-    # Write with translation (ts mapped to integer backing type)
-    cpl.sink_delta(df, table_path, mode="overwrite")
-
-    # Filter on mapped column, then select a different column and collect
-    lf = cpl.scan_delta(table_path)
-    out = lf.filter(pl.col("ts") == datetime(2024, 1, 2)).select("val").collect()
-    assert out.shape == (1, 1)
-    assert out["val"].to_list() == [20]
-
-
-def test_delta_partition_pushdown_mixed_or_clause_unsafe_prune(_partitioned_delta_table, monkeypatch):
-    """OR of an unsupported clause and a supported clause should not prune at all (pf None)."""
-    calls = {"filters": []}
-
-    import deltalake
-
-    orig = deltalake.DeltaTable.file_uris
-
-    def _spy(self, *args, **kwargs):
-        calls["filters"].append(kwargs.get("partition_filters", None))
-        return orig(self, *args, **kwargs)
-
-    monkeypatch.setattr(deltalake.DeltaTable, "file_uris", _spy, raising=True)
-
-    lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None, pushdown_predicate_deltalake=True)
-    # Construct OR of unsupported (<) and supported (=) predicate
-    pred = (pl.col("p") < "B") | (pl.col("p") == "B") | pl.col("p").is_null()
-    out = lf.filter(pred).sort("x").collect()
-
-    # Expect rows for p == 'A' (from first) and p == 'B' (from second); null may pass through via filter semantics
-    assert set(out["p"].to_list()) == {"A", "B", None}
-    # Verify that file_uris was called without partition_filters at least once (pf None)
-    assert any(f is None for f in calls["filters"]) and len(calls["filters"]) >= 1
-
-
-@pytest.fixture()
-def _int_partitioned_delta_table(tmp_path):
-    """Delta table partitioned by an Int64 column 'a', including a null partition."""
-    table_path = os.path.join(tmp_path, "delta_int_partition")
-    df = pl.DataFrame({"a": [1, 1, 2, None, 257], "b": ["xx", "xyz", "xx", "xx", "xx"]}, schema={"a": pl.Int64, "b": pl.String})
-    write_deltalake(table_path, df.to_arrow(), mode="overwrite", partition_by=["a"])
-    return table_path, df
-
-
-def test_scan_delta_ne_missing_keeps_null_partition(_int_partitioned_delta_table):
-    """End to end: ``ne_missing`` must not prune the null partition."""
-    table_path, df = _int_partitioned_delta_table
-    pred = pl.col("a").ne_missing(1)
-    got = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
-    assert got.height == df.filter(pred).height
-    assert got.height == 3  # rows a in {2, None, 257}
-
-
-def test_scan_delta_narrowing_cast_does_not_prune_wrapped_partition(_int_partitioned_delta_table):
-    """End to end: ``cast(Int8)`` wrapping must not prune the partition where a == 257 (257 -> 1)."""
-    table_path, df = _int_partitioned_delta_table
-    pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
-    got = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
-    assert got.height == df.filter(pred).height
-    assert got.height == 3  # a == 1 (two rows) and a == 257 (wraps to 1)
-
-
-_NS_BASE = 1704198600000000000  # 2024-01-02 12:30:00
-_NOON_30 = datetime(2024, 1, 2, 12, 30)
-_MAPPED_PREDICATES = {
-    "arithmetic": (pl.col("d") * 2) < timedelta(minutes=5),
-    "column_difference": (pl.col("t") - pl.col("tm")) <= timedelta(0),
-    "cast_to_string": pl.col("t").cast(pl.String).str.starts_with("2024-01-02"),
-    "epoch": pl.col("t").dt.epoch("s") <= 1704198600,
-    "year": pl.col("t").dt.year() == 2024,
-    "time_hour": pl.col("tt").dt.hour() == 12,
-    "total_seconds": pl.col("d").dt.total_seconds() >= 60,
-    "truncate": pl.col("t").dt.truncate("1h") == datetime(2024, 1, 2, 12),
-    "offset_by": pl.col("t").dt.offset_by("1h") > _NOON_30,
-    "strftime": pl.col("t").dt.strftime("%Y") == "2024",
-    "replace_time_zone": pl.col("t").dt.replace_time_zone("UTC") >= datetime(2024, 1, 1).astimezone(),
-    "subtract_literal": (pl.col("tm") - _NOON_30) >= timedelta(0),
-    "date_is_in": pl.col("t").dt.date().is_in([date(2024, 1, 2)]),
-    "date_is_between": pl.col("t").dt.date().is_between(date(2024, 1, 1), date(2024, 1, 3)),
-    "date_eq": pl.col("t").dt.date() == date(2024, 1, 2),
-    "cast_date_le": pl.col("t").cast(pl.Date) <= date(2024, 1, 2),
-    "cast_ms_eq": pl.col("t").cast(pl.Datetime("ms")) == _NOON_30,
-    "cast_duration_us_eq": pl.col("d").cast(pl.Duration("us")) == timedelta(minutes=1),
-    "cast_time_to_duration": pl.col("tt").cast(pl.Duration("ns")) <= timedelta(hours=13),
-    "ns_upper_bound": pl.col("t") <= _NOON_30,
-    "ns_literal_eq": pl.col("t") == pl.lit(_NS_BASE + 500).cast(pl.Datetime("ns")),
-    "ns_is_in": pl.col("t").is_in(pl.Series([_NS_BASE + 500]).cast(pl.Datetime("ns")).implode()),
-    "duration_upper_bound": pl.col("d") <= timedelta(minutes=1),
-    "ne_missing": pl.col("x").ne_missing(1),
-    "not_eq_missing": ~pl.col("x").eq_missing(1),
-    "eq_missing_column": pl.col("x").eq_missing(pl.col("x")),
-    "is_in_nulls_equal": pl.col("x").is_in([1, None], nulls_equal=True),
-    "is_between_string_literals": pl.col("s").is_between(pl.lit("a"), pl.lit("b")),
-    "is_between_string_not_columns": pl.col("s").is_between(pl.lit("q"), pl.lit("r")),
-    "is_null_non_strict_cast": pl.col("ss").cast(pl.Int64, strict=False).is_null(),
-    "and_untranslatable_side": (pl.col("t").dt.hour() == 12) & (pl.col("x") > 1),
-    "or_untranslatable_side": (pl.col("t").dt.hour() == 12) | (pl.col("x") > 1),
-    "not_untranslatable": ~((pl.col("t").dt.hour() == 12) & (pl.col("x") > 1)),
+_DELTA_VALUES = {
+    pl.Int64(): st.integers(-5, 300),
+    pl.Int8(): st.integers(-5, 100),
+    pl.Boolean(): st.booleans(),
+    pl.String(): st.sampled_from(["", "a", "ab", "b", "B", " x", "é", "a/b", "None"]),
+    pl.Date(): st.integers(19_000, 19_040),
+    pl.Datetime("us"): st.integers(0, 60).map(lambda h: 1_704_067_200 * 10**6 + h * _HOUR_US),
+    pl.Datetime("us", "UTC"): st.integers(0, 60).map(lambda h: 1_704_067_200 * 10**6 + h * _HOUR_US),
+    pl.Datetime("ns"): st.tuples(st.integers(0, 60), st.sampled_from([0, 500])).map(
+        lambda p: (1_704_067_200 * 10**6 + p[0] * _HOUR_US) * 1000 + p[1]
+    ),
+    pl.Float64(): st.sampled_from([0.0, 1.5, -2.0, math.nan]),
+    pl.Decimal(10, 2): st.integers(0, 500),  # deltalake cannot write a negative Decimal partition value
 }
 
 
-@pytest.fixture(scope="module")
-def _mapped_delta_table(tmp_path_factory):
-    df = pl.DataFrame(
-        {
-            "t": pl.Series([_NS_BASE, _NS_BASE + 500, _NS_BASE + 1500, None]).cast(pl.Datetime("ns")),
-            "tm": pl.Series([_NS_BASE // 10**6, _NS_BASE // 10**6 - 1, _NS_BASE // 10**6 + 1, _NS_BASE // 10**6]).cast(pl.Datetime("ms")),
-            "d": pl.Series([60 * 10**9, 60 * 10**9 + 500, 30 * 10**9, None]).cast(pl.Duration("ns")),
-            "tt": pl.Series([45000 * 10**9, 45000 * 10**9 + 500, 46800 * 10**9, None]).cast(pl.Time),
-            "x": [1, 2, None, 3],
-            "s": ["a", "ab", "b", "c"],
-            "ss": ["1", "x", None, "2"],
-            "a": ["zz"] * 4,
-            "b": ["zzz"] * 4,
-        }
-    )
-    table_path = str(tmp_path_factory.mktemp("mapped") / "table")
-    cpl.sink_delta(df.lazy(), table_path, mode="overwrite")
-    return table_path, df
+@st.composite
+def _delta_cases(draw):
+    dtypes = draw(st.lists(st.sampled_from(list(_DELTA_VALUES)), min_size=1, max_size=3))
+    schema = {f"c{i}": d for i, d in enumerate(dtypes)}
+    pools = {name: draw(st.lists(_DELTA_VALUES[d], min_size=1, max_size=3)) for name, d in schema.items()}
+    columns = {name: series_from_raw(d, draw(st.lists(st.sampled_from([*pools[name], None]), min_size=5, max_size=5))) for name, d in schema.items()}
+    frame = pl.DataFrame({**columns, "v": list(range(5))})
+    partition_by = draw(st.lists(st.sampled_from(list(schema)), min_size=1, max_size=2, unique=True))
+    return frame, partition_by, random_filter(draw, schema, pools, depth=2)
 
 
-@pytest.mark.parametrize("pred", list(_MAPPED_PREDICATES.values()), ids=list(_MAPPED_PREDICATES))
-def test_scan_delta_mapped_predicate_matches_eager(_mapped_delta_table, pred):
-    table_path, df = _mapped_delta_table
-    # Disable Delta file pruning so only the translated predicate pushed to the Parquet scan is exercised.
-    got = cpl.scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False).filter(pred).collect()
-    assert_frame_equal(got, df.filter(pred), check_row_order=False)
+@SETTINGS
+@given(case=_delta_cases())
+def test_scan_delta_pruning_keeps_the_rows_a_filter_keeps(tmp_path_factory, case):
+    """Partition pruning keeps every row the predicate keeps and only rows a read of every file gives."""
+    pytest.importorskip("deltalake")
+    frame, partition_by, pred = case
+    note(f"partition_by={partition_by} pred={show(pred)}")
+    root = tmp_path_factory.mktemp("delta")
+    table_path = str(root / "table")
+    try:
+        sink_delta(frame.lazy(), table_path, mode="overwrite", delta_write_options={"partition_by": partition_by})
+        unpruned = scan_delta(table_path, credential_provider=None, pushdown_predicate_deltalake=False)
+        try:
+            kept, unpruned_kept = set(unpruned.collect().filter(pred)["v"]), set(unpruned.filter(pred).collect()["v"])
+        except POLARS_ERRORS:
+            return
+        # Filtering a scan of hive partitions may keep null partition values that filtering the collected frame drops.
+        assert kept <= set(scan_delta(table_path, credential_provider=None).filter(pred).collect()["v"]) <= unpruned_kept
+    finally:
+        shutil.rmtree(root)
+
+
+class TestScanDeltaPickle:
+    """Tests for cpl.scan_delta pickle support."""
+
+    def test_scan_delta_pickle_basic(self, tmp_path):
+        """scan_delta LazyFrames can be pickled and unpickled."""
+        path = str(tmp_path / "delta_table")
+
+        # Create a simple delta table
+        df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        df.write_delta(path)
+
+        # Create LazyFrame and pickle roundtrip
+        lf = cpl.scan_delta(path)
+        lf_unpickled = pickle_round_trip(lf)
+
+        # Verify results match
+        expected = df
+        result = lf_unpickled.collect()
+        assert_frame_equal(result, expected)
+
+    def test_scan_delta_pickle_with_mapping(self, tmp_path):
+        """scan_delta with type mappings can be pickled."""
+        path = str(tmp_path / "delta_table")
+
+        # Create delta table with Datetime[ns] (requires mapping)
+        df = pl.DataFrame(
+            {
+                "ts": pl.Series([datetime(2025, 1, 1)]).cast(pl.Datetime("ns")),
+                "value": [42],
+            }
+        )
+        cpl.sink_delta(df.lazy(), path, mode="overwrite")
+
+        lf = cpl.scan_delta(path)
+        lf_unpickled = pickle_round_trip(lf)
+
+        result = lf_unpickled.collect()
+        assert result.schema["ts"] == pl.Datetime("ns")
+        assert result["ts"].to_list() == [datetime(2025, 1, 1)]
+
+    def test_scan_delta_pickle_with_filter(self, tmp_path):
+        """scan_delta with filters can be pickled."""
+        path = str(tmp_path / "delta_table")
+
+        df = pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": ["a", "b", "c", "d", "e"]})
+        df.write_delta(path)
+
+        lf = cpl.scan_delta(path).filter(pl.col("a") > 2)
+        lf_unpickled = pickle_round_trip(lf)
+
+        expected = df.filter(pl.col("a") > 2)
+        result = lf_unpickled.collect()
+        assert_frame_equal(result, expected)
+
+    def test_scan_delta_pickle_with_select(self, tmp_path):
+        """scan_delta with column selection can be pickled."""
+        path = str(tmp_path / "delta_table")
+
+        df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"], "c": [10, 20, 30]})
+        df.write_delta(path)
+
+        lf = cpl.scan_delta(path).select(["a", "b"])
+        lf_unpickled = pickle_round_trip(lf)
+
+        expected = df.select(["a", "b"])
+        result = lf_unpickled.collect()
+        assert_frame_equal(result, expected)

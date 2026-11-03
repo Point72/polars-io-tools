@@ -1,29 +1,33 @@
+"""piot.cache: per-column, per-partition caching against a source that counts the columns it is asked for.
+
+Step tables give a sequence of queries, the source columns each must fetch and the cache size after it; every
+result is compared with the same query on the uncached frame.
+
+The property test at the end (using the Hypothesis library) runs random filters on a cache, cold then warm, and
+compares each with a plain filter.
+"""
+
 import os
 import pickle
 import subprocess
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import NamedTuple
+from dataclasses import KW_ONLY, dataclass, field
 
+import cloudpickle
 import polars as pl
 import pytest
+from hypothesis import example, given, strategies as st
 from polars.testing import assert_frame_equal
 
 import polars_io_tools.io_sources  # noqa: F401
-from polars_io_tools.io_sources.lazy_cache import _is_contradiction
-from polars_io_tools.io_sources.util import register_io_source_with_is_pure
-
-
-def assert_expr_equal(a: pl.Expr | None, b: pl.Expr | None):
-    """Assert that two polars expressions are equal"""
-    if a is None:
-        assert b is None
-    elif b is None:
-        assert a is None
-    else:
-        assert a.meta.serialize(format="json") == b.meta.serialize(format="json")
+from polars_io_tools.io_sources import util
+from polars_io_tools.io_sources.util import _exclusion_from_frame, register_io_source_with_is_pure
+from polars_io_tools.tests.helpers.assertions import failure_note
+from polars_io_tools.tests.helpers.cases import HOUR_US, NEW_YORK_FIRST_0130_US, as_params
+from polars_io_tools.tests.helpers.pickling import pickle_round_trip
+from polars_io_tools.tests.helpers.property_checks import SETTINGS, check_cache_keeps_filtered_rows
+from polars_io_tools.tests.helpers.strategies import partitioned_frames_and_predicates
 
 
 @dataclass
@@ -37,78 +41,45 @@ class CallRecord:
 
 @dataclass
 class TrackableSource:
-    """
-    A trackable IO source that records column requests.
-
-    This replaces the previous approach of using map_batches with Mocks,
-    which was fundamentally flawed because map_batches requires pure functions
-    and Polars may call them with arbitrary input data.
-    """
+    """An IO source over ``data`` that records the columns and predicate of every call."""
 
     data: pl.DataFrame
     calls: list[CallRecord] = field(default_factory=list)
 
     def reset(self):
-        """Clear all recorded calls."""
         self.calls.clear()
 
-    def get_column_counts(self) -> dict[str, int]:
-        """
-        Count how many times each column was requested.
-
-        Returns a dict mapping column name to request count.
-        If with_columns was None (all columns), counts all columns.
-        """
+    def get_column_counts(self, since: int = 0) -> dict[str, int]:
+        """How often each column was requested by the calls from number ``since`` on; a call without a projection
+        requests every column."""
         counts: dict[str, int] = {}
-        for call in self.calls:
-            cols = call.with_columns or list(self.data.columns)
-            for col in cols:
+        for call in self.calls[since:]:
+            for col in call.with_columns or list(self.data.columns):
                 counts[col] = counts.get(col, 0) + 1
         return counts
 
     def as_lazy_frame(self) -> pl.LazyFrame:
-        """Create a LazyFrame backed by this trackable source."""
-        schema = self.data.schema
         tracker = self
-        base_data = self.data
 
-        def source_generator(
-            with_columns: list[str] | None,
-            predicate: pl.Expr | None,
-            n_rows: int | None,
-            batch_size: int | None,
-        ) -> Iterator[pl.DataFrame]:
-            # Record the call - use `is not None` to avoid Expr truthiness issues
-            tracker.calls.append(
-                CallRecord(
-                    with_columns=with_columns,
-                    predicate_str=str(predicate) if predicate is not None else None,
-                    n_rows=n_rows,
-                )
-            )
-
-            df = base_data.lazy()
+        def source_generator(with_columns, predicate, n_rows, batch_size) -> Iterator[pl.DataFrame]:
+            tracker.calls.append(CallRecord(with_columns, str(predicate) if predicate is not None else None, n_rows))
+            df = tracker.data.lazy()
             if predicate is not None:
                 df = df.filter(predicate)
             if with_columns is not None:
                 df = df.select(with_columns)
             if n_rows is not None:
                 df = df.head(n_rows)
-
             if batch_size is None:
                 yield df.collect()
             else:
                 yield from df.collect().iter_slices(n_rows=batch_size)
 
-        return register_io_source_with_is_pure(source_generator, schema=schema, validate_schema=False)
+        return register_io_source_with_is_pure(source_generator, schema=self.data.schema, validate_schema=False)
 
 
 @pytest.fixture
 def source():
-    """Create a trackable source with test data.
-
-    The source is automatically reset after each test.
-    """
     data = pl.DataFrame(
         {
             "x": [1, 2, 3, 4, 5, 6],
@@ -125,89 +96,76 @@ def source():
 
 
 @pytest.fixture
-def df(source):
-    """Build a lazy frame backed by the trackable source."""
+def tracked_frame(source):
     return source.as_lazy_frame()
 
 
-class Scenario(NamedTuple):
-    filter: pl.Expr = pl.lit(True)
-    select: pl.Expr = pl.all()
+@dataclass(frozen=True)
+class TrackingSourceCase:
+    """A query on the tracking source, and whether it returns no rows."""
+
+    id: str
+    _: KW_ONLY
+    pred: pl.Expr | None
+    select: str | list[str]
+    empty: bool
+
+
+@pytest.mark.parametrize(
+    "case",
+    as_params(
+        [
+            TrackingSourceCase("source_basic", pred=None, select=["x2", "y2"], empty=False),
+            TrackingSourceCase("filter", pred=pl.col("p"), select="x2", empty=False),
+            TrackingSourceCase("logically_false", pred=pl.col("p") & ~pl.col("p"), select="x2", empty=True),
+            TrackingSourceCase("derived_filter", pred=pl.col("p2"), select="x2", empty=False),
+            TrackingSourceCase("logically_false_derived", pred=pl.col("p2") & ~pl.col("p2"), select="x2", empty=True),
+        ]
+    ),
+)
+def test_source(source, tracked_frame, case: TrackingSourceCase):
+    """The tracking source is called once per query, sees the projection and pushed predicate, and filters correctly."""
+    out = (tracked_frame if case.pred is None else tracked_frame.filter(case.pred)).select(case.select).collect()
+    assert len(source.calls) == 1
+    call = source.calls[0]
+    if case.pred is None:
+        assert set(call.with_columns) == {"x2", "y2"}
+    else:
+        assert call.predicate_str is not None and case.pred.meta.root_names()[0] in call.predicate_str
+        assert_frame_equal(out, source.data.filter(case.pred).select(case.select))
+        assert out.is_empty() is case.empty
+
+
+@dataclass(frozen=True)
+class FreshCacheQueryCase:
+    """A query on a fresh cache: ``filter``, then ``select``, then ``head``, with the cache split by ``partition_cols``.
+
+    ``cache_size`` is the number of cache entries after the query, and ``complete_cache_size`` after reading every row
+    and column. ``counts`` is how often each of the columns x2, y2 and p2 is fetched from the source by the query, and
+    ``complete_counts`` by the full read; the full read is only counted with ``cache_mode="cache"``, the one mode that
+    reuses what the query fetched.
+    """
+
+    id: str
+    _: KW_ONLY
+    filter: pl.Expr = field(default_factory=lambda: pl.lit(True))
+    select: pl.Expr = field(default_factory=pl.all)
     head: int | None = None
     partition_cols: tuple[str, ...] = ()
 
     # Results to test against
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = field(default_factory=dict)
     cache_size: int = 0
 
-    # For partitioned data, we "complete" the cache by collecting the frame for all columns and no filters
-    complete_counts: dict[str, int] = {}
+    # A full read (every column, no filter) after the query fills the rest of the cache.
+    complete_counts: dict[str, int] = field(default_factory=dict)
     complete_cache_size: int = 0
 
 
-def test_source_basic(source, df):
-    """Test that the trackable source correctly records column requests."""
-    # Select specific columns
-    df.select(["x2", "y2"]).collect()
-    assert len(source.calls) == 1
-    assert set(source.calls[0].with_columns) == {"x2", "y2"}
-
-    source.reset()
-
-    # Filter and select
-    df.filter(pl.col("p")).select("x2").collect()
-    assert len(source.calls) == 1
-    # The predicate should be pushed down
-    assert source.calls[0].predicate_str is not None
-    assert "p" in source.calls[0].predicate_str
-
-
-def test_source_logically_false_and_derived_filters(source, df):
-    # Baseline raw data for logical comparisons
-    raw_df = source.data
-
-    # 1) Simple filter on p, select x2
-    source.reset()
-    out = df.filter(pl.col("p")).select("x2").collect()
-    assert len(source.calls) == 1
-    expected = raw_df.filter(pl.col("p"))["x2"]
-    assert out["x2"].to_list() == expected.to_list()
-
-    # 2) Logically false predicate p & ~p
-    source.reset()
-    out_false = df.filter(pl.col("p") & ~pl.col("p")).select("x2").collect()
-    # Expression is still evaluated once at the IO layer
-    assert len(source.calls) == 1
-    # Result is logically empty
-    assert len(out_false) == 0
-    call = source.calls[0]
-    # Predicate should be present and mention p
-    assert call.predicate_str is not None
-    assert "p" in call.predicate_str
-
-    # 3) Filter on derived column p2, select x2
-    source.reset()
-    out_p2 = df.filter(pl.col("p2")).select("x2").collect()
-    assert len(source.calls) == 1
-    expected_p2 = raw_df.filter(pl.col("p2"))["x2"]
-    assert out_p2["x2"].to_list() == expected_p2.to_list()
-
-    # 4) Logically false predicate on derived column p2 & ~p2
-    source.reset()
-    out_p2_false = df.filter(pl.col("p2") & ~pl.col("p2")).select("x2").collect()
-    # Again, expression evaluated once at IO, result empty
-    assert len(source.calls) == 1
-    assert len(out_p2_false) == 0
-    call = source.calls[0]
-    assert call.predicate_str is not None
-    assert "p2" in call.predicate_str
-
-
 SCENARIOS = [
-    # Scenario 0
-    Scenario(head=3, counts={"x2": 1, "y2": 1, "p2": 1}, cache_size=6, complete_cache_size=6),
-    # Scenario 1
-    Scenario(
+    FreshCacheQueryCase("head_of_three", head=3, counts={"x2": 1, "y2": 1, "p2": 1}, cache_size=6, complete_cache_size=6),
+    FreshCacheQueryCase(
+        "filter_then_aggregate",
         filter=pl.col("p2"),
         select=pl.col("x2").max(),
         counts={"x2": 1, "p2": 1},
@@ -215,32 +173,32 @@ SCENARIOS = [
         complete_counts={"y2": 1},
         complete_cache_size=6,
     ),
-    # Scenario 2
-    Scenario(
+    FreshCacheQueryCase(
+        "partitioned_by_p",
         partition_cols=("p",),
         counts={"x2": 1, "y2": 1, "p2": 1},
         cache_size=12,
         complete_counts={"x2": 1, "y2": 1, "p2": 1},
         complete_cache_size=12,
     ),
-    # Scenario 3
-    Scenario(
+    FreshCacheQueryCase(
+        "partitioned_by_y",
         partition_cols=("y",),
         counts={"x2": 1, "y2": 1, "p2": 1},
         cache_size=18,
         complete_counts={"x2": 1, "y2": 1, "p2": 1},
         complete_cache_size=18,
     ),
-    # Scenario 4
-    Scenario(
+    FreshCacheQueryCase(
+        "partitioned_by_y_and_p",
         partition_cols=("y", "p"),
         counts={"x2": 1, "y2": 1, "p2": 1},
         cache_size=36,
         complete_counts={"x2": 1, "y2": 1, "p2": 1},
         complete_cache_size=36,
     ),
-    # Scenario 5
-    Scenario(
+    FreshCacheQueryCase(
+        "partition_filter_then_aggregate",
         filter=pl.col("p"),
         select=pl.col("x2").max(),
         partition_cols=("p",),
@@ -249,8 +207,8 @@ SCENARIOS = [
         complete_counts={"x2": 1, "y2": 2, "p2": 2},
         complete_cache_size=12,
     ),
-    # Scenario 6
-    Scenario(
+    FreshCacheQueryCase(
+        "partition_filter_with_value_filter",
         filter=pl.col("p") & (pl.col("x2") >= 0),  # Add a predicate that doesn't matter
         select=pl.all(),
         partition_cols=("p",),
@@ -259,8 +217,8 @@ SCENARIOS = [
         complete_counts={"x2": 1, "y2": 1, "p2": 1},
         complete_cache_size=12,
     ),
-    # Scenario 7
-    Scenario(
+    FreshCacheQueryCase(
+        "partition_filter_partitioned_by_y_and_p",
         filter=pl.col("p"),
         select=pl.all(),
         partition_cols=("y", "p"),
@@ -272,665 +230,215 @@ SCENARIOS = [
 ]
 
 
+def _value_column_counts(source: TrackableSource, since: int = 0) -> dict[str, int]:
+    """``source.get_column_counts(since)`` for the columns x2, y2 and p2 only."""
+    return {col: n for col, n in source.get_column_counts(since).items() if col in ("x2", "y2", "p2")}
+
+
 @pytest.mark.parametrize("cache_mode", ["cache", "rebuild", "ignore"])
-@pytest.mark.parametrize(
-    "scenario",
-    SCENARIOS,
-)
-def test_scenarios(source, df, cache_mode, scenario):
-    """Check the caching behavior for various scenarios.
-
-    This test verifies:
-    1. First call populates the cache with the expected size
-    2. Second identical call uses cache (no new source calls in cache mode)
-    3. Third call to collect all data completes the cache
-    """
+@pytest.mark.parametrize("case", as_params(SCENARIOS))
+def test_scenarios(source, tracked_frame, cache_mode, case: FreshCacheQueryCase):
+    """A query populates the cache, a fresh frame over the same cache returns the same, and a full read completes it."""
     cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=scenario.partition_cols, cache_mode=cache_mode)
 
-    # First call
-    out_cached = df_cache.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
-    first_call_count = len(source.calls)
-    assert first_call_count >= 1, "Expected at least one source call"
-    if cache_mode == "ignore":
-        assert len(cache) == 0
-    else:
-        assert len(cache) == scenario.cache_size
+    def run(partition_cols):
+        # The source's call log is part of the serialized plan, and so of the cache key.
+        source.reset()
+        lf = tracked_frame.piot.cache(cache, order_by="x", partition_cols=partition_cols, cache_mode=cache_mode)
+        return lf, lf.filter(case.filter).select(case.select).head(case.head).collect()
 
-    # Verify results match direct query
-    source.reset()
-    out = df.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
-    assert_frame_equal(out_cached, out, check_row_order=not scenario.partition_cols)
+    df_cache, out_cached = run(case.partition_cols)
+    assert len(source.calls) >= 1
+    assert _value_column_counts(source) == case.counts
+    assert len(cache) == (0 if cache_mode == "ignore" else case.cache_size)
+    out = tracked_frame.filter(case.filter).select(case.select).head(case.head).collect()
+    assert_frame_equal(out_cached, out, check_row_order=not case.partition_cols)
 
-    # Second call - reset source to track new calls
-    source.reset()
-
-    # Re-create df_cache (but using the same `cache`) to prove there is no state in df_cache that's not captured by `cache`
-    # We also reverse the partition cols here to make sure that doesn't impact things
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=list(reversed(scenario.partition_cols)), cache_mode=cache_mode)
-    out_cached2 = df_cache.filter(scenario.filter).select(scenario.select).head(scenario.head).collect()
-
-    if cache_mode == "cache":
-        # In cache mode, second call should not need new source data (or minimal calls for partitioned)
-        assert len(cache) == scenario.cache_size
-    else:
-        # In rebuild/ignore mode, source is called again
-        if cache_mode == "ignore":
-            assert len(cache) == 0
-        else:
-            assert len(cache) == scenario.cache_size
+    # A new frame over the same cache, with the partition columns reversed, holds no state of its own.
+    df_cache, out_cached2 = run(list(reversed(case.partition_cols)))
+    assert len(cache) == (0 if cache_mode == "ignore" else case.cache_size)
     assert_frame_equal(out_cached2, out_cached)
 
-    # Third Call - "Complete" the cache by selecting all the data
-    source.reset()
-
+    calls_before_full_read = len(source.calls)
     out_cached3 = df_cache.collect()
+    assert len(cache) == (0 if cache_mode == "ignore" else case.complete_cache_size)
     if cache_mode == "cache":
-        assert len(cache) == scenario.complete_cache_size
-    else:
-        if cache_mode == "ignore":
-            assert len(cache) == 0
-        else:
-            assert len(cache) == scenario.complete_cache_size
-
-    assert_frame_equal(out_cached3, df.collect(), check_row_order=not scenario.partition_cols)
+        assert _value_column_counts(source, since=calls_before_full_read) == case.complete_counts
+    assert_frame_equal(out_cached3, tracked_frame.collect(), check_row_order=not case.partition_cols)
 
 
-def test_df_partitioned(source, df):
-    """Test partitioning scenarios with single partition column."""
+# Fetch counts that accept any number of fetches, or at least one.
+ANY_NUMBER_OF_TIMES = range(99)
+AT_LEAST_ONCE = range(1, 99)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CacheQuery:
+    """One query on a shared cache, and what it must fetch from the source.
+
+    ``filter`` (one expression or a list) and ``select`` make the query. ``fetches`` maps a source column to how often
+    the query fetches it (a number or a range); ``served_from_cache`` means the source is not called. ``cache_size`` is the number of cache entries afterwards. ``compare_row_order`` compares the result row by row.
+    """
+
+    filter: pl.Expr | list | None = None
+    select: object = None
+    fetches: dict = field(default_factory=dict)
+    served_from_cache: bool = False
+    cache_size: int | None = None
+    compare_row_order: bool = True
+
+
+_Y_IS_A, _Y_IS_B = pl.col("y") == "a", pl.col("y") == "b"
+_Y_IS_A_OR_B = pl.col("y").is_in(["a", "b"])
+_EVERY_COLUMN_ONCE = {column: 1 for column in ("x", "y", "p", "x2", "y2", "p2")}
+_EVERY_COLUMN_BUT_Y_ONCE = {column: 1 for column in ("x", "p", "x2", "y2", "p2")}
+
+
+@dataclass(frozen=True)
+class CacheStepsCase:
+    """Queries run in turn on one cache; each result must equal the uncached query."""
+
+    id: str
+    _: KW_ONLY
+    queries: list[CacheQuery]
+    partition_cols: tuple[str, ...] = ()
+    column_granularity: bool = True
+
+
+# Query sequences on one cache, the columns each query fetches from the source, and the cache size after it.
+CACHE_STEPS = [
+    CacheStepsCase(
+        "df_partitioned",
+        queries=[
+            # x2, plus y (partition) and x (order_by), for y=a
+            CacheQuery(filter=_Y_IS_A, select="x2", fetches={"x2": 1, "y2": 0, "p2": 0}, cache_size=3),
+            CacheQuery(filter=_Y_IS_A, select="p2", fetches={"x2": 0, "y2": 0, "p2": 1}),
+            CacheQuery(filter=_Y_IS_B, select="y2", fetches={"x2": 0, "y2": 1, "p2": 0}),
+            CacheQuery(filter=_Y_IS_B, select=["x2", "y2"], fetches={"x2": 1, "y2": 0, "p2": 0}),
+            # only y2 for y=a and p2 for y=b are missing
+            CacheQuery(filter=_Y_IS_A_OR_B, select=None, fetches={"x2": 0, "y2": 1, "p2": 1}, compare_row_order=False),
+        ],
+        partition_cols=("y",),
+    ),
+    CacheStepsCase(
+        "df_multi_partitioned",
+        queries=[
+            # x2, y, p and x for y=a/p=True and y=a/p=False
+            CacheQuery(filter=_Y_IS_A, select="x2", fetches={"x2": 1, "y2": 0, "p2": 0}, cache_size=8),
+            CacheQuery(filter=_Y_IS_A, select="x2", fetches={"x2": ANY_NUMBER_OF_TIMES}, cache_size=8),
+            CacheQuery(filter=_Y_IS_A, select="p2", fetches={"x2": 0, "y2": 0, "p2": AT_LEAST_ONCE}),
+            CacheQuery(filter=_Y_IS_B, select="y2", fetches={"x2": 0, "y2": 1, "p2": 0}),
+            CacheQuery(filter=_Y_IS_B, select=["x2", "y2"], fetches={"x2": AT_LEAST_ONCE, "p2": 0}),
+            CacheQuery(filter=_Y_IS_A_OR_B, select=None, fetches={}, compare_row_order=False),
+        ],
+        partition_cols=("y", "p"),
+    ),
+    CacheStepsCase(
+        "df_multi_partitioned_contradiction",
+        queries=[
+            CacheQuery(filter=[_Y_IS_A, pl.col("p") == pl.lit(True)], select="x2", fetches={"x2": 1, "y2": 0, "p2": 0}, cache_size=4),
+            CacheQuery(filter=[_Y_IS_A, pl.col("p") == pl.lit(True)], select="x2", fetches={"x2": 0}, cache_size=4),
+            CacheQuery(filter=[_Y_IS_B, pl.col("p") == pl.lit(False)], select="x2", fetches={"x2": 1, "y2": 0, "p2": 0}, cache_size=8),
+            CacheQuery(filter=[_Y_IS_B, pl.col("p") == pl.lit(True)], select="x2", fetches={"x2": 1, "y2": 0, "p2": 0}, cache_size=12),
+            CacheQuery(filter=[_Y_IS_B, pl.col("p").eq(True)], select="x2", fetches={"x2": 0}, cache_size=12),
+            # needs y=c/p=True
+            CacheQuery(filter=pl.col("p").eq(True), select="x2", fetches={"x2": 1, "y2": 0, "p2": 0}, cache_size=16),
+            CacheQuery(filter=_Y_IS_A_OR_B & pl.col("p").eq(True), select="x2", fetches={"x2": 0}, cache_size=16),
+            # needs y=a/p=False
+            CacheQuery(
+                filter=_Y_IS_A_OR_B & pl.col("p").is_in([False, True]),
+                select="x2",
+                fetches={"x2": 1, "y2": 0, "p2": 0},
+                cache_size=20,
+                compare_row_order=False,
+            ),
+            CacheQuery(
+                filter=_Y_IS_A_OR_B & pl.col("p").is_in([False, True]), select="x2", fetches={"x2": 0}, cache_size=20, compare_row_order=False
+            ),
+        ],
+        partition_cols=("y", "p"),
+    ),
+    # With column_granularity=False the first touch of a block fetches its whole schema.
+    CacheStepsCase(
+        "column_granularity_false_fills_all_columns",
+        queries=[
+            CacheQuery(filter=None, select="x2", fetches=_EVERY_COLUMN_ONCE, cache_size=6),
+            CacheQuery(filter=None, select=["y2", "p2"], served_from_cache=True),
+        ],
+        column_granularity=False,
+    ),
+    CacheStepsCase(
+        "column_granularity_false_preserves_partitioning",
+        queries=[
+            CacheQuery(filter=_Y_IS_A, select="x2", fetches=_EVERY_COLUMN_BUT_Y_ONCE),
+            CacheQuery(filter=_Y_IS_A, select="p2", served_from_cache=True),
+            CacheQuery(filter=_Y_IS_B, select="x2", fetches=_EVERY_COLUMN_BUT_Y_ONCE),
+        ],
+        partition_cols=("y",),
+        column_granularity=False,
+    ),
+]
+
+
+def _run(lf: pl.LazyFrame, step: CacheQuery) -> pl.DataFrame:
+    lf = lf if step.filter is None else lf.filter(step.filter)
+    return (lf if step.select is None else lf.select(step.select)).collect()
+
+
+@pytest.mark.parametrize("case", as_params(CACHE_STEPS))
+def test_cache_steps(source, tracked_frame, case: CacheStepsCase):
     cache = {}
-    # Get x2 on y=a
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",))
-    out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # x2 fetched once
-    assert counts.get("y2", 0) == 0  # y2 not fetched
-    assert counts.get("p2", 0) == 0  # p2 not fetched
-    assert len(cache) == 3  # x2, y (partition col), x (order_by) for partition y=a
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get p2 on y=a (x2 should be cached, need to fetch p2)
-    out_cached = df_cache.filter(pl.col("y") == "a").select("p2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 already cached
-    assert counts.get("y2", 0) == 0  # y2 not needed
-    assert counts.get("p2", 0) == 1  # p2 fetched
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("p2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get y2 on y=b (different partition)
-    out_cached = df_cache.filter(pl.col("y") == "b").select("y2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 not needed
-    assert counts.get("y2", 0) == 1  # y2 fetched for new partition
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select("y2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get x2 and y2 on y=b (y2 already cached for y=b, need x2)
-    out_cached = df_cache.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # x2 fetched for y=b partition
-    assert counts.get("y2", 0) == 0  # y2 already cached for y=b
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get all columns on y=a and y=b (only need y2 for y=a, p2 for y=b)
-    out_cached = df_cache.filter(pl.col("y").is_in(["a", "b"])).collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 cached for both partitions
-    assert counts.get("y2", 0) == 1  # y2 needed for y=a
-    assert counts.get("p2", 0) == 1  # p2 needed for y=b
-
-    source.reset()
-    out = df.filter(pl.col("y").is_in(["a", "b"])).collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
+    df_cache = tracked_frame.piot.cache(cache, order_by="x", partition_cols=case.partition_cols, column_granularity=case.column_granularity)
+    for number, step in enumerate(case.queries, start=1):
+        source.reset()
+        out = _run(df_cache, step)
+        counts = source.get_column_counts()
+        if step.served_from_cache:
+            assert source.calls == [], f"query {number} called the source"
+        for col, want in step.fetches.items():
+            assert counts.get(col, 0) in (want if isinstance(want, range) else (want,)), (number, col, counts)
+        if step.cache_size is not None:
+            assert len(cache) == step.cache_size, f"query {number}: {len(cache)} cache entries"
+        with failure_note(f"query {number}"):
+            assert_frame_equal(out, _run(tracked_frame, step), check_row_order=step.compare_row_order)
 
 
-def test_df_multi_partitioned(source, df):
-    """Test partitioning scenarios with multiple partition columns."""
-    cache = {}
-    # Get x2 on y=a (covers 2 partitions: y=a/p=True and y=a/p=False)
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y", "p"))
-    out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 8  # x2, y, p, x (order_by) for 2 partitions (y=a, p=True) and (y=a, p=False)
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Repeat query - with multi-partition, may still need to query due to partition key ambiguity
-    out_cached = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) >= 0  # May or may not need to query depending on cache state
-    assert len(cache) == 8
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get p2 on y=a - need to fetch p2 for y=a partitions
-    out_cached = df_cache.filter(pl.col("y") == "a").select("p2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 not needed
-    assert counts.get("y2", 0) == 0  # y2 not needed
-    assert counts.get("p2", 0) >= 1  # p2 fetched
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a").select("p2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get y2 on y=b (different partition)
-    out_cached = df_cache.filter(pl.col("y") == "b").select("y2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # x2 not needed
-    assert counts.get("y2", 0) == 1  # y2 fetched
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select("y2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get x2 and y2 on y=b (y2 cached, need x2)
-    out_cached = df_cache.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) >= 1  # x2 fetched for y=b partitions
-    assert counts.get("p2", 0) == 0  # p2 not needed
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b").select(["x2", "y2"]).collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-
-    # Get all columns on y=a and y=b
-    out_cached = df_cache.filter(pl.col("y").is_in(["a", "b"])).collect()
-    counts = source.get_column_counts()
-    # Some columns may need to be fetched for missing partitions
-
-    source.reset()
-    out = df.filter(pl.col("y").is_in(["a", "b"])).collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
-
-
-def test_df_multi_partitioned_contradiction(source, df):
-    """Test partitioning with multiple partition columns and contradiction detection."""
-    cache = {}
-    # Get x2 on y=a, p=True (single partition)
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y", "p"))
-    out_cached = df_cache.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 4  # x2, y, p, x (order_by) for single partition (y=a, p=True)
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Repeat - should hit cache (no new source calls)
-    out_cached = df_cache.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # Cache hit
-    assert len(cache) == 4
-
-    source.reset()
-    out = df.filter(pl.col("y") == "a", pl.col("p") == pl.lit(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Different partition (y=b, p=False)
-    out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(False)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # New partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 8
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b", pl.col("p") == pl.lit(False)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Another partition (y=b, p=True)
-    out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # New partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 12
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Repeat - should hit cache
-    out_cached = df_cache.filter(pl.col("y") == "b", pl.col("p") == pl.lit(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # Cache hit
-    assert len(cache) == 12
-
-    source.reset()
-    out = df.filter(pl.col("y") == "b", pl.col("p").eq(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Filter only on p=True (needs to query for y=c partition)
-    out_cached = df_cache.filter(pl.col("p").eq(True)).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # Need y=c/p=True partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 16
-
-    source.reset()
-    out = df.filter(pl.col("p").eq(True)).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Combined filter that should hit cache
-    filter_expr = pl.col("y").is_in(["a", "b"]) & pl.col("p").eq(True)
-    out_cached = df_cache.filter(filter_expr).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # All needed partitions cached
-    assert len(cache) == 16
-
-    source.reset()
-    out = df.filter(filter_expr).select("x2").collect()
-    assert_frame_equal(out_cached, out)
-
-    source.reset()
-    # Filter that needs additional partitions (y=a/p=False missing)
-    filter_expr = pl.col("y").is_in(["a", "b"]) & pl.col("p").is_in([False, True])
-    out_cached = df_cache.filter(filter_expr).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 1  # Need y=a/p=False partition
-    assert counts.get("y2", 0) == 0
-    assert counts.get("p2", 0) == 0
-    assert len(cache) == 20
-
-    source.reset()
-    out = df.filter(filter_expr).select("x2").collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
-
-    source.reset()
-    # Repeat - should hit cache
-    filter_expr = pl.col("y").is_in(["a", "b"]) & pl.col("p").is_in([False, True])
-    out_cached = df_cache.filter(filter_expr).select("x2").collect()
-    counts = source.get_column_counts()
-    assert counts.get("x2", 0) == 0  # All partitions cached
-    assert len(cache) == 20
-
-    source.reset()
-    out = df.filter(filter_expr).select("x2").collect()
-    assert_frame_equal(out_cached, out, check_row_order=False)
-
-
-def test_streaming(df):
-    cache = {}
-    df_cache = df.piot.cache(cache, order_by="x")
-    assert_frame_equal(df.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
-
+def test_cache_collects_with_the_streaming_engine(tracked_frame):
+    df_cache = tracked_frame.piot.cache({}, order_by="x")
+    assert_frame_equal(tracked_frame.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
     with pl.Config() as cfg:
         cfg.set_streaming_chunk_size(2)
-        assert_frame_equal(df.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
+        assert_frame_equal(tracked_frame.collect(), df_cache.collect(engine="streaming"), check_row_order=False)
 
 
-@pytest.mark.parametrize("cache_arg", [None, {}, "diskcache"])
-def test_cache_types(cache_arg, source, df, tmp_path):
-    """Test that both default and provided caches work on a simple example"""
+@pytest.mark.parametrize("cache_arg", [None, {}, "diskcache"], ids=["default_cache", "dict", "diskcache"])
+def test_cache_types(cache_arg, source, tracked_frame, tmp_path):
+    """The default cache, a dict and a diskcache each serve a repeated query without calling the source."""
     cache = cache_arg
     if cache_arg == "diskcache":
         diskcache = pytest.importorskip("diskcache")
         cache = diskcache.Cache(tmp_path / "cache")
-
-    df_cache = df.piot.cache(cache, order_by="x")
-    df_cache.select("x2").collect()
-    first_call_count = len(source.calls)
-    assert first_call_count == 1
-
+    df_cache = tracked_frame.piot.cache(cache, order_by="x")
+    for expected_calls in (1, 0):
+        source.reset()
+        df_cache.select("x2").collect()
+        assert len(source.calls) == expected_calls
     source.reset()
-
-    # Second call - should hit cache
-    df_cache.select("x2").collect()
-    assert len(source.calls) == 0  # No new source calls
-
-    source.reset()
-
-    # Re-create df_cache with same cache - should still hit cache
-    df_cache = df.piot.cache(cache, order_by="x")
-    df_cache.select("x2").collect()
-    assert len(source.calls) == 0  # No new source calls
-
+    tracked_frame.piot.cache(cache, order_by="x").select("x2").collect()
+    assert len(source.calls) == 0
     if cache is not None:
         assert len(cache)
 
 
 def test_docstring():
-    """Test that the docstring is accessible"""
     assert len(pl.LazyFrame.piot.cache.__doc__.split("\n")) > 10
 
 
-# Test cases for _is_contradiction from lazy_cache.py
-# Each case is a tuple: (description, polars_expression, expected_is_contradiction)
-lazy_cache_contradiction_test_cases = [
-    (
-        "Single DNF clause, is a contradiction",
-        (pl.col("a") == 5) & (pl.col("a") == 6),
-        True,
-    ),
-    (
-        "Single DNF clause, not a contradiction",
-        (pl.col("a") == 5) & (pl.col("a") > 0),
-        False,
-    ),
-    (
-        "Single DNF clause, contradiction a == 5 & a > 5",
-        (pl.col("a") == 5) & (pl.col("a") > 5),
-        True,
-    ),
-    (
-        "Multiple DNF clauses, all are contradictions",
-        ((pl.col("a") == 5) & (pl.col("a") == 6)) | ((pl.col("b") < 0) & (pl.col("b") > 10)),
-        True,
-    ),
-    (
-        "Multiple DNF clauses, one is not a contradiction",
-        ((pl.col("a") == 5) & (pl.col("a") == 6)) | ((pl.col("b") > 0) & (pl.col("b") < 10)),
-        False,
-    ),
-    (
-        "Multiple DNF clauses, none are contradictions",
-        ((pl.col("a") == 5) & (pl.col("a") > 0)) | ((pl.col("b") > 0) & (pl.col("b") < 10)),
-        False,
-    ),
-    (
-        "Literal True expression",
-        pl.lit(True),
-        False,
-    ),
-    (
-        "Literal False expression",
-        pl.lit(False),
-        True,
-    ),
-    (
-        "Complex nested: ((C1 or C2) and C3) -> (C1 and C3) or (C2 and C3) -- all contradictions",
-        (
-            ((pl.col("a") == 1) & (pl.col("a") == 2))  # C1
-            | ((pl.col("b") == 3) & (pl.col("b") == 4))  # C2
-        )
-        & (
-            (pl.col("c") > 5) & (pl.col("c") < 0)  # C3
-        ),
-        True,
-    ),
-    (
-        "Complex nested: ((NC1 or C2) and NC3) -> (NC1 and NC3) or (C2 and NC3) -- one path not contradiction",
-        (
-            ((pl.col("a") == 1) & (pl.col("a") > 0))  # NC1 (Not Contradiction)
-            | ((pl.col("b") == 3) & (pl.col("b") == 4))  # C2  (Contradiction)
-        )
-        & (
-            (pl.col("c") > 0) & (pl.col("c") < 10)  # NC3 (Not Contradiction)
-        ),
-        False,
-    ),
-    ("Contradiction involving IS NULL", (pl.col("x").is_null()) & (pl.col("x") == 5), True),
-    (
-        "Not a contradiction with IS NULL",
-        (pl.col("x").is_null()) | (pl.col("x") == 5),  # x can be NULL or x can be 5
-        False,
-    ),
-    ("Contradiction with IS NOT NULL", (pl.col("x").is_not_null()) & (pl.col("x").is_null()), True),
-    ("Not a contradiction with IS NOT NULL", (pl.col("x").is_not_null()) & (pl.col("x") == 5), False),
-    (
-        "Expression that becomes empty DNF (e.g. not (lit(False))) -> should not be contradiction",
-        ~pl.lit(False),  # equivalent to pl.lit(True)
-        False,
-    ),
-    (
-        "Expression that becomes DNF with empty clause (e.g. from complex True OR True)",
-        (pl.col("a") > 0) | (pl.col("a") <= 0),  # This is always true
-        False,  # An always true statement is not a contradiction
-    ),
-    # Tests for is_between
-    (
-        "is_between: Contradiction (disjoint ranges)",
-        (pl.col("x").is_between(1, 5)) & (pl.col("x").is_between(10, 15)),
-        True,
-    ),
-    (
-        "is_between: No contradiction (disjoint ranges and exclusive of one)",
-        (pl.col("x").is_between(1, 5)) & ~(pl.col("x").is_between(10, 15)),
-        False,
-    ),
-    (
-        "is_between: Contradiction (same range negated)",
-        (pl.col("x").is_between(1, 5)) & ~(pl.col("x").is_between(1, 5)),
-        True,
-    ),
-    (
-        "is_between: Not a contradiction (overlapping ranges)",
-        (pl.col("x").is_between(1, 10)) & (pl.col("x").is_between(5, 15)),
-        False,
-    ),
-    (
-        "is_between: Contradiction with exact value (value outside range)",
-        (pl.col("x").is_between(1, 5)) & (pl.col("x") == 10),
-        True,
-    ),
-    (
-        "is_between: Not a contradiction with exact value (value inside range)",
-        (pl.col("x").is_between(1, 5)) & (pl.col("x") == 3),
-        False,
-    ),
-    (
-        "is_between: Contradiction (upper bound less than lower bound in one expr)",
-        (pl.col("x").is_between(5, 1)) & (pl.col("x") == 3),  # is_between(5,1) is always false
-        True,
-    ),
-    (
-        "is_between: Not a contradiction (inclusive bounds)",
-        (pl.col("x").is_between(1, 5, closed="both")) & (pl.col("x") == 5),
-        False,
-    ),
-    (
-        "is_between: Contradiction (exclusive upper bound)",
-        (pl.col("x").is_between(1, 5, closed="left")) & (pl.col("x") == 5),  # x >= 1 and x < 5
-        True,
-    ),
-    (
-        "is_between: Contradiction, we exclude both bounds and can equal either one.",
-        (
-            (pl.col("x").is_between(5, 6, closed="none"))
-            & ((pl.col("x") == 5) | (pl.col("x") == 6))  # x == 5 or x == 6
-            & (pl.col("x").is_between(4, 7, closed="none"))
-        ),
-        True,
-    ),
-    # Tests for is_in
-    (
-        "is_in: Contradiction (disjoint sets)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([4, 5, 6]),
-        True,
-    ),
-    (
-        "is_in: Not a contradiction (overlapping sets)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([3, 4, 5]),
-        False,
-    ),
-    (
-        "is_in: Contradiction with exact value (value not in set)",
-        pl.col("x").is_in([1, 2, 3]) & (pl.col("x") == 4),
-        True,
-    ),
-    (
-        "is_in: Not a contradiction with exact value (value in set)",
-        pl.col("x").is_in([1, 2, 3]) & (pl.col("x") == 2),
-        False,
-    ),
-    (
-        "is_in: Contradiction with is_not_in (same sets)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([1, 2, 3]).not_(),
-        True,
-    ),
-    (
-        "is_in: Not a contradiction with is_not_in (different sets, but compatible)",
-        pl.col("x").is_in([1, 2, 3]) & pl.col("x").is_in([4, 5, 6]).not_(),  # e.g. x can be 1
-        False,
-    ),
-    (
-        "is_in: Contradiction with is_not_in (value from is_in is excluded by is_not_in)",
-        # x in [1,2,3] AND x not in [3,4,5] -> x can be 1 or 2
-        # (x in [1,2,3] AND x not in [3,4,5]) AND x == 3 -> contradiction
-        (pl.col("x").is_in([1, 2, 3])) & (~pl.col("x").is_in([3, 4, 5])) & (pl.col("x") == 3),
-        True,
-    ),
-    (
-        "is_in: A contradiction (empty list in is_in means always false for that part)",
-        # (pl.col("x").is_in([])) is effectively False. So (False & True) is False.
-        # The DNF for (A & B) is [(A,B)]. If A is False, then (False, B) is a contradiction.
-        # So the whole expression is a contradiction.
-        (pl.col("x").is_in([])) & (pl.col("x") == 5),
-        True,
-    ),
-    (
-        "is_in: A contradiction (is_in contains the minimum value, exclusive)",
-        # (pl.col("x").is_in([])) is effectively False. So (False & True) is False.
-        # The DNF for (A & B) is [(A,B)]. If A is False, then (False, B) is a contradiction.
-        # So the whole expression is a contradiction.
-        (pl.col("x").is_in([5])) & (pl.col("x") > 5),
-        True,
-    ),
-    (
-        "is_in: A contradiction (is_in contains the minimum value, inclusive)",
-        # (pl.col("x").is_in([])) is effectively False. So (False & True) is False.
-        # The DNF for (A & B) is [(A,B)]. If A is False, then (False, B) is a contradiction.
-        # So the whole expression is a contradiction.
-        (pl.col("x").is_in([5])) & (pl.col("x") == 5),
-        False,
-    ),
-    # Tests for edge cases
-    (
-        "Contradiction for int but not float (so we say False)",
-        (
-            (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
-        ),
-        False,
-    ),
-]
-
-
-@pytest.mark.parametrize("description, expr, expected", lazy_cache_contradiction_test_cases)
-def test_lazy_cache_is_contradiction(description: str, expr: pl.Expr, expected: bool):
-    assert _is_contradiction(expr) == expected, f"Test failed for: {description}"
-
-
-expr_with_schema = [
-    (
-        "Contradiction for int but not float (so we say True)",
-        (
-            (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Int32}),
-        True,  # we can iterate through the bounds because we have an int type.
-    ),
-    (
-        "Contradiction for int but not float (so we say False)",
-        (
-            (pl.col("x").is_between(5, 6, closed="both")) & pl.col.x.ne(5) & pl.col.x.ne(6)  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Float64}),
-        False,  # we cannot iterate through the bounds with a float.
-    ),
-    (
-        "Contradiction for date but not datetime (so we say False)",
-        (
-            (pl.col("x").is_between(datetime(2024, 1, 1), datetime(2024, 1, 2), closed="both"))
-            & pl.col.x.ne(datetime(2024, 1, 1))
-            & pl.col.x.ne(datetime(2024, 1, 2))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Datetime()}),
-        False,  # we cannot iterate through the bounds with a Datetime.
-    ),
-    (
-        "Contradiction for date but not datetime (so we say False)",
-        (
-            (pl.col("x").is_between(date(2024, 1, 1), date(2024, 1, 2), closed="both"))
-            & pl.col.x.ne(date(2024, 1, 1))
-            & pl.col.x.ne(date(2024, 1, 2))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Date()}),
-        True,  # we can iterate through the bounds with a Date.
-    ),
-    (
-        "Contradiction for date across larger range.",
-        (
-            (pl.col("x").is_between(date(2024, 1, 1), date(2024, 1, 4), closed="left"))
-            & pl.col.x.ne(date(2024, 1, 1))
-            & pl.col.x.ne(date(2024, 1, 2))
-            & pl.col.x.ne(date(2024, 1, 3))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Date()}),
-        True,  # we can iterate through the bounds with a Date.
-    ),
-    (
-        "No contradiction for date across larger range.",
-        (
-            (pl.col("x").is_between(date(2024, 1, 1), date(2024, 1, 4), closed="right"))
-            & pl.col.x.ne(date(2024, 1, 1))
-            & pl.col.x.ne(date(2024, 1, 2))
-            & pl.col.x.ne(date(2024, 1, 3))  # x != 5 and x != 6
-        ),
-        pl.Schema({"x": pl.Date()}),
-        False,  # we can iterate through the bounds with a Date, but 2024-01-04 is included in the filter so we don't have a contradiction.
-    ),
-]
-
-
-@pytest.mark.parametrize("description, expr, schema, expected", expr_with_schema)
-def test_lazy_cache_is_contradiction_with_schema(description: str, expr: pl.Expr, schema: pl.Schema, expected: bool):
-    assert _is_contradiction(expr, schema) == expected, f"Test failed for: {description}"
-
-
-def test_pickle(df):
+def test_pickle(tracked_frame):
     """Test that the namespace sticks even after pickling/unpickling"""
-    df = pickle.loads(pickle.dumps(df))
-    assert hasattr(df, "piot")
-    assert hasattr(df.piot, "cache")
+    tracked_frame = pickle.loads(pickle.dumps(tracked_frame))
+    assert hasattr(tracked_frame, "piot")
+    assert hasattr(tracked_frame.piot, "cache")
 
 
 def test_nondeterministic_source_stays_aligned_with_order_by():
@@ -1057,14 +565,14 @@ def test_piot_cache_shared_cache_different_partition_cols():
     assert sorted(coarse["v"].to_list()) == [10, 20, 30, 40]
 
 
-def test_unfiltered_select_excludes_cached_partitions(source, df):
+def test_unfiltered_select_excludes_cached_partitions(source, tracked_frame):
     """An unfiltered read over a fully-cached partitioned frame must not re-scan everything.
 
     It should restrict the discovery query to exclude the already-cached partitions instead of
     issuing a full-source scan (predicate=None).
     """
     cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",))
+    df_cache = tracked_frame.piot.cache(cache, order_by="x", partition_cols=("y",))
 
     # Fully populate: every column of every partition.
     full = df_cache.collect()
@@ -1072,13 +580,13 @@ def test_unfiltered_select_excludes_cached_partitions(source, df):
 
     # Unfiltered read again: the discovery query must carry a partition-exclusion predicate.
     out = df_cache.collect()
-    preds = [c.predicate_str for c in source.calls]
+    preds = [call.predicate_str for call in source.calls]
     assert preds, "expected a partition-discovery query"
     assert all(p is not None for p in preds), f"expected exclusion predicate, got a full re-scan: {preds}"
     assert any("y" in (p or "") for p in preds), f"exclusion should reference partition col y: {preds}"
 
     assert_frame_equal(out.sort(["y", "x"]), full.sort(["y", "x"]))
-    assert_frame_equal(out.sort(["y", "x"]), df.collect().sort(["y", "x"]))
+    assert_frame_equal(out.sort(["y", "x"]), tracked_frame.collect().sort(["y", "x"]))
 
 
 def test_null_partition_unfiltered_incremental_fetch():
@@ -1105,67 +613,20 @@ def test_null_partition_unfiltered_incremental_fetch():
     )
 
 
-def test_column_granularity_false_fills_all_columns(source, df):
-    """With column_granularity=False, the first touch pulls the whole schema."""
-    cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", column_granularity=False)
-
-    out = df_cache.select("x2").collect()
-    counts = source.get_column_counts()
-    # Every column was fetched even though only x2 was requested.
-    for col in ("x", "y", "p", "x2", "y2", "p2"):
-        assert counts.get(col, 0) == 1, col
-    # One key per column of the (single, unpartitioned) block.
-    assert len(cache) == 6
-
-    source.reset()
-    # A later select of different columns is a pure cache hit: no source query.
-    out2 = df_cache.select(["y2", "p2"]).collect()
-    assert source.calls == []
-    assert_frame_equal(out, df.select("x2").collect())
-    assert_frame_equal(out2, df.select(["y2", "p2"]).collect())
-
-
-def test_column_granularity_false_preserves_partitioning(source, df):
-    """Row partitioning is preserved; each partition fills its full schema once."""
-    cache = {}
-    df_cache = df.piot.cache(cache, order_by="x", partition_cols=("y",), column_granularity=False)
-
-    out_a = df_cache.filter(pl.col("y") == "a").select("x2").collect()
-    counts = source.get_column_counts()
-    for col in ("x", "p", "x2", "y2", "p2"):
-        assert counts.get(col, 0) == 1, col
-
-    source.reset()
-    # Same partition, different column -> served from cache, no query.
-    out_a2 = df_cache.filter(pl.col("y") == "a").select("p2").collect()
-    assert source.calls == []
-
-    source.reset()
-    # A different partition triggers exactly one more full-schema fill.
-    df_cache.filter(pl.col("y") == "b").select("x2").collect()
-    counts = source.get_column_counts()
-    for col in ("x", "p", "x2", "y2", "p2"):
-        assert counts.get(col, 0) == 1, col
-
-    assert_frame_equal(out_a, df.filter(pl.col("y") == "a").select("x2").collect())
-    assert_frame_equal(out_a2, df.filter(pl.col("y") == "a").select("p2").collect())
-
-
-def test_column_granularity_false_and_true_share_cache(source, df):
+def test_column_granularity_false_and_true_share_cache(source, tracked_frame):
     """A column_granularity=False fill populates keys a granularity=True reader hits."""
     cache = {}
     # Eager fill of all columns via the False reader.
-    df.piot.cache(cache, order_by="x", column_granularity=False).select("x2").collect()
+    tracked_frame.piot.cache(cache, order_by="x", column_granularity=False).select("x2").collect()
 
     source.reset()
     # Default (per-column) reader finds every column already cached -> no query.
-    out = df.piot.cache(cache, order_by="x").select(["x2", "y2"]).collect()
+    out = tracked_frame.piot.cache(cache, order_by="x").select(["x2", "y2"]).collect()
     assert source.calls == []
-    assert_frame_equal(out, df.select(["x2", "y2"]).collect())
+    assert_frame_equal(out, tracked_frame.select(["x2", "y2"]).collect())
 
 
-@pytest.mark.parametrize("num_threads", [1, 2])
+@pytest.mark.parametrize("num_threads", [1, 2], ids=["one_thread", "two_threads"])
 def test_concurrent_collections_shared_cache_do_not_race(num_threads):
     result = subprocess.run(
         [
@@ -1240,32 +701,32 @@ def _collect_concurrently():
     assert len(cache) == n_partitions * len(universe.collect_schema())
 
 
-def test_explicit_df_key_replaces_plan_identity(source, df):
+def test_explicit_df_key_replaces_plan_identity(source, tracked_frame):
     """With ``df_key``, frames with different plans share cache entries; without it they do not."""
     cache = {}
-    same_data_other_plan = df.select(pl.all())
+    same_data_other_plan = tracked_frame.select(pl.all())
 
-    df.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
+    tracked_frame.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
     source.reset()
     out = same_data_other_plan.piot.cache(cache, order_by="x", df_key="frame-v1").select("x2").collect()
     assert source.calls == []
-    assert_frame_equal(out, df.select("x2").collect().sort("x2"), check_row_order=False)
+    assert_frame_equal(out, tracked_frame.select("x2").collect().sort("x2"), check_row_order=False)
 
     source.reset()
     same_data_other_plan.piot.cache(cache, order_by="x").select("x2").collect()
     assert source.calls
 
     source.reset()
-    df.piot.cache(cache, order_by="x", df_key="frame-v2").select("x2").collect()
+    tracked_frame.piot.cache(cache, order_by="x", df_key="frame-v2").select("x2").collect()
     assert source.calls
 
 
-def test_explicit_df_key_still_separates_layouts(df):
+def test_explicit_df_key_still_separates_layouts(tracked_frame):
     """``order_by`` and ``partition_cols`` stay part of the key when ``df_key`` is given."""
     cache = {}
-    df.piot.cache(cache, order_by="x", df_key="k").select("x2").collect()
-    df.piot.cache(cache, order_by=["x", "y"], df_key="k").select("x2").collect()
-    df.piot.cache(cache, order_by="x", partition_cols=("y",), df_key="k").select("x2").collect()
+    tracked_frame.piot.cache(cache, order_by="x", df_key="k").select("x2").collect()
+    tracked_frame.piot.cache(cache, order_by=["x", "y"], df_key="k").select("x2").collect()
+    tracked_frame.piot.cache(cache, order_by="x", partition_cols=("y",), df_key="k").select("x2").collect()
     assert len({k.df_key for k in cache}) == 3
 
 
@@ -1273,9 +734,9 @@ def test_explicit_df_key_still_separates_layouts(df):
     getattr(pl.Categorical(), "ordering", "lexical") != "physical",
     reason="Physical categorical ordering is not supported by this Polars version",
 )
-@pytest.mark.parametrize("order_by", ["key", ("part", "key")])
-@pytest.mark.parametrize("partition_cols", [(), ("part",)])
-@pytest.mark.parametrize("column_granularity", [False, True])
+@pytest.mark.parametrize("order_by", ["key", ("part", "key")], ids=["key", "part_then_key"])
+@pytest.mark.parametrize("partition_cols", [(), ("part",)], ids=["unpartitioned", "by_part"])
+@pytest.mark.parametrize("column_granularity", [False, True], ids=["whole_rows", "per_column"])
 def test_explicit_df_key_rejects_physical_categorical_ordering(order_by, partition_cols, column_granularity):
     frame = pl.DataFrame({"key": ["b", "a"], "part": ["p", "p"], "value": [20, 10]}).with_columns(pl.col("key").cast(pl.Categorical)).lazy()
     cache = {}
@@ -1332,7 +793,7 @@ def test_explicit_df_key_rejects_nested_physical_categorical_ordering(key_expr):
     [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
     ids=["scalar", "struct", "list"],
 )
-@pytest.mark.parametrize("column_granularity", [False, True])
+@pytest.mark.parametrize("column_granularity", [False, True], ids=["whole_rows", "per_column"])
 @pytest.mark.parametrize("cache_mode", ["cache", "rebuild"])
 def test_explicit_df_key_rejects_materialized_physical_categorical_ordering(key_expr, column_granularity, cache_mode):
     base = pl.DataFrame({"text": ["v3", "v1", "v2", "v0", "v5", "v4"], "value": [3, 1, 2, 0, 5, 4]}).lazy()
@@ -1354,8 +815,8 @@ def test_explicit_df_key_rejects_materialized_physical_categorical_ordering(key_
     [pl.col("key"), pl.struct(pl.col("key").alias("category")), pl.concat_list(pl.col("key"))],
     ids=["scalar", "struct", "list"],
 )
-@pytest.mark.parametrize("partition_cols", [(), ("part",)])
-@pytest.mark.parametrize("column_granularity", [False, True])
+@pytest.mark.parametrize("partition_cols", [(), ("part",)], ids=["unpartitioned", "by_part"])
+@pytest.mark.parametrize("column_granularity", [False, True], ids=["whole_rows", "per_column"])
 def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(key_expr, partition_cols, column_granularity):
     dtype = pl.Categorical()
     if getattr(dtype, "ordering", "lexical") == "physical":
@@ -1381,28 +842,181 @@ def test_explicit_df_key_lexical_categorical_partial_fill_stays_aligned(key_expr
     assert_frame_equal(out, pl.DataFrame({"left": [10, 20], "right": [100, 200]}))
 
 
-_FOLD_US = 1_730_611_800_000_000  # 2024-11-03 05:30 UTC, 01:30 EDT; one hour later is 01:30 EST
+@dataclass(frozen=True)
+class CacheLossyKeyCase:
+    """A partition column dtype whose values can share a key, and three values ``step`` apart from ``start``."""
+
+    id: str
+    _: KW_ONLY
+    dtype: pl.DataType | type[pl.DataType]
+    # cast to ``dtype``
+    start: int
+    step: int
 
 
 @pytest.mark.parametrize(
-    "dtype, start, step",
-    [
-        (pl.Datetime("ns"), 1000, 1),
-        (pl.Duration("ns"), 1000, 1),
-        (pl.Time, 1000, 1),
-        (pl.Datetime("us", "America/New_York"), _FOLD_US, 3_600_000_000),
-    ],
+    "case",
+    as_params(
+        [
+            CacheLossyKeyCase("ns_datetime_keys_1ns_apart", dtype=pl.Datetime("ns"), start=1000, step=1),
+            CacheLossyKeyCase("ns_duration_keys_1ns_apart", dtype=pl.Duration("ns"), start=1000, step=1),
+            CacheLossyKeyCase("time_keys_1ns_apart", dtype=pl.Time, start=1000, step=1),
+            CacheLossyKeyCase(
+                "new_york_repeated_hour_keys_1h_apart", dtype=pl.Datetime("us", "America/New_York"), start=NEW_YORK_FIRST_0130_US, step=HOUR_US
+            ),
+        ]
+    ),
 )
-def test_lossy_key_partitions_do_not_collide(dtype, start, step):
-    df = pl.DataFrame({"k": pl.Series([start, start + step, start + 2 * step, None]).cast(dtype), "v": [1, 2, 3, 4]})
+def test_lossy_key_partitions_do_not_collide(case: CacheLossyKeyCase):
+    df = pl.DataFrame({"k": pl.Series([case.start, case.start + case.step, case.start + 2 * case.step, None]).cast(case.dtype), "v": [1, 2, 3, 4]})
     lf = df.lazy().piot.cache({}, order_by="v", partition_cols=["k"])
-    for pred in [pl.col("k") == pl.lit(start + step).cast(dtype), pl.col("k") == pl.lit(start).cast(dtype), pl.col("v") > 0]:
+    for pred in [pl.col("k") == pl.lit(case.start + case.step).cast(case.dtype), pl.col("k") == pl.lit(case.start).cast(case.dtype), pl.col("v") > 0]:
         assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))
 
 
-@pytest.mark.parametrize("column_granularity", [True, False])
+_NAN_KEY = (pl.DataFrame({"x": [float("nan")], "i": [0]}), [pl.col("x").is_nan()])
+
+
+@SETTINGS
+@given(case=partitioned_frames_and_predicates(), partition_cols=st.sampled_from([("x",), ("date", "x"), ()]), column_granularity=st.booleans())
+@example(case=_NAN_KEY, partition_cols=("x",), column_granularity=True)
+@example(case=_NAN_KEY, partition_cols=("x",), column_granularity=False)
+def test_cache_keeps_the_rows_a_filter_keeps(case, partition_cols, column_granularity):
+    frame, predicates = case
+    check_cache_keeps_filtered_rows(
+        frame.lazy().piot.cache({}, order_by="i", partition_cols=partition_cols, column_granularity=column_granularity),
+        frame,
+        predicates,
+    )
+
+
+@pytest.mark.parametrize("column_granularity", [True, False], ids=["per_column", "whole_rows"])
 def test_cache_on_a_nan_partition_key(column_granularity):
     frame = pl.DataFrame({"x": [float("nan")], "i": [0]})
     lf = frame.lazy().piot.cache({}, order_by="i", partition_cols=("x",), column_granularity=column_granularity)
     for pred in [pl.col("x").is_nan(), pl.lit(True)]:
         assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
+
+
+@dataclass(frozen=True)
+class LegacyHelperCase:
+    """A helper that old pickles reference by its old name, and the ids of the rows its filter keeps."""
+
+    id: str
+    _: KW_ONLY
+    helper_name: str
+    expected_ids: list[int]
+
+
+@dataclass(frozen=True)
+class RenamedHelperCase:
+    """A helper that old pickles reference by its old name, and the name the helper has in ``util`` now."""
+
+    id: str
+    _: KW_ONLY
+    helper_name: str
+    new_util_name: str
+
+
+@dataclass(frozen=True)
+class CallbackDependencyCase:
+    """A module and a symbol that pickled callbacks reference, which must still load and pickle to itself."""
+
+    id: str
+    _: KW_ONLY
+    module_name: str
+    symbol: str
+
+
+class TestpiotCachePickle:
+    """Tests for cachepickle support."""
+
+    def test_piot_cache_pickle_basic(self, tmp_path):
+        """cacheLazyFrames can be pickled and unpickled."""
+        df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        source_lf = df.lazy()
+
+        lf = source_lf.piot.cache(order_by="a")
+        lf_unpickled = pickle_round_trip(lf)
+
+        result = lf_unpickled.collect()
+        assert_frame_equal(result, df)
+
+    def test_piot_cache_pickle_after_caching_a_nan_partition(self):
+        df = pl.DataFrame({"x": [float("nan")], "i": [0]})
+        lf = df.lazy().piot.cache({}, order_by="i", partition_cols=("x",))
+        lf.collect()
+        assert_frame_equal(pickle_round_trip(lf).collect(), df)
+
+    @pytest.mark.parametrize(
+        "case",
+        as_params(
+            [
+                LegacyHelperCase("_generate_expr", helper_name="_generate_expr", expected_ids=[2, 3, 4, 5]),
+                LegacyHelperCase("_repeated_grouping", helper_name="_repeated_grouping", expected_ids=[3, 4, 5]),
+                LegacyHelperCase("_extract_filter_from_df", helper_name="_extract_filter_from_df", expected_ids=[3, 4, 5]),
+            ]
+        ),
+    )
+    def test_legacy_cache_helper_pickle_references(self, case: LegacyHelperCase):
+        helper_name = case.helper_name
+        payload = f"cpolars_io_tools.io_sources.lazy_cache\n{helper_name}\n.".encode("ascii")
+        helper = cloudpickle.loads(payload)
+        frame = pl.DataFrame({"id": [1, 2, 3, 4, 5], "desk": ["a", "a", "b", "c", None], "day": [1, 2, 1, 1, 1]})
+        known = pl.DataFrame({"desk": ["a", "a"], "day": [1, 2]})
+        if helper_name == "_generate_expr":
+            predicate = helper({"desk": "a", "day": 1}, frame.schema)
+        elif helper_name == "_repeated_grouping":
+            grouped = helper(known)
+            assert grouped.height == 1
+            predicate = _exclusion_from_frame(grouped)
+        else:
+            predicate = helper(known)
+        assert frame.filter(predicate)["id"].to_list() == case.expected_ids
+
+    @pytest.mark.parametrize(
+        "case",
+        as_params(
+            [
+                RenamedHelperCase("_generate_expr-_exclude_row_predicate", helper_name="_generate_expr", new_util_name="_exclude_row_predicate"),
+                RenamedHelperCase("_repeated_grouping-_repeated_grouping", helper_name="_repeated_grouping", new_util_name="_repeated_grouping"),
+                RenamedHelperCase(
+                    "_extract_filter_from_df-_exclusion_from_frame", helper_name="_extract_filter_from_df", new_util_name="_exclusion_from_frame"
+                ),
+            ]
+        ),
+    )
+    def test_legacy_helpers_repickle_without_new_util_names(self, case: RenamedHelperCase, monkeypatch):
+        payload = f"cpolars_io_tools.io_sources.lazy_cache\n{case.helper_name}\n.".encode("ascii")
+        helper = cloudpickle.loads(payload)
+        repickled = cloudpickle.dumps(helper)
+        with monkeypatch.context() as old_runtime:
+            old_runtime.delattr(util, case.new_util_name)
+            restored = cloudpickle.loads(repickled)
+        assert restored is helper
+
+    @pytest.mark.parametrize(
+        "case",
+        as_params(
+            [
+                CallbackDependencyCase("lazy_cache-_CacheKey", module_name="lazy_cache", symbol="_CacheKey"),
+                CallbackDependencyCase("lazy_cache-_validate_order_by_unique", module_name="lazy_cache", symbol="_validate_order_by_unique"),
+                CallbackDependencyCase("dnf_visitor-_is_contradiction", module_name="dnf_visitor", symbol="_is_contradiction"),
+                CallbackDependencyCase(
+                    "restrict_visitor-restrict_expr_to_columns", module_name="restrict_visitor", symbol="restrict_expr_to_columns"
+                ),
+                CallbackDependencyCase("profiling-profile_io_source_iterator", module_name="profiling", symbol="profile_io_source_iterator"),
+                CallbackDependencyCase("profiling-_fallback_n_columns", module_name="profiling", symbol="_fallback_n_columns"),
+                CallbackDependencyCase("profiling-_emit_span", module_name="profiling", symbol="_emit_span"),
+                CallbackDependencyCase("profiling-_close_inner", module_name="profiling", symbol="_close_inner"),
+                CallbackDependencyCase("util-partition_key", module_name="util", symbol="partition_key"),
+                CallbackDependencyCase("util-_format_arg_for_error", module_name="util", symbol="_format_arg_for_error"),
+                CallbackDependencyCase("util-_format_args_for_error", module_name="util", symbol="_format_args_for_error"),
+                CallbackDependencyCase("util-_format_kwargs_for_error", module_name="util", symbol="_format_kwargs_for_error"),
+            ]
+        ),
+    )
+    def test_legacy_callback_dependency_pickle_references(self, case: CallbackDependencyCase):
+        payload = f"cpolars_io_tools.io_sources.{case.module_name}\n{case.symbol}\n.".encode("ascii")
+        dependency = cloudpickle.loads(payload)
+        assert cloudpickle.loads(cloudpickle.dumps(dependency)) is dependency
