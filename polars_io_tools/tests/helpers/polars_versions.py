@@ -24,7 +24,7 @@ POLARS_BEHAVIORS: dict[str, tuple[str, str]] = {
     "pushes_fill_null_predicates": ("1.31.0b1", "a fill_null predicate reaches the source"),
     "struct_literal_parsed": ("1.32.0b1", "a dict literal parses as a struct LiteralNode instead of an ErrorNode"),
     "pushes_join_filters": ("1.32.0b1", "Polars pushes filters through joins itself and may rewrite a left join as inner"),
-    "anonymous_function_not_pushed": ("1.32.0b1", "a predicate on an anonymous function is no longer pushed as expected"),
+    "anonymous_function_not_pushed": ("1.32.0b1", "a predicate on an anonymous function reaches the source as an expression the parser cannot read"),
     "pure_udf_cse": ("1.33.1", "common-subexpression elimination dedupes a pure map_batches UDF"),
     "datetime_literal_unwrapped": ("1.36.0b1", "pl.lit(datetime) parses as a LiteralNode instead of a CastNode"),
     "time_partition_subsecond": ("1.38.0", "a Time partition key keeps sub-second precision in its path"),
