@@ -21,7 +21,7 @@ from .partitions import (
     discrete_partitions,
     retained_columns,
 )
-from .util import optional_deps_error, register_io_source_with_is_pure
+from .util import _lossy_python_key, optional_deps_error, register_io_source_with_is_pure
 
 try:
     import cloudpickle
@@ -342,7 +342,16 @@ def _canonical_key(value):
     return value
 
 
-def _prune_by_key(specs: list[RayPartition], key_cols: list[str], predicate: pl.Expr | None, schema: pl.Schema) -> list[RayPartition]:
+def _key_lit(values: pl.Series, i: int, dtype: pl.DataType) -> pl.Expr:
+    """Literal of ``values[i]`` in ``dtype``, built from the physical value where a Python object would lose precision."""
+    if _lossy_python_key(values.dtype):
+        return pl.lit(values.to_physical()[i]).cast(values.dtype).cast(dtype)
+    return pl.lit(values[i], dtype=dtype)
+
+
+def _prune_by_key(
+    specs: list[RayPartition], key_cols: list[str], predicate: pl.Expr | None, schema: pl.Schema, keys: pl.DataFrame | None = None
+) -> list[RayPartition]:
     """Drop equality partitions that cannot match the pushed-down ``predicate``.
 
     Sound and exact: each partition corresponds to a concrete key value on ``key_cols``, so a
@@ -350,7 +359,7 @@ def _prune_by_key(specs: list[RayPartition], key_cols: list[str], predicate: pl.
     ``key_cols``, evaluating it -- with polars' real semantics -- on a one-row-per-partition
     frame of the key values is equivalent to evaluating it on any real row of the partition,
     provided both preconditions below hold. We then keep only partitions whose key row
-    satisfies it.
+    satisfies it. ``keys`` holds the key values in ``specs`` order; without it they are read from ``specs``.
 
     Preconditions for exactness (otherwise fail open, keeping every partition):
     - **Non-float key dtype.** Float ``==`` is not observational (``-0.0``/``+0.0``, NaN), so a
@@ -379,7 +388,7 @@ def _prune_by_key(specs: list[RayPartition], key_cols: list[str], predicate: pl.
         columns = {}
         for i, c in enumerate(key_cols):
             values = [(sp.key[i] if isinstance(sp.key, tuple) else sp.key) for sp in specs]
-            columns[c] = pl.Series(c, values, dtype=schema[c])
+            columns[c] = keys[c].cast(schema[c]) if keys is not None else pl.Series(c, values, dtype=schema[c])
         keep_mask = pl.DataFrame(columns).select(predicate.alias("__keep__"))["__keep__"].to_list()
     except Exception:  # noqa: BLE001 -- evaluation failed, fail open
         return specs
@@ -620,15 +629,31 @@ def _execute_on_ray_by(
         if not key_cols:
             raise ValueError("`by` must select at least one key column distinct from the options column.")
 
+    # Resolve the output dtype of the key expression once, for a typed literal.
+    key_expr_dtype = None
+    if key_expr is not None:
+        key_expr_dtype = original_lf.select(key_expr.alias("__key__")).collect_schema()["__key__"]
+
     # Reject duplicate partition keys up front (cheap, deterministic). NaN keys are
     # canonicalized so that repeated NaNs (which compare unequal in a Python set but match
-    # under polars equality) are rejected.
+    # under polars equality) are rejected. Keys are compared in the dtype they are matched in,
+    # and physically where Python objects cannot tell them apart.
     if key_expr is not None:
-        _keys = pdf["__key__"].to_list()
-    elif len(key_cols) > 1:
-        _keys = [tuple(r) for r in pdf.select(key_cols).iter_rows()]
+        key_dtypes = {"__key__": key_expr_dtype}
     else:
-        _keys = pdf[key_cols[0]].to_list()
+        frame_schema = original_lf.collect_schema()
+        key_dtypes = {c: frame_schema[c] for c in key_cols if c in frame_schema}
+    try:
+        _pdf = pdf.with_columns(pl.col(c).cast(dtype) for c, dtype in key_dtypes.items())
+    except Exception:  # noqa: BLE001 -- keys that do not cast fail when their partition is matched
+        _pdf = pdf
+    _pdf = _pdf.with_columns(pl.col(c).to_physical() for c, dtype in _pdf.schema.items() if _lossy_python_key(dtype))
+    if key_expr is not None:
+        _keys = _pdf["__key__"].to_list()
+    elif len(key_cols) > 1:
+        _keys = [tuple(r) for r in _pdf.select(key_cols).iter_rows()]
+    else:
+        _keys = _pdf[key_cols[0]].to_list()
     _seen: set = set()
     for _k in _keys:
         _canon = _canonical_key(_k)
@@ -636,18 +661,13 @@ def _execute_on_ray_by(
             raise ValueError(f"Duplicate partition key {_k!r} in `partitions`.")
         _seen.add(_canon)
 
-    # Resolve the output dtype of the key expression once, for a typed literal.
-    key_expr_dtype = None
-    if key_expr is not None:
-        key_expr_dtype = original_lf.select(key_expr.alias("__key__")).collect_schema()["__key__"]
-
     def make_specs(predicate: pl.Expr | None) -> list[RayPartition]:
         exec_schema = original_lf.collect_schema()
         specs: list[RayPartition] = []
-        for row in pdf.iter_rows(named=True):
+        for i, row in enumerate(pdf.iter_rows(named=True)):
             if key_expr is not None:
                 val = row["__key__"]
-                pred = key_expr.is_null() if val is None else (key_expr == pl.lit(val, dtype=key_expr_dtype))
+                pred = key_expr.is_null() if val is None else (key_expr == _key_lit(pdf["__key__"], i, key_expr_dtype))
                 key = val
             else:
                 conds = []
@@ -658,7 +678,7 @@ def _execute_on_ray_by(
                     if v is None:
                         conds.append(pl.col(c).is_null())
                     else:
-                        conds.append(pl.col(c) == pl.lit(v, dtype=exec_schema[c]))
+                        conds.append(pl.col(c) == _key_lit(pdf[c], i, exec_schema[c]))
                 pred = conds[0]
                 for extra in conds[1:]:
                     pred = pred & extra
@@ -674,7 +694,7 @@ def _execute_on_ray_by(
         # only). Pruning drops only partitions that cannot match; retained partitions are
         # unchanged.
         if key_cols is not None:
-            specs = _prune_by_key(specs, key_cols, predicate, exec_schema)
+            specs = _prune_by_key(specs, key_cols, predicate, exec_schema, pdf)
         return specs
 
     return _run_on_ray(

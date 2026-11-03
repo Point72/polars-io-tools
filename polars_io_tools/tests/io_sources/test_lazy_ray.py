@@ -590,6 +590,28 @@ def test_duplicate_nan_keys_rejected():
         lf.piot.execute_on_ray(by_key([nan, nan], "x")).collect()
 
 
+def test_keys_equal_in_the_column_dtype_rejected():
+    # Both keys match the microsecond 1970-01-01 00:00:00.000001.
+    lf = pl.LazyFrame({"t": pl.Series([1], dtype=pl.Datetime("us")), "v": [1]})
+    with pytest.raises(ValueError, match="Duplicate partition key"):
+        lf.piot.execute_on_ray(by_key(pl.Series([1000, 1500], dtype=pl.Datetime("ns")), "t")).collect()
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        pl.Series("x", [1_730_611_800_000_000, 1_730_615_400_000_000]).cast(pl.Datetime("us", "America/New_York")),
+        pl.Series("x", [1_000, 1_001]).cast(pl.Datetime("ns")),
+        pl.Series("x", [1_000, 1_001]).cast(pl.Time),
+    ],
+    ids=["dst_fold", "ns", "time"],
+)
+def test_keys_equal_as_python_objects_are_distinct(keys):
+    lf = pl.LazyFrame({"x": keys, "v": [1, 2]}).piot.execute_on_ray(by_key(keys.to_frame(), "x"))
+    assert lf.collect().sort("v")["v"].to_list() == [1, 2]
+    assert lf.filter(pl.col("x") == pl.lit(keys[1:])).collect()["v"].to_list() == [2]
+
+
 # ---------------------------------------------------------------------------
 # Predicate-pushdown key pruning (fail-open)
 # ---------------------------------------------------------------------------
