@@ -413,6 +413,14 @@ def test_delta_partition_pushdown_ne_keeps_empty_string(tmp_path):
     assert sorted(cpl.scan_delta(path, credential_provider=None).filter(pl.col("c") != "a").collect()["i"]) == [1, 2]
 
 
+def test_delta_partition_pushdown_ne_keeps_the_rows_of_a_native_scan_of_a_null_integer_partition(tmp_path):
+    path = str(tmp_path / "t")
+    pl.DataFrame({"q": [1, 2, None], "i": [0, 1, 2]}).write_delta(path, delta_write_options={"partition_by": ["q"]})
+    pred = pl.col("q") != 1
+    out = cpl.scan_delta(path, credential_provider=None).filter(pred).collect()
+    assert sorted(out["i"]) == sorted(pl.scan_delta(path).filter(pred).collect()["i"])
+
+
 def _run_delta_io_roundtrip(path: str, aws_profile: str | None) -> None:
     """Overwrite, append through the streaming path, and filter like a native scan of the stored integers.
 
