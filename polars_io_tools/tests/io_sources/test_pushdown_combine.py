@@ -768,13 +768,17 @@ SCENARIOS = [
     shift_bounds_row(
         "datetime", c("date").is_between(datetime(2024, 1, 12, 6), datetime(2024, 1, 15, 6)), datetime(2024, 1, 11, 6), datetime(2024, 1, 14, 6)
     ),
-    Scenario(
-        "interval_timedelta_mapping_must_be_whole_days_for_dates",
-        windows(SCHED_11_20, spine(d(13)), value_mapping=timedelta(hours=12)),
-        interval_join(),
-        c("date") == d(13),
-        raises=(Exception, "whole number of days"),
-    ),
+    # A partial day shifts a Date request outward to whole days.
+    *[
+        Scenario(
+            f"interval_timedelta_mapping_rounds_dates_outward-{hours}h",
+            windows(SCHED_11_20, spine(d(13)), value_mapping=timedelta(hours=hours)),
+            interval_join(),
+            c("date") == d(13),
+            check=pushed_text("sched", has=(f'(col("end")) >= ({end_lower})', f'(col("start")) <= ({start_upper})')),
+        )
+        for hours, end_lower, start_upper in [(12, d(13), d(14)), (-12, d(12), d(13))]
+    ],
     endpoint_row("both", True, True),
     endpoint_row("left", True, False),
     endpoint_row("right", False, True),

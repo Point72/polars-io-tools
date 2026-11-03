@@ -150,14 +150,12 @@ class IntervalFilterSpec:
               - ``"none"``  (``(start, end)``): ``end >  lo`` and ``start <  hi``
 
         value_mapping (dict[Any, Any] | Callable[[Any], Any] | timedelta | None): Transform the request
-            bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
-            values (e.g. a business-day offset applied to the request date). A ``timedelta`` is a
-            constant shift of both bounds, which must be whole days for a ``Date`` request; it is
-            pushed for any request, and a bound shifted out of range is left unbounded. For a dict or
-            callable, every day of a bounded ``Date`` request is mapped and the pushed range spans the
-            mapped days. Nothing is pushed
-            for other requests, or when a dict lacks a requested day or a day maps to None. ``None``
-            passes bounds through.
+            bounds before pushdown (e.g. a business-day offset). A ``timedelta`` shifts both bounds; for a
+            ``Date`` request a partial day is rounded outward to whole days, and a bound shifted out of range
+            is left unbounded. A dict or callable maps every day of a bounded ``Date`` request of at most
+            10,000 days, and the pushed range spans the mapped days. Open, ``Datetime`` or longer requests, a
+            dict missing a requested day, a day mapped to None, or a callable that raises push nothing for the
+            interval. ``None`` passes bounds through.
 
     Notes:
         The pushdown is **conservative** -- it may keep non-overlapping rows, but never drops an
@@ -388,11 +386,16 @@ def _bound_expr(value: Any, source_col: str, source_dtype: pl.DataType, *, is_lo
 
 
 def _shift_bound(bound: Any, shift: timedelta, overflow: Any) -> Any:
-    """``bound`` shifted by ``shift``, ``overflow`` if the result is out of range; infinite bounds are kept."""
+    """``bound`` shifted by ``shift``, ``overflow`` if the result is out of range; infinite bounds are kept.
+
+    A ``date`` bound is shifted by whole days, rounding a partial day outward: down for a lower bound (``overflow`` is
+    ``-inf``), up for an upper bound.
+    """
     if not isinstance(bound, date):
         return bound
-    if not isinstance(bound, datetime) and shift % timedelta(days=1):
-        raise ValueError(f"IntervalFilterSpec value_mapping {shift!r} must be a whole number of days for a Date request")
+    if not isinstance(bound, datetime):
+        whole_days = shift // timedelta(days=1) if overflow == -portion.inf else -(-shift // timedelta(days=1))
+        shift = timedelta(days=whole_days)
     try:
         return bound + shift
     except OverflowError:
