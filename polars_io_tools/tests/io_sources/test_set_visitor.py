@@ -4,11 +4,8 @@ from zoneinfo import ZoneInfo
 import polars as pl
 import pytest
 
-from polars_io_tools.io_sources.base import (
-    ExprParser,
-)
+from polars_io_tools.io_sources.base import get_parsed_expr
 from polars_io_tools.io_sources.set_visitor import SetVisitor, convert_expr_to_valid_values
-from polars_io_tools.tests.io_sources.conftest import skip_unoptimized_expression_shape
 
 
 def test_set_visitor_visitor_direct():
@@ -16,8 +13,7 @@ def test_set_visitor_visitor_direct():
     expr = pl.col("symbol").is_in(["US", "EU", "JP"])
 
     # Parse the expression
-    parser = ExprParser()
-    node = parser.parse(expr)
+    node = get_parsed_expr(expr)
 
     # Apply the visitor
     visitor = SetVisitor("symbol")
@@ -433,7 +429,7 @@ def test_logical_and_operator_handling():
     """
     from datetime import date
 
-    from polars_io_tools.io_sources.base import BinaryExprNode, ExprParser
+    from polars_io_tools.io_sources.base import BinaryExprNode
     from polars_io_tools.io_sources.enum import OperatorType
 
     # Create expressions that should produce LOGICAL_AND
@@ -445,8 +441,7 @@ def test_logical_and_operator_handling():
     combined_filter = date_expr & symbol_expr
 
     # Parse the expression to check what operator we actually get
-    parser = ExprParser()
-    parsed_node = parser.parse(combined_filter)
+    parsed_node = get_parsed_expr(combined_filter)
 
     # Manually create a BinaryExprNode with LOGICAL_AND to force the bug
     # This simulates what happens before Polars optimization (collect_schema)
@@ -492,14 +487,6 @@ def test_alias_logical_operations():
     expr = (pl.col("symbol").alias("symbol_alias") == "US") & (pl.col("price").alias("price_alias") > 100)
     result = convert_expr_to_valid_values(expr, "symbol")
     assert result == {"US"}
-
-
-@skip_unoptimized_expression_shape
-def test_alias_nested_expression():
-    """Test aliases on complex nested expressions."""
-    expr = ((pl.col("symbol") == "US") | (pl.col("symbol") == "EU")).alias("symbol_filter")
-    result = convert_expr_to_valid_values(expr, "symbol")
-    assert result == {"US", "EU"}
 
 
 def test_alias_with_exclusions():

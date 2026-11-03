@@ -5,7 +5,7 @@ import pytest
 from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
-from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, ExprParser, get_parsed_expr
+from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import OperatorType
 from polars_io_tools.io_sources.restrict_visitor import RestrictPredicateVisitor, restrict_expr_to_columns
 
@@ -47,8 +47,7 @@ def test_restrict_predicate_visitor_direct():
     expr = (pl.col("symbol") == "US") & (pl.col("price") > 100)
 
     # Parse the expression
-    parser = ExprParser()
-    node = parser.parse(expr)
+    node = get_parsed_expr(expr)
 
     # Apply the visitor, restricting to just "symbol"
     visitor = RestrictPredicateVisitor({"symbol"})
@@ -722,7 +721,7 @@ _NULLABLE_DATA = pl.DataFrame(
 def test_restricted_predicate_keeps_all_matching_rows(expr, columns):
     """The restricted predicate, evaluated on the kept columns only, must keep every row the original keeps."""
     visitor = RestrictPredicateVisitor(columns)
-    visitor.visit(ExprParser().parse(expr))
+    visitor.visit(get_parsed_expr(expr))
     cols = sorted(columns)
     kept = Counter(_NULLABLE_DATA.filter(expr).select(cols).rows())
     for restricted in (restrict_expr_to_columns(expr, columns), visitor.process_results()):
