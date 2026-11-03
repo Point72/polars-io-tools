@@ -2357,6 +2357,61 @@ class TestIntervalFilterSpecOverlap:
         assert start_upper == date(2024, 1, 15)  # start <= hi
 
 
+@pytest.mark.parametrize(
+    ("pred", "end_lower", "start_upper"),
+    [
+        (pl.col("date") >= date(2024, 1, 12), date(2024, 1, 11), None),
+        (pl.col("date").is_between(date(1990, 1, 1), date(2024, 1, 15)), date(1989, 12, 31), date(2024, 1, 14)),
+        (pl.col("date").is_between(datetime(2024, 1, 12, 6), datetime(2024, 1, 15, 6)), datetime(2024, 1, 11, 6), datetime(2024, 1, 14, 6)),
+    ],
+    ids=["open", "over_cap", "datetime"],
+)
+def test_interval_timedelta_mapping_shifts_bounds(pred, end_lower, start_upper):
+    is_datetime = isinstance(end_lower, datetime)
+    sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
+    if is_datetime:
+        sched = sched.with_columns(pl.col("start", "end").cast(pl.Datetime("us")))
+    tracker = PredicateTracker(sched)
+    spine = pl.DataFrame({"root": ["A"], "date": [datetime(2024, 1, 13) if is_datetime else date(2024, 1, 13)]})
+    spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=timedelta(days=-1))
+    lf = pushdown_combine(
+        sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
+        combine=lambda s: s["spine"].join(s["sched"], on="root"),
+    )
+    assert lf.filter(pred).collect()["val"].to_list() == [2]
+    pushed = str(tracker.last_predicate)
+    assert f'(col("end")) >= ({end_lower})' in pushed
+    assert f'(col("start")) <= ({start_upper})' in pushed if start_upper is not None else 'col("start")' not in pushed
+
+
+@pytest.mark.parametrize(
+    ("hours", "end_lower", "start_upper"),
+    [(12, date(2024, 1, 13), date(2024, 1, 14)), (-12, date(2024, 1, 12), date(2024, 1, 13))],
+)
+def test_interval_timedelta_mapping_rounds_dates_outward(hours, end_lower, start_upper):
+    """A partial day shifts a Date request outward to whole days."""
+    sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
+    tracker = PredicateTracker(sched)
+    spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 13)]})
+    spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=timedelta(hours=hours))
+    lf = pushdown_combine(
+        sources={"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})},
+        combine=lambda s: s["spine"].join(s["sched"], on="root"),
+    )
+    assert lf.filter(pl.col("date") == date(2024, 1, 13)).collect()["val"].to_list() == [2]
+    pushed = str(tracker.last_predicate)
+    assert f'(col("end")) >= ({end_lower})' in pushed
+    assert f'(col("start")) <= ({start_upper})' in pushed
+
+
+@pytest.mark.parametrize("shift", [timedelta.max, timedelta.min], ids=["max", "min"])
+def test_interval_timedelta_mapping_out_of_range_leaves_the_bound_unbounded(shift):
+    # Rounding a shift of nearly the whole timedelta range out to whole days overflows.
+    sched = pl.DataFrame({"root": ["A"], "start": [date(2024, 1, 11)], "end": [date(2024, 1, 20)], "val": [2]})
+    lf = _interval_lf(sched, pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 13)]}), value_mapping=shift)
+    assert lf.filter(pl.col("date") == date(2024, 1, 13)).collect()["val"].to_list() == [2]
+
+
 class TestIntervalFilterSpecClosed:
     """closed x {Date, Datetime}: half-open modes flip only the exact-endpoint boundary, and a
     Date request against a Datetime column keeps intraday boundary-day windows for every mode."""

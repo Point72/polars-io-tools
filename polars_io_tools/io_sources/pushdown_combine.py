@@ -149,12 +149,13 @@ class IntervalFilterSpec:
               - ``"right"`` (``(start, end]``): ``end >= lo`` and ``start <  hi``
               - ``"none"``  (``(start, end)``): ``end >  lo`` and ``start <  hi``
 
-        value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform the request
-            bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
-            values (e.g. a business-day offset applied to the request date). Every day of a bounded
-            ``Date`` request is mapped and the pushed range spans the mapped days. Nothing is pushed
-            for other requests, or when a dict lacks a requested day or a day maps to None. ``None``
-            passes bounds through.
+        value_mapping (dict[Any, Any] | Callable[[Any], Any] | timedelta | None): Transform the request
+            bounds before pushdown (e.g. a business-day offset). A ``timedelta`` shifts both bounds; for a
+            ``Date`` request a partial day is rounded outward to whole days, and a bound shifted out of range
+            is left unbounded. A dict or callable maps every day of a bounded ``Date`` request of at most
+            10,000 days, and the pushed range spans the mapped days. Open, ``Datetime`` or longer requests, a
+            dict missing a requested day, a day mapped to None, or a callable that raises push nothing for the
+            interval. ``None`` passes bounds through.
 
     Notes:
         The pushdown is **conservative** -- it may keep non-overlapping rows, but never drops an
@@ -172,7 +173,7 @@ class IntervalFilterSpec:
     start_col: str
     end_col: str
     closed: str = "both"
-    value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
+    value_mapping: dict[Any, Any] | Callable[[Any], Any] | timedelta | None = None
 
     def __post_init__(self) -> None:
         if self.closed not in _CLOSED_MODES:
@@ -384,6 +385,23 @@ def _bound_expr(value: Any, source_col: str, source_dtype: pl.DataType, *, is_lo
     return expr if isinstance(expr, pl.Expr) else None
 
 
+def _shift_bound(bound: Any, shift: timedelta, overflow: Any) -> Any:
+    """``bound`` shifted by ``shift``, ``overflow`` if the result is out of range; infinite bounds are kept.
+
+    A ``date`` bound is shifted by whole days, rounding a partial day outward: down for a lower bound (``overflow`` is
+    ``-inf``), up for an upper bound.
+    """
+    if not isinstance(bound, date):
+        return bound
+    try:
+        if not isinstance(bound, datetime):
+            whole_days = shift // timedelta(days=1) if overflow == -portion.inf else -(-shift // timedelta(days=1))
+            shift = timedelta(days=whole_days)
+        return bound + shift
+    except OverflowError:
+        return overflow
+
+
 def _apply_interval_filter(
     filtered_lf: pl.LazyFrame,
     spec: IntervalFilterSpec,
@@ -393,10 +411,14 @@ def _apply_interval_filter(
     """Apply an interval-overlap filter to a source LazyFrame.
 
     Given the request range ``date_range`` extracted for the output column, push the overlap
-    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source, mapping the
-    request bounds through ``spec.value_mapping`` first. The overlap is fully determined per source
-    row, so the surviving rows are exactly the overlapping windows -- no post-combine membership
-    predicate is needed.
+    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source. The overlap is
+    fully determined per source row, so the surviving rows are exactly the overlapping windows -- no
+    post-combine membership predicate is needed.
+
+    A ``timedelta`` ``spec.value_mapping`` shifts ``lo`` and ``hi``, by whole days rounded outward for
+    ``Date`` bounds. A dict or callable maps every day of a bounded ``Date`` request (see
+    ``_MAX_ENUMERATED_DAYS``) and ``lo``/``hi`` become the least and greatest mapped days; when the days
+    cannot be enumerated or one of them cannot be mapped, nothing is pushed.
     """
     if spec.start_col not in source_schema or spec.end_col not in source_schema:
         log.debug(f"Interval columns {spec.start_col!r}/{spec.end_col!r} not both in source, skipping interval pushdown")
@@ -408,7 +430,9 @@ def _apply_interval_filter(
     enclosure = date_range.enclosure
     lo, hi = enclosure.lower, enclosure.upper
     mapping = spec.value_mapping
-    if mapping is not None:
+    if isinstance(mapping, timedelta):
+        lo, hi, mapping = _shift_bound(lo, mapping, -portion.inf), _shift_bound(hi, mapping, portion.inf), None
+    elif mapping is not None:
         # The mapping need not be monotone, so every requested day is mapped, not only the range ends.
         # A day the mapping does not know (a missing dict key, a null result or an error) pushes nothing.
         try:
