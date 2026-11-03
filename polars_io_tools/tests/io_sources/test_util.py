@@ -474,7 +474,7 @@ def test_with_columns_topo_large_scale():
     assert_frame_equal(df, expected)
 
 
-@pytest.mark.xfail(reason="Selectors expansion not yet supported by with_columns_topo")
+@pytest.mark.xfail(reason="Selectors expansion not yet supported by with_columns_topo", strict=True)
 def test_with_columns_topo_with_selector():
     import polars.selectors as cs
 
@@ -498,7 +498,7 @@ def test_with_columns_topo_with_selector():
     assert_frame_equal(df, expected)
 
 
-@pytest.mark.xfail(reason="Implicit selectors expansion not yet supported by with_columns_topo")
+@pytest.mark.xfail(reason="Implicit selectors expansion not yet supported by with_columns_topo", strict=True)
 def test_with_columns_topo_with_implicit_selector_and_dependency():
     # Implicit selector via multi-column expr and .name.suffix; plus dependent expr
     lf = pl.LazyFrame(
