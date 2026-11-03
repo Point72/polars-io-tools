@@ -30,7 +30,9 @@ Example usage::
 
 from __future__ import annotations
 
+import functools
 import logging
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -231,6 +233,7 @@ def _union_discrete_filter(
     members: list[tuple[str, FilterSpec]],
     extracted_values: dict[str, set[Any] | None],
     dtype: pl.DataType,
+    float32_outputs: Callable[[], frozenset[str]] = frozenset,
 ) -> pl.Expr | None:
     """Build a single discrete predicate for the output columns mapped to ``source_col``.
 
@@ -248,8 +251,13 @@ def _union_discrete_filter(
 
     Otherwise returns a filter keeping rows whose ``source_col`` is in the union (a ``None`` value keeps null
     rows). Each member's values are mapped through that member's own ``spec.value_mapping`` before unioning.
+    Values requested through an output column in ``float32_outputs`` over another numeric source dtype are matched
+    against the source column cast to Float32.
     """
     union: dict[Any, Any] = {}
+    # Values requested through a Float32 output over another numeric source dtype, matched after the same cast.
+    cast_union: dict[Any, Any] = {}
+    casts = dtype.is_numeric() and dtype != pl.Float32
     for output_col, spec in members:
         discrete_values = extracted_values.get(output_col)
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
@@ -262,26 +270,65 @@ def _union_discrete_filter(
                 f"pushing nothing for source col '{source_col}' (will be applied after combine)"
             )
             return None
+        target = cast_union if casts and output_col in float32_outputs() else union
         for value in mapped_values:
-            union.setdefault(_value_key(value), value)
+            target.setdefault(_value_key(value), value)
 
     col = pl.col(source_col)
+    exprs = []
+    cast_expr = _float32_membership(col, list(cast_union.values()), dtype)
+    if cast_expr is None:
+        union.update(cast_union)
+    else:
+        exprs.append(cast_expr)
     # A value_mapping may map to None, or (via an empty set result) to no source values at all. Do not sort:
     # the values may be unorderable (e.g. mixed types).
     non_null = [v for v in union.values() if v is not None]
-    if not non_null:
-        # No non-null source values. An empty union (every requested value mapped to an empty set) matches no
-        # source row, so keep nothing; a union of only None(s) keeps null rows (the existing mapped-to-None case).
+    if not non_null and not exprs:
+        # An empty union (every requested value mapped to an empty set) matches no source row; a union of only
+        # None(s) keeps null rows.
         return pl.lit(False) if not union else col.is_null()
+    keeps_null = len(non_null) < len(union) or any(v is None for v in cast_union.values())
     if len(non_null) == 1:
-        expr = col == non_null[0]
-    else:
+        exprs.append(col == non_null[0])
+    elif dtype.is_integer() and any(isinstance(v, float) for v in non_null):
+        # Polars 2 rejects an is_in of floats on an integer column.
+        exprs.append(pl.any_horizontal([col == v for v in non_null]))
+    elif non_null:
         if not _membership_supported(non_null, dtype):
             log.debug(f"Values for source col '{source_col}' cannot form a membership on {dtype}; pushing nothing")
             return None
-        expr = col.is_in(_is_in_collection(non_null, dtype))
+        exprs.append(col.is_in(_is_in_collection(non_null, dtype)))
+    expr = exprs[0].or_(*exprs[1:]) if exprs else pl.lit(False)
     # ``== None`` and ``is_in`` never match null rows.
-    return expr | col.is_null() if len(non_null) < len(union) else expr
+    return expr | col.is_null() if keeps_null else expr
+
+
+def _float32_membership(col: pl.Expr, values: list[Any], dtype: pl.DataType) -> pl.Expr | None:
+    """Rows of ``col`` whose Float32 cast is one of the numeric ``values``, or None if ``values`` are not all numbers.
+
+    Over an integer ``dtype`` the membership is also bounded by the integers that can round into its range, so a
+    source can prune by column statistics.
+    """
+    numbers = [v for v in values if v is not None]
+    if not numbers or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in numbers):
+        return None
+    try:
+        targets = pl.Series(numbers).cast(pl.Float32)
+    except Exception:  # noqa: BLE001 -- e.g. an integer too large for any Polars dtype
+        return None
+    expr = col.cast(pl.Float32).is_in(pl.lit(targets.implode()))
+    finite = [v for v in targets.to_list() if math.isfinite(v)]
+    if dtype.is_integer() and finite:
+        # An integer rounds to a Float32 within half a Float32 step of it.
+        lo, hi = min(finite), max(finite)
+        lo = math.floor(lo) - max(1, 2 ** (math.frexp(lo)[1] - 24))
+        hi = math.ceil(hi) + max(1, 2 ** (math.frexp(hi)[1] - 24))
+        dtype_lo, dtype_hi = pl.select(dtype.min().alias("lo"), dtype.max().alias("hi")).row(0)
+        lo, hi = max(lo, dtype_lo), min(hi, dtype_hi)
+        if lo <= hi:
+            expr = expr & col.is_between(lo, hi)
+    return expr
 
 
 def _value_key(value: Any) -> Any:
@@ -920,6 +967,10 @@ def pushdown_combine(
         log.debug(f"Extracted ranges: {extracted_ranges}")
         log.debug(f"Extracted values: {extracted_values}")
 
+        @functools.cache
+        def float32_outputs() -> frozenset[str]:
+            return frozenset(name for name, dtype in output_schema().items() if dtype == pl.Float32)
+
         # Apply transformed filters to each source
         # IMPORTANT: For temporal columns with lookback/lookahead, we apply the EXPANDED
         # filter here (e.g., date >= Jan 2 for a lookback of 3 days when user filters >= Jan 5).
@@ -1037,7 +1088,7 @@ def pushdown_combine(
             for source_col, members in by_source_col.items():
                 # Output columns sharing a source column push the UNION of their value sets, or nothing if any
                 # sharer is unconstrained/unmappable (see _union_discrete_filter).
-                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col])
+                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col], float32_outputs)
                 if union_filter is not None:
                     filtered_lf = filtered_lf.filter(union_filter)
                     log.debug(f"Applied discrete filter to {source_name}.{source_col}: {union_filter}")
