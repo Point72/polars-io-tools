@@ -44,16 +44,16 @@ from polars_io_tools.tests.helpers.sql_backends import ENTRY_POINTS, Backend, cc
 
 ELECTION_CSV = (
     "Country,ElectFor,EventDate,Status,KnowledgeDate,SourceFile,Isbackfill,DBTimestamp\n"
-    "Chile,Referendum,2022-09-04T00:00:00.000,Held,2022-09-13T16:51:26.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20220913\\20220913_1651Past.csv,0,2022-09-13T17:03:07.000\n"
-    "Nicaragua,Nicaraguan Presidency,2021-11-07T00:00:00.000,Held,2023-04-18T16:38:30.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20230418\\20230418_1638Past.csv,0,2023-04-18T16:49:12.000\n"
+    "Chile,Referendum,2022-09-04T00:00:00.000,Held,2022-09-13T16:51:26.000,\\\\fileserver\\share\\ElectionCalendar\\20220913\\20220913_1651Past.csv,0,2022-09-13T17:03:07.000\n"
+    "Nicaragua,Nicaraguan Presidency,2021-11-07T00:00:00.000,Held,2023-04-18T16:38:30.000,\\\\fileserver\\share\\ElectionCalendar\\20230418\\20230418_1638Past.csv,0,2023-04-18T16:49:12.000\n"
     "Jordan,Jordanian House of Deputies,2010-11-09T00:00:00.000,Snap,2017-04-17T02:32:24.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,2010-10-10T00:00:00.000\n"
-    "Kiribati,Kiribati Presidency,2024-06-30T00:00:00.000,Date not confirmed,2024-04-01T09:34:51.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20240401\\20240401_0934Upcoming.csv,0,2024-04-01T09:46:00.000\n"
+    "Kiribati,Kiribati Presidency,2024-06-30T00:00:00.000,Date not confirmed,2024-04-01T09:34:51.000,\\\\fileserver\\share\\ElectionCalendar\\20240401\\20240401_0934Upcoming.csv,0,2024-04-01T09:46:00.000\n"
     "Liberia,President,2017-10-10T00:00:00.000,Held,2018-04-03T00:07:41.000,E:\\SourceData\\ElectionCalendar\\20180403\\20180403_00.csv,1,2018-04-03T00:07:44.000\n"
     "Honduras,President,2017-11-26T00:00:00.000,Confirmed,2017-04-17T02:32:24.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,2017-04-17T02:32:27.000\n"
     "Moldova,Moldovan Parliament,1998-03-22T00:00:00.000,Held,2017-04-17T02:32:25.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,1998-02-20T00:00:00.000\n"
-    "Singapore,Singapore Parliament,2020-07-10T00:00:00.000,Confirmed,2020-07-09T17:08:37.000,//sacrshfs03/SourceData/ElectionCalendar\\20200709\\20200709_17.csv,0,2020-07-09T17:10:22.000\n"
-    "India,Indian People's Assembly,2024-04-19T00:00:00.000,Held,2024-06-17T16:48:06.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20240617\\20240617_1648Past.csv,0,2024-06-17T16:59:07.000\n"
-    "Guatemala,Guatemalan Presidency,2023-06-25T00:00:00.000,Held,2023-07-11T10:43:16.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20230711\\20230711_1043Past.csv,0,2023-07-11T10:54:04.000\n"
+    "Singapore,Singapore Parliament,2020-07-10T00:00:00.000,Confirmed,2020-07-09T17:08:37.000,//fileserver/SourceData/ElectionCalendar\\20200709\\20200709_17.csv,0,2020-07-09T17:10:22.000\n"
+    "India,Indian People's Assembly,2024-04-19T00:00:00.000,Held,2024-06-17T16:48:06.000,\\\\fileserver\\share\\ElectionCalendar\\20240617\\20240617_1648Past.csv,0,2024-06-17T16:59:07.000\n"
+    "Guatemala,Guatemalan Presidency,2023-06-25T00:00:00.000,Held,2023-07-11T10:43:16.000,\\\\fileserver\\share\\ElectionCalendar\\20230711\\20230711_1043Past.csv,0,2023-07-11T10:54:04.000\n"
 )
 
 

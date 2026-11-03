@@ -28,7 +28,7 @@ def mock_metric_query():
         yield mock
 
 
-# A subset of a real response to "sum:piot_telemetry.test{type:call} by {user,module,function}.as_count()".
+# A response in the shape of one to "sum:piot_telemetry.test{type:call} by {user,module,function}.as_count()".
 BASIC_RESPONSE = {
     "status": "ok",
     "res_type": "time_series",
@@ -42,9 +42,9 @@ BASIC_RESPONSE = {
             "query_index": 0,
             "aggr": "sum",
             "metric": "piot_telemetry.test",
-            "tag_set": ["function:reutersadapter._init", "module:csp_internal.adapters.reuters", "user:svchfalgodev"],
-            "expression": "sum:piot_telemetry.test{function:reutersadapter._init,module:csp_internal.adapters.reuters,user:svchfalgodev,type:call}.as_count()",
-            "scope": "function:reutersadapter._init,module:csp_internal.adapters.reuters,type:call,user:svchfalgodev",
+            "tag_set": ["function:feed._init", "module:example.adapters.feed", "user:service_user"],
+            "expression": "sum:piot_telemetry.test{function:feed._init,module:example.adapters.feed,user:service_user,type:call}.as_count()",
+            "scope": "function:feed._init,module:example.adapters.feed,type:call,user:service_user",
             "interval": 1,
             "length": 5,
             "start": 1748635902000,
@@ -64,9 +64,9 @@ BASIC_RESPONSE = {
             "query_index": 0,
             "aggr": "sum",
             "metric": "piot_telemetry.test",
-            "tag_set": ["function:dags", "module:cubist_sdlc.cli.dags", "user:cl8999"],
-            "expression": "sum:piot_telemetry.test{function:dags,module:cubist_sdlc.cli.dags,user:cl8999,type:call}.as_count()",
-            "scope": "function:dags,module:cubist_sdlc.cli.dags,type:call,user:cl8999",
+            "tag_set": ["function:jobs", "module:example.cli.jobs", "user:user1"],
+            "expression": "sum:piot_telemetry.test{function:jobs,module:example.cli.jobs,user:user1,type:call}.as_count()",
+            "scope": "function:jobs,module:example.cli.jobs,type:call,user:user1",
             "interval": 1,
             "length": 5,
             "start": 1748635902000,
