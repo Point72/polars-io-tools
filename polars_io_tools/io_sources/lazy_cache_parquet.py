@@ -536,7 +536,9 @@ def _unnamed_expr(cols: list[str], schema: pl.Schema) -> pl.Expr | None:
             exprs.append(pl.col(c).dt.nanosecond() % 1000 != 0)
         elif schema[c] in (pl.String, pl.Categorical) or isinstance(schema[c], pl.Enum):
             name = pl.col(c).cast(pl.String)
-            exprs.append(name.is_in(["", *_NULL_KEY_TOKENS]) | name.str.contains(_UNNAMED_PATTERN) | (name.str.len_bytes() > _MAX_SEGMENT_BYTES))
+            # Measured as the file key Windows percent-encodes (see _encode_partition_file_key), the longest on any system.
+            length = name.str.len_bytes() + 2 * name.str.count_matches(r'[%<>:"\\|?*]')
+            exprs.append(name.is_in(["", *_NULL_KEY_TOKENS]) | name.str.contains(_UNNAMED_PATTERN) | (length > _MAX_SEGMENT_BYTES))
     return pl.any_horizontal(exprs).fill_null(False) if exprs else None
 
 
@@ -1734,7 +1736,7 @@ def cache_parquet(
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
             Duration, nanosecond Datetime, List, Array, Struct, Binary and Object columns are not supported. Rows whose value cannot name a path segment of its own (for
             example a string containing ``/``, ``""``, ``"None"``, one ending in ``.`` or a space, a Windows device name such as
-            ``"CON"``, one longer than 200 bytes, or a Time with a sub-microsecond part) are always read from upstream.
+            ``"CON"``, one longer than 200 bytes when percent-encoded as on Windows, or a Time with a sub-microsecond part) are always read from upstream.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
         partition_format (str, optional): Format using ``$year``, ``$month``, ``$day`` placeholders. If None, defaults based on time_unit:
 

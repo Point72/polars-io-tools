@@ -2139,7 +2139,11 @@ def test_values_without_a_path_segment_of_their_own_are_read_from_upstream(tmp_p
     assert len(list(tmp_path.rglob("*.*"))) == 2
 
 
-@pytest.mark.parametrize("value", ["x" * 201, "a.", "a ", "CON", "nul.txt", "Com1"], ids=["long", "dot", "space", "con", "nul_ext", "com1"])
+@pytest.mark.parametrize(
+    "value",
+    ["x" * 201, "%" * 100, "a.", "a ", "CON", "nul.txt", "Com1"],
+    ids=["long", "long_when_percent_encoded", "dot", "space", "con", "nul_ext", "com1"],
+)
 def test_values_no_file_can_be_named_are_read_from_upstream(tmp_path, value):
     src = pl.LazyFrame({"date": [D(2024, 1, 10)] * 2, "x": [value, "ok"], "v": [1, 2]})
     for pred in [pl.lit(True), pl.col("x") == value]:
