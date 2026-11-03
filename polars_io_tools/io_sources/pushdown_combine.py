@@ -411,10 +411,14 @@ def _apply_interval_filter(
     """Apply an interval-overlap filter to a source LazyFrame.
 
     Given the request range ``date_range`` extracted for the output column, push the overlap
-    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source, mapping the
-    request bounds through ``spec.value_mapping`` first. The overlap is fully determined per source
-    row, so the surviving rows are exactly the overlapping windows -- no post-combine membership
-    predicate is needed.
+    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source. The overlap is
+    fully determined per source row, so the surviving rows are exactly the overlapping windows -- no
+    post-combine membership predicate is needed.
+
+    A ``timedelta`` ``spec.value_mapping`` shifts ``lo`` and ``hi``, by whole days rounded outward for
+    ``Date`` bounds. A dict or callable maps every day of a bounded ``Date`` request (see
+    ``_MAX_ENUMERATED_DAYS``) and ``lo``/``hi`` become the least and greatest mapped days; when the days
+    cannot be enumerated or one of them cannot be mapped, nothing is pushed.
     """
     if spec.start_col not in source_schema or spec.end_col not in source_schema:
         log.debug(f"Interval columns {spec.start_col!r}/{spec.end_col!r} not both in source, skipping interval pushdown")
