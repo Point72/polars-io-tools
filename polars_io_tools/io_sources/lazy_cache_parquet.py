@@ -1734,9 +1734,11 @@ def cache_parquet(
         date_column (str, optional): Name of the column that contains dates or datetimes. If None, only extra_partition_cols
             will be used for partitioning (no date-based organization).
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
-            Duration, nanosecond Datetime, List, Array, Struct, Binary and Object columns are not supported. Rows whose value cannot name a path segment of its own (for
-            example a string containing ``/``, ``""``, ``"None"``, one ending in ``.`` or a space, a Windows device name such as
-            ``"CON"``, one longer than 200 bytes when percent-encoded as on Windows, or a Time with a sub-microsecond part) are always read from upstream.
+            Duration, nanosecond Datetime, List, Array, Struct, Binary and Object columns are not supported. Rows
+            whose value cannot name a path segment of its own (for example a string containing ``/``, ``""``,
+            ``"None"``, one ending in ``.`` or a space, a Windows device name such as ``"CON"``, one longer than 200
+            bytes when percent-encoded as on Windows, or a Time with a sub-microsecond part) are always read from
+            upstream.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
         partition_format (str, optional): Format using ``$year``, ``$month``, ``$day`` placeholders. If None, defaults based on time_unit:
 
