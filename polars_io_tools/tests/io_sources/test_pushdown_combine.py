@@ -811,6 +811,12 @@ SCENARIOS = [
         c("date").is_between(d(1), d(3)),
     ),
     Scenario(
+        "value_mapping_that_raises_pushes_nothing",
+        windows(schedule([d(1), d(3)], [d(1), d(3)], [1, 3]), spine(d(1), d(2), d(3)), value_mapping={d(1): d(1), d(3): d(3)}.__getitem__),
+        interval_join(),
+        c("date").is_between(d(1), d(3)),
+    ),
+    Scenario(
         "interval_filter_with_tz_aware_endpoints",
         {
             "spine": (pl.DataFrame({"d": [datetime(2024, 1, 2, tzinfo=UTC_ZONE)]}), {"d": F()}),

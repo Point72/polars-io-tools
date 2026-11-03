@@ -427,11 +427,14 @@ def _apply_interval_filter(
         lo, hi, mapping = _shift_bound(lo, mapping, -portion.inf), _shift_bound(hi, mapping, portion.inf), None
     elif mapping is not None:
         # The mapping need not be monotone, so every requested day is mapped, not only the range ends.
-        mapped = [_map_bound(day, mapping) for day in _enumerate_days(date_range) or ()]
-        # A day the mapping does not know (a missing dict key or a null result) pushes nothing.
-        if not mapped or not all(ok and v is not None for v, ok in mapped):
+        # A day the mapping does not know (a missing dict key, a null result or an error) pushes nothing.
+        try:
+            mapped = [_map_bound(day, mapping) for day in _enumerate_days(date_range) or ()]
+            if not mapped or not all(ok and v is not None for v, ok in mapped):
+                return filtered_lf
+            lo, hi, mapping = min(v for v, _ in mapped), max(v for v, _ in mapped), None
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
             return filtered_lf
-        lo, hi, mapping = min(v for v, _ in mapped), max(v for v, _ in mapped), None
 
     conditions: list[pl.Expr] = []
 
