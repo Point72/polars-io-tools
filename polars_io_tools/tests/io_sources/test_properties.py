@@ -445,6 +445,31 @@ def test_dnf_of_wide_clauses_stays_within_budget():
     assert convert_expr_to_dnf(~pred, schema) is None
 
 
+def _any_of(col: str, n: int) -> pl.Expr:
+    return functools.reduce(operator.or_, [pl.col(col) == i for i in range(n)])
+
+
+@pytest.mark.parametrize(
+    ("last", "bounds"),
+    [
+        (_any_of("c", 50), [("c", "in", list(range(50)))]),
+        (functools.reduce(operator.or_, [pl.col("c").is_between(i, i + 1) for i in range(50)]), [("c", ">=", 0), ("c", "<=", 50)]),
+    ],
+    ids=["members", "range"],
+)
+def test_an_and_over_the_budget_keeps_the_bounds_of_the_side_it_drops(last, bounds):
+    pred = _any_of("a", 50) & _any_of("b", 50) & last
+    values = pl.DataFrame({"a": [0, 1, 49, 50, 51, -1, None]}, schema={"a": pl.Int64})
+    frame = values.join(values.rename({"a": "b"}), how="cross").join(values.rename({"a": "c"}), how="cross")
+    schema = dict(frame.schema)
+    dnf = convert_expr_to_dnf(pred, schema)
+    assert dnf is not None and sum(len(clause) for clause in dnf) <= MAX_DNF_TUPLES
+    assert all(clause[-len(bounds) :] == bounds for clause in dnf)
+    # The other tuples of each clause are those of an exact AND of the first two disjunctions.
+    assert _dnf_mask(frame, [bounds]).filter(mask(frame, last)).all()
+    assert convert_expr_to_dnf(~pred, schema) is None
+
+
 @pytest.mark.xfail(strict=True, raises=pl.exceptions.PanicException, reason="a Polars panic on an out-of-range literal breaks the parser")
 def test_out_of_range_datetime_literal_does_not_crash_pushdown_combine():
     frame = pl.DataFrame({"t": pl.Series([1, None]).cast(pl.Datetime("us"))})
