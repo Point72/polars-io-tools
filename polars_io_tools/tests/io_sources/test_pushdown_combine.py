@@ -779,6 +779,16 @@ SCENARIOS = [
         )
         for hours, end_lower, start_upper in [(12, d(13), d(14)), (-12, d(12), d(13))]
     ],
+    # Rounding a shift of nearly the whole timedelta range out to whole days overflows; the bound is left unbounded.
+    *[
+        Scenario(
+            f"interval_timedelta_mapping_out_of_range-{name}",
+            windows(SCHED_11_20, spine(d(13)), value_mapping=shift),
+            interval_join(),
+            c("date") == d(13),
+        )
+        for name, shift in [("max", timedelta.max), ("min", timedelta.min)]
+    ],
     endpoint_row("both", True, True),
     endpoint_row("left", True, False),
     endpoint_row("right", False, True),

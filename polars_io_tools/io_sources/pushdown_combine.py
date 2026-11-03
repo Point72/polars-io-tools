@@ -393,10 +393,10 @@ def _shift_bound(bound: Any, shift: timedelta, overflow: Any) -> Any:
     """
     if not isinstance(bound, date):
         return bound
-    if not isinstance(bound, datetime):
-        whole_days = shift // timedelta(days=1) if overflow == -portion.inf else -(-shift // timedelta(days=1))
-        shift = timedelta(days=whole_days)
     try:
+        if not isinstance(bound, datetime):
+            whole_days = shift // timedelta(days=1) if overflow == -portion.inf else -(-shift // timedelta(days=1))
+            shift = timedelta(days=whole_days)
         return bound + shift
     except OverflowError:
         return overflow
