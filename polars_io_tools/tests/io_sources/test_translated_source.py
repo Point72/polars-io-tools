@@ -17,6 +17,7 @@ from polars_io_tools.io_sources.translated_source import (
     translate_polars_predicate,
 )
 from polars_io_tools.tests.helpers.cases import Case, params
+from polars_io_tools.tests.helpers.polars_versions import xfail_unless
 
 
 def _ns(dt: datetime) -> int:
@@ -37,9 +38,7 @@ _TS4 = {"ts": [_ns(t) for t in (T0, T1, T2, T3)]}
 _DUR = {"dur": [0, 500, 1500, 2500]}
 _TIMES = {"t": _time_ns(*NOON)}
 ts, dur, t = pl.col("ts"), pl.col("dur"), pl.col("t")
-_IS_IN_ISSUE = pytest.mark.xfail(
-    reason="Polars handles is_in differently than equality here, see this issue: https://github.com/pola-rs/polars/issues/22824"
-)
+_IS_IN_ISSUE = xfail_unless("is_in_coerces_temporal_units")
 
 
 def V(id, stored, mapping, pred, expect="exact", via="visitor", marks=()):
@@ -88,7 +87,7 @@ CASES = [
         _DUR,
         MS,
         lambda: dur.is_in([pl.lit(timedelta(milliseconds=v), dtype=pl.Duration("ms")) for v in (500, 2500)]),
-        marks=pytest.mark.xfail(reason="Polars does not support nested object types so the predicate is_in cannot be created."),
+        marks=pytest.mark.xfail(reason="Polars does not support nested object types so the predicate is_in cannot be created.", strict=True),
     ),
     # the mapping applies first, then the user's cast
     V("translated_visitor_user_cast_layering", {"ts": [_ns(T0), _ns(T1)]}, NS, ts.cast(pl.Datetime("ns"), strict=False) == T1),

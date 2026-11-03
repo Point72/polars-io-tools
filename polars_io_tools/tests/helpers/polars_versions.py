@@ -25,6 +25,7 @@ POLARS_BEHAVIORS: dict[str, tuple[str, str]] = {
     "datetime_literal_unwrapped": ("1.36.0b1", "pl.lit(datetime) parses as a LiteralNode instead of a CastNode"),
     "time_partition_subsecond": ("1.38.0", "a Time partition key keeps sub-second precision in its path"),
     "join_asof_null_by_unmatched": ("1.44.0", "join_asof no longer matches a null by key, and two filtered IO sources cross join correctly"),
+    "is_in_coerces_temporal_units": ("2.0.0", "is_in compares a temporal list in the column's unit, as equality does (polars#22824)"),
     "ns_literal_min_overflows": ("2.0.0", "re-reading a nanosecond literal near the Int64 minimum overflows"),
     "pushes_widening_cast": ("2.1.0", "a filter above a widening cast reaches the source (polars#23369)"),
     "pushes_asof_filter": ("2.1.0", "the post-join filter of a forward join_asof reaches the right source, and col == True becomes col"),
