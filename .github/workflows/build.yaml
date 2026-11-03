@@ -23,6 +23,9 @@ permissions:
   checks: write
   pull-requests: write
 
+env:
+  HYPOTHESIS_PROFILE: ci
+
 jobs:
   build:
     name: build (${{ matrix.name }})

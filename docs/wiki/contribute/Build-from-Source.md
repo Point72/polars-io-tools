@@ -120,6 +120,21 @@ make develop
 make test-py
 ```
 
+The property tests use [Hypothesis](https://hypothesis.readthedocs.io), which the `develop` extra
+installs. They run a quick profile of 50 examples per test by default. Set
+`HYPOTHESIS_PROFILE=hunt` for 2,000 examples per test, a longer search for bugs. Each property test
+sits in the test file of the module it checks, for example the filter readers:
+
+```bash
+HYPOTHESIS_PROFILE=hunt python -m pytest polars_io_tools/tests/io_sources/test_dnf_visitor.py
+```
+
+CI sets `HYPOTHESIS_PROFILE=ci`, the quick profile with a fixed order of examples, which prints
+a blob to reproduce a failure with `@reproduce_failure`.
+
+Tests marked `gap` pin a pushdown that Polars could perform but does not, so that a change in
+Polars shows up as a test failure. Select them with `-m gap`.
+
 **Rust**
 
 ```bash
