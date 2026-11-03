@@ -2478,6 +2478,38 @@ class TestIntervalFilterSpecConservative:
         end_lower, _ = analyzer.extract_temporal_bounds(analyzer.find_temporal_filter("end"))
         assert end_lower == date(2024, 1, 1)
 
+    def test_non_monotone_value_mapping_keeps_interior_days(self):
+        # Monday maps to the previous Friday, other days to the day before: Sun 1 Sep maps after Mon 2 Sep.
+        def offset(d):
+            return d - timedelta(days=3 if d.weekday() == 0 else 1)
+
+        sched = pl.DataFrame(
+            {"root": ["A", "A"], "start": [date(2024, 8, 1), date(2024, 8, 31)], "end": [date(2024, 8, 30), date(2024, 9, 30)], "val": [1, 2]}
+        )
+        spine = pl.DataFrame({"root": ["A"] * 3, "date": [date(2024, 9, 1), date(2024, 9, 2), date(2024, 9, 3)]})
+        mapped = pl.col("date").map_elements(offset, return_dtype=pl.Date)
+        lf = _interval_lf(sched, spine, value_mapping=offset, membership=mapped.is_between(pl.col("start"), pl.col("end")))
+        result = lf.filter(pl.col("date").is_between(date(2024, 9, 1), date(2024, 9, 3))).sort("date").collect()
+        assert result["val"].to_list() == [2, 1, 2]
+
+    def test_value_mapping_to_none_pushes_nothing(self):
+        sched = pl.DataFrame(
+            {"root": ["A", "A"], "start": [date(2024, 1, 1), date(2024, 1, 3)], "end": [date(2024, 1, 1), date(2024, 1, 3)], "val": [1, 3]}
+        )
+        spine = pl.DataFrame({"root": ["A"] * 3, "date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)]})
+        lf = _interval_lf(sched, spine, value_mapping=lambda d: None if d == date(2024, 1, 2) else d)
+        result = lf.filter(pl.col("date").is_between(date(2024, 1, 1), date(2024, 1, 3))).sort("date").collect()
+        assert result["val"].to_list() == [1, 3]
+
+    def test_value_mapping_that_raises_pushes_nothing(self):
+        sched = pl.DataFrame(
+            {"root": ["A", "A"], "start": [date(2024, 1, 1), date(2024, 1, 3)], "end": [date(2024, 1, 1), date(2024, 1, 3)], "val": [1, 3]}
+        )
+        spine = pl.DataFrame({"root": ["A"] * 3, "date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)]})
+        lf = _interval_lf(sched, spine, value_mapping={date(2024, 1, 1): date(2024, 1, 1), date(2024, 1, 3): date(2024, 1, 3)}.__getitem__)
+        result = lf.filter(pl.col("date").is_between(date(2024, 1, 1), date(2024, 1, 3))).sort("date").collect()
+        assert result["val"].to_list() == [1, 3]
+
 
 class TestSharedSourceColUnion:
     """Two or more output columns mapping to the same source column union their discrete filters.
@@ -3240,9 +3272,10 @@ class TestIntervalFilterSpecSetBound:
         expected = self._combine({"sched": self.SCHED.lazy(), "spine": self.SPINE.lazy()}).filter(pred).collect()
         assert_frame_equal(result, expected, check_row_order=False)
 
-    def test_scalar_bound_still_pushed_when_other_bound_is_a_set(self):
-        # lo (-> ``end >= lo``) maps to a set and is deferred; hi (-> ``start <= hi``) is scalar and pushed.
-        mapping = {date(2024, 1, 4): frozenset({date(2024, 1, 4)}), date(2024, 1, 6): date(2024, 1, 6)}
+    def test_a_day_mapped_to_a_set_pushes_nothing(self):
+        # Every requested day is mapped; a day mapped to a set has no single day to compare against, so nothing is
+        # pushed for the interval.
+        mapping = {date(2024, 1, 4): frozenset({date(2024, 1, 4)}), date(2024, 1, 5): date(2024, 1, 5), date(2024, 1, 6): date(2024, 1, 6)}
         spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=mapping)
         tracker = PredicateTracker(self.SCHED)
         spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 5)]})
@@ -3252,7 +3285,4 @@ class TestIntervalFilterSpecSetBound:
         result = pushdown_combine(sources, self._combine).filter(pred).collect()
         expected = self._combine({"sched": self.SCHED.lazy(), "spine": spine.lazy()}).filter(pred).collect()
         assert_frame_equal(result, expected, check_row_order=False)
-
-        analyzer = tracker.get_analyzer()
-        assert analyzer.find_temporal_filter("start") is not None  # scalar hi pushed
-        assert analyzer.find_temporal_filter("end") is None  # set-valued lo deferred
+        assert tracker.last_predicate is None
