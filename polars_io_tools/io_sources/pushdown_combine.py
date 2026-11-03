@@ -240,10 +240,13 @@ def _union_discrete_filter(
 
     Otherwise returns a filter keeping rows whose ``source_col`` is in the union (a ``None`` value keeps null
     rows). Each member's values are mapped through that member's own ``spec.value_mapping`` before unioning.
-    A large integral float requested through an output column in ``float32_outputs`` is pushed as the integers rounding to it.
+    Values requested through an output column in ``float32_outputs`` over another numeric source dtype are matched
+    against the source column cast to Float32.
     """
     union: dict[Any, Any] = {}
-    widened: set[Any] = set()
+    # Values requested through a Float32 output over another numeric source dtype, matched after the same cast.
+    cast_union: dict[Any, Any] = {}
+    casts = dtype.is_numeric() and dtype != pl.Float32
     for output_col, spec in members:
         discrete_values = extracted_values.get(output_col)
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
@@ -256,20 +259,22 @@ def _union_discrete_filter(
                 f"pushing nothing for source col '{source_col}' (will be applied after combine)"
             )
             return None
+        target = cast_union if casts and output_col in float32_outputs() else union
         for value in mapped_values:
-            union.setdefault(_value_key(value), value)
-            if output_col in float32_outputs() and _float32_preimage(value, dtype) is not None:
-                widened.add(_value_key(value))
+            target.setdefault(_value_key(value), value)
 
     col = pl.col(source_col)
+    exprs = []
+    cast_expr = _float32_membership(col, list(cast_union.values()), dtype)
+    if cast_expr is None:
+        union.update(cast_union)
+    else:
+        exprs.append(cast_expr)
     # A value_mapping may map to None. Do not sort: the values may be unorderable (e.g. mixed types).
     non_null = [v for v in union.values() if v is not None]
-    if not non_null:
+    if not non_null and not exprs:
         return col.is_null()
-    keeps_null = len(non_null) < len(union)
-    bounds = [_float32_preimage(union[key], dtype) for key in widened]
-    exprs = [col.is_between(lo, hi) for lo, hi in bounds if lo <= hi]
-    non_null = [v for key, v in union.items() if v is not None and key not in widened]
+    keeps_null = len(non_null) < len(union) or any(v is None for v in cast_union.values())
     if len(non_null) == 1:
         exprs.append(col == non_null[0])
     elif dtype.is_integer() and any(isinstance(v, float) for v in non_null):
@@ -285,17 +290,31 @@ def _union_discrete_filter(
     return expr | col.is_null() if keeps_null else expr
 
 
-def _float32_preimage(value: Any, dtype: pl.DataType) -> tuple[int, int] | None:
-    """Integers of ``dtype`` around an integral float ``value`` that a Float32 cast may round to it, or None if no other can.
+def _float32_membership(col: pl.Expr, values: list[Any], dtype: pl.DataType) -> pl.Expr | None:
+    """Rows of ``col`` whose Float32 cast is one of the numeric ``values``, or None if ``values`` are not all numbers.
 
-    The bounds are clipped to ``dtype``, so the range is empty when no value of ``dtype`` is near ``value``.
+    Over an integer ``dtype`` the membership is also bounded by the integers that can round into its range, so a
+    source can prune by column statistics.
     """
-    if not (dtype.is_integer() and isinstance(value, float) and value.is_integer() and abs(value) >= 2**24):
+    numbers = [v for v in values if v is not None]
+    if not numbers or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in numbers):
         return None
-    # Integer arithmetic: the float sum overflows to infinity near the largest float.
-    ulp = 2 ** (math.frexp(value)[1] - 24)
-    lo, hi = pl.select(dtype.min().alias("lo"), dtype.max().alias("hi")).row(0)
-    return max(int(value) - ulp, lo), min(int(value) + ulp, hi)
+    try:
+        targets = pl.Series(numbers).cast(pl.Float32)
+    except Exception:  # noqa: BLE001 -- e.g. an integer too large for any Polars dtype
+        return None
+    expr = col.cast(pl.Float32).is_in(pl.lit(targets.implode()))
+    finite = [v for v in targets.to_list() if math.isfinite(v)]
+    if dtype.is_integer() and finite:
+        # An integer rounds to a Float32 within half a Float32 step of it.
+        lo, hi = min(finite), max(finite)
+        lo = math.floor(lo) - max(1, 2 ** (math.frexp(lo)[1] - 24))
+        hi = math.ceil(hi) + max(1, 2 ** (math.frexp(hi)[1] - 24))
+        dtype_lo, dtype_hi = pl.select(dtype.min().alias("lo"), dtype.max().alias("hi")).row(0)
+        lo, hi = max(lo, dtype_lo), min(hi, dtype_hi)
+        if lo <= hi:
+            expr = expr & col.is_between(lo, hi)
+    return expr
 
 
 def _value_key(value: Any) -> Any:

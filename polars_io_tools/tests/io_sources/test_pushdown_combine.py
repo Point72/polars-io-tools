@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -902,6 +903,13 @@ SCENARIOS = [
         Scenario(f"float_cast_in_combine_keeps_rounded_rows-{i}", one(pl.DataFrame({"x": [16777217, 5, None]}), x=F()), cast_to(dtype), pred)
         for i, (pred, dtype) in enumerate(FLOAT_CASTS)
     ],
+    # A Float64 value next to a Float32 value rounds to it under the cast.
+    *[
+        Scenario(
+            f"float32_cast_of_float64_keeps_rounded_rows-{i}", one(pl.DataFrame({"x": [2.0**24 + 1, 0.1, None]}), x=F()), cast_to(pl.Float32), pred
+        )
+        for i, pred in enumerate([c("x") == 2.0**24, c("x") == float(np.float32(0.1)), c("x").is_in([2.0**24, -1.0])])
+    ],
     # A value set containing None keeps null rows, also when two output columns share a source column.
     *[
         Scenario(
@@ -1123,6 +1131,23 @@ def test_lone_side_pushes_no_group_predicate():
     assert_matches_native(lf, group_pairs({"data": THREE_GROUPS.lazy()}), c("group1") == "A")
     assert predicates
     assert any(p is None or PredicateAnalyzer(p).find_discrete_filter("group") is None for p in predicates)
+
+
+def test_many_float32_values_push_one_membership():
+    values = {float(2**30 + 64 * i) for i in range(10_000)}
+    expr = _union_discrete_filter("x", [("x", F())], {"x": values}, pl.Int64, lambda: frozenset({"x"}))
+    assert len(str(expr)) < 1_000
+    rows = [2**30 + 64, 2**30 + 65, 2**30 + 64 * 10_000, 2**30 + 64 * 10_001, 5]
+    targets = {np.float32(v) for v in values}
+    assert pl.DataFrame({"x": rows}).filter(expr)["x"].to_list() == [x for x in rows if np.float32(x) in targets]
+
+
+def test_non_numeric_source_does_not_resolve_float32_outputs():
+    def float32_outputs():
+        raise AssertionError("output schema resolved")
+
+    expr = _union_discrete_filter("x", [("x", F())], {"x": {"a"}}, pl.String, float32_outputs)
+    assert pl.DataFrame({"x": ["a", "b"]}).filter(expr)["x"].to_list() == ["a"]
 
 
 def test_integral_float_without_float32_consumer_pushes_equality():
