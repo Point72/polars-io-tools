@@ -1727,7 +1727,8 @@ def cache_parquet(
 
     Args:
         self (pl.LazyFrame): The LazyFrame to cache.
-        cache_path (str | pathlib.Path): Root directory where Parquet files are stored.
+        cache_path (str | pathlib.Path): Root directory where Parquet files are stored. The cache follows symbolic
+            links inside it; partition paths are only confined to it by name.
         date_column (str, optional): Name of the column that contains dates or datetimes. If None, only extra_partition_cols
             will be used for partitioning (no date-based organization).
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
