@@ -444,6 +444,23 @@ def test_delta_partition_pushdown_not_in_empty_string(_partitioned_delta_table, 
     assert set(expected["x"]) <= set(out["x"])
 
 
+def test_delta_partition_pushdown_ne_keeps_empty_string(tmp_path):
+    # delta-rs reads the "" partition as null, so "!=" must not prune it
+    table_path = os.path.join(tmp_path, "t")
+    df = pl.DataFrame({"c": ["a", "", "b"], "i": [0, 1, 2]})
+    write_deltalake(table_path, df.to_arrow(), mode="overwrite", partition_by=["c"])
+    out = cpl.scan_delta(table_path, credential_provider=None).filter(pl.col("c") != "a").collect()
+    assert sorted(out["i"]) == [1, 2]
+
+
+def test_delta_partition_pushdown_ne_keeps_the_rows_of_a_native_scan_of_a_null_integer_partition(tmp_path):
+    table_path = os.path.join(tmp_path, "t")
+    pl.DataFrame({"q": [1, 2, None], "i": [0, 1, 2]}).write_delta(table_path, delta_write_options={"partition_by": ["q"]})
+    pred = pl.col("q") != 1
+    out = cpl.scan_delta(table_path, credential_provider=None).filter(pred).collect()
+    assert sorted(out["i"]) == sorted(pl.scan_delta(table_path).filter(pred).collect()["i"])
+
+
 def test_delta_partition_pushdown_is_null(_partitioned_delta_table):
     lf = cpl.scan_delta(_partitioned_delta_table, credential_provider=None)
     # Match the null partition using is_null, and equality against None
