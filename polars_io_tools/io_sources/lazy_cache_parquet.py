@@ -1751,8 +1751,9 @@ def cache_parquet(
               partitions that are not, without writing anything to the cache. A cached partition is always served
               from the cache, even if it is empty.
             - ``CacheMode.CACHE_ONLY``: Read only the partitions that are already cached; never query upstream or
-              write. Returns an empty frame if nothing matching is cached. With a callable source and an empty
-              cache, ``schema`` is required.
+              write. Returns an empty frame if nothing matching is cached. Rows that are never cached, such as those
+              whose ``extra_partition_cols`` value cannot name a file, are not returned. With a callable source and
+              an empty cache, ``schema`` is required.
         ttl (timedelta | Callable, optional): Expire cached files written at least this long ago. An expired file is
             refetched and overwritten under ``CacheMode.CACHE``, and read from upstream instead of the cache under
             ``CacheMode.READ_ONLY``. ``CacheMode.CACHE_ONLY`` serves expired files and ``CacheMode.REBUILD`` ignores
