@@ -929,6 +929,29 @@ def test_cache_memory_keeps_the_rows_of_random_predicates(case):
     _check_cache_keeps_filtered_rows(cache_memory(frame.lazy(), schema=frame.schema, partition_cols=frame.columns[1:]), frame, [pred])
 
 
+def test_cache_parquet_after_caching_only_null_partition_keys(tmp_path):
+    frame = pl.DataFrame({"date": [date(2024, 1, 31), date(2024, 2, 1)], "x": [None, 1], "i": [0, 1]})
+    lf = cache_parquet(frame.lazy(), tmp_path, "date", extra_partition_cols="x")
+    for pred in [pl.col("date") < date(2024, 2, 1), pl.col("x") == 1]:
+        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
+
+
+@pytest.mark.parametrize("column_granularity", [True, False])
+def test_cache_on_a_nan_partition_key(column_granularity):
+    frame = pl.DataFrame({"x": [float("nan")], "i": [0]})
+    lf = frame.lazy().piot.cache({}, order_by="i", partition_cols=("x",), column_granularity=column_granularity)
+    for pred in [pl.col("x").is_nan(), pl.lit(True)]:
+        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))
+
+
+def test_cache_memory_on_a_nan_partition_key():
+    frame = pl.DataFrame({"x": [0.0, float("nan")], "i": [0, 1]})
+    lf = cache_memory(frame.lazy(), schema=frame.schema, partition_cols="x")
+    # A literal the predicate analysis cannot read, so the query names no partition.
+    for pred in [pl.lit(True), pl.col("x") == pl.lit(pl.Series([0.0])).first(), pl.lit(True)]:
+        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
+
+
 @xfail_unless("time_partition_subsecond", reason="Polars 1.37 names Time partitions to the second")
 def test_cache_parquet_on_sub_second_time_keys(tmp_path):
     frame = pl.DataFrame({"date": [date(2024, 1, 31)] * 2, "x": pl.Series([0, 1000]).cast(pl.Time), "i": [0, 1]})
