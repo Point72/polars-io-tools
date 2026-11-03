@@ -1398,3 +1398,11 @@ def test_lossy_key_partitions_do_not_collide(dtype, start, step):
     lf = df.lazy().piot.cache({}, order_by="v", partition_cols=["k"])
     for pred in [pl.col("k") == pl.lit(start + step).cast(dtype), pl.col("k") == pl.lit(start).cast(dtype), pl.col("v") > 0]:
         assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))
+
+
+@pytest.mark.parametrize("column_granularity", [True, False])
+def test_cache_on_a_nan_partition_key(column_granularity):
+    frame = pl.DataFrame({"x": [float("nan")], "i": [0]})
+    lf = frame.lazy().piot.cache({}, order_by="i", partition_cols=("x",), column_granularity=column_granularity)
+    for pred in [pl.col("x").is_nan(), pl.lit(True)]:
+        assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred))

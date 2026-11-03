@@ -157,6 +157,12 @@ class TestpiotCachePickle:
         result = lf_unpickled.collect()
         assert_frame_equal(result, df)
 
+    def test_piot_cache_pickle_after_caching_a_nan_partition(self):
+        df = pl.DataFrame({"x": [float("nan")], "i": [0]})
+        lf = df.lazy().piot.cache({}, order_by="i", partition_cols=("x",))
+        lf.collect()
+        assert_frame_equal(_pickle_roundtrip(lf).collect(), df)
+
     @pytest.mark.parametrize(
         "helper_name,expected_ids",
         [
