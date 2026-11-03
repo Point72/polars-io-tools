@@ -14,7 +14,7 @@ POLARS = Version(pl.__version__)
 POLARS_BEHAVIORS: dict[str, tuple[str, str]] = {
     "logical_operands_reach_source_uncast": (
         "1.8.0",
-        "all_horizontal(i8, i8).cast(Boolean) reaches an IO source as i8 & i8, whose operands are not Boolean",
+        "all_horizontal(i8, i8).cast(Boolean) reaches an IO source as i8 && i8, whose non-Boolean operands a lazy filter rejects",
     ),
     "pushes_function_predicates": ("1.25.2", "string and temporal-component predicates such as str.contains and dt.day reach the source"),
     "pushes_python_datetime_comparison": ("1.26.0", "a comparison with a Python datetime literal reaches the source"),

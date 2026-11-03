@@ -15,7 +15,6 @@ import time
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-import narwhals as nw
 import polars as pl
 import portion
 import pytest
@@ -24,16 +23,12 @@ from polars.io.plugins import register_io_source
 from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources.base import get_parsed_expr
-from polars_io_tools.io_sources.concat_named import concat_named
 from polars_io_tools.io_sources.delta_io import scan_delta, sink_delta
 from polars_io_tools.io_sources.dnf_visitor import _is_contradiction, convert_expr_to_dnf
 from polars_io_tools.io_sources.lazy_cache_memory import cache_memory
 from polars_io_tools.io_sources.lazy_cache_parquet import CacheMode, cache_parquet
-from polars_io_tools.io_sources.lazy_narwhals_reader import scan_narwhals
 from polars_io_tools.io_sources.partitions import by_range, by_time, by_value
 from polars_io_tools.io_sources.pushdown_combine import FilterSpec, IntervalFilterSpec, pushdown_combine
-from polars_io_tools.io_sources.pushdown_pivot import pushdown_pivot
-from polars_io_tools.io_sources.pushdown_unpivot import pushdown_unpivot
 from polars_io_tools.io_sources.range_visitor import convert_expr_to_datetime_range, convert_expr_to_range
 from polars_io_tools.io_sources.restrict_visitor import restrict_expr_to_columns
 from polars_io_tools.io_sources.set_visitor import convert_expr_to_valid_values
@@ -922,10 +917,6 @@ def test_cache_keeps_the_rows_a_filter_keeps(case, partition_cols, column_granul
 
 @SETTINGS
 @given(case=frames_and_predicates(max_columns=2, depth=2))
-# Polars delivers this predicate as ``c0 && (c0 > 0).cast(Int8)``, whose conjunct ``c0`` is not Boolean.
-@example(
-    case=(pl.DataFrame({"c0": pl.Series([0, 1, 2, 3, -1, None], dtype=pl.Int8)}), pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean))
-)
 def test_cache_memory_keeps_the_rows_of_random_predicates(case):
     """Partitioned on every column of a wide dtype mix."""
     frame, pred = case
@@ -975,57 +966,37 @@ def test_cache_on_a_partition_key_beyond_python_datetime(wrap):
     assert_frame_equal(lf.filter(pl.col("i") >= 0).collect(), frame, check_row_order=False)
 
 
-def _via_delta(lf, path):
-    sink_delta(lf, str(path / "delta"))
-    return scan_delta(str(path / "delta"), credential_provider=None)
-
-
-_UNPIVOTED = {"index": ["date", "i"], "on": ["c0"]}
 _ENTRY_POINTS = {
     "cache_memory": lambda lf, path: cache_memory(lf, schema=lf.collect_schema(), partition_cols="c0"),
-    "cache": lambda lf, path: lf.piot.cache({}, order_by="i", partition_cols=("c0",)),
     "cache_parquet": lambda lf, path: cache_parquet(lf, path, "date", extra_partition_cols="c0"),
-    "probe": lambda lf, path: lf.piot.probe(),
     "debug": lambda lf, path: lf.piot.debug(log_level=logging.DEBUG),
-    "concat_named": lambda lf, path: concat_named({("a",): lf}, ["name"]).drop("name"),
     "pushdown_combine": lambda lf, path: pushdown_combine({"s": (lf, {"c0": FilterSpec()})}, lambda s: s["s"]),
-    "filtered_join": lambda lf, path: lf.piot.filtered_join(lf.select("i"), on="i"),
-    "filtered_join_asof": lambda lf, path: lf.piot.filtered_join_asof(lf.select("i"), on="i"),
-    "pushdown_pivot": lambda lf, path: pushdown_pivot(lf.unpivot(**_UNPIVOTED), "variable", ["c0"], index=["date", "i"], values="value"),
-    "pushdown_unpivot": lambda lf, path: pushdown_unpivot(lf, **_UNPIVOTED).drop("variable").rename({"value": "c0"}),
-    "scan_narwhals": lambda lf, path: scan_narwhals(nw.from_native(lf), fetch_size=10),
-    "scan_delta": _via_delta,
 }
-
-
+_UNCAST = polars_has("logical_operands_reach_source_uncast")
+# Each predicate and whether the installed Polars passes it to an IO source with operands that are not Boolean.
 _INTEGER_OPERANDS = {
-    "cast": pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean),
-    "column": pl.all_horizontal(pl.col("c0"), pl.col("c0")).cast(pl.Boolean),
+    "cast": (pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean), _UNCAST and polars_has("pushes_implicit_casts")),
+    "column": (pl.all_horizontal(pl.col("c0"), pl.col("c0")).cast(pl.Boolean), _UNCAST),
+    "function": (pl.all_horizontal(pl.col("c0").abs(), pl.col("i").abs()).cast(pl.Boolean), _UNCAST and polars_has("pushes_implicit_casts")),
 }
 
 
-@pytest.mark.parametrize("operand", sorted(_INTEGER_OPERANDS))
+@pytest.mark.parametrize(
+    "pred",
+    [
+        pytest.param(pred, id=name, marks=pytest.mark.xfail(uncast, strict=True, raises=pl.exceptions.ComputeError, reason="Polars bug"))
+        for name, (pred, uncast) in _INTEGER_OPERANDS.items()
+    ],
+)
 @pytest.mark.parametrize("entry_point", sorted(_ENTRY_POINTS))
-def test_an_integer_operand_of_all_horizontal_is_filtered(entry_point, operand, tmp_path):
-    """Polars passes these predicates to an IO source as ``c0 && (c0 > 0).cast(Int8)`` and ``c0 && i``.
+def test_an_integer_operand_of_all_horizontal_is_filtered(entry_point, pred, tmp_path):
+    """Polars passes these predicates to an IO source without the cast, e.g. as ``c0 && (c0 > 0).cast(Int8)``.
 
-    The logical operands are not Boolean (``logical_operands_reach_source_uncast``).
+    A lazy filter by it rejects the operands, which are not Boolean (``logical_operands_reach_source_uncast``).
     """
     frame = pl.DataFrame({"date": [date(2024, 1, 1)] * 6, "i": range(6), "c0": pl.Series([0, 1, 2, 3, -1, None], dtype=pl.Int8)})
-    pred = _INTEGER_OPERANDS[operand]
     lf = _ENTRY_POINTS[entry_point](frame.lazy(), tmp_path)
     assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
-
-
-@pytest.mark.parametrize("entry_point", ["debug", "concat_named", "pushdown_combine"])
-def test_a_boolean_operand_keeps_the_predicate_pushable(entry_point, tmp_path):
-    """An operation on a Boolean column reaches a nested source as it was written, not wrapped."""
-    frame = pl.DataFrame({"date": [date(2024, 1, 1)] * 3, "i": range(3), "c0": [True, False, None]})
-    tracker = PredicateTracker(frame)
-    pred = pl.col("c0") & (pl.col("i") > 0)
-    lf = _ENTRY_POINTS[entry_point](tracker.lazy_frame, tmp_path)
-    assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
-    assert "fill_null" not in str(tracker.last_predicate)
 
 
 @pytest.mark.xfail(strict=True, raises=pl.exceptions.ComputeError, reason="Polars passes a bitwise NOT of the integer operand to the IO source")

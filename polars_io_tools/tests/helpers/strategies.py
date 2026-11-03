@@ -138,12 +138,13 @@ def _literal(draw, dtype: pl.DataType, pool: list) -> pl.Expr:
     return typed_lit(value, dtype)
 
 
-def _leaf(draw, schema: dict, pools: dict, negated: bool = False) -> pl.Expr:
+def _leaf(draw, schema: dict, pools: dict) -> pl.Expr:
     name = draw(st.sampled_from(sorted(schema)))
     dtype, pool, col = schema[name], pools[name], pl.col(name)
     kinds = ["cmp", "cmp", "in", "between", "null", "const"]
-    # Polars issue "IO plugin receives all_horizontal(int, bool) without the cast": negated, it is passed as a bitwise NOT.
-    kinds += ["bitwise", *([] if negated else ["horizontal"])] if dtype.is_integer() else []
+    # No horizontal function over integers: Polars issue "IO plugin receives `all_horizontal(int, bool).cast(Boolean)`
+    # without the cast, and a lazy filter by it fails".
+    kinds += ["bitwise"] if dtype.is_integer() else []
     kinds += ["bool"] if dtype == pl.Boolean else []
     kinds += ["pattern"] if dtype == pl.String else []
     kinds += ["date"] if isinstance(dtype, pl.Datetime) else []
@@ -176,8 +177,6 @@ def _leaf(draw, schema: dict, pools: dict, negated: bool = False) -> pl.Expr:
     if kind == "bitwise":
         other = pl.col(draw(st.sampled_from([n for n, d in schema.items() if d.is_integer()])))
         return [(col & other) > 0, (col | other).cast(pl.Boolean), (~col) == -1][draw(st.integers(0, 2))]
-    if kind == "horizontal":
-        return pl.all_horizontal(col, col > 0) if draw(st.booleans()) else pl.any_horizontal(col)
     if kind == "bool":
         return col if draw(st.booleans()) else ~col
     if kind == "pattern":
@@ -194,16 +193,16 @@ def _leaf(draw, schema: dict, pools: dict, negated: bool = False) -> pl.Expr:
     return OPS[draw(st.sampled_from(["==", "<", ">="]))](cast, typed_lit(draw(physical(target)), target))
 
 
-def predicate(draw, schema: dict, pools: dict, depth: int, negated: bool = False) -> pl.Expr:
+def predicate(draw, schema: dict, pools: dict, depth: int) -> pl.Expr:
     """A random Boolean predicate over the columns of ``schema``, comparing with values drawn mostly from ``pools``."""
     if depth == 0 or draw(st.integers(0, 2)) == 0:
-        return _leaf(draw, schema, pools, negated)
-    sub = functools.partial(predicate, draw, schema, pools, depth - 1, negated)
+        return _leaf(draw, schema, pools)
+    sub = functools.partial(predicate, draw, schema, pools, depth - 1)
     shape = draw(st.sampled_from(["and", "and", "or", "or", "xor", "not", "when", "all", "any", "is_null", "is_not_null", "cast"]))
     if shape in ("and", "or", "xor"):
         return {"and": operator.and_, "or": operator.or_, "xor": operator.xor}[shape](sub(), sub())
     if shape == "not":
-        return ~predicate(draw, schema, pools, depth - 1, negated=True)
+        return ~sub()
     if shape == "when":
         return pl.when(sub()).then(sub()).otherwise(sub())
     if shape in ("all", "any"):
