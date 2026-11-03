@@ -20,7 +20,7 @@ from .base import (
     is_value_order_preserving_cast,
 )
 from .enum import BooleanFunctionType, OperatorType
-from .util import _as_filter, collect_lf_in_io_source, optional_deps_error, register_io_source_with_is_pure
+from .util import collect_lf_in_io_source, optional_deps_error, register_io_source_with_is_pure
 
 try:
     import narwhals as nw
@@ -353,7 +353,7 @@ def scan_narwhals(obj: Any, fetch_size: int, description: str | None = None) -> 
             if with_columns is not None:
                 pl_lf = pl_lf.select(with_columns)
             if predicate is not None:
-                pl_lf = pl_lf.filter(_as_filter(predicate))
+                pl_lf = pl_lf.filter(predicate)
             if n_rows is not None:
                 pl_lf = pl_lf.head(n_rows)
 

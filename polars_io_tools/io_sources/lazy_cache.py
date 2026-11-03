@@ -10,7 +10,6 @@ from .dnf_visitor import _is_contradiction
 from .restrict_visitor import restrict_expr_to_columns
 from .util import (
     PartitionKey as _PartitionKey,
-    _as_filter,
     _exclude_row_predicate,
     _exclusion_from_frame,
     _lossy_python_key,
@@ -405,7 +404,7 @@ def cache(
             if not can_skip_query:
                 log.debug("Querying for data without a fixed partition key... %s", query_predicate)
                 frames_to_collect[None] = (
-                    self.filter(_as_filter(query_predicate)).select(cols_to_collect).sort(list(order_by))
+                    self.filter(query_predicate).select(cols_to_collect).sort(list(order_by))
                     if query_predicate is not None
                     else self.select(cols_to_collect).sort(list(order_by))
                 )

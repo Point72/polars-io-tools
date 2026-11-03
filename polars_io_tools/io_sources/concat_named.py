@@ -8,7 +8,7 @@ import polars as pl
 
 from polars_io_tools.io_sources.restrict_visitor import restrict_expr_to_columns
 
-from .util import _as_filter, collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import collect_lf_in_io_source, register_io_source_with_is_pure
 
 __all__ = ("concat_named",)
 
@@ -206,7 +206,7 @@ def concat_named(
         else:
             true_lf = pl.concat(data_dict.values(), **kwargs)  # type: ignore[assignment]
         if predicate is not None:
-            true_lf = true_lf.filter(_as_filter(predicate))
+            true_lf = true_lf.filter(predicate)
         if with_columns is not None:
             true_lf = true_lf.select(with_columns)
 

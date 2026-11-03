@@ -21,7 +21,7 @@ from .partitions import (
     discrete_partitions,
     retained_columns,
 )
-from .util import _as_filter, _lossy_python_key, optional_deps_error, register_io_source_with_is_pure
+from .util import _lossy_python_key, optional_deps_error, register_io_source_with_is_pure
 
 try:
     import cloudpickle
@@ -80,7 +80,7 @@ def _execute_partition(
     lf = cloudpickle.loads(plan_bytes)
     predicate = cloudpickle.loads(predicate_bytes)
 
-    out = lf.filter(_as_filter(predicate)).collect()
+    out = lf.filter(predicate).collect()
 
     if return_as == "arrow":
         return out.to_arrow()
@@ -181,7 +181,7 @@ def _run_on_ray(
                 lf = lf.select(retained)
 
         if predicate is not None:
-            lf = lf.filter(_as_filter(predicate))
+            lf = lf.filter(predicate)
 
         plan_bytes = cloudpickle.dumps(lf)
 

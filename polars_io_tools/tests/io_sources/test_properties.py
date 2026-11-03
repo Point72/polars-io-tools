@@ -946,13 +946,34 @@ _ENTRY_POINTS = {
 }
 
 
+_INTEGER_OPERANDS = {
+    "cast": pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean),
+    "column": pl.all_horizontal(pl.col("c0"), pl.col("c0")).cast(pl.Boolean),
+}
+
+
+@pytest.mark.parametrize("operand", sorted(_INTEGER_OPERANDS))
 @pytest.mark.parametrize("entry_point", sorted(_ENTRY_POINTS))
-def test_an_integer_operand_of_all_horizontal_is_filtered(entry_point, tmp_path):
-    """Polars passes this predicate to an IO source as ``c0 && (c0 > 0).cast(Int8)``, whose conjunct ``c0`` is not Boolean."""
+def test_an_integer_operand_of_all_horizontal_is_filtered(entry_point, operand, tmp_path):
+    """Polars passes these predicates to an IO source as ``c0 && (c0 > 0).cast(Int8)`` and ``c0 && i``.
+
+    The logical operands are not Boolean (``logical_operands_reach_source_uncast``).
+    """
     frame = pl.DataFrame({"date": [date(2024, 1, 1)] * 6, "i": range(6), "c0": pl.Series([0, 1, 2, 3, -1, None], dtype=pl.Int8)})
-    pred = pl.all_horizontal(pl.col("c0"), pl.col("c0") > 0).cast(pl.Boolean)
+    pred = _INTEGER_OPERANDS[operand]
     lf = _ENTRY_POINTS[entry_point](frame.lazy(), tmp_path)
-    assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False, check_column_order=False)
+    assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
+
+
+@pytest.mark.parametrize("entry_point", ["debug", "concat_named", "pushdown_combine"])
+def test_a_boolean_operand_keeps_the_predicate_pushable(entry_point, tmp_path):
+    """An operation on a Boolean column reaches a nested source as it was written, not wrapped."""
+    frame = pl.DataFrame({"date": [date(2024, 1, 1)] * 3, "i": range(3), "c0": [True, False, None]})
+    tracker = PredicateTracker(frame)
+    pred = pl.col("c0") & (pl.col("i") > 0)
+    lf = _ENTRY_POINTS[entry_point](tracker.lazy_frame, tmp_path)
+    assert_frame_equal(lf.filter(pred).collect(), frame.filter(pred), check_row_order=False)
+    assert "fill_null" not in str(tracker.last_predicate)
 
 
 @pytest.mark.xfail(strict=True, raises=pl.exceptions.ComputeError, reason="Polars passes a bitwise NOT of the integer operand to the IO source")

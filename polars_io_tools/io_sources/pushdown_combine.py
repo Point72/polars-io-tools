@@ -53,7 +53,7 @@ from .range_visitor import (
 )
 from .restrict_visitor import restrict_expr_to_columns
 from .set_visitor import convert_expr_to_valid_values
-from .util import _as_filter, _is_in_collection, _membership_supported, collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import _is_in_collection, _membership_supported, collect_lf_in_io_source, register_io_source_with_is_pure
 
 __all__ = ("FilterSpec", "IntervalFilterSpec", "pushdown_combine")
 
@@ -1081,7 +1081,7 @@ def pushdown_combine(
             output_cols = result_lf.collect_schema().names()
             restricted_predicate = restrict_expr_to_columns(predicate, output_cols)
             if restricted_predicate is not None:
-                result_lf = result_lf.filter(_as_filter(restricted_predicate))
+                result_lf = result_lf.filter(restricted_predicate)
 
         # Select requested columns
         if with_columns is not None:
