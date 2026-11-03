@@ -2149,6 +2149,44 @@ def test_values_no_file_can_be_named_are_read_from_upstream(tmp_path, value):
 
 
 @pytest.mark.parametrize(
+    ("value", "dtype"),
+    [(["../../victim"], pl.List(pl.String)), (b"../../victim", pl.Binary), ({"a": "../../victim"}, pl.Struct({"a": pl.String}))],
+    ids=["list", "binary", "struct"],
+)
+def test_a_nested_or_binary_partition_value_writes_and_deletes_nothing(tmp_path, value, dtype):
+    victim = tmp_path / "victim.parquet"
+    victim.write_bytes(b"data")
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)], "x": [value], "v": [1]}, schema={"date": pl.Date, "x": dtype, "v": pl.Int64})
+    with pytest.raises(ValueError, match="cannot partition on"):
+        cache_parquet(src, tmp_path / "cache", "date", extra_partition_cols="x")
+    assert [p.name for p in tmp_path.rglob("*")] == ["victim.parquet"]
+    assert victim.read_bytes() == b"data"
+
+
+def test_a_partition_path_outside_its_directory_is_refused(tmp_path):
+    # The default monthly file of January 2024 sits next to the monthly directory.
+    victim = tmp_path / "2024-01.parquet"
+    victim.write_bytes(b"data")
+    src = pl.LazyFrame({"date": [D(2024, 1, 10)], "v": [1]})
+    with pytest.raises(Exception, match="refusing to write partition path '../2024-01'"):
+        cache_parquet(src, tmp_path, "date", partition_format="../$year-$month").collect()
+    assert victim.read_bytes() == b"data"
+
+
+def test_cleanup_deletes_nothing_outside_the_cache_directory(tmp_path):
+    from pyarrow.fs import LocalFileSystem
+
+    from polars_io_tools.io_sources.lazy_cache_parquet import _delete_cache_file
+
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "inside.parquet").write_bytes(b"data")
+    (tmp_path / "victim.parquet").write_bytes(b"data")
+    for path in ["../victim.parquet", "inside.parquet"]:
+        _delete_cache_file(LocalFileSystem(), str(tmp_path / "cache"), path)
+    assert [p.name for p in tmp_path.rglob("*.parquet")] == ["victim.parquet"]
+
+
+@pytest.mark.parametrize(
     ("date_column", "legacy_file", "mode"),
     [(None, "null/a/b.parquet", CacheMode.CACHE), ("date", "monthly/a/b/2024-01.parquet", CacheMode.REBUILD)],
     ids=["no_date", "date"],

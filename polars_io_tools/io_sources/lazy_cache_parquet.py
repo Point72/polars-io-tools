@@ -5,6 +5,7 @@ import itertools
 import logging
 import operator
 import os
+import posixpath
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -1502,6 +1503,8 @@ def _sink_cache_partitions(
             unnamed_files.append(f"{_UNNAMED_DIR}/{uuid.uuid4().hex}.tmp")
             return unnamed_files[-1]
         logical_key = "/".join(values)
+        if any(segment in ("", ".", "..") for segment in logical_key.split("/")):
+            raise ValueError(f"cache_parquet: refusing to write partition path {logical_key!r} outside its own directory")
         key = physical_key(logical_key)
         if key in protected_keys:
             raise RuntimeError(f"cache_parquet: refusing to overwrite completed partition path {key!r} during this write")
@@ -1552,7 +1555,7 @@ def _sink_cache_partitions(
             log.warning("Cache write failed; deleting %d partition file(s) it opened: %s", len(written), sorted(written))
         for path in [f"{key}.parquet" for key in sorted(written)] + (unnamed_files or []):
             try:
-                fs.delete_file(f"{fs_path_prefix}/{path}")
+                _delete_cache_file(fs, fs_path_prefix, path)
             except FileNotFoundError:
                 pass
             except Exception as e:  # noqa: BLE001 -- keep the original error; this file may hold incomplete data
@@ -1560,6 +1563,15 @@ def _sink_cache_partitions(
         raise
     log.debug("Wrote %i new partition(s): %s", len(written), sorted(written))
     return written_logical
+
+
+def _delete_cache_file(fs: "pa_fs.FileSystem", fs_path_prefix: str, path: str) -> None:
+    """Delete ``path`` relative to ``fs_path_prefix``, unless it resolves outside it."""
+    full = f"{fs_path_prefix}/{path}"
+    if not posixpath.normpath(full).startswith(posixpath.normpath(fs_path_prefix) + "/"):
+        log.warning("cache_parquet: not deleting %s, which is outside the cache directory %s", full, fs_path_prefix)
+        return
+    fs.delete_file(full)
 
 
 def _missing_empty_keys(
@@ -1719,7 +1731,7 @@ def cache_parquet(
         date_column (str, optional): Name of the column that contains dates or datetimes. If None, only extra_partition_cols
             will be used for partitioning (no date-based organization).
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
-            Duration and nanosecond Datetime columns are not supported. Rows whose value cannot name a path segment of its own (for
+            Duration, nanosecond Datetime, List, Array, Struct, Binary and Object columns are not supported. Rows whose value cannot name a path segment of its own (for
             example a string containing ``/``, ``""``, ``"None"``, one ending in ``.`` or a space, a Windows device name such as
             ``"CON"``, one longer than 200 bytes, or a Time with a sub-microsecond part) are always read from upstream.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
@@ -1967,6 +1979,8 @@ def cache_parquet(
             raise ValueError(f"extra_partition_cols: column {c} not present in dataframe")
         if schema[c].base_type() == pl.Duration or (isinstance(schema[c], pl.Datetime) and schema[c].time_unit == "ns"):
             raise ValueError(f"extra_partition_cols: cannot partition on Duration or nanosecond Datetime column {c}")
+        if schema[c].base_type() in (pl.List, pl.Array, pl.Struct, pl.Binary, pl.Object):
+            raise ValueError(f"extra_partition_cols: cannot partition on {schema[c].base_type()} column {c}")
 
     if time_unit not in {"daily", "monthly", "yearly"}:
         raise ValueError(f"Invalid time unit {time_unit}; must be one of {{'daily','monthly','yearly'}}")
@@ -2017,7 +2031,7 @@ def cache_parquet(
         finally:
             for f in unnamed_files:
                 with contextlib.suppress(FileNotFoundError):
-                    fs.delete_file(f"{fs_path_prefix}/{f}")
+                    _delete_cache_file(fs, fs_path_prefix, f)
 
     def generate(
         with_columns: list[str] | None,
