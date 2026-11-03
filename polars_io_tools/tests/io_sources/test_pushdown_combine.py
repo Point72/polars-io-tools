@@ -11,10 +11,12 @@ including:
 - Edge cases (empty filters, empty results, schema inference)
 """
 
+import sys
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
@@ -2716,6 +2718,60 @@ class TestPushdownCombineCastSafety:
         pred = pl.col("a").cast(pl.Int8, wrap_numerical=True) == 1
         # 257 wraps to 1 under Int8, so both 1 and 257 match; pushdown must keep them.
         assert lf.filter(pred).collect().height == src.filter(pred).collect().height == 2
+
+    @pytest.mark.parametrize(
+        ("pred", "dtype"),
+        [
+            (pl.col("x") == 16777216.0, pl.Float32),
+            ((pl.col("x") == 16777216.0) | (pl.col("x") == 5.0), pl.Float32),
+            (pl.col("x") == 1e300, pl.Float32),
+            (pl.col("x") == 16777216.0, pl.Float64),
+            (pl.col("x") == 1e300, pl.Float64),
+            (pl.col("x") == sys.float_info.max, pl.Float32),
+            (pl.col("x") == sys.float_info.max, pl.Float64),
+            ((pl.col("x") == 16777216.0) | (pl.col("x") == 5.0), pl.Float64),
+        ],
+    )
+    def test_float_cast_in_combine_keeps_rounded_rows(self, pred, dtype):
+        # 16777217 rounds to 16777216.0 under Float32, so the cast row matches.
+        src = pl.LazyFrame({"x": [16777217, 5, None]})
+        combine = lambda s: s["s"].with_columns(pl.col("x").cast(dtype))
+        lf = pushdown_combine({"s": (src, {"x": FilterSpec()})}, combine)
+        assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect(), check_row_order=False)
+
+    def test_integral_float_without_float32_consumer_pushes_equality(self):
+        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
+
+        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {16777216.0}}, pl.Int64)
+        # Neither the integer next to the value nor nulls are kept.
+        assert pl.DataFrame({"x": [16777216, 16777217, None]}).filter(expr)["x"].to_list() == [16777216]
+
+    @pytest.mark.parametrize("pred", [pl.col("x") == 2.0**24, pl.col("x") == float(np.float32(0.1)), pl.col("x").is_in([2.0**24, -1.0])])
+    def test_float32_cast_of_float64_keeps_rounded_rows(self, pred):
+        # A Float64 value next to a Float32 value rounds to it under the cast.
+        src = pl.LazyFrame({"x": [2.0**24 + 1, 0.1, None]})
+        combine = lambda s: s["s"].with_columns(pl.col("x").cast(pl.Float32))
+        lf = pushdown_combine({"s": (src, {"x": FilterSpec()})}, combine)
+        assert_frame_equal(lf.filter(pred).collect(), combine({"s": src}).filter(pred).collect(), check_row_order=False)
+
+    def test_many_float32_values_push_one_membership(self):
+        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
+
+        values = {float(2**30 + 64 * i) for i in range(10_000)}
+        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": values}, pl.Int64, lambda: frozenset({"x"}))
+        assert len(str(expr)) < 1_000
+        rows = [2**30 + 64, 2**30 + 65, 2**30 + 64 * 10_000, 2**30 + 64 * 10_001, 5]
+        targets = {np.float32(v) for v in values}
+        assert pl.DataFrame({"x": rows}).filter(expr)["x"].to_list() == [x for x in rows if np.float32(x) in targets]
+
+    def test_non_numeric_source_does_not_resolve_float32_outputs(self):
+        from polars_io_tools.io_sources.pushdown_combine import _union_discrete_filter
+
+        def float32_outputs():
+            raise AssertionError("output schema resolved")
+
+        expr = _union_discrete_filter("x", [("x", FilterSpec())], {"x": {"a"}}, pl.String, float32_outputs)
+        assert pl.DataFrame({"x": ["a", "b"]}).filter(expr)["x"].to_list() == ["a"]
 
 
 @pytest.mark.parametrize(
