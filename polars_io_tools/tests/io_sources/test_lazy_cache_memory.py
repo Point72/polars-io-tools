@@ -767,3 +767,15 @@ def test_lossy_key_partitions_do_not_collide(dtype, start, step):
     lf = cache_memory(df.lazy(), schema=df.schema, partition_cols="k")
     for pred in [pl.col("k") == pl.lit(start + step).cast(dtype), pl.col("k") == pl.lit(start).cast(dtype), pl.col("v") > 0]:
         assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))
+
+
+@pytest.mark.parametrize("dtype", [pl.Datetime("ms"), pl.Duration("ms")])
+def test_millisecond_partitions_exclude_built_keys(dtype):
+    df = pl.DataFrame({"k": pl.Series([1_500, 2_500, 1_000, 2_000]).cast(dtype), "v": [1, 2, 3, 4]})
+
+    def gen(with_columns, predicate, n_rows, batch_size):
+        yield df if predicate is None else df.filter(predicate)
+
+    lf = cache_memory(register_io_source(io_source=gen, schema=df.schema), schema=df.schema, partition_cols="k")
+    for pred in [pl.col("k") == df["k"][0], pl.col("k").is_in(df["k"][:2].implode()), pl.lit(True)]:
+        assert_frame_equal(lf.filter(pred).collect().sort("v"), df.filter(pred))
