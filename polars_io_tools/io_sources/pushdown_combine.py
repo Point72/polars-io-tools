@@ -30,7 +30,9 @@ Example usage::
 
 from __future__ import annotations
 
+import functools
 import logging
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -147,11 +149,13 @@ class IntervalFilterSpec:
               - ``"right"`` (``(start, end]``): ``end >= lo`` and ``start <  hi``
               - ``"none"``  (``(start, end)``): ``end >  lo`` and ``start <  hi``
 
-        value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform the request
-            bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
-            values (e.g. a business-day offset applied to the request date). A callable is applied to
-            each finite bound; a dict maps finite bounds present in it and leaves absent bounds
-            unmapped (that bound's predicate is then not pushed). ``None`` passes bounds through.
+        value_mapping (dict[Any, Any] | Callable[[Any], Any] | timedelta | None): Transform the request
+            bounds before pushdown (e.g. a business-day offset). A ``timedelta`` shifts both bounds; for a
+            ``Date`` request a partial day is rounded outward to whole days, and a bound shifted out of range
+            is left unbounded. A dict or callable maps every day of a bounded ``Date`` request of at most
+            10,000 days, and the pushed range spans the mapped days. Open, ``Datetime`` or longer requests, a
+            dict missing a requested day, a day mapped to None, or a callable that raises push nothing for the
+            interval. ``None`` passes bounds through.
 
     Notes:
         The pushdown is **conservative** -- it may keep non-overlapping rows, but never drops an
@@ -162,14 +166,14 @@ class IntervalFilterSpec:
 
           - **Disjoint requests** (e.g. ``date in [Jan1..Jan5] OR [Feb1..Feb5]``) collapse to their
             outer hull ``[Jan1, Feb5]``, so windows overlapping only the gap survive the pushdown.
-          - **A dict ``value_mapping`` missing a bound** skips that side's predicate entirely, so that
-            side is left unconstrained.
+          - **A ``value_mapping``** pushes the range spanning the mapped days, which may also cover
+            windows that no single requested day needs.
     """
 
     start_col: str
     end_col: str
     closed: str = "both"
-    value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
+    value_mapping: dict[Any, Any] | Callable[[Any], Any] | timedelta | None = None
 
     def __post_init__(self) -> None:
         if self.closed not in _CLOSED_MODES:
@@ -216,6 +220,7 @@ def _union_discrete_filter(
     members: list[tuple[str, FilterSpec]],
     extracted_values: dict[str, set[Any] | None],
     dtype: pl.DataType,
+    float32_outputs: Callable[[], frozenset[str]] = frozenset,
 ) -> pl.Expr | None:
     """Build a single discrete predicate for the output columns mapped to ``source_col``.
 
@@ -233,8 +238,13 @@ def _union_discrete_filter(
 
     Otherwise returns a filter keeping rows whose ``source_col`` is in the union (a ``None`` value keeps null
     rows). Each member's values are mapped through that member's own ``spec.value_mapping`` before unioning.
+    Values requested through an output column in ``float32_outputs`` over another numeric source dtype are matched
+    against the source column cast to Float32.
     """
     union: dict[Any, Any] = {}
+    # Values requested through a Float32 output over another numeric source dtype, matched after the same cast.
+    cast_union: dict[Any, Any] = {}
+    casts = dtype.is_numeric() and dtype != pl.Float32
     for output_col, spec in members:
         discrete_values = extracted_values.get(output_col)
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
@@ -247,23 +257,62 @@ def _union_discrete_filter(
                 f"pushing nothing for source col '{source_col}' (will be applied after combine)"
             )
             return None
+        target = cast_union if casts and output_col in float32_outputs() else union
         for value in mapped_values:
-            union.setdefault(_value_key(value), value)
+            target.setdefault(_value_key(value), value)
 
     col = pl.col(source_col)
+    exprs = []
+    cast_expr = _float32_membership(col, list(cast_union.values()), dtype)
+    if cast_expr is None:
+        union.update(cast_union)
+    else:
+        exprs.append(cast_expr)
     # A value_mapping may map to None. Do not sort: the values may be unorderable (e.g. mixed types).
     non_null = [v for v in union.values() if v is not None]
-    if not non_null:
+    if not non_null and not exprs:
         return col.is_null()
+    keeps_null = len(non_null) < len(union) or any(v is None for v in cast_union.values())
     if len(non_null) == 1:
-        expr = col == non_null[0]
-    else:
+        exprs.append(col == non_null[0])
+    elif dtype.is_integer() and any(isinstance(v, float) for v in non_null):
+        # Polars 2 rejects an is_in of floats on an integer column.
+        exprs.append(pl.any_horizontal([col == v for v in non_null]))
+    elif non_null:
         if not _membership_supported(non_null, dtype):
             log.debug(f"Values for source col '{source_col}' cannot form a membership on {dtype}; pushing nothing")
             return None
-        expr = col.is_in(_is_in_collection(non_null, dtype))
+        exprs.append(col.is_in(_is_in_collection(non_null, dtype)))
+    expr = exprs[0].or_(*exprs[1:]) if exprs else pl.lit(False)
     # ``== None`` and ``is_in`` never match null rows.
-    return expr | col.is_null() if len(non_null) < len(union) else expr
+    return expr | col.is_null() if keeps_null else expr
+
+
+def _float32_membership(col: pl.Expr, values: list[Any], dtype: pl.DataType) -> pl.Expr | None:
+    """Rows of ``col`` whose Float32 cast is one of the numeric ``values``, or None if ``values`` are not all numbers.
+
+    Over an integer ``dtype`` the membership is also bounded by the integers that can round into its range, so a
+    source can prune by column statistics.
+    """
+    numbers = [v for v in values if v is not None]
+    if not numbers or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in numbers):
+        return None
+    try:
+        targets = pl.Series(numbers).cast(pl.Float32)
+    except Exception:  # noqa: BLE001 -- e.g. an integer too large for any Polars dtype
+        return None
+    expr = col.cast(pl.Float32).is_in(pl.lit(targets.implode()))
+    finite = [v for v in targets.to_list() if math.isfinite(v)]
+    if dtype.is_integer() and finite:
+        # An integer rounds to a Float32 within half a Float32 step of it.
+        lo, hi = min(finite), max(finite)
+        lo = math.floor(lo) - max(1, 2 ** (math.frexp(lo)[1] - 24))
+        hi = math.ceil(hi) + max(1, 2 ** (math.frexp(hi)[1] - 24))
+        dtype_lo, dtype_hi = pl.select(dtype.min().alias("lo"), dtype.max().alias("hi")).row(0)
+        lo, hi = max(lo, dtype_lo), min(hi, dtype_hi)
+        if lo <= hi:
+            expr = expr & col.is_between(lo, hi)
+    return expr
 
 
 def _value_key(value: Any) -> Any:
@@ -336,6 +385,23 @@ def _bound_expr(value: Any, source_col: str, source_dtype: pl.DataType, *, is_lo
     return expr if isinstance(expr, pl.Expr) else None
 
 
+def _shift_bound(bound: Any, shift: timedelta, overflow: Any) -> Any:
+    """``bound`` shifted by ``shift``, ``overflow`` if the result is out of range; infinite bounds are kept.
+
+    A ``date`` bound is shifted by whole days, rounding a partial day outward: down for a lower bound (``overflow`` is
+    ``-inf``), up for an upper bound.
+    """
+    if not isinstance(bound, date):
+        return bound
+    try:
+        if not isinstance(bound, datetime):
+            whole_days = shift // timedelta(days=1) if overflow == -portion.inf else -(-shift // timedelta(days=1))
+            shift = timedelta(days=whole_days)
+        return bound + shift
+    except OverflowError:
+        return overflow
+
+
 def _apply_interval_filter(
     filtered_lf: pl.LazyFrame,
     spec: IntervalFilterSpec,
@@ -345,10 +411,14 @@ def _apply_interval_filter(
     """Apply an interval-overlap filter to a source LazyFrame.
 
     Given the request range ``date_range`` extracted for the output column, push the overlap
-    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source, mapping the
-    request bounds through ``spec.value_mapping`` first. The overlap is fully determined per source
-    row, so the surviving rows are exactly the overlapping windows -- no post-combine membership
-    predicate is needed.
+    ``start_col <= hi AND end_col >= lo`` (adjusted for ``spec.closed``) onto the source. The overlap is
+    fully determined per source row, so the surviving rows are exactly the overlapping windows -- no
+    post-combine membership predicate is needed.
+
+    A ``timedelta`` ``spec.value_mapping`` shifts ``lo`` and ``hi``, by whole days rounded outward for
+    ``Date`` bounds. A dict or callable maps every day of a bounded ``Date`` request (see
+    ``_MAX_ENUMERATED_DAYS``) and ``lo``/``hi`` become the least and greatest mapped days; when the days
+    cannot be enumerated or one of them cannot be mapped, nothing is pushed.
     """
     if spec.start_col not in source_schema or spec.end_col not in source_schema:
         log.debug(f"Interval columns {spec.start_col!r}/{spec.end_col!r} not both in source, skipping interval pushdown")
@@ -359,12 +429,25 @@ def _apply_interval_filter(
 
     enclosure = date_range.enclosure
     lo, hi = enclosure.lower, enclosure.upper
+    mapping = spec.value_mapping
+    if isinstance(mapping, timedelta):
+        lo, hi, mapping = _shift_bound(lo, mapping, -portion.inf), _shift_bound(hi, mapping, portion.inf), None
+    elif mapping is not None:
+        # The mapping need not be monotone, so every requested day is mapped, not only the range ends.
+        # A day the mapping does not know (a missing dict key, a null result or an error) pushes nothing.
+        try:
+            mapped = [_map_bound(day, mapping) for day in _enumerate_days(date_range) or ()]
+            if not mapped or not all(ok and v is not None for v, ok in mapped):
+                return filtered_lf
+            lo, hi, mapping = min(v for v, _ in mapped), max(v for v, _ in mapped), None
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
+            return filtered_lf
 
     conditions: list[pl.Expr] = []
 
     # end_col >= lo  (drops expired/seed rows). Skipped for an unbounded lower request bound.
     if lo != -portion.inf:
-        lo_mapped, ok = _map_bound(lo, spec.value_mapping)
+        lo_mapped, ok = _map_bound(lo, mapping)
         if ok:
             expr = _bound_expr(lo_mapped, spec.end_col, source_schema[spec.end_col], is_lower=True, boundary=_CLOSED_TO_LEFT[spec.closed])
             if expr is not None:
@@ -372,7 +455,7 @@ def _apply_interval_filter(
 
     # start_col <= hi  (drops windows starting after the request). Skipped for an unbounded upper bound.
     if hi != portion.inf:
-        hi_mapped, ok = _map_bound(hi, spec.value_mapping)
+        hi_mapped, ok = _map_bound(hi, mapping)
         if ok:
             expr = _bound_expr(hi_mapped, spec.start_col, source_schema[spec.start_col], is_lower=False, boundary=_CLOSED_TO_RIGHT[spec.closed])
             if expr is not None:
@@ -850,6 +933,10 @@ def pushdown_combine(
         # need it.
         source_schemas: dict[str, dict[str, pl.DataType]] = {name: lf.collect_schema() for name, (lf, _) in sources.items()}
 
+        @functools.cache
+        def float32_outputs() -> frozenset[str]:
+            return frozenset(name for name, dtype in output_schema().items() if dtype == pl.Float32)
+
         # Apply transformed filters to each source
         # IMPORTANT: For temporal columns with lookback/lookahead, we apply the EXPANDED
         # filter here (e.g., date >= Jan 2 for a lookback of 3 days when user filters >= Jan 5).
@@ -967,7 +1054,7 @@ def pushdown_combine(
             for source_col, members in by_source_col.items():
                 # Output columns sharing a source column push the UNION of their value sets, or nothing if any
                 # sharer is unconstrained/unmappable (see _union_discrete_filter).
-                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col])
+                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col], float32_outputs)
                 if union_filter is not None:
                     filtered_lf = filtered_lf.filter(union_filter)
                     log.debug(f"Applied discrete filter to {source_name}.{source_col}: {union_filter}")

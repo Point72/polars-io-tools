@@ -1,3 +1,5 @@
+"""The enums of ``io_sources.enum``: mapping Polars dtypes to ``DataType`` and back, and ``TimeUnit``."""
+
 import polars as pl
 
 from polars_io_tools.io_sources.enum import DataType, TimeUnit

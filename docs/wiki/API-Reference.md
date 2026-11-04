@@ -416,6 +416,15 @@ IntervalFilterSpec(start_col, end_col, closed="both", value_mapping=None)
 Maps a filter on a request-date column onto a validity-interval source whose rows are valid
 over `[start_col, end_col]`. A range `[lo, hi]` pushes the overlap `start_col <= hi AND end_col >= lo` (adjusted for `closed`), remapping bounds with `value_mapping` first.
 
+`value_mapping` transforms the request bounds before pushdown (e.g. a business-day offset):
+
+- A `timedelta` shifts both bounds. For a `Date` request a partial day is rounded outward to
+  whole days, and a bound shifted out of range is left unbounded.
+- A dict or callable maps every day of a bounded `Date` request of at most 10,000 days, and the
+  pushed range spans the mapped days. Open, `Datetime` or longer requests, a dict missing a
+  requested day, a day mapped to `None`, or a callable that raises push nothing for the interval.
+- `None` passes the bounds through.
+
 ### `concat_named`
 
 ```python

@@ -1,44 +1,37 @@
-"""Pushdown matrix for regular ``pl.LazyFrame.join``.
-
-Asof joins are in ``test_join_asof.py``; the lookup-join lock-in is in
-``test_join_lookup.py``.
-"""
-
-from __future__ import annotations
+"""Filters and column selections after an equi-join of two sources."""
 
 import polars as pl
 import pytest
 
-from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.assertions import ExpectedPushdown
+from polars_io_tools.tests.helpers.cases import as_params
+from polars_io_tools.tests.pushdown.helpers import PushdownCase, check_pushdown
+
+KEYED_VALUES = pl.DataFrame({"key": [1, 2, 3], "value": [10, 20, 30]})
+JOINED = {"left": KEYED_VALUES, "right": pl.DataFrame({"key": [1, 2, 3], "other_value": [100, 200, 300], "unused": [1, 2, 3]})}
+
+ROWS = [
+    PushdownCase(
+        "join-inner_join_filter_on_key_pushed",
+        sources=JOINED,
+        pipeline=lambda frames: frames["left"].join(frames["right"], on="key").filter(pl.col("key") == 2),
+        expected_pushdown={"left": ExpectedPushdown(predicate=True), "right": ExpectedPushdown(predicate=True)},
+    ),
+    PushdownCase(
+        "join-right_join_filter_on_key_pushed",
+        sources=JOINED,
+        pipeline=lambda frames: frames["left"].join(frames["right"], on="key", how="right").filter(pl.col("key") == 2),
+        expected_pushdown={"left": ExpectedPushdown(predicate=True), "right": ExpectedPushdown(predicate=True)},
+    ),
+    PushdownCase(
+        "join-inner_join_projection_prunes_unused_right_cols",
+        sources=JOINED,
+        pipeline=lambda frames: frames["left"].join(frames["right"], on="key").select("key", "value", "other_value"),
+        expected_pushdown={"right": ExpectedPushdown(projection={"key", "other_value"})},
+    ),
+]
 
 
-@pytest.fixture
-def tracker_a() -> PredicateTracker:
-    return PredicateTracker(pl.DataFrame({"k": [1, 2, 3], "a": [10, 20, 30]}))
-
-
-@pytest.fixture
-def tracker_b() -> PredicateTracker:
-    return PredicateTracker(pl.DataFrame({"k": [1, 2, 3], "b": [100, 200, 300], "c": [1, 2, 3]}))
-
-
-def test_inner_join_filter_on_key_pushed(tracker_a: PredicateTracker, tracker_b: PredicateTracker):
-    """Baseline: an inner join filter on the join key is pushed to both sides."""
-    tracker_a.lazy_frame.join(tracker_b.lazy_frame, on="k").filter(pl.col("k") == 2).collect()
-    assert tracker_a.last_predicate is not None
-    assert tracker_b.last_predicate is not None
-
-
-def test_right_join_filter_on_key_pushed(tracker_a: PredicateTracker, tracker_b: PredicateTracker):
-    """Baseline: right joins also push the join-key filter to both sides."""
-    tracker_a.lazy_frame.join(tracker_b.lazy_frame, on="k", how="right").filter(pl.col("k") == 2).collect()
-    assert tracker_a.last_predicate is not None
-    assert tracker_b.last_predicate is not None
-
-
-def test_inner_join_projection_prunes_unused_right_cols(tracker_a: PredicateTracker, tracker_b: PredicateTracker):
-    """Baseline: selecting only ``[k, a, b]`` from the join lets polars drop
-    ``c`` from the right-side scan."""
-    tracker_a.lazy_frame.join(tracker_b.lazy_frame, on="k").select(["k", "a", "b"]).collect()
-    assert tracker_b.last_with_columns is not None
-    assert "c" not in tracker_b.last_with_columns
+@pytest.mark.parametrize("case", as_params(ROWS))
+def test_pushdown(case: PushdownCase):
+    check_pushdown(case)

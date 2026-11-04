@@ -1,64 +1,65 @@
-"""Pushdown matrix for ``pl.LazyFrame.join_asof``.
+"""Filters and expressions after ``join_asof``.
 
-Notable cases that are deliberately *NOT* tested as lock-ins because they
-are not unconditionally sound:
-
-* Pushing a filter on the ``on=`` key to the right side is unsound for
-  backward asof: a right row with ``t=2`` can still be the valid backward
-  match for a left row with ``t=5``. Filtering ``t >= 3`` on the right
-  drops valid match candidates.
-* Pushing a filter on a right-only column to the right side changes the
-  set of match candidates and is not equivalent to filtering after the
-  join.
+A ``by`` value either matches on both sides or is null after the join, so a filter on it reaches both sources. A
+filter on the ``on`` column reaches the left source only: removing right rows by it could change which right row a
+kept left row matches. A filter on a right-only column reaches neither source, for the same reason. An expression on
+a right-only column computed after the join stays after the join, although the right source could compute it. These
+hold on every Polars version the tests run on.
 """
-
-from __future__ import annotations
-
-import warnings
 
 import polars as pl
 import pytest
 
-from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.assertions import ExpectedPushdown
+from polars_io_tools.tests.helpers.cases import as_params
+from polars_io_tools.tests.pushdown.helpers import PushdownCase, check_pushdown
+
+ASOF = {
+    "left": pl.DataFrame({"time": [1, 2, 3, 4], "group": ["a", "a", "b", "b"], "left_value": [10, 20, 30, 40]}),
+    "right": pl.DataFrame({"time": [1, 2, 3, 4], "group": ["a", "a", "b", "b"], "right_value": [100, 200, 300, 400]}),
+}
 
 
-@pytest.fixture
-def tracker_a() -> PredicateTracker:
-    df = pl.DataFrame({"t": [1, 2, 3, 4], "g": ["a", "a", "b", "b"], "va": [10, 20, 30, 40]}).sort("t")
-    return PredicateTracker(df)
+def _join_asof_by_group(frames):
+    return frames["left"].join_asof(frames["right"], on="time", by="group")
 
 
-@pytest.fixture
-def tracker_b() -> PredicateTracker:
-    df = pl.DataFrame({"t": [1, 2, 3, 4], "g": ["a", "a", "b", "b"], "vb": [100, 200, 300, 400]}).sort("t")
-    return PredicateTracker(df)
+# With ``by`` groups Polars cannot check that ``on`` is sorted and warns; the data here is sorted, so the warning is noise.
+ignore_unsorted_columns_warning = pytest.mark.filterwarnings("ignore:Sortedness of columns cannot be checked")
+
+ROWS = [
+    PushdownCase(
+        "join_asof-filter_on_by_column_pushed",
+        sources=ASOF,
+        pipeline=lambda frames: _join_asof_by_group(frames).filter(pl.col("group") == "a"),
+        expected_pushdown={"left": ExpectedPushdown(predicate=True), "right": ExpectedPushdown(predicate=True)},
+        marks=(ignore_unsorted_columns_warning,),
+    ),
+    PushdownCase(
+        "join_asof-filter_on_on_column_reaches_left_only",
+        sources=ASOF,
+        pipeline=lambda frames: _join_asof_by_group(frames).filter(pl.col("time") >= 3),
+        expected_pushdown={"left": ExpectedPushdown(predicate=True), "right": ExpectedPushdown(predicate=False)},
+        marks=(ignore_unsorted_columns_warning,),
+    ),
+    PushdownCase(
+        "join_asof-filter_on_right_only_column_not_pushed",
+        sources=ASOF,
+        pipeline=lambda frames: _join_asof_by_group(frames).filter(pl.col("right_value") > 150),
+        expected_pushdown={"left": ExpectedPushdown(predicate=False), "right": ExpectedPushdown(predicate=False)},
+        marks=(ignore_unsorted_columns_warning,),
+    ),
+    # ``right_value + 1`` works row by row and keeps nulls, so the right source could compute it (polars#25867).
+    PushdownCase(
+        "join_asof-post_join_elementwise_expr_on_right_col_NOT_moved_into_right_scan",
+        sources=ASOF,
+        pipeline=lambda frames: _join_asof_by_group(frames).with_columns((pl.col("right_value") + 1).alias("right_value_plus_one")),
+        result_check=lambda _, trackers: "right_value_plus_one" not in (trackers["right"].last_with_columns or []),
+        marks=(pytest.mark.gap, ignore_unsorted_columns_warning),
+    ),
+]
 
 
-def test_filter_on_by_column_pushed(tracker_a: PredicateTracker, tracker_b: PredicateTracker):
-    """Baseline: filter on the ``by=`` column is pushed to both sides — a
-    ``by`` value either matches in both sides or yields a null in the join
-    output, so restricting it pre-join is equivalent."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        tracker_a.lazy_frame.join_asof(tracker_b.lazy_frame, on="t", by="g").filter(pl.col("g") == "a").collect()
-    assert tracker_a.last_predicate is not None
-    assert tracker_b.last_predicate is not None
-
-
-@pytest.mark.gap
-def test_post_join_elementwise_expr_on_right_col_NOT_moved_into_right_scan(tracker_a: PredicateTracker, tracker_b: PredicateTracker):
-    """Lock-in: a post-join column-wise pure expression on a right-only
-    column (e.g. ``(col("vb") + 1).alias(...)``) could be moved into the
-    right-side scan as a ``with_columns`` — the asof join only inspects
-    the ``on=`` and ``by=`` columns, and the expression is null-preserving
-    and row-local. Polars does not perform this rewrite.
-
-    See https://github.com/pola-rs/polars/issues/25867. Soundness caveat:
-    only applies to null-preserving column-wise pure expressions.
-    """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        tracker_a.lazy_frame.join_asof(tracker_b.lazy_frame, on="t", by="g").with_columns((pl.col("vb") + 1).alias("vb1")).collect()
-    assert tracker_b.last_with_columns is None or "vb1" not in (tracker_b.last_with_columns or []), (
-        f"unexpectedly moved into right scan: {tracker_b.last_with_columns!r}"
-    )
+@pytest.mark.parametrize("case", as_params(ROWS))
+def test_pushdown(case: PushdownCase):
+    check_pushdown(case)

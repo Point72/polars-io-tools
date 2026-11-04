@@ -47,19 +47,19 @@ def _pushed_down_sql(caplog) -> list[str]:
 
 
 @pytest.fixture(scope="module")
-def ch_params(clickhouse_url, clickhouse_user, clickhouse_password):
+def clickhouse_url_and_params(clickhouse_url, clickhouse_user, clickhouse_password):
     """Return (url, params) tuple for scan_clickhouse calls."""
     return clickhouse_url, {"user": clickhouse_user, "password": clickhouse_password}
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _seed_tables(ch_params):
+def _seed_tables(clickhouse_url_and_params):
     """Create and populate quote_bar_10m and trade_bar_5m, then drop the database.
 
     Everything lives in a dedicated database so the tests never touch tables in the
     caller's default database. The database is recreated fresh for idempotent reruns.
     """
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     _clickhouse_command(f"DROP DATABASE IF EXISTS {TEST_DB}", url, params)
     _clickhouse_command(f"CREATE DATABASE {TEST_DB}", url, params)
 
@@ -157,9 +157,9 @@ def _seed_tables(ch_params):
         pass
 
 
-def test_basic_query(ch_params):
+def test_basic_query(clickhouse_url_and_params):
     """Test that a basic query returns a non-empty DataFrame with expected columns."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT active, instrument, run_session_id, bar_start_time, avg_mid
     FROM {QUOTE_BAR_TABLE}
@@ -171,9 +171,9 @@ def test_basic_query(ch_params):
     assert result.columns == ["active", "instrument", "run_session_id", "bar_start_time", "avg_mid"]
 
 
-def test_column_selection(ch_params):
+def test_column_selection(clickhouse_url_and_params):
     """Test that selecting a subset of columns via Polars .select() works."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT *
     FROM {QUOTE_BAR_TABLE}
@@ -186,9 +186,9 @@ def test_column_selection(ch_params):
     assert result.shape[0] > 0
 
 
-def test_filter_equality(ch_params):
+def test_filter_equality(clickhouse_url_and_params):
     """Test that SQL WHERE and Polars filter on equality produce equivalent results."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
 
     # Approach 1: Filter in ClickHouse SQL
     sql_with_where = f"""
@@ -218,9 +218,9 @@ def test_filter_equality(ch_params):
     assert_frame_equal(result_sql.sort(sort_cols), result_polars.sort(sort_cols))
 
 
-def test_filter_comparison(ch_params):
+def test_filter_comparison(clickhouse_url_and_params):
     """Test that SQL WHERE and Polars filter on comparison produce equivalent results."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
 
     # Approach 1: Filter in ClickHouse SQL
     sql_with_where = f"""
@@ -250,9 +250,9 @@ def test_filter_comparison(ch_params):
     assert_frame_equal(result_sql.sort(sort_cols), result_polars.sort(sort_cols))
 
 
-def test_filter_and(ch_params):
+def test_filter_and(clickhouse_url_and_params):
     """Test that SQL WHERE with AND and Polars filter produce equivalent results."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     select_cols = ["instrument", "run_session_id", "avg_mid"]
 
     # Approach 1: Filter in ClickHouse SQL
@@ -284,9 +284,9 @@ def test_filter_and(ch_params):
     assert_frame_equal(result_sql.sort(select_cols), result_polars.sort(select_cols))
 
 
-def test_filter_in_operator(ch_params):
+def test_filter_in_operator(clickhouse_url_and_params):
     """Test that SQL WHERE IN and Polars is_in filter produce equivalent results."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
 
     # First get some instrument values to use in IN clause
     sql_distinct = f"""
@@ -330,9 +330,9 @@ def test_filter_in_operator(ch_params):
     assert_frame_equal(result_sql.sort(select_cols), result_polars.sort(select_cols))
 
 
-def test_filter_not_null(ch_params):
+def test_filter_not_null(clickhouse_url_and_params):
     """Test IS NOT NULL filter."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT instrument, avg_mid, avg_spr
     FROM {QUOTE_BAR_TABLE}
@@ -344,9 +344,9 @@ def test_filter_not_null(ch_params):
     assert result["avg_mid"].null_count() == 0
 
 
-def test_complex_filter(ch_params):
+def test_complex_filter(clickhouse_url_and_params):
     """Test that complex SQL WHERE and Polars filter produce equivalent results."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     select_cols = ["instrument", "run_session_id", "avg_mid", "avg_spr", "count_mid_changes"]
 
     # Approach 1: Filter in ClickHouse SQL
@@ -385,9 +385,9 @@ def test_complex_filter(ch_params):
     assert_frame_equal(result_sql.sort(select_cols), result_polars.sort(select_cols))
 
 
-def test_empty_result(ch_params):
+def test_empty_result(clickhouse_url_and_params):
     """Test that a query returning no rows produces an empty DataFrame with correct schema."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     # Use a filter that should match nothing
     sql_query = f"""
     SELECT instrument, avg_mid, bar_start_time
@@ -400,9 +400,9 @@ def test_empty_result(ch_params):
     assert result.columns == ["instrument", "avg_mid", "bar_start_time"]
 
 
-def test_head_pushdown(ch_params):
+def test_head_pushdown(clickhouse_url_and_params):
     """Test that .head() pushes down a LIMIT to ClickHouse."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT instrument, avg_mid, bar_start_time
     FROM {QUOTE_BAR_TABLE}
@@ -412,9 +412,9 @@ def test_head_pushdown(ch_params):
     assert result.shape[0] == 3
 
 
-def test_head_pushdown_with_log(ch_params, caplog):
+def test_head_pushdown_with_log(clickhouse_url_and_params, caplog):
     """Test that head pushdown is reflected in the executed SQL."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     caplog.set_level(logging.DEBUG)
     sql_query = f"""
     SELECT instrument, avg_mid
@@ -426,9 +426,9 @@ def test_head_pushdown_with_log(ch_params, caplog):
     assert any("Executing SQL with pushdown" in record.message and "LIMIT" in record.message for record in caplog.records)
 
 
-def test_select_star_quote_bar(ch_params):
+def test_select_star_quote_bar(clickhouse_url_and_params):
     """Test SELECT * returns all columns for quote_bar_10m."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT *
     FROM {QUOTE_BAR_TABLE}
@@ -451,9 +451,9 @@ def test_select_star_quote_bar(ch_params):
     assert result.shape[0] > 0
 
 
-def test_nonexistent_column(ch_params):
+def test_nonexistent_column(clickhouse_url_and_params):
     """Test that querying a nonexistent column raises an error."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT does_not_exist
     FROM {QUOTE_BAR_TABLE}
@@ -463,9 +463,9 @@ def test_nonexistent_column(ch_params):
         cpl.scan_clickhouse(sql_query, url, params).collect()
 
 
-def test_alias_with_filter(ch_params):
+def test_alias_with_filter(clickhouse_url_and_params):
     """Test that column aliases work correctly with filters."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT
         instrument AS inst,
@@ -482,9 +482,9 @@ def test_alias_with_filter(ch_params):
     assert (result["mid_price"] > 0).all()
 
 
-def test_join(ch_params):
+def test_join(clickhouse_url_and_params):
     """Test a SQL JOIN between quote_bar_10m and trade_bar_5m."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT
         q.instrument AS q_instrument,
@@ -517,9 +517,9 @@ def test_join(ch_params):
     assert result.columns == expected_cols
 
 
-def test_join_with_filter(ch_params):
+def test_join_with_filter(clickhouse_url_and_params):
     """Test that SQL WHERE and Polars filter on a JOIN produce equivalent results."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     select_cols = ["instrument", "run_session_id", "avg_mid", "avg_price", "volume"]
 
     # Approach 1: Filter in ClickHouse SQL
@@ -567,9 +567,9 @@ def test_join_with_filter(ch_params):
     assert_frame_equal(result_sql.sort(select_cols), result_polars.sort(select_cols))
 
 
-def test_join_select_columns(ch_params):
+def test_join_select_columns(clickhouse_url_and_params):
     """Test a JOIN query with Polars-side column selection."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     sql_query = f"""
     SELECT
         q.instrument AS q_instrument,
@@ -590,9 +590,9 @@ def test_join_select_columns(ch_params):
     assert result.columns == cols
 
 
-def test_column_pushdown_logged(ch_params, caplog):
+def test_column_pushdown_logged(clickhouse_url_and_params, caplog):
     """Verify that column selection pushdown appears in debug logs."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     caplog.set_level(logging.DEBUG)
 
     sql_query = f"""
@@ -608,9 +608,9 @@ def test_column_pushdown_logged(ch_params, caplog):
     )
 
 
-def test_predicate_pushdown_logged(ch_params, caplog):
+def test_predicate_pushdown_logged(clickhouse_url_and_params, caplog):
     """Verify that predicate pushdown appears in debug logs."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     caplog.set_level(logging.DEBUG)
 
     sql_query = f"""
@@ -628,20 +628,20 @@ def test_predicate_pushdown_logged(ch_params, caplog):
     assert any("WHERE" in sql.upper() and "active" in sql.lower() for sql in pushed)
 
 
-def test_filter_timezone_aware_datetime(ch_params):
+def test_filter_timezone_aware_datetime(clickhouse_url_and_params):
     """A timezone-aware datetime filter on a DateTime64(_, 'UTC') column pushes down and works.
 
     The reader previously emitted an offset-bearing string that ClickHouse rejects (HTTP 400);
     it must now round-trip and return the expected rows.
     """
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     base = f"SELECT instrument, event_time FROM {RAW_QUOTES_TABLE}"
     result = cpl.scan_clickhouse(base, url, params).filter(pl.col("event_time") >= datetime(2024, 1, 16, tzinfo=UTC)).collect()
 
     assert result["instrument"].to_list() == ["BBB"]
 
 
-def test_filter_nanosecond_precision_not_truncated(ch_params, caplog):
+def test_filter_nanosecond_precision_not_truncated(clickhouse_url_and_params, caplog):
     """A microsecond-precision filter on a DateTime64(9) column keeps sub-microsecond rows.
 
     Equality against a nanosecond column matches the whole microsecond bucket, so both the
@@ -649,7 +649,7 @@ def test_filter_nanosecond_precision_not_truncated(ch_params, caplog):
     microseconds, ClickHouse would drop the ``.123456789`` row before the client-side filter,
     so returning both rows proves the nanosecond bounds survive pushdown.
     """
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     caplog.set_level(logging.DEBUG)
 
     base = f"SELECT instrument, event_time, bid FROM {RAW_QUOTES_TABLE}"

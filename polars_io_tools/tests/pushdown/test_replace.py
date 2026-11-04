@@ -1,51 +1,41 @@
-"""Pushdown matrix for ``pl.Expr.replace_strict`` (native value mapping).
+"""Filters after ``replace_strict``, on the column it makes and on the column it reads.
 
-A filter on the column produced by ``replace_strict`` could be rewritten
-as ``source_col.is_in([keys mapping to the filtered output])`` on the
-source scan: ``replace_strict`` is a deterministic value-by-value mapping
-expressed as a literal dict, and (unlike non-strict ``replace``) every
-source value is guaranteed to be a mapping key — no pass-through case
-complicates the inverse derivation.
-
-Polars 1.40.1 does not perform this rewrite. No exact upstream issue
-tracks this case as of the validation date; it is one shape of the
-broader "derive a source-side filter from a downstream filter on a
-deterministically-computed column" idea, umbrella-tracked in
-https://github.com/pola-rs/polars/issues/23345.
-
-The non-strict ``replace`` variant is intentionally NOT a lock-in here:
-the naive inverse ``source.is_in(mapped_keys)`` is unsound when a source
-value happens to equal one of the mapping's *output* values, because that
-value passes through ``replace`` unchanged and would satisfy the filter
-without appearing in ``mapped_keys``. A correct rewrite for non-strict
-``replace`` requires a more complex predicate.
+``replace_strict`` maps every source value through a literal dict, so a filter on its output could become an ``is_in``
+on the source (polars#23345). Non-strict ``replace`` passes unmapped values through and has no such simple inverse, so
+it is not tested.
 """
-
-from __future__ import annotations
 
 import polars as pl
 import pytest
 
-from polars_io_tools.testing import PredicateTracker
+from polars_io_tools.tests.helpers.assertions import ExpectedPushdown
+from polars_io_tools.tests.helpers.cases import as_params
+from polars_io_tools.tests.pushdown.helpers import PushdownCase, check_pushdown
 
-_MAPPING = {"A": "X", "B": "X", "C": "Y", "D": "Y"}
+MODELS = {"table": pl.DataFrame({"model": ["A", "B", "C", "D"], "value": [1, 2, 3, 4]})}
+FAMILY_OF_MODEL = {"A": "X", "B": "X", "C": "Y", "D": "Y"}
+
+ROWS = [
+    PushdownCase(
+        "replace-replace_strict_filter_on_derived_col_NOT_pushed",
+        sources=MODELS,
+        pipeline=lambda frames: (
+            frames["table"].with_columns(pl.col("model").replace_strict(FAMILY_OF_MODEL).alias("family")).filter(pl.col("family") == "X")
+        ),
+        expected_pushdown={"table": ExpectedPushdown(predicate=False)},
+        marks=(pytest.mark.gap,),
+    ),
+    PushdownCase(
+        "replace-filter_on_source_col_after_replace_strict_pushed",
+        sources=MODELS,
+        pipeline=lambda frames: (
+            frames["table"].with_columns(pl.col("model").replace_strict(FAMILY_OF_MODEL).alias("family")).filter(pl.col("model") == "B")
+        ),
+        expected_pushdown={"table": ExpectedPushdown(predicate=True)},
+    ),
+]
 
 
-@pytest.fixture
-def tracker() -> PredicateTracker:
-    return PredicateTracker(pl.DataFrame({"model": ["A", "B", "C", "D"], "val": [1, 2, 3, 4]}))
-
-
-@pytest.mark.gap
-def test_replace_strict_filter_on_derived_col_NOT_pushed(tracker: PredicateTracker):
-    """Lock-in: ``with_columns(col.replace_strict({...})).filter(derived == "X")``
-    is not rewritten as ``model.is_in(["A", "B"])`` on the source."""
-    tracker.lazy_frame.with_columns(pl.col("model").replace_strict(_MAPPING).alias("family")).filter(pl.col("family") == "X").collect()
-    assert tracker.last_predicate is None, f"unexpectedly pushed: {tracker.last_predicate!r}"
-
-
-def test_filter_on_source_col_after_replace_strict_pushed(tracker: PredicateTracker):
-    """Baseline: a filter on the *source* column (passed straight through
-    ``replace_strict`` without going via the derived column) is pushed."""
-    tracker.lazy_frame.with_columns(pl.col("model").replace_strict(_MAPPING).alias("family")).filter(pl.col("model") == "B").collect()
-    assert tracker.last_predicate is not None
+@pytest.mark.parametrize("case", as_params(ROWS))
+def test_pushdown(case: PushdownCase):
+    check_pushdown(case)

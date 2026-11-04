@@ -1,4 +1,11 @@
-from datetime import date
+"""sink_clickhouse, with the HTTP insert replaced by an insert into an in-memory DuckDB.
+
+Two tables: a write -> the table's contents; a column dtype -> the dtype and values ClickHouse receives.
+"""
+
+from collections.abc import Callable
+from dataclasses import KW_ONLY, dataclass
+from datetime import date, time
 
 import duckdb
 import polars as pl
@@ -8,279 +15,130 @@ from polars.testing import assert_frame_equal
 
 import polars_io_tools as cpl
 from polars_io_tools.io_sources import lazy_clickhouse_writer
+from polars_io_tools.tests.helpers.cases import UNSORTED_ENUM, as_params
 
-"""
-This module contains tests for the lazy ClickHouse writer (sink_clickhouse).
-We mock _write_arrow_to_clickhouse and _clickhouse_command to execute writes
-against an in-memory DuckDB database, similar to the reader tests.
-"""
+URL = "http://localhost:8123"
 
-
-def get_employee_df() -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "id": [1, 2, 3, 4, 5],
-            "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
-            "score": [85.4, 92.1, 78.3, 90.5, 87.9],
-            "passed": [True, True, False, True, True],
-            "test_date": [
-                date(2022, 1, 1),
-                date(2022, 1, 2),
-                date(2022, 1, 3),
-                date(2022, 1, 4),
-                date(2022, 1, 5),
-            ],
-        }
-    )
-
-
-_duckdb_conn: duckdb.DuckDBPyConnection | None = None
+EMPLOYEES = pl.DataFrame(
+    {
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
+        "score": [85.4, 92.1, 78.3, 90.5, 87.9],
+        "passed": [True, True, False, True, True],
+        "test_date": [date(2022, 1, d) for d in range(1, 6)],
+    }
+)
 
 
 @pytest.fixture(scope="module")
 def duckdb_connection():
-    """Create a DuckDB connection once per test module."""
-    global _duckdb_conn
     conn = duckdb.connect(database=":memory:")
-    _duckdb_conn = conn
     yield conn
     conn.close()
-    _duckdb_conn = None
 
 
 @pytest.fixture(autouse=True)
-def reset_state(duckdb_connection):
-    """Isolate each test via DuckDB transactions."""
+def read_table(monkeypatch, duckdb_connection):
+    """Route writes to DuckDB inside a transaction; return a reader of a written table."""
+
+    def write(table: str, arrow_table: pa.Table, url: str, params: dict) -> None:
+        duckdb_connection.execute(f"CREATE TABLE IF NOT EXISTS {table} AS SELECT * FROM arrow_table WHERE 1=0")
+        duckdb_connection.execute(f"INSERT INTO {table} SELECT * FROM arrow_table")
+
+    monkeypatch.setattr(lazy_clickhouse_writer, "_write_arrow_to_clickhouse", write)
     duckdb_connection.execute("BEGIN TRANSACTION")
-    yield
+    yield lambda table: pl.DataFrame(duckdb_connection.sql(f"SELECT * FROM {table}").to_arrow_table())
     duckdb_connection.execute("ROLLBACK")
 
 
-def fake_write_arrow_to_clickhouse(table: str, arrow_table: pa.Table, url: str, params: dict) -> None:
-    """Mock _write_arrow_to_clickhouse: insert Arrow data into DuckDB."""
-    global _duckdb_conn
+@dataclass(frozen=True)
+class ClickhouseWriteCase:
+    """A way to write the employee frame, and what the table holds afterwards."""
 
-    # Create DuckDB table from Arrow if it doesn't exist yet
-    _duckdb_conn.execute(f"CREATE TABLE IF NOT EXISTS {table} AS SELECT * FROM arrow_table WHERE 1=0")
-
-    _duckdb_conn.execute(f"INSERT INTO {table} SELECT * FROM arrow_table")
-
-
-@pytest.fixture(autouse=True)
-def patch_writer(monkeypatch, duckdb_connection):
-    """Monkeypatch the writer's HTTP functions to use DuckDB."""
-    monkeypatch.setattr(
-        lazy_clickhouse_writer,
-        "_write_arrow_to_clickhouse",
-        fake_write_arrow_to_clickhouse,
-    )
+    id: str
+    _: KW_ONLY
+    # receives the employee frame and writes it
+    write: Callable[[pl.LazyFrame], object]
+    expected: pl.DataFrame
 
 
-def read_duckdb_table(table: str) -> pl.DataFrame:
-    global _duckdb_conn
-    arrow_table = _duckdb_conn.sql(f"SELECT * FROM {table}").to_arrow_table()
-    return pl.DataFrame(arrow_table)
+WRITES = [
+    ClickhouseWriteCase("basic_write", write=lambda lf: cpl.sink_clickhouse(lf, "t", URL, {}), expected=EMPLOYEES),
+    ClickhouseWriteCase("write_empty_dataframe", write=lambda lf: cpl.sink_clickhouse(lf.head(0), "t", URL, {}), expected=EMPLOYEES.head(0)),
+    ClickhouseWriteCase(
+        "write_twice_appends", write=lambda lf: [cpl.sink_clickhouse(lf, "t", URL, {}) for _ in range(2)], expected=pl.concat([EMPLOYEES, EMPLOYEES])
+    ),
+    ClickhouseWriteCase("write_with_batching", write=lambda lf: cpl.sink_clickhouse(lf, "t", URL, {}, chunk_size=2), expected=EMPLOYEES),
+    ClickhouseWriteCase("piot_sink_clickhouse", write=lambda lf: lf.piot.sink_clickhouse("t", URL, {}), expected=EMPLOYEES),
+]
 
 
-FAKE_URL = "http://localhost:8123"
-FAKE_PARAMS = {}
+@pytest.mark.parametrize("case", as_params(WRITES))
+def test_write(read_table, case: ClickhouseWriteCase):
+    case.write(EMPLOYEES.lazy())
+    assert_frame_equal(read_table("t"), case.expected, check_row_order=False)
 
 
-class TestBasicWrite:
-    def test_basic_write(self):
-        """Write a LazyFrame and verify the data lands in DuckDB."""
-        df = get_employee_df()
-
-        cpl.sink_clickhouse(df.lazy(), "test_basic", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_basic")
-        assert_frame_equal(result, df)
-
-    def test_write_empty_dataframe(self):
-        """Writing zero rows should succeed without error."""
-        df = get_employee_df().head(0)
-
-        cpl.sink_clickhouse(df.lazy(), "test_empty", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_empty")
-        assert result.height == 0
-
-    def test_write_various_dtypes(self):
-        """Write a DataFrame with Int64, Float64, String, Boolean, Date columns."""
-        df = get_employee_df()
-
-        cpl.sink_clickhouse(df.lazy(), "test_dtypes", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_dtypes")
-        assert result.height == 5
-        assert set(result.columns) == {"id", "name", "score", "passed", "test_date"}
-
-    def test_write_twice_appends(self):
-        """Writing twice to the same table appends rows."""
-        df = get_employee_df()
-
-        cpl.sink_clickhouse(df.lazy(), "test_append", FAKE_URL, FAKE_PARAMS)
-        cpl.sink_clickhouse(df.lazy(), "test_append", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_append")
-        assert result.height == 10
+def _series(values, dtype):
+    return pl.Series(values, dtype=dtype)
 
 
-class TestBatching:
-    def test_write_with_batching(self):
-        """Write with chunk_size=2 and verify all rows arrive."""
-        df = get_employee_df()
+@dataclass(frozen=True)
+class ClickhouseDtypeCase:
+    """A column, and the column ClickHouse receives when it is written."""
 
-        cpl.sink_clickhouse(
-            df.lazy(),
-            "test_batched",
-            FAKE_URL,
-            FAKE_PARAMS,
-            chunk_size=2,
-        )
-
-        result = read_duckdb_table("test_batched")
-        assert_frame_equal(result.sort("id"), df.sort("id"))
+    id: str
+    _: KW_ONLY
+    series: pl.Series
+    # None: the column is received unchanged
+    expected: pl.Series | None
 
 
-class TestTypeCasting:
-    """Verify that _prepare_for_clickhouse casts types correctly before writing."""
-
-    def test_passthrough_types(self):
-        """Types that ClickHouse supports natively should pass through unchanged."""
-        df = pl.DataFrame(
-            {
-                "col_bool": pl.Series([True, False], dtype=pl.Boolean),
-                "col_i8": pl.Series([1, 2], dtype=pl.Int8),
-                "col_i16": pl.Series([1, 2], dtype=pl.Int16),
-                "col_i32": pl.Series([1, 2], dtype=pl.Int32),
-                "col_i64": pl.Series([1, 2], dtype=pl.Int64),
-                "col_u8": pl.Series([1, 2], dtype=pl.UInt8),
-                "col_u16": pl.Series([1, 2], dtype=pl.UInt16),
-                "col_u32": pl.Series([1, 2], dtype=pl.UInt32),
-                "col_u64": pl.Series([1, 2], dtype=pl.UInt64),
-                "col_f32": pl.Series([1.0, 2.0], dtype=pl.Float32),
-                "col_f64": pl.Series([1.0, 2.0], dtype=pl.Float64),
-                "col_str": pl.Series(["a", "b"], dtype=pl.String),
-                "col_date": pl.Series([date(2024, 1, 1), date(2024, 6, 15)], dtype=pl.Date),
-                "col_dt_us": pl.Series([1_000_000, 2_000_000], dtype=pl.Datetime("us")),
-                "col_dt_ns": pl.Series([1_000_000, 2_000_000], dtype=pl.Datetime("ns")),
-                "col_dt_ms": pl.Series([1_000, 2_000], dtype=pl.Datetime("ms")),
-            }
-        )
-        cpl.sink_clickhouse(df.lazy(), "test_passthrough", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_passthrough")
-        assert result.height == 2
-        # All passthrough types should keep their original schema
-        for col in df.columns:
-            assert result[col].dtype == df[col].dtype, f"Column {col}: expected {df[col].dtype}, got {result[col].dtype}"
-
-    def test_duration_cast_to_int64(self):
-        """Duration columns should be cast to Int64 (raw tick count)."""
-        df = pl.DataFrame(
-            {
-                "id": [1, 2],
-                "dur_us": pl.Series([1_000_000, 2_000_000], dtype=pl.Duration("us")),
-                "dur_ns": pl.Series([1_000_000_000, 2_000_000_000], dtype=pl.Duration("ns")),
-                "dur_ms": pl.Series([1_000, 2_000], dtype=pl.Duration("ms")),
-            }
-        )
-        cpl.sink_clickhouse(df.lazy(), "test_duration", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_duration")
-        assert result["dur_us"].dtype == pl.Int64
-        assert result["dur_ns"].dtype == pl.Int64
-        assert result["dur_ms"].dtype == pl.Int64
-        # Values should be the raw tick counts
-        assert result["dur_us"].to_list() == [1_000_000, 2_000_000]
-        assert result["dur_ns"].to_list() == [1_000_000_000, 2_000_000_000]
-        assert result["dur_ms"].to_list() == [1_000, 2_000]
-
-    def test_time_cast_to_int64(self):
-        """Time columns should be cast to Int64 (nanoseconds since midnight)."""
-        from datetime import time
-
-        df = pl.DataFrame(
-            {
-                "id": [1, 2],
-                "t": pl.Series([time(12, 0, 0), time(23, 59, 59)], dtype=pl.Time),
-            }
-        )
-        cpl.sink_clickhouse(df.lazy(), "test_time", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_time")
-        assert result["t"].dtype == pl.Int64
-        # 12:00:00 = 12 * 3600 * 1e9 ns
-        assert result["t"][0] == 12 * 3600 * 1_000_000_000
-
-    def test_categorical_cast_to_string(self):
-        """Categorical columns should be cast to String."""
-        df = pl.DataFrame(
-            {
-                "id": [1, 2, 3],
-                "cat": pl.Series(["a", "b", "a"], dtype=pl.Categorical),
-            }
-        )
-        cpl.sink_clickhouse(df.lazy(), "test_categorical", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_categorical")
-        assert result["cat"].dtype == pl.String
-        assert result["cat"].to_list() == ["a", "b", "a"]
-
-    def test_enum_cast_to_string(self):
-        """Enum columns should be cast to String."""
-        df = pl.DataFrame(
-            {
-                "id": [1, 2, 3],
-                "color": pl.Series(
-                    ["red", "green", "blue"],
-                    dtype=pl.Enum(["red", "green", "blue"]),
-                ),
-            }
-        )
-        cpl.sink_clickhouse(df.lazy(), "test_enum", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_enum")
-        assert result["color"].dtype == pl.String
-        assert result["color"].to_list() == ["red", "green", "blue"]
-
-    def test_all_cast_types_together(self):
-        """Verify a DataFrame mixing passthrough and cast types writes correctly."""
-        from datetime import time
-
-        df = pl.DataFrame(
-            {
-                "id": pl.Series([1, 2], dtype=pl.Int64),
-                "name": pl.Series(["x", "y"], dtype=pl.String),
-                "dur": pl.Series([100, 200], dtype=pl.Duration("us")),
-                "t": pl.Series([time(1, 0), time(2, 0)], dtype=pl.Time),
-                "cat": pl.Series(["a", "b"], dtype=pl.Categorical),
-            }
-        )
-        cpl.sink_clickhouse(df.lazy(), "test_mixed", FAKE_URL, FAKE_PARAMS)
-
-        result = read_duckdb_table("test_mixed")
-        assert result.height == 2
-        # Passthrough columns keep dtype
-        assert result["id"].dtype == pl.Int64
-        assert result["name"].dtype == pl.String
-        # Cast columns become Int64 or String
-        assert result["dur"].dtype == pl.Int64
-        assert result["t"].dtype == pl.Int64
-        assert result["cat"].dtype == pl.String
-        # Values preserved
-        assert result["id"].to_list() == [1, 2]
-        assert result["dur"].to_list() == [100, 200]
-        assert result["cat"].to_list() == ["a", "b"]
+# dtype -> what reaches ClickHouse: dtypes it supports pass through; durations and times become their Int64 ticks
+# (time: nanoseconds since midnight); categoricals and enums become strings.
+DTYPES = [
+    *[
+        ClickhouseDtypeCase(f"passthrough_types-{dtype}", series=_series(values, dtype), expected=None)
+        for dtype, values in [
+            (pl.Boolean, [True, False]),
+            *[(t, [1, 2]) for t in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)],
+            (pl.Float32, [1.0, 2.0]),
+            (pl.Float64, [1.0, 2.0]),
+            (pl.String, ["a", "b"]),
+            (pl.Date, [date(2024, 1, 1), date(2024, 6, 15)]),
+            (pl.Datetime("us"), [1_000_000, 2_000_000]),
+            (pl.Datetime("ns"), [1_000_000, 2_000_000]),
+            (pl.Datetime("ms"), [1_000, 2_000]),
+        ]
+    ],
+    ClickhouseDtypeCase(
+        "duration_cast_to_int64-us", series=_series([1_000_000, 2_000_000], pl.Duration("us")), expected=_series([1_000_000, 2_000_000], pl.Int64)
+    ),
+    ClickhouseDtypeCase(
+        "duration_cast_to_int64-ns",
+        series=_series([1_000_000_000, 2_000_000_000], pl.Duration("ns")),
+        expected=_series([1_000_000_000, 2_000_000_000], pl.Int64),
+    ),
+    ClickhouseDtypeCase("duration_cast_to_int64-ms", series=_series([1_000, 2_000], pl.Duration("ms")), expected=_series([1_000, 2_000], pl.Int64)),
+    ClickhouseDtypeCase(
+        "time_cast_to_int64",
+        series=_series([time(12, 0, 0), time(23, 59, 59)], pl.Time),
+        expected=_series([12 * 3600 * 10**9, (23 * 3600 + 59 * 60 + 59) * 10**9], pl.Int64),
+    ),
+    ClickhouseDtypeCase("categorical_cast_to_string", series=_series(["a", "b", "a"], pl.Categorical), expected=_series(["a", "b", "a"], pl.String)),
+    ClickhouseDtypeCase("enum_cast_to_string", series=_series(["c", "a", "b"], UNSORTED_ENUM), expected=_series(["c", "a", "b"], pl.String)),
+]
 
 
-class TestNamespaceMethod:
-    def test_piot_sink_clickhouse(self):
-        """lf.piot.sink_clickhouse(...) should work."""
-        df = get_employee_df()
+@pytest.mark.parametrize("case", as_params(DTYPES))
+def test_column_dtype(read_table, case: ClickhouseDtypeCase):
+    cpl.sink_clickhouse(pl.DataFrame({"col": case.series}).lazy(), "t", URL, {})
+    assert_frame_equal(read_table("t"), pl.DataFrame({"col": case.series if case.expected is None else case.expected}))
 
-        df.lazy().piot.sink_clickhouse("test_namespace", FAKE_URL, FAKE_PARAMS)
 
-        result = read_duckdb_table("test_namespace")
-        assert_frame_equal(result, df)
+def test_all_cast_types_together(read_table):
+    """Every column of the dtype table in one frame."""
+    n = 2
+    df = pl.DataFrame({c.id: c.series[:n] for c in DTYPES})
+    cpl.sink_clickhouse(df.lazy(), "t", URL, {})
+    assert_frame_equal(read_table("t"), pl.DataFrame({c.id: (c.series if c.expected is None else c.expected)[:n] for c in DTYPES}))
