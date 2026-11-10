@@ -1376,7 +1376,12 @@ def _rebuild_partition_scope(
                 filters.append(date_expr.is_null())
             elif values is not None:
                 dates = _extract_and_widen_dates(analyzer, time_unit, exact_exclusions=time_unit == "daily" and schema[date_column] == pl.Date)
-                selected = row_key.is_in(dates).fill_null(False)
+                if partition_keys or not dates:
+                    selected = row_key.is_in(dates)
+                else:
+                    # A range on the raw column, unlike ``is_in`` on the truncated key, stays visible to a nested cache's DNF.
+                    periods = [portion.closedopen(d, _step_date(d, time_unit)) for d in dates]
+                    selected = _periods_predicate(periods, date_column, schema[date_column], time_unit)
                 filters.append(selected | date_expr.is_null() if None in values and includes_null_date else selected)
             else:
                 filters.append(pl.lit(True) if includes_null_date else date_expr.is_not_null())
