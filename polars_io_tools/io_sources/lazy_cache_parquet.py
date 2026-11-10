@@ -1850,8 +1850,9 @@ def cache_parquet(
         **sort_by**
 
         The returned frame is not marked globally sorted: across partitions the key is usually not monotonic
-        (for example time within symbol-month), so ``sort``, ``join_asof``, and a bare ``set_sorted`` are not
-        safe on it. Grouped ``group_by_dynamic`` and ``rolling`` instead check physical order and raise
+        (for example time within symbol-month). Explicitly ``sort`` by the required keys before order-dependent
+        operations; do not assert unverified sortedness with ``set_sorted``. Grouped ``group_by_dynamic`` and
+        ``rolling`` check physical order and raise
         ``input data is not sorted`` if it is violated. Under ``CacheMode.CACHE`` an existing file is not
         rewritten, so change ``sort_by`` with ``CacheMode.REBUILD``.
     """
