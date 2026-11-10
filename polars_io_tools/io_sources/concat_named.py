@@ -133,6 +133,8 @@ def concat_named(
     col_names = [col if isinstance(col, str) else col[0] for col in identifier_cols]
     index_lf = {col: [] for col in col_names}
     lf_id_col = "__lf_id"
+    while lf_id_col in col_names:
+        lf_id_col += "_"
     index_lf[lf_id_col] = []
 
     for keys, lf in lf_dict.items():
