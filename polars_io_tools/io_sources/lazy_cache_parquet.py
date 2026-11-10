@@ -2364,7 +2364,8 @@ def cache_parquet(
                 cache_scan = pl.concat([_conform_to_schema(cache_scan, read_schema), upstream_lf], how="vertical")
                 if "n_rows" in read_kwargs:
                     cache_scan = cache_scan.head(read_kwargs["n_rows"])
-            return _build_final_scan(cache_scan, predicate, with_columns, n_rows)
+            # Cache files can hold columns upstream has since dropped, which the declared schema does not list.
+            return _build_final_scan(cache_scan, predicate, with_columns if with_columns is not None else schema.names(), n_rows)
 
         yield from _collect_cache_scan(make_scan, schema, with_columns, batch_size, time_unit_dir, retry=not (no_write and upstream_lf is not None))
 
