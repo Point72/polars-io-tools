@@ -6,7 +6,7 @@ import logging
 import operator
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from enum import Enum, auto
@@ -1438,12 +1438,17 @@ def _sink_cache_partitions(
     protected_keys: set[str],
     fs: "pa_fs.FileSystem",
     fs_path_prefix: str,
+    sort_exprs: list[pl.Expr] | None = None,
+    sort_descending: list[bool] | None = None,
 ) -> set[str]:
     """Sink one file per partition and return the logical keys written.
 
     If the sink fails, every file it opened is deleted (best effort), so a partially written partition is refetched rather than read as complete.
     Physical keys in ``protected_keys`` belong to completed batches and are never replaced or removed.
+    When ``sort_exprs`` is set the input is sorted first, so that (with ``maintain_order=True``) each partition file is written in that order.
     """
+    if sort_exprs:
+        lf = lf.sort(sort_exprs, descending=sort_descending or False)
     written: set[str] = set()
     written_logical: set[str] = set()
 
@@ -1642,6 +1647,8 @@ def cache_parquet(
     write_kwargs: dict | None = None,
     read_kwargs: dict | None = None,
     extra_partition_cols: str | list[str] | None = None,
+    sort_by: str | Sequence[str] | None = None,
+    descending: bool | Sequence[bool] = False,
     schema: pl.Schema | None = None,
     write_bounding_columns: list[str] | None = None,
     description: str | None = None,
@@ -1681,6 +1688,15 @@ def cache_parquet(
             will be used for partitioning (no date-based organization).
         extra_partition_cols (str | list[str], optional): Additional columns to partition by.
             Duration and nanosecond Datetime columns are not supported.
+        sort_by (str | Sequence[str], optional): Column(s) to physically sort each written cache file by, within
+            each partition (each ``extra_partition_cols`` value and each date bucket). Clustering the rows makes a
+            file's per-row-group statistics on the first key non-overlapping, so ``scan_parquet`` skips row groups
+            for range or equality predicates on that key (fewer bytes read, especially on S3), and the physical
+            order lets grouped ``group_by_dynamic`` and ``rolling`` run on the cached read without a manual sort.
+            The returned frame is not marked globally sorted; see the ``sort_by`` note below. Default None writes
+            in source order.
+        descending (bool | Sequence[bool], default False): Sort direction for ``sort_by``. A single bool applies to
+            every key; a sequence must match the length of ``sort_by``.
         time_unit ({"daily", "monthly", "yearly"}, default "monthly"): Partitioning granularity.
         partition_format (str, optional): Format using ``$year``, ``$month``, ``$day`` placeholders. If None, defaults based on time_unit:
 
@@ -1830,6 +1846,14 @@ def cache_parquet(
           ``ttl=lambda written_at, period_end, now: written_at < cutoff``, refreshes the same partitions
           under ``CacheMode.CACHE``, and rerunning it with the same ``cutoff`` refetches only the files not
           yet rewritten.
+
+        **sort_by**
+
+        The returned frame is not marked globally sorted: across partitions the key is usually not monotonic
+        (for example time within symbol-month), so ``sort``, ``join_asof``, and a bare ``set_sorted`` are not
+        safe on it. Grouped ``group_by_dynamic`` and ``rolling`` instead check physical order and raise
+        ``input data is not sorted`` if it is violated. Under ``CacheMode.CACHE`` an existing file is not
+        rewritten, so change ``sort_by`` with ``CacheMode.REBUILD``.
     """
     if cache_mode == CacheMode.IGNORE:
         return self_or_fn() if callable(self_or_fn) else self_or_fn
@@ -1927,6 +1951,19 @@ def cache_parquet(
         if schema[c].base_type() == pl.Duration or (isinstance(schema[c], pl.Datetime) and schema[c].time_unit == "ns"):
             raise ValueError(f"extra_partition_cols: cannot partition on Duration or nanosecond Datetime column {c}")
 
+    # Normalize and validate the optional write-side sort key(s).
+    if sort_by is None:
+        _sort_cols: list[str] = []
+    elif isinstance(sort_by, str):
+        _sort_cols = [sort_by]
+    else:
+        _sort_cols = list(sort_by)
+    if missing := [c for c in _sort_cols if c not in schema.names()]:
+        raise ValueError(f"sort_by: column(s) {missing} not present in dataframe")
+    _sort_descending = [descending] * len(_sort_cols) if isinstance(descending, bool) else list(descending)
+    if len(_sort_descending) != len(_sort_cols):
+        raise ValueError(f"descending must be a bool or match the length of sort_by ({len(_sort_cols)}); got {descending!r}")
+
     if time_unit not in {"daily", "monthly", "yearly"}:
         raise ValueError(f"Invalid time unit {time_unit}; must be one of {{'daily','monthly','yearly'}}")
 
@@ -1945,6 +1982,15 @@ def cache_parquet(
         key_exprs.append(pl.col(date_column).dt.strftime(partition_format).alias("__piot_key_date__"))
     if not key_exprs:
         key_exprs = [pl.lit("data").alias("__piot_key_single__")]
+
+    # Per-file write sort: prefix the file-determining partition keys (constant within a file, so each file's
+    # rows end up ordered purely by sort_by). The synthetic single-partition literal is not a usable sort key.
+    if _sort_cols:
+        sort_prefix = list(key_exprs) if all_partition_cols else []
+        write_sort_exprs: list[pl.Expr] | None = [*sort_prefix, *(pl.col(c) for c in _sort_cols)]
+        write_sort_descending = [False] * len(sort_prefix) + _sort_descending
+    else:
+        write_sort_exprs, write_sort_descending = None, []
 
     no_write = cache_mode in (CacheMode.READ_ONLY, CacheMode.CACHE_ONLY)
 
@@ -2153,6 +2199,8 @@ def cache_parquet(
                         protected_keys=completed_keys,
                         fs=fs,
                         fs_path_prefix=fs_path_prefix,
+                        sort_exprs=write_sort_exprs,
+                        sort_descending=write_sort_descending,
                     )
                     written_logical_parts |= batch_written
                     batch_files = {physical_key(key) for key in batch_written}

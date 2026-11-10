@@ -54,7 +54,7 @@ lf.piot.cache_parquet(cache_path, date_column=None, *, time_unit="monthly",
                       partition_format=None, cache_mode=CacheMode.CACHE, ttl=None,
                       final_after=None, lock=None, file_visitor=None,
                       write_batch_size=None, aws_profile=None, write_kwargs=None, read_kwargs=None,
-                      extra_partition_cols=None, schema=None,
+                      extra_partition_cols=None, sort_by=None, descending=False, schema=None,
                       write_bounding_columns=None)
 ```
 
@@ -124,6 +124,18 @@ source must return the same data each time and should push the date filter down.
 applies under `CacheMode.CACHE` when the query's partitions can be enumerated and none of its
 keys is null. It also keeps each write under Polars' open-sink cap (`POLARS_MAX_OPEN_SINKS`,
 default 128).
+
+`sort_by` physically orders the rows of each cache file it writes, within each partition (per
+`extra_partition_cols` value and date bucket), with an optional matching `descending`. This is a
+layout optimization, not a global sort: clustering the rows makes a file's per-row-group statistics
+on the first key non-overlapping, so `scan_parquet` skips row groups for range or equality predicates
+on that key (fewer bytes read, especially on S3), and the physical order lets grouped `group_by_dynamic`
+and `rolling` run on the cached read without a manual sort. The returned frame is **not**
+marked globally sorted, because the key is generally not monotonic across partitions (e.g. time within
+symbol-month); `group_by_dynamic` and `rolling` rely on physical order and raise if it is violated rather
+than returning wrong results, while `join_asof` with `by` groups only warns, so a caller must still ensure
+ascending order within each join group on both inputs. Under `CacheMode.CACHE` an already-cached file is
+not rewritten, so change `sort_by` with `CacheMode.REBUILD`.
 
 ### `cache_memory`
 
