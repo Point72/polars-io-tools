@@ -24,8 +24,8 @@ uses with FORMAT ArrowStream).
 HTTP tests mock requests.post instead, exercising the real batch reader.
 """
 
-CC_BOND_CSV = (
-    "CenterID,CentreCode,ISOCountryCode,Centre,EventYear,EventDate,EventDayOfWeek,EventName,FileType\n"
+SAMPLE_A_CSV = (
+    "item_id,item_code,country_code,item_name,year,event_date,day_of_week,event_name,file_type\n"
     "103,GTQ,GT,Guatemala Quetzal,2021,2021-01-01T00:00:00.000,Fri,New Year's Day,G\n"
     "146,PHP,PH,Philippine Peso,2045,2045-04-06T00:00:00.000,Thu,Holy Thursday,G\n"
     "158,KPW,KP,Pyongyang,2053,2053-02-19T00:00:00.000,Wed,Lunar New Year 1,G\n"
@@ -39,8 +39,8 @@ CC_BOND_CSV = (
 )
 
 
-def get_cc_bond_df() -> pl.DataFrame:
-    return pl.read_csv(io.StringIO(CC_BOND_CSV), try_parse_dates=True)
+def get_sample_a_df() -> pl.DataFrame:
+    return pl.read_csv(io.StringIO(SAMPLE_A_CSV), try_parse_dates=True)
 
 
 def get_employee_df() -> pl.DataFrame:
@@ -103,10 +103,10 @@ def duckdb_connection():
 
     conn = duckdb.connect(database=":memory:")
 
-    _cc_bond_df = get_cc_bond_df()
+    _sample_a_df = get_sample_a_df()
     _employee_df = get_employee_df()
 
-    conn.execute("CREATE TABLE CC_Bond AS SELECT * FROM _cc_bond_df")
+    conn.execute("CREATE TABLE SampleA AS SELECT * FROM _sample_a_df")
     conn.execute("CREATE TABLE EmployeeTbl AS SELECT * FROM _employee_df")
 
     _duckdb_conn = conn
@@ -219,7 +219,7 @@ def test_scan_clickhouse_forwards_timeout_to_schema_and_data(monkeypatch):
     calls = _capture_reader_calls(monkeypatch)
     timeout = (2, 30)
 
-    cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, timeout=timeout).collect()
+    cpl.scan_clickhouse("SELECT item_id FROM SampleA", FAKE_URL, FAKE_PARAMS, timeout=timeout).collect()
 
     assert len(calls) == 2
     assert all(call["kwargs"]["timeout"] == timeout for call in calls)
@@ -228,7 +228,7 @@ def test_scan_clickhouse_forwards_timeout_to_schema_and_data(monkeypatch):
 def test_scan_clickhouse_uses_fetch_size_as_block_size(monkeypatch):
     calls = _capture_reader_calls(monkeypatch)
 
-    cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, fetch_size=321).collect()
+    cpl.scan_clickhouse("SELECT item_id FROM SampleA", FAKE_URL, FAKE_PARAMS, fetch_size=321).collect()
 
     data_calls = [call for call in calls if "LIMIT 0" not in call["query"]]
     assert [call["params"]["max_block_size"] for call in data_calls] == [321]
@@ -249,7 +249,7 @@ def test_scan_clickhouse_runtime_batch_size_overrides_fetch_size(monkeypatch):
 
     monkeypatch.setattr(ch_mod, "register_io_source_with_is_pure", capturing_register)
     calls = _capture_reader_calls(monkeypatch)
-    lf = cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, fetch_size=200000)
+    lf = cpl.scan_clickhouse("SELECT item_id FROM SampleA", FAKE_URL, FAKE_PARAMS, fetch_size=200000)
 
     list(lf.collect_batches(chunk_size=2))
 
@@ -262,7 +262,7 @@ def test_scan_clickhouse_preserves_explicit_max_block_size(monkeypatch):
     calls = _capture_reader_calls(monkeypatch)
     params = {"max_block_size": 777}
 
-    cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, params, fetch_size=321).collect()
+    cpl.scan_clickhouse("SELECT item_id FROM SampleA", FAKE_URL, params, fetch_size=321).collect()
 
     assert all(call["params"]["max_block_size"] == 777 for call in calls)
     assert params == {"max_block_size": 777}
@@ -271,14 +271,14 @@ def test_scan_clickhouse_preserves_explicit_max_block_size(monkeypatch):
 def test_basic_query():
     """Test simple query with WHERE clause."""
     base_query = """
-    SELECT CenterID, Centre, EventYear
-    FROM CC_Bond
+    SELECT item_id, item_name, year
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventYear > 2015"
+    sql_query = base_query + " WHERE year > 2015"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") > 2015]
-    expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventYear"])
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("year") > 2015]
+    expected = df.filter(*equivalent_filters).select(["item_id", "item_name", "year"])
     actual = cpl.scan_clickhouse(sql_query, FAKE_URL, FAKE_PARAMS).collect()
     actual_from_query = cpl.scan_clickhouse(base_query, FAKE_URL, FAKE_PARAMS).filter(*equivalent_filters).collect()
     assert_frame_equal(actual, expected)
@@ -289,14 +289,14 @@ def test_column_selection():
     """Test column selection and LIKE filter."""
     base_query = """
     SELECT *
-    FROM CC_Bond
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE Centre LIKE '%Da%'"
+    sql_query = base_query + " WHERE item_name LIKE '%Da%'"
 
-    cols = ["CenterID", "Centre", "EventDate"]
+    cols = ["item_id", "item_name", "event_date"]
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("Centre").str.contains("Da")]
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("item_name").str.contains("Da")]
     expected = df.filter(*equivalent_filters).select(cols)
 
     actual = cpl.scan_clickhouse(sql_query, FAKE_URL, FAKE_PARAMS).select(cols).collect()
@@ -312,25 +312,25 @@ def test_column_selection():
 def test_complex_query():
     """Test complex query with AND and OR."""
     base_query = """
-    SELECT CenterID, CentreCode, ISOCountryCode, Centre, EventYear, EventDate, EventDayOfWeek, EventName, FileType
-    FROM CC_Bond
+    SELECT item_id, item_code, country_code, item_name, year, event_date, day_of_week, event_name, file_type
+    FROM SampleA
     """
     sql_query = (
         base_query
         + """
-    WHERE EventYear BETWEEN 2015 AND 2050
-      AND (EventDayOfWeek = 'Fri' OR EventDayOfWeek = 'Sat')
-      AND EventName LIKE '%Day%'
+    WHERE year BETWEEN 2015 AND 2050
+      AND (day_of_week = 'Fri' OR day_of_week = 'Sat')
+      AND event_name LIKE '%Day%'
     """
     )
 
-    cols = ["CenterID", "CentreCode", "ISOCountryCode", "Centre", "EventYear", "EventDate", "EventDayOfWeek", "EventName", "FileType"]
+    cols = ["item_id", "item_code", "country_code", "item_name", "year", "event_date", "day_of_week", "event_name", "file_type"]
 
-    df = get_cc_bond_df()
+    df = get_sample_a_df()
     equivalent_filters = [
-        (pl.col("EventYear").is_between(2015, 2050))
-        & ((pl.col("EventDayOfWeek") == "Fri") | (pl.col("EventDayOfWeek") == "Sat"))
-        & (pl.col("EventName").str.contains("Day"))
+        (pl.col("year").is_between(2015, 2050))
+        & ((pl.col("day_of_week") == "Fri") | (pl.col("day_of_week") == "Sat"))
+        & (pl.col("event_name").str.contains("Day"))
     ]
     expected = df.filter(*equivalent_filters).select(cols)
 
@@ -348,14 +348,14 @@ def test_complex_query():
 def test_not_null():
     """Test NOT NULL filter."""
     base_query = """
-    SELECT CenterID, Centre, EventDate
-    FROM CC_Bond
+    SELECT item_id, item_name, event_date
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventDate IS NOT NULL"
+    sql_query = base_query + " WHERE event_date IS NOT NULL"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventDate").is_not_null()]
-    expected = df.select(["CenterID", "Centre", "EventDate"]).filter(*equivalent_filters)
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("event_date").is_not_null()]
+    expected = df.select(["item_id", "item_name", "event_date"]).filter(*equivalent_filters)
 
     actual = cpl.scan_clickhouse(sql_query, FAKE_URL, FAKE_PARAMS).collect()
     actual_from_query = cpl.scan_clickhouse(base_query, FAKE_URL, FAKE_PARAMS).filter(*equivalent_filters).collect()
@@ -367,18 +367,18 @@ def test_not_null():
 def test_empty_df():
     """Test functionality on a query that returns no records."""
     base_query = """
-    SELECT CenterID, Centre, EventDate, EventYear
-    FROM CC_Bond
+    SELECT item_id, item_name, event_date, year
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventYear < 1900"
+    sql_query = base_query + " WHERE year < 1900"
 
     cols = [
-        "CenterID",
-        "Centre",
-        "EventDate",
+        "item_id",
+        "item_name",
+        "event_date",
     ]
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") < 1900]
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("year") < 1900]
     expected = df.filter(*equivalent_filters).select(cols)
 
     actual = cpl.scan_clickhouse(sql_query, FAKE_URL, FAKE_PARAMS).select(cols).collect()
@@ -391,15 +391,15 @@ def test_empty_df():
 def test_in_operator():
     """Test IN operator."""
     base_query = """
-    SELECT CenterID, Centre, EventYear, EventDate, EventDayOfWeek
-    FROM CC_Bond
+    SELECT item_id, item_name, year, event_date, day_of_week
+    FROM SampleA
     """
 
-    cols = ["CenterID", "Centre", "EventYear", "EventDate", "EventDayOfWeek"]
-    sql_query = base_query + " WHERE EventDayOfWeek IN ('Fri', 'Sat', 'Sun')"
+    cols = ["item_id", "item_name", "year", "event_date", "day_of_week"]
+    sql_query = base_query + " WHERE day_of_week IN ('Fri', 'Sat', 'Sun')"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventDayOfWeek").is_in(["Fri", "Sat", "Sun"])]
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("day_of_week").is_in(["Fri", "Sat", "Sun"])]
     expected = df.filter(*equivalent_filters).select(cols)
 
     actual = cpl.scan_clickhouse(sql_query, FAKE_URL, FAKE_PARAMS).collect()
@@ -416,14 +416,14 @@ def test_in_operator():
 def test_not_like():
     """Test NOT LIKE operator."""
     base_query = """
-    SELECT CenterID, Centre, EventYear, EventName
-    FROM CC_Bond
+    SELECT item_id, item_name, year, event_name
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventName NOT LIKE '%Day%'"
+    sql_query = base_query + " WHERE event_name NOT LIKE '%Day%'"
 
-    cols = ["CenterID", "Centre", "EventYear", "EventName"]
-    df = get_cc_bond_df()
-    equivalent_filters = [~pl.col("EventName").str.contains("Day")]
+    cols = ["item_id", "item_name", "year", "event_name"]
+    df = get_sample_a_df()
+    equivalent_filters = [~pl.col("event_name").str.contains("Day")]
     expected = df.filter(*equivalent_filters).select(cols)
 
     actual = cpl.scan_clickhouse(sql_query, FAKE_URL, FAKE_PARAMS).collect()
@@ -481,20 +481,20 @@ def test_dt_date_filter_pushdown():
             return fake_get_batch_reader_http(query, url, params)
         # Data query uses ClickHouse-only Date32 syntax DuckDB can't parse; return an empty
         # stream with the full schema so the generator completes and we can inspect the SQL.
-        return fake_get_batch_reader_http("SELECT * FROM CC_Bond LIMIT 0", url, params)
+        return fake_get_batch_reader_http("SELECT * FROM SampleA LIMIT 0", url, params)
 
     ch_mod.get_batch_reader_http = capturing_fake
     try:
-        lf = cpl.scan_clickhouse("SELECT * FROM CC_Bond", FAKE_URL, FAKE_PARAMS)
+        lf = cpl.scan_clickhouse("SELECT * FROM SampleA", FAKE_URL, FAKE_PARAMS)
         captured_queries.clear()
 
-        lf.filter(pl.col("EventDate").dt.date() == date(2016, 1, 1)).collect()
+        lf.filter(pl.col("event_date").dt.date() == date(2016, 1, 1)).collect()
 
         data_queries = [q for q in captured_queries if "LIMIT 0" not in q]
         assert len(data_queries) == 1
         sql = data_queries[0]
         assert "Date32" in sql, f"Expected a Date32 cast in pushed-down SQL, got: {sql}"
-        assert "EventDate" in sql
+        assert "event_date" in sql
         assert "2016-01-01" in sql
     finally:
         ch_mod.get_batch_reader_http = prev
