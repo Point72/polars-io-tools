@@ -6,6 +6,7 @@ import shutil
 import time
 from datetime import timedelta
 from pathlib import Path, PureWindowsPath
+from zoneinfo import ZoneInfo
 
 import cloudpickle
 import numpy as np
@@ -2709,6 +2710,77 @@ class TestRebuildBehavior:
 
         # Partition should now be empty
         assert pl.read_parquet(base_daily / "2024-10-01.parquet").is_empty()
+
+
+class TestNestedRebuildDatePushdown:
+    """A REBUILD ``cache_parquet`` over another REBUILD ``cache_parquet`` rewrites only the queried inner partitions."""
+
+    @staticmethod
+    def _tracked_source(seen, source_df):
+        from polars_io_tools.io_sources.util import register_io_source_with_is_pure
+
+        def gen(with_columns, predicate, n_rows, batch_size):
+            seen.append(predicate)
+            frame = source_df if predicate is None else source_df.filter(predicate)
+            yield frame.select(with_columns) if with_columns else frame
+
+        return register_io_source_with_is_pure(gen, schema=source_df.schema, is_pure=True)
+
+    @pytest.mark.parametrize(
+        ("time_unit", "dates", "target"),
+        [
+            ("daily", [datetime.date(2025, 1, 1) + timedelta(days=i) for i in range(40)], datetime.date(2025, 1, 31)),
+            ("monthly", [datetime.date(2025, m, 15) for m in range(1, 13)], datetime.date(2025, 6, 15)),
+            (
+                "monthly",
+                [datetime.datetime(2025, m, 1, 9, tzinfo=ZoneInfo("America/New_York")) for m in range(1, 13)],
+                datetime.datetime(2025, 6, 1, 9, tzinfo=ZoneInfo("America/New_York")),
+            ),
+        ],
+        ids=["daily", "monthly", "monthly-tz"],
+    )
+    def test_nested_rebuild_scopes_inner_to_requested_partition(self, tmp_path, time_unit, dates, target):
+        source_df = pl.DataFrame({"date": dates, "value": list(range(len(dates)))})
+        seen: list[pl.Expr | None] = []
+        inner = cache_parquet(
+            lambda: self._tracked_source(seen, source_df), tmp_path / "inner", "date", time_unit=time_unit, cache_mode=CacheMode.REBUILD
+        )
+        outer = cache_parquet(lambda: inner, tmp_path / "outer", "date", time_unit=time_unit, cache_mode=CacheMode.REBUILD)
+
+        out = outer.filter(pl.col("date") == target).collect()
+        assert out["value"].to_list() == [dates.index(target)]
+
+        # The inner cache rewrote exactly the requested partition, not its whole history.
+        inner_files = list((tmp_path / "inner").rglob("*.parquet"))
+        assert len(inner_files) == 1
+
+        # The inner source was scanned with a date-bounded predicate, never unfiltered.
+        assert seen, "inner source was never scanned"
+        assert all(p is not None for p in seen), "inner source scanned upstream without a predicate"
+        for pushed in seen:
+            kept = source_df.filter(pushed)["date"].to_list()
+            assert target in kept
+            assert len(kept) < len(dates), "pushed predicate did not bound the scan"
+
+    def test_nested_rebuild_preserves_null_date_partition(self, tmp_path):
+        """A null-including query still scopes the inner cache to the target day and the null partition only."""
+        dates = [datetime.date(2025, 1, 10), datetime.date(2025, 1, 20), None]
+        source_df = pl.DataFrame({"date": dates, "value": [1, 2, 3]}, schema={"date": pl.Date, "value": pl.Int64})
+        seen: list[pl.Expr | None] = []
+        inner = cache_parquet(
+            lambda: self._tracked_source(seen, source_df), tmp_path / "inner", "date", time_unit="daily", cache_mode=CacheMode.REBUILD
+        )
+        outer = cache_parquet(lambda: inner, tmp_path / "outer", "date", time_unit="daily", cache_mode=CacheMode.REBUILD)
+
+        predicate = pl.col("date").is_in([datetime.date(2025, 1, 10), None], nulls_equal=True)
+        out = outer.filter(predicate).collect().sort("value")
+        assert out["value"].to_list() == [1, 3]
+
+        # Only the target day and the null partition were written; 2025-01-20 was untouched.
+        inner_files = sorted((tmp_path / "inner").rglob("*.parquet"))
+        inner_dates = pl.concat([pl.read_parquet(p) for p in inner_files])["date"].to_list()
+        assert set(inner_dates) == {datetime.date(2025, 1, 10), None}
+        assert seen and all(p is not None for p in seen)
 
 
 class TestCacheModePydantic:
