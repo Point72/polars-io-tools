@@ -37,10 +37,9 @@ proof that this works on real data), please refer to the file
 `lazy_polars_sql.py` in examples/.
 """
 
-# This sample data is from the [Calendar].[dbo].[CC_Bond]
-# and [Calendar].[dbo].[ElectionCalendar] databases.
-CC_BOND_CSV = (
-    "CenterID,CentreCode,ISOCountryCode,Centre,EventYear,EventDate,EventDayOfWeek,EventName,FileType\n"
+# Synthetic sample data for the SQL reader tests.
+SAMPLE_A_CSV = (
+    "item_id,item_code,country_code,item_name,year,event_date,day_of_week,event_name,file_type\n"
     "103,GTQ,GT,Guatemala Quetzal,2021,2021-01-01T00:00:00.000,Fri,New Year's Day,G\n"
     "146,PHP,PH,Philippine Peso,2045,2045-04-06T00:00:00.000,Thu,Holy Thursday,G\n"
     "158,KPW,KP,Pyongyang,2053,2053-02-19T00:00:00.000,Wed,Lunar New Year 1,G\n"
@@ -53,27 +52,27 @@ CC_BOND_CSV = (
     "148,BDT,BD,Dhaka,2053,2053-05-20T00:00:00.000,Tue,Eid-ul Fitr 2*,G\n"
 )
 
-ELECTION_CSV = (
-    "Country,ElectFor,EventDate,Status,KnowledgeDate,SourceFile,Isbackfill,DBTimestamp\n"
-    "Chile,Referendum,2022-09-04T00:00:00.000,Held,2022-09-13T16:51:26.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20220913\\20220913_1651Past.csv,0,2022-09-13T17:03:07.000\n"
-    "Nicaragua,Nicaraguan Presidency,2021-11-07T00:00:00.000,Held,2023-04-18T16:38:30.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20230418\\20230418_1638Past.csv,0,2023-04-18T16:49:12.000\n"
-    "Jordan,Jordanian House of Deputies,2010-11-09T00:00:00.000,Snap,2017-04-17T02:32:24.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,2010-10-10T00:00:00.000\n"
-    "Kiribati,Kiribati Presidency,2024-06-30T00:00:00.000,Date not confirmed,2024-04-01T09:34:51.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20240401\\20240401_0934Upcoming.csv,0,2024-04-01T09:46:00.000\n"
-    "Liberia,President,2017-10-10T00:00:00.000,Held,2018-04-03T00:07:41.000,E:\\SourceData\\ElectionCalendar\\20180403\\20180403_00.csv,1,2018-04-03T00:07:44.000\n"
-    "Honduras,President,2017-11-26T00:00:00.000,Confirmed,2017-04-17T02:32:24.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,2017-04-17T02:32:27.000\n"
-    "Moldova,Moldovan Parliament,1998-03-22T00:00:00.000,Held,2017-04-17T02:32:25.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,1998-02-20T00:00:00.000\n"
-    "Singapore,Singapore Parliament,2020-07-10T00:00:00.000,Confirmed,2020-07-09T17:08:37.000,//sacrshfs03/SourceData/ElectionCalendar\\20200709\\20200709_17.csv,0,2020-07-09T17:10:22.000\n"
-    "India,Indian People's Assembly,2024-04-19T00:00:00.000,Held,2024-06-17T16:48:06.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20240617\\20240617_1648Past.csv,0,2024-06-17T16:59:07.000\n"
-    "Guatemala,Guatemalan Presidency,2023-06-25T00:00:00.000,Held,2023-07-11T10:43:16.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20230711\\20230711_1043Past.csv,0,2023-07-11T10:54:04.000\n"
+SAMPLE_B_CSV = (
+    "country,label,event_date,status,knowledge_date,source_file,is_backfill,db_timestamp\n"
+    "Chile,Referendum,2022-09-04T00:00:00.000,Held,2022-09-13T16:51:26.000,data/sample_b/20220913_1651Past.csv,0,2022-09-13T17:03:07.000\n"
+    "Nicaragua,Nicaraguan Presidency,2021-11-07T00:00:00.000,Held,2023-04-18T16:38:30.000,data/sample_b/20230418_1638Past.csv,0,2023-04-18T16:49:12.000\n"
+    "Jordan,Jordanian House of Deputies,2010-11-09T00:00:00.000,Snap,2017-04-17T02:32:24.000,data/sample_b/20170417_02.csv,1,2010-10-10T00:00:00.000\n"
+    "Kiribati,Kiribati Presidency,2024-06-30T00:00:00.000,Date not confirmed,2024-04-01T09:34:51.000,data/sample_b/20240401_0934Upcoming.csv,0,2024-04-01T09:46:00.000\n"
+    "Liberia,President,2017-10-10T00:00:00.000,Held,2018-04-03T00:07:41.000,data/sample_b/20180403_00.csv,1,2018-04-03T00:07:44.000\n"
+    "Honduras,President,2017-11-26T00:00:00.000,Confirmed,2017-04-17T02:32:24.000,data/sample_b/20170417_02.csv,1,2017-04-17T02:32:27.000\n"
+    "Moldova,Moldovan Parliament,1998-03-22T00:00:00.000,Held,2017-04-17T02:32:25.000,data/sample_b/20170417_02.csv,1,1998-02-20T00:00:00.000\n"
+    "Singapore,Singapore Parliament,2020-07-10T00:00:00.000,Confirmed,2020-07-09T17:08:37.000,data/sample_b/20200709_17.csv,0,2020-07-09T17:10:22.000\n"
+    "India,Indian People's Assembly,2024-04-19T00:00:00.000,Held,2024-06-17T16:48:06.000,data/sample_b/20240617_1648Past.csv,0,2024-06-17T16:59:07.000\n"
+    "Guatemala,Guatemalan Presidency,2023-06-25T00:00:00.000,Held,2023-07-11T10:43:16.000,data/sample_b/20230711_1043Past.csv,0,2023-07-11T10:54:04.000\n"
 )
 
 
-def get_cc_bond_df() -> pl.DataFrame:
-    return pl.read_csv(io.StringIO(CC_BOND_CSV), try_parse_dates=True)
+def get_sample_a_df() -> pl.DataFrame:
+    return pl.read_csv(io.StringIO(SAMPLE_A_CSV), try_parse_dates=True)
 
 
-def get_election_df() -> pl.DataFrame:
-    return pl.read_csv(io.StringIO(ELECTION_CSV), try_parse_dates=True)
+def get_sample_b_df() -> pl.DataFrame:
+    return pl.read_csv(io.StringIO(SAMPLE_B_CSV), try_parse_dates=True)
 
 
 def get_employee_df() -> pl.DataFrame:
@@ -142,14 +141,14 @@ def duckdb_connection():
     conn = duckdb.connect(database=":memory:")
 
     # Load test data frames into DuckDB
-    _cc_bond_df = get_cc_bond_df()
-    _election_df = get_election_df()
+    _sample_a_df = get_sample_a_df()
+    _sample_b_df = get_sample_b_df()
     _employee_df = get_employee_df()
 
     # DuckDB can natively query Polars DataFrames by referring to the name of Polars DataFrames
     # as they exist in the current scope.
-    conn.execute("CREATE TABLE CC_Bond AS SELECT * FROM _cc_bond_df")
-    conn.execute("CREATE TABLE ElectionCalendar AS SELECT * FROM _election_df")
+    conn.execute("CREATE TABLE SampleA AS SELECT * FROM _sample_a_df")
+    conn.execute("CREATE TABLE ElectionCalendar AS SELECT * FROM _sample_b_df")
     conn.execute("CREATE TABLE EmployeeTbl AS SELECT * FROM _employee_df")
 
     # Store in module variable for the batch reader to access
@@ -296,14 +295,14 @@ def test_logical_and_operator():
 def test_basic_query():
     """Test simple query"""
     base_query = """
-    SELECT CenterID, Centre, EventYear
-    FROM CC_Bond
+    SELECT item_id, item_name, year
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventYear > 2015"
+    sql_query = base_query + " WHERE year > 2015"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") > 2015]
-    expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventYear"])
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("year") > 2015]
+    expected = df.filter(*equivalent_filters).select(["item_id", "item_name", "year"])
     actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
     actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
     assert_frame_equal(actual, expected)
@@ -318,9 +317,9 @@ def test_dt_date_filter_pushdown():
     """
     import arrow_odbc
 
-    base_query = "SELECT CenterID, Centre, EventDate FROM CC_Bond"
-    df = get_cc_bond_df()
-    target = df["EventDate"].dt.date().min()
+    base_query = "SELECT item_id, item_name, event_date FROM SampleA"
+    df = get_sample_a_df()
+    target = df["event_date"].dt.date().min()
 
     captured: list[str] = []
     original_fake_func = arrow_odbc.read_arrow_batches_from_odbc
@@ -332,10 +331,10 @@ def test_dt_date_filter_pushdown():
     arrow_odbc.read_arrow_batches_from_odbc = capturing_fake_func
     try:
         for equivalent_filters in (
-            [pl.col("EventDate").dt.date() == target],
-            [pl.col("EventDate").dt.date() >= target],
+            [pl.col("event_date").dt.date() == target],
+            [pl.col("event_date").dt.date() >= target],
         ):
-            expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventDate"])
+            expected = df.filter(*equivalent_filters).select(["item_id", "item_name", "event_date"])
             actual = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
             assert expected.height > 0
             assert_frame_equal(actual, expected)
@@ -344,20 +343,20 @@ def test_dt_date_filter_pushdown():
 
     assert captured, "No SQL captured from read_arrow_batches_from_odbc"
     data_queries = [sql for sql in captured if "WHERE" in sql]
-    assert data_queries and all('CAST("EventDate" AS DATE)' in sql for sql in data_queries), data_queries
+    assert data_queries and all('CAST("event_date" AS DATE)' in sql for sql in data_queries), data_queries
 
 
 def test_implicit_cast_query():
     """Test implicit cast query"""
     base_query = """
-    SELECT CenterID, Centre, EventYear
-    FROM CC_Bond
+    SELECT item_id, item_name, year
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventYear > 2015"
+    sql_query = base_query + " WHERE year > 2015"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") > 2015.1]
-    expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventYear"])
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("year") > 2015.1]
+    expected = df.filter(*equivalent_filters).select(["item_id", "item_name", "year"])
     actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
     actual_from_query = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
 
@@ -369,14 +368,14 @@ def test_column_selection():
     """Test column selection and LIKE"""
     base_query = """
     SELECT *
-    FROM CC_Bond
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE Centre LIKE '%Da%'"
+    sql_query = base_query + " WHERE item_name LIKE '%Da%'"
 
-    cols = ["CenterID", "Centre", "EventDate"]
+    cols = ["item_id", "item_name", "event_date"]
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("Centre").str.contains("Da")]
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("item_name").str.contains("Da")]
     expected = df.filter(*equivalent_filters).select(cols)
 
     # Test both ways: direct SQL and base query + filters
@@ -393,25 +392,25 @@ def test_column_selection():
 def test_complex_query():
     """Test more complex query with AND and OR"""
     base_query = """
-    SELECT CenterID, CentreCode, ISOCountryCode, Centre, EventYear, EventDate, EventDayOfWeek, EventName, FileType
-    FROM CC_Bond
+    SELECT item_id, item_code, country_code, item_name, year, event_date, day_of_week, event_name, file_type
+    FROM SampleA
     """
     sql_query = (
         base_query
         + """
-    WHERE EventYear BETWEEN 2015 AND 2050
-      AND (EventDayOfWeek = 'Fri' OR EventDayOfWeek = 'Sat')
-      AND EventName LIKE '%Day%'
+    WHERE year BETWEEN 2015 AND 2050
+      AND (day_of_week = 'Fri' OR day_of_week = 'Sat')
+      AND event_name LIKE '%Day%'
     """
     )
 
-    cols = ["CenterID", "CentreCode", "ISOCountryCode", "Centre", "EventYear", "EventDate", "EventDayOfWeek", "EventName", "FileType"]
+    cols = ["item_id", "item_code", "country_code", "item_name", "year", "event_date", "day_of_week", "event_name", "file_type"]
 
-    df = get_cc_bond_df()
+    df = get_sample_a_df()
     equivalent_filters = [
-        (pl.col("EventYear").is_between(2015, 2050))
-        & ((pl.col("EventDayOfWeek") == "Fri") | (pl.col("EventDayOfWeek") == "Sat"))
-        & (pl.col("EventName").str.contains("Day"))
+        (pl.col("year").is_between(2015, 2050))
+        & ((pl.col("day_of_week") == "Fri") | (pl.col("day_of_week") == "Sat"))
+        & (pl.col("event_name").str.contains("Day"))
     ]
     expected = df.filter(*equivalent_filters).select(cols)
 
@@ -430,18 +429,18 @@ def test_complex_query():
 def test_join():
     """Test on a joined table with filters"""
     base_query = """
-    SELECT cb.CenterID, cb.Centre, ec.Country, ec.ElectFor
-    FROM CC_Bond AS cb, ElectionCalendar AS ec
+    SELECT cb.item_id, cb.item_name, ec.country, ec.label
+    FROM SampleA AS cb, ElectionCalendar AS ec
     """
-    sql_query = base_query + " WHERE ec.Country LIKE '%a%'"
-    cols = ["CenterID", "Centre", "Country", "ElectFor"]
+    sql_query = base_query + " WHERE ec.country LIKE '%a%'"
+    cols = ["item_id", "item_name", "country", "label"]
 
-    df_cb = get_cc_bond_df().select(["CenterID", "Centre"])
-    df_ec = get_election_df().select(["Country", "ElectFor"])
+    df_cb = get_sample_a_df().select(["item_id", "item_name"])
+    df_ec = get_sample_b_df().select(["country", "label"])
 
     # Create a cross join and then apply filter
     cross_join = df_cb.join(df_ec, how="cross")
-    equivalent_filters = [pl.col("Country").str.contains("a")]
+    equivalent_filters = [pl.col("country").str.contains("a")]
     expected = cross_join.filter(*equivalent_filters)
 
     # Test both ways: direct SQL and base query + filters
@@ -459,14 +458,14 @@ def test_join():
 def test_not_null():
     """Test NOT NULL"""
     base_query = """
-    SELECT CenterID, Centre, EventDate
-    FROM CC_Bond
+    SELECT item_id, item_name, event_date
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventDate IS NOT NULL"
+    sql_query = base_query + " WHERE event_date IS NOT NULL"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventDate").is_not_null()]
-    expected = df.select(["CenterID", "Centre", "EventDate"]).filter(*equivalent_filters)
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("event_date").is_not_null()]
+    expected = df.select(["item_id", "item_name", "event_date"]).filter(*equivalent_filters)
 
     # Test both ways: direct SQL and base query + filters
     actual = cpl.scan_db(sql_query, "fake_connection_string").collect()
@@ -479,18 +478,18 @@ def test_not_null():
 def test_empty_df():
     """Test functionality on a query that returns no records"""
     base_query = """
-    SELECT CenterID, Centre, EventDate, EventYear
-    FROM CC_Bond
+    SELECT item_id, item_name, event_date, year
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventYear < 1900"
+    sql_query = base_query + " WHERE year < 1900"
 
     cols = [
-        "CenterID",
-        "Centre",
-        "EventDate",
+        "item_id",
+        "item_name",
+        "event_date",
     ]
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventYear") < 1900]
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("year") < 1900]
     expected = df.filter(*equivalent_filters).select(cols)
 
     # Test both ways: direct SQL and base query + filters
@@ -505,15 +504,15 @@ def test_empty_df():
 def test_in_operator():
     """Test IN operator"""
     base_query = """
-    SELECT CenterID, Centre, EventYear, EventDate, EventDayOfWeek
-    FROM CC_Bond
+    SELECT item_id, item_name, year, event_date, day_of_week
+    FROM SampleA
     """
 
-    cols = ["CenterID", "Centre", "EventYear", "EventDate", "EventDayOfWeek"]
-    sql_query = base_query + " WHERE EventDayOfWeek IN ('Fri', 'Sat', 'Sun')"
+    cols = ["item_id", "item_name", "year", "event_date", "day_of_week"]
+    sql_query = base_query + " WHERE day_of_week IN ('Fri', 'Sat', 'Sun')"
 
-    df = get_cc_bond_df()
-    equivalent_filters = [pl.col("EventDayOfWeek").is_in(["Fri", "Sat", "Sun"])]
+    df = get_sample_a_df()
+    equivalent_filters = [pl.col("day_of_week").is_in(["Fri", "Sat", "Sun"])]
     expected = df.filter(*equivalent_filters).select(cols)
 
     # Test both ways: direct SQL and base query + filters
@@ -531,14 +530,14 @@ def test_in_operator():
 def test_not_like():
     """Test NOT LIKE operator"""
     base_query = """
-    SELECT CenterID, Centre, EventYear, EventName
-    FROM CC_Bond
+    SELECT item_id, item_name, year, event_name
+    FROM SampleA
     """
-    sql_query = base_query + " WHERE EventName NOT LIKE '%Day%'"
+    sql_query = base_query + " WHERE event_name NOT LIKE '%Day%'"
 
-    cols = ["CenterID", "Centre", "EventYear", "EventName"]
-    df = get_cc_bond_df()
-    equivalent_filters = [~pl.col("EventName").str.contains("Day")]
+    cols = ["item_id", "item_name", "year", "event_name"]
+    df = get_sample_a_df()
+    equivalent_filters = [~pl.col("event_name").str.contains("Day")]
     expected = df.filter(*equivalent_filters).select(cols)
 
     # Test both ways: direct SQL and base query + filters
@@ -954,7 +953,7 @@ def test_mssql_bracket_quoting():
     Test that our custom MSSQL dialect wraps identifiers in brackets,
     even when the name is a reserved keyword or contains spaces/brackets.
     """
-    assert exp.Column(this="CenterID").sql(dialect=MSSQL) == "[CenterID]"
+    assert exp.Column(this="item_id").sql(dialect=MSSQL) == "[item_id]"
     assert exp.Column(this="GROUP").sql(dialect=MSSQL) == "[GROUP]"
     assert exp.Column(this="Some ] Column").sql(dialect=MSSQL) == "[Some ]] Column]"
 
@@ -1306,14 +1305,14 @@ def test_rename_with_filter_integration():
 
     base_query = """
     SELECT
-        CenterID,
-        EventYear
-    FROM CC_Bond
+        item_id,
+        year
+    FROM SampleA
     """
 
     # Test filtering on aliased columns created via select
     lf = cpl.scan_db(base_query, "fake_connection_string")
-    lf = lf.select(pl.col("CenterID").alias("center_id"), pl.col("EventYear").alias("event_year"))
+    lf = lf.select(pl.col("item_id").alias("center_id"), pl.col("year").alias("event_year"))
     lf = lf.filter(pl.col("event_year").is_not_null())
     result = lf.collect()
 
@@ -1322,8 +1321,8 @@ def test_rename_with_filter_integration():
     assert result.columns == ["center_id", "event_year"]
 
     # Verify the filtering actually worked by comparing with expected data
-    df = get_cc_bond_df()
-    expected = df.select([pl.col("CenterID").alias("center_id"), pl.col("EventYear").alias("event_year")]).filter(pl.col("event_year").is_not_null())
+    df = get_sample_a_df()
+    expected = df.select([pl.col("item_id").alias("center_id"), pl.col("year").alias("event_year")]).filter(pl.col("event_year").is_not_null())
 
     assert_frame_equal(result.sort("center_id"), expected.sort("center_id"))
 
@@ -1332,17 +1331,17 @@ def test_select_alias_predicate_pushdown_simple():
     """Predicates referencing simple SELECT aliases are rewritten to original columns in WHERE."""
     base_query = """
     SELECT
-        EventYear AS event_year,
-        CenterID AS center_id
-    FROM CC_Bond
+        year AS event_year,
+        item_id AS center_id
+    FROM SampleA
     """
 
     # Filter uses alias; pushdown should rewrite to original columns
     lf = cpl.scan_db(base_query, "fake_connection_string")
     res = lf.filter(pl.col("event_year") > 2016).select(["event_year", "center_id"]).collect()
 
-    df = get_cc_bond_df()
-    expected = df.select([pl.col("EventYear").alias("event_year"), pl.col("CenterID").alias("center_id")]).filter(pl.col("event_year") > 2016)
+    df = get_sample_a_df()
+    expected = df.select([pl.col("year").alias("event_year"), pl.col("item_id").alias("center_id")]).filter(pl.col("event_year") > 2016)
     assert_frame_equal(res.sort(["event_year", "center_id"]), expected.sort(["event_year", "center_id"]))
 
 
@@ -1350,9 +1349,9 @@ def test_select_alias_cast_datetime_to_date_types():
     """Casting Datetime to Date via SELECT alias yields Date in schema and result."""
     base_query = """
     SELECT
-        CAST(EventDate AS DATE) AS BusDate,
-        CenterID
-    FROM CC_Bond
+        CAST(event_date AS DATE) AS BusDate,
+        item_id
+    FROM SampleA
     """
 
     lf = cpl.scan_db(base_query, "fake_connection_string")
@@ -1360,60 +1359,60 @@ def test_select_alias_cast_datetime_to_date_types():
     # Validate collect_schema types
     schema = lf.collect_schema()
     assert schema.get("BusDate") == pl.Date
-    assert schema.get("CenterID") in (pl.Int64, pl.Int32)
+    assert schema.get("item_id") in (pl.Int64, pl.Int32)
 
     # Validate actual collected types
     res = lf.collect()
     assert res.schema.get("BusDate") == pl.Date
-    assert res.schema.get("CenterID") in (pl.Int64, pl.Int32)
+    assert res.schema.get("item_id") in (pl.Int64, pl.Int32)
 
     # Validate values match expected cast
-    df = get_cc_bond_df()
-    expected = df.select([pl.col("EventDate").cast(pl.Date).alias("BusDate"), pl.col("CenterID")])
-    assert_frame_equal(res.sort(["BusDate", "CenterID"]), expected.sort(["BusDate", "CenterID"]))
+    df = get_sample_a_df()
+    expected = df.select([pl.col("event_date").cast(pl.Date).alias("BusDate"), pl.col("item_id")])
+    assert_frame_equal(res.sort(["BusDate", "item_id"]), expected.sort(["BusDate", "item_id"]))
 
 
 def test_select_original_and_cast_same_column():
     """Select the same column twice: original Datetime and CAST to Date with alias."""
     base_query = """
     SELECT
-        EventDate,
-        CAST(EventDate AS DATE) AS BusDate,
-        CenterID
-    FROM CC_Bond
+        event_date,
+        CAST(event_date AS DATE) AS BusDate,
+        item_id
+    FROM SampleA
     """
 
     lf = cpl.scan_db(base_query, "fake_connection_string")
 
     # Validate collect_schema types
     schema = lf.collect_schema()
-    assert schema.get("EventDate") == pl.Datetime
+    assert schema.get("event_date") == pl.Datetime
     assert schema.get("BusDate") == pl.Date
-    assert schema.get("CenterID") in (pl.Int64, pl.Int32)
+    assert schema.get("item_id") in (pl.Int64, pl.Int32)
 
     # Validate actual collected types
     res = lf.collect()
-    assert res.schema.get("EventDate") == pl.Datetime
+    assert res.schema.get("event_date") == pl.Datetime
     assert res.schema.get("BusDate") == pl.Date
-    assert res.schema.get("CenterID") in (pl.Int64, pl.Int32)
+    assert res.schema.get("item_id") in (pl.Int64, pl.Int32)
 
     # Validate values match expected selection
-    df = get_cc_bond_df()
+    df = get_sample_a_df()
     expected = df.select(
         [
-            pl.col("EventDate"),
-            pl.col("EventDate").cast(pl.Date).alias("BusDate"),
-            pl.col("CenterID"),
+            pl.col("event_date"),
+            pl.col("event_date").cast(pl.Date).alias("BusDate"),
+            pl.col("item_id"),
         ]
     )
-    assert_frame_equal(res.sort(["CenterID", "EventDate"]), expected.sort(["CenterID", "EventDate"]))
+    assert_frame_equal(res.sort(["item_id", "event_date"]), expected.sort(["item_id", "event_date"]))
 
 
 def test_nested_select_star_with_cast_alias(caplog):
     """Support subquery with CAST alias and star expansion."""
     query = """
     SELECT * FROM (
-        SELECT CAST(EventDate AS DATE) AS EventDateAsDate, * FROM CC_Bond
+        SELECT CAST(event_date AS DATE) AS EventDateAsDate, * FROM SampleA
     ) AS t
     """
 
@@ -1423,24 +1422,24 @@ def test_nested_select_star_with_cast_alias(caplog):
     # Schema checks
     schema = lf.collect_schema()
     assert schema.get("EventDateAsDate") == pl.Date
-    assert schema.get("EventDate") == pl.Datetime
+    assert schema.get("event_date") == pl.Datetime
 
     # Data checks
     res = lf.collect()
-    df = get_cc_bond_df()
+    df = get_sample_a_df()
     # Expected columns: alias first, then original table columns in their order
     orig_cols = [
-        "CenterID",
-        "CentreCode",
-        "ISOCountryCode",
-        "Centre",
-        "EventYear",
-        "EventDate",
-        "EventDayOfWeek",
-        "EventName",
-        "FileType",
+        "item_id",
+        "item_code",
+        "country_code",
+        "item_name",
+        "year",
+        "event_date",
+        "day_of_week",
+        "event_name",
+        "file_type",
     ]
-    expected = df.select([pl.col("EventDate").cast(pl.Date).alias("EventDateAsDate"), *orig_cols])
+    expected = df.select([pl.col("event_date").cast(pl.Date).alias("EventDateAsDate"), *orig_cols])
     assert_frame_equal(res, expected)
 
     # Verify logged SQL matches normalized expected SQL via sqlglot
@@ -1461,7 +1460,7 @@ class TestScanDbPickle:
         """scan_db LazyFrames can be pickled and unpickled."""
         import cloudpickle
 
-        query = "SELECT * FROM CC_Bond"
+        query = "SELECT * FROM SampleA"
         lf = cpl.scan_db(query, "fake_connection_string")
 
         # Pickle roundtrip
@@ -1473,35 +1472,35 @@ class TestScanDbPickle:
 
         # Verify data is correct after unpickling
         result = lf_unpickled.collect()
-        expected = get_cc_bond_df()
+        expected = get_sample_a_df()
         assert_frame_equal(result, expected)
 
     def test_scan_db_pickle_with_filter(self):
         """scan_db with filters can be pickled."""
         import cloudpickle
 
-        query = "SELECT * FROM CC_Bond"
-        lf = cpl.scan_db(query, "fake_connection_string").filter(pl.col("EventYear") > 2020)
+        query = "SELECT * FROM SampleA"
+        lf = cpl.scan_db(query, "fake_connection_string").filter(pl.col("year") > 2020)
 
         pickled = cloudpickle.dumps(lf)
         lf_unpickled = cloudpickle.loads(pickled)
 
         result = lf_unpickled.collect()
-        expected = get_cc_bond_df().filter(pl.col("EventYear") > 2020)
+        expected = get_sample_a_df().filter(pl.col("year") > 2020)
         assert_frame_equal(result, expected)
 
     def test_scan_db_pickle_with_select(self):
         """scan_db with column selection can be pickled."""
         import cloudpickle
 
-        query = "SELECT CenterID, Centre, EventYear FROM CC_Bond"
+        query = "SELECT item_id, item_name, year FROM SampleA"
         lf = cpl.scan_db(query, "fake_connection_string")
 
         pickled = cloudpickle.dumps(lf)
         lf_unpickled = cloudpickle.loads(pickled)
 
         result = lf_unpickled.collect()
-        expected = get_cc_bond_df().select(["CenterID", "Centre", "EventYear"])
+        expected = get_sample_a_df().select(["item_id", "item_name", "year"])
         assert_frame_equal(result, expected)
 
 
@@ -1679,7 +1678,7 @@ class TestArrowOdbcKwargsPassthrough:
 
         monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
 
-        query = "SELECT * FROM CC_Bond"
+        query = "SELECT * FROM SampleA"
         timeout_value = 30
 
         # Create the LazyFrame with query_timeout_sec - this triggers schema query
@@ -1706,7 +1705,7 @@ class TestArrowOdbcKwargsPassthrough:
 
         monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
 
-        query = "SELECT * FROM CC_Bond"
+        query = "SELECT * FROM SampleA"
         timeout_value = 45
 
         lf = cpl.scan_db(query, "fake_connection_string", query_timeout_sec=timeout_value)
@@ -1737,7 +1736,7 @@ class TestArrowOdbcKwargsPassthrough:
 
         monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
 
-        query = "SELECT * FROM CC_Bond"
+        query = "SELECT * FROM SampleA"
 
         # Pass multiple kwargs
         lf = cpl.scan_db(
@@ -1782,10 +1781,10 @@ class TestArrowOdbcKwargsPassthrough:
 
         monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
 
-        query = "SELECT CenterID, Centre FROM CC_Bond"
+        query = "SELECT item_id, item_name FROM SampleA"
 
         # Create a custom schema to pass
-        custom_schema = pa.schema([("CenterID", pa.int64()), ("Centre", pa.string())])
+        custom_schema = pa.schema([("item_id", pa.int64()), ("item_name", pa.string())])
 
         lf = cpl.scan_db(
             query,
@@ -1825,7 +1824,7 @@ class TestArrowOdbcKwargsPassthrough:
 
         monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
 
-        query = "SELECT CenterID, Centre FROM CC_Bond"
+        query = "SELECT item_id, item_name FROM SampleA"
 
         # Create a custom map_schema function
         def custom_map_schema(schema):
@@ -1870,8 +1869,8 @@ class TestArrowOdbcKwargsPassthrough:
 
         monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", capturing_func)
 
-        query = "SELECT CenterID, Centre FROM CC_Bond"
-        custom_schema = pa.schema([("CenterID", pa.int64()), ("Centre", pa.string())])
+        query = "SELECT item_id, item_name FROM SampleA"
+        custom_schema = pa.schema([("item_id", pa.int64()), ("item_name", pa.string())])
 
         def custom_map_schema(schema):
             return schema
@@ -1949,11 +1948,11 @@ class TestMSSQLAnonymousCasePreservation:
 
     def test_tvf_with_literal_args_preserves_case(self):
         """Table-valued functions with literal arguments should not be uppercased."""
-        query = "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')"
+        query = "SELECT * FROM [SampleDb].[dbo].f_GetSampleAsOfDate('2026-02-06')"
         parsed = parse_one(query, dialect=MSSQL)
         result = parsed.sql(dialect=MSSQL)
-        assert "f_GetFuturesMaxVolAsOfDate" in result
-        assert "F_GETFUTURESMAXVOLASOFDATE" not in result
+        assert "f_GetSampleAsOfDate" in result
+        assert "F_GETMAXVALUEASOFDATE" not in result
 
     def test_table_with_nolock_hint_preserves_case(self):
         """Table names with (nolock) hints should preserve original casing."""
@@ -1973,12 +1972,12 @@ class TestMSSQLAnonymousCasePreservation:
 
     def test_tvf_roundtrip_preserves_full_query(self):
         """Full query with TVF should roundtrip correctly through parse/generate."""
-        query = "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')"
+        query = "SELECT * FROM [SampleDb].[dbo].f_GetSampleAsOfDate('2026-02-06')"
         parsed = parse_one(query, dialect=MSSQL)
         result = parsed.sql(dialect=MSSQL)
-        assert "[FuturesData]" in result
+        assert "[SampleDb]" in result
         assert "[dbo]" in result
-        assert "f_GetFuturesMaxVolAsOfDate('2026-02-06')" in result
+        assert "f_GetSampleAsOfDate('2026-02-06')" in result
 
 
 def _make_capture_sql():
@@ -2028,28 +2027,28 @@ class TestJoinStarAmbiguousColumns:
     outer SELECT picks columns from the flat result set — no ambiguity possible.
     """
 
-    BASE_QUERY = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+    BASE_QUERY = "SELECT cr.*, br.RIGHT_ATTR FROM LeftTbl cr LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
 
     @pytest.fixture(autouse=True)
     def _create_join_tables(self, duckdb_connection):
-        """Create test tables that share a column name (ID_BB_COMPANY)."""
+        """Create test tables that share a column name (JOIN_KEY)."""
         duckdb_connection.execute(
             """
-            CREATE TABLE CreditRef AS SELECT * FROM (
-                SELECT 1 AS ID, 100 AS ID_BB_COMPANY, 'US' AS CNTRY, DATE '2024-01-15' AS SOME_DATE
+            CREATE TABLE LeftTbl AS SELECT * FROM (
+                SELECT 1 AS ID, 100 AS JOIN_KEY, 'x' AS LEFT_ATTR, DATE '2024-01-15' AS SOME_DATE
                 UNION ALL
-                SELECT 2 AS ID, 200 AS ID_BB_COMPANY, 'GB' AS CNTRY, DATE '2024-02-20' AS SOME_DATE
+                SELECT 2 AS ID, 200 AS JOIN_KEY, 'y' AS LEFT_ATTR, DATE '2024-02-20' AS SOME_DATE
                 UNION ALL
-                SELECT 3 AS ID, 100 AS ID_BB_COMPANY, 'JP' AS CNTRY, DATE '2024-03-10' AS SOME_DATE
+                SELECT 3 AS ID, 100 AS JOIN_KEY, 'z' AS LEFT_ATTR, DATE '2024-03-10' AS SOME_DATE
             )
             """
         )
         duckdb_connection.execute(
             """
-            CREATE TABLE BBCredit AS SELECT * FROM (
-                SELECT 100 AS ID_BB_COMPANY, 'USA' AS CNTRY_OF_RISK
+            CREATE TABLE RightTbl AS SELECT * FROM (
+                SELECT 100 AS JOIN_KEY, 'r1' AS RIGHT_ATTR
                 UNION ALL
-                SELECT 200 AS ID_BB_COMPANY, 'GBR' AS CNTRY_OF_RISK
+                SELECT 200 AS JOIN_KEY, 'r2' AS RIGHT_ATTR
             )
             """
         )
@@ -2082,10 +2081,10 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]).collect()
+            result = lf.select(["JOIN_KEY", "RIGHT_ATTR"]).collect()
 
         assert result.shape[0] == 3
-        assert set(result.columns) == {"ID_BB_COMPANY", "CNTRY_OF_RISK"}
+        assert set(result.columns) == {"JOIN_KEY", "RIGHT_ATTR"}
 
         sql = self._data_sql(captured)
         assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
@@ -2095,7 +2094,7 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID", "CNTRY"]).collect()
+            result = lf.select(["ID", "LEFT_ATTR"]).collect()
 
         assert result.shape[0] == 3
         sql = self._data_sql(captured)
@@ -2106,7 +2105,7 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID", "ID_BB_COMPANY", "CNTRY", "SOME_DATE"]).collect()
+            result = lf.select(["ID", "JOIN_KEY", "LEFT_ATTR", "SOME_DATE"]).collect()
 
         assert result.shape[0] == 3
         sql = self._data_sql(captured)
@@ -2120,10 +2119,10 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.filter(pl.col("CNTRY") == "US").collect()
+            result = lf.filter(pl.col("LEFT_ATTR") == "x").collect()
 
         assert result.shape[0] == 1
-        assert result["CNTRY"][0] == "US"
+        assert result["LEFT_ATTR"][0] == "x"
 
         sql = self._data_sql(captured)
         assert "WHERE" in sql.upper()
@@ -2132,16 +2131,16 @@ class TestJoinStarAmbiguousColumns:
         """Compound AND filter on columns unique to the star-expanded table.
 
         Mirrors the real-world query:
-          SELECT cr.*, br.CNTRY_OF_RISK FROM ... LEFT JOIN ...
+          SELECT cr.*, br.RIGHT_ATTR FROM ... LEFT JOIN ...
           WHERE (DATE = '...' AND PointID = ...)
         where DATE and PointID only exist on the cr side, so the database
         resolves them without qualification.
         """
-        # Add a PointID column to CreditRef so we can filter on it
-        duckdb_connection.execute("ALTER TABLE CreditRef ADD COLUMN PointID BIGINT")
-        duckdb_connection.execute("UPDATE CreditRef SET PointID = ID * 100000")
+        # Add a PointID column to LeftTbl so we can filter on it
+        duckdb_connection.execute("ALTER TABLE LeftTbl ADD COLUMN PointID BIGINT")
+        duckdb_connection.execute("UPDATE LeftTbl SET PointID = ID * 100000")
 
-        base_query = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+        base_query = "SELECT cr.*, br.RIGHT_ATTR FROM LeftTbl cr LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
 
         lf = cpl.scan_db(base_query, "fake_connection_string")
 
@@ -2157,17 +2156,17 @@ class TestJoinStarAmbiguousColumns:
     def test_combined_select_qualified_and_predicate_unqualified(self):
         """Column selection uses subquery; predicate is applied on the outer query.
 
-        The filter uses CNTRY (unique to cr) so it's unambiguous in WHERE even
+        The filter uses LEFT_ATTR (unique to cr) so it's unambiguous in WHERE even
         without table qualification — matching real-world SQL Server behaviour
         where unqualified WHERE columns resolve fine for non-shared names.
         """
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.filter(pl.col("CNTRY") == "US").select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]).collect()
+            result = lf.filter(pl.col("LEFT_ATTR") == "x").select(["JOIN_KEY", "RIGHT_ATTR"]).collect()
 
         assert result.shape[0] == 1
-        assert set(result.columns) == {"ID_BB_COMPANY", "CNTRY_OF_RISK"}
+        assert set(result.columns) == {"JOIN_KEY", "RIGHT_ATTR"}
 
         sql = self._data_sql(captured)
         assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
@@ -2176,9 +2175,7 @@ class TestJoinStarAmbiguousColumns:
     def test_alias_predicate_rewrites_to_underlying_expression(self):
         """A predicate on a CAST alias expands to the underlying CAST, not a bare column."""
         base_query = (
-            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK "
-            "FROM CreditRef cr "
-            "LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.RIGHT_ATTR FROM LeftTbl cr LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
         )
 
         lf = cpl.scan_db(base_query, "fake_connection_string")
@@ -2195,18 +2192,16 @@ class TestJoinStarAmbiguousColumns:
     def test_select_alias_column_alongside_star_expanded(self):
         """Selecting an alias + a star-expanded column uses subquery wrapping."""
         base_query = (
-            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK "
-            "FROM CreditRef cr "
-            "LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.RIGHT_ATTR FROM LeftTbl cr LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
         )
 
         lf = cpl.scan_db(base_query, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["bus_date", "ID_BB_COMPANY"]).collect()
+            result = lf.select(["bus_date", "JOIN_KEY"]).collect()
 
         assert result.shape[0] == 3
-        assert set(result.columns) == {"bus_date", "ID_BB_COMPANY"}
+        assert set(result.columns) == {"bus_date", "JOIN_KEY"}
 
         sql = self._data_sql(captured)
         assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
@@ -2277,11 +2272,11 @@ class TestJoinStarAmbiguousColumns:
 
     def test_no_expansion_when_no_joins(self):
         """Single-table SELECT * does not trigger star expansion."""
-        base_query = "SELECT * FROM CreditRef"
+        base_query = "SELECT * FROM LeftTbl"
         lf = cpl.scan_db(base_query, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID", "CNTRY"]).collect()
+            result = lf.select(["ID", "LEFT_ATTR"]).collect()
 
         assert result.shape[0] == 3
         sql = self._data_sql(captured)
@@ -2533,7 +2528,7 @@ class TestSubqueryWrappingHoisting:
     def test_mssql_order_by_hoisted_with_table_qualifiers_stripped(self):
         """MSSQL: table qualifiers are stripped from hoisted ORDER BY columns.
 
-        ``ORDER BY cb.EventDate`` becomes ``ORDER BY EventDate`` because the
+        ``ORDER BY cb.event_date`` becomes ``ORDER BY event_date`` because the
         table alias ``cb`` only exists inside the subquery.
         """
         from polars_io_tools.io_sources.sql_utils import _prepare_inner_for_subquery
@@ -2772,7 +2767,7 @@ class TestSubqueryWrappingHoisting:
 
 def test_head_zero_skips_query(monkeypatch):
     """head(0) should return an empty DataFrame without sending a query to the database."""
-    query = "SELECT CenterID, Centre, EventYear FROM CC_Bond"
+    query = "SELECT item_id, item_name, year FROM SampleA"
     lf = cpl.scan_db(query, "fake_connection_string")
 
     # Track whether the ODBC reader is invoked
@@ -2788,13 +2783,13 @@ def test_head_zero_skips_query(monkeypatch):
     result = lf.head(0).collect()
 
     assert result.height == 0
-    assert set(result.columns) == {"CenterID", "Centre", "EventYear"}
+    assert set(result.columns) == {"item_id", "item_name", "year"}
     assert calls["n"] == 0, f"Expected no ODBC queries, but {calls['n']} were made"
 
 
 def test_head_zero_with_column_selection(monkeypatch):
     """head(0) with column selection should return the correct empty schema."""
-    query = "SELECT CenterID, Centre, EventYear FROM CC_Bond"
+    query = "SELECT item_id, item_name, year FROM SampleA"
     lf = cpl.scan_db(query, "fake_connection_string")
 
     calls = {"n": 0}
@@ -2806,10 +2801,10 @@ def test_head_zero_with_column_selection(monkeypatch):
 
     monkeypatch.setattr("arrow_odbc.read_arrow_batches_from_odbc", tracking_reader)
 
-    result = lf.select(["CenterID", "Centre"]).head(0).collect()
+    result = lf.select(["item_id", "item_name"]).head(0).collect()
 
     assert result.height == 0
-    assert set(result.columns) == {"CenterID", "Centre"}
+    assert set(result.columns) == {"item_id", "item_name"}
     assert calls["n"] == 0
 
 
@@ -2824,43 +2819,43 @@ def test_str_contains_regex_skips_pushdown(dialect):
         r"CL\d+",  # digit class
     ]
     for pattern in regex_patterns:
-        expr = pl.col("Centre").str.contains(pattern)
+        expr = pl.col("item_name").str.contains(pattern)
         result = convert_predicate_to_sql(expr, dialect=dialect)
         assert result is None, f"Expected None for regex pattern {pattern!r}, got {result}"
 
 
 def test_str_contains_regex_with_and_partial_pushdown():
     """When AND-ed with a pushable predicate, the regex term is dropped but the other term pushes (TSQL)."""
-    expr = pl.col("Centre").str.contains("^test") & (pl.col("EventYear") > 2020)
+    expr = pl.col("item_name").str.contains("^test") & (pl.col("year") > 2020)
     result = convert_predicate_to_sql(expr, dialect="tsql")
     assert result is not None
     sql = result.sql()
     assert "LIKE" not in sql  # regex term was dropped
-    assert "EventYear" in sql  # numeric comparison still pushed
+    assert "year" in sql  # numeric comparison still pushed
 
 
 @pytest.mark.parametrize(
     "filter_expr",
     [
-        pl.col("Centre").str.contains("^(Dh|Ph)"),
-        pl.col("Centre").str.contains(".*mala"),
-        pl.col("Centre").str.contains("Da"),
-        pl.col("Centre").str.contains("Da", literal=True),
-        pl.col("Centre").str.contains("^(Dh|Ph)") & (pl.col("EventYear") > 2020),
-        ~pl.col("Centre").str.contains("Da"),
+        pl.col("item_name").str.contains("^(Dh|Ph)"),
+        pl.col("item_name").str.contains(".*mala"),
+        pl.col("item_name").str.contains("Da"),
+        pl.col("item_name").str.contains("Da", literal=True),
+        pl.col("item_name").str.contains("^(Dh|Ph)") & (pl.col("year") > 2020),
+        ~pl.col("item_name").str.contains("Da"),
     ],
 )
 def test_str_contains(filter_expr):
     """scan_db with str.contains filter matches Polars in-memory result."""
-    base_query = "SELECT * FROM CC_Bond"
+    base_query = "SELECT * FROM SampleA"
 
     # Lazy path: goes through the full scan_db pushdown pipeline
     actual = cpl.scan_db(base_query, "fake_connection_string").filter(filter_expr).collect()
     # Eager path: Polars filters in-memory (ground truth)
-    expected = get_cc_bond_df().filter(filter_expr)
+    expected = get_sample_a_df().filter(filter_expr)
 
-    actual = actual.sort("CenterID", "EventDate")
-    expected = expected.sort("CenterID", "EventDate")
+    actual = actual.sort("item_id", "event_date")
+    expected = expected.sort("item_id", "event_date")
     assert_frame_equal(actual, expected)
 
 
@@ -3336,10 +3331,10 @@ def _install_threadsafe_reader(monkeypatch):
 class TestScanDbPartitions:
     """Tests for the opt-in ``partitions=`` reading path in ``scan_db``."""
 
-    QUERY = "SELECT * FROM CC_Bond"
-    # CC_Bond.EventDate spans many years; this window straddles several so buckets are non-trivial.
-    DATE_FILTER = (pl.col("EventDate") >= datetime(2013, 1, 1)) & (pl.col("EventDate") < datetime(2017, 1, 1))
-    COUNTRY_FILTER = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+    QUERY = "SELECT * FROM SampleA"
+    # SampleA.event_date spans many years; this window straddles several so buckets are non-trivial.
+    DATE_FILTER = (pl.col("event_date") >= datetime(2013, 1, 1)) & (pl.col("event_date") < datetime(2017, 1, 1))
+    COUNTRY_FILTER = pl.col("country_code").is_in(["GT", "BD", "RO"])
 
     @pytest.fixture(autouse=True)
     def _threadsafe(self, monkeypatch):
@@ -3351,57 +3346,57 @@ class TestScanDbPartitions:
     @pytest.mark.parametrize("every", ["1y", "1mo", "6mo", 90, "1q"])
     def test_by_time_matches_unpartitioned(self, every):
         baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", every)).filter(self.DATE_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date", every)).filter(self.DATE_FILTER).collect()
         assert got.height > 0
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_by_time_partition_count(self, caplog):
         # [2013-01-01, 2017-01-01) split yearly is exactly four windows (exclusive upper bound).
         with caplog.at_level(logging.DEBUG):
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date", "1y")).filter(self.DATE_FILTER).collect()
         assert any("running 4 partition(s)" in record.message for record in caplog.records)
 
     def test_by_value_derived_from_predicate(self):
         baseline = cpl.scan_db(self.QUERY, "conn").filter(self.COUNTRY_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode")).filter(self.COUNTRY_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("country_code")).filter(self.COUNTRY_FILTER).collect()
         assert got.height > 0
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_by_value_explicit_groups(self):
         values = [["GT", "BD"], "RO"]
-        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
+        flt = pl.col("country_code").is_in(["GT", "BD", "RO"])
         baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", values)).filter(flt).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("country_code", values)).filter(flt).collect()
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_by_range_numeric(self):
-        flt = (pl.col("EventYear") >= 2013) & (pl.col("EventYear") < 2055)
+        flt = (pl.col("year") >= 2013) & (pl.col("year") < 2055)
         baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_range("EventYear", every=10)).filter(flt).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_range("year", every=10)).filter(flt).collect()
         assert got.height > 0
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_explicit_read_partition_list(self):
-        # All CC_Bond rows are FileType 'G', so this single explicit slice returns everything.
+        # All SampleA rows are file_type 'G', so this single explicit slice returns everything.
         baseline = cpl.scan_db(self.QUERY, "conn").collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(pl.col("FileType") == "G", key="G")]).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(pl.col("file_type") == "G", key="G")]).collect()
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_generator_partitions_retain_columns_under_projection(self):
         # A one-shot generator of slices, plus a projection that omits the partition column: the
         # column must still be retained to evaluate (and drop) the client-side filter.
-        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
-        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).select("CentreCode").collect()
-        parts = (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"])
-        got = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt).select("CentreCode").collect()
+        flt = pl.col("country_code").is_in(["GT", "BD", "RO"])
+        baseline = cpl.scan_db(self.QUERY, "conn").filter(flt).select("item_code").collect()
+        parts = (cpl.ReadPartition(pl.col("country_code") == c, key=c) for c in ["GT", "BD", "RO"])
+        got = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt).select("item_code").collect()
         assert got.height > 0
-        assert got.columns == ["CentreCode"]
+        assert got.columns == ["item_code"]
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_generator_partitions_are_reusable(self):
         # A generator is materialised once, so re-collecting the same LazyFrame is not empty.
-        flt = pl.col("ISOCountryCode").is_in(["GT", "BD", "RO"])
-        parts = (cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"])
+        flt = pl.col("country_code").is_in(["GT", "BD", "RO"])
+        parts = (cpl.ReadPartition(pl.col("country_code") == c, key=c) for c in ["GT", "BD", "RO"])
         lf = cpl.scan_db(self.QUERY, "conn", partitions=parts).filter(flt)
         first, second = lf.collect(), lf.collect()
         assert first.height > 0
@@ -3409,29 +3404,29 @@ class TestScanDbPartitions:
 
     def test_unbounded_predicate_falls_back_to_single_query(self, caplog):
         with caplog.at_level(logging.DEBUG):
-            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate")).collect()
+            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date")).collect()
         baseline = cpl.scan_db(self.QUERY, "conn").collect()
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
         assert any("running 1 partition(s)" in record.message for record in caplog.records)
 
     def test_max_partitions_guardrail_raises(self):
         with pytest.raises(pl.exceptions.ComputeError, match="exceeds max_partitions"):
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1d"), max_partitions=5).filter(self.DATE_FILTER).collect()
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date", "1d"), max_partitions=5).filter(self.DATE_FILTER).collect()
 
     def test_projection_and_row_limit(self):
         got = (
-            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1y"))
+            cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date", "1y"))
             .filter(self.DATE_FILTER)
-            .select("CenterID", "EventDate")
+            .select("item_id", "event_date")
             .head(3)
             .collect()
         )
-        assert got.columns == ["CenterID", "EventDate"]
+        assert got.columns == ["item_id", "event_date"]
         assert got.height == 3
 
     def test_max_concurrency_matches_unpartitioned(self):
         baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1mo"), max_concurrency=1).filter(self.DATE_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date", "1mo"), max_concurrency=1).filter(self.DATE_FILTER).collect()
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
     def test_unknown_partition_column_raises(self):
@@ -3440,22 +3435,22 @@ class TestScanDbPartitions:
 
     def test_untranslatable_predicate_filters_client_side(self):
         # A predicate that cannot be pushed to SQL is still enforced client-side, so the slice
-        # stays exact (here: only rows whose EventName contains "Day").
-        udf = pl.col("EventName").map_elements(lambda s: "Day" in s, return_dtype=pl.Boolean)
+        # stays exact (here: only rows whose event_name contains "Day").
+        udf = pl.col("event_name").map_elements(lambda s: "Day" in s, return_dtype=pl.Boolean)
         expected = cpl.scan_db(self.QUERY, "conn").filter(udf).collect()
         got = cpl.scan_db(self.QUERY, "conn", partitions=[cpl.ReadPartition(udf, key=0)]).collect()
         assert got.height > 0
         assert_frame_equal(self._sorted(got), self._sorted(expected))
 
     def test_explicit_partitions_over_max_raises(self):
-        parts = [cpl.ReadPartition(pl.col("ISOCountryCode") == c, key=c) for c in ["GT", "BD", "RO"]]
+        parts = [cpl.ReadPartition(pl.col("country_code") == c, key=c) for c in ["GT", "BD", "RO"]]
         with pytest.raises(pl.exceptions.ComputeError, match="exceeds max_partitions"):
             cpl.scan_db(self.QUERY, "conn", partitions=parts, max_partitions=2).collect()
 
     def test_unordered_matches_unpartitioned(self):
         # Completion order returns the same rows as an unpartitioned read (order aside).
         baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("EventDate", "1mo")).filter(self.DATE_FILTER).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_time("event_date", "1mo")).filter(self.DATE_FILTER).collect()
         assert got.height > 0
         assert_frame_equal(self._sorted(got), self._sorted(baseline))
 
@@ -3463,16 +3458,16 @@ class TestScanDbPartitions:
         # No outer predicate, so Polars pushes n_rows to the source and the partitioned fan-out
         # itself must honour the limit (exercising _emit truncation and the early return).
         groups = [["GT"], ["BD"], ["RO"]]
-        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", groups)).head(3).collect()
+        got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("country_code", groups)).head(3).collect()
         assert got.height == 3
-        assert set(got["ISOCountryCode"].to_list()) <= {"GT", "BD", "RO"}
+        assert set(got["country_code"].to_list()) <= {"GT", "BD", "RO"}
 
     def test_partitioned_query_with_order_by_warns_not_raises(self, caplog):
         # A top-level ORDER BY only loses global order under partitioning (row set stays correct):
         # warn and proceed, don't raise.
-        q = "SELECT * FROM CC_Bond ORDER BY EventDate DESC"
+        q = "SELECT * FROM SampleA ORDER BY event_date DESC"
         with caplog.at_level(logging.WARNING):
-            got = cpl.scan_db(q, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
+            got = cpl.scan_db(q, "conn", partitions=cpl.by_time("event_date", "1y")).filter(self.DATE_FILTER).collect()
         baseline = cpl.scan_db(self.QUERY, "conn").filter(self.DATE_FILTER).collect()
         assert_frame_equal(self._sorted(got), self._sorted(baseline))  # same rows
         assert any("ORDER BY" in r.message for r in caplog.records)
@@ -3480,19 +3475,19 @@ class TestScanDbPartitions:
     @pytest.mark.parametrize(
         ("query", "match"),
         [
-            ("SELECT * FROM CC_Bond ORDER BY EventDate LIMIT 10", "LIMIT"),
-            ("SELECT * FROM CC_Bond OFFSET 5 ROWS", "OFFSET"),
-            ("SELECT *, ROW_NUMBER() OVER (ORDER BY EventDate) AS rn FROM CC_Bond", "window"),
+            ("SELECT * FROM SampleA ORDER BY event_date LIMIT 10", "LIMIT"),
+            ("SELECT * FROM SampleA OFFSET 5 ROWS", "OFFSET"),
+            ("SELECT *, ROW_NUMBER() OVER (ORDER BY event_date) AS rn FROM SampleA", "window"),
         ],
     )
     def test_partitioned_query_with_unsafe_clause_raises(self, query, match):
         with pytest.raises((ValueError, pl.exceptions.ComputeError), match=match):
-            cpl.scan_db(query, "conn", partitions=cpl.by_time("EventDate", "1y")).filter(self.DATE_FILTER).collect()
+            cpl.scan_db(query, "conn", partitions=cpl.by_time("event_date", "1y")).filter(self.DATE_FILTER).collect()
 
     def test_unpartitioned_query_with_limit_is_allowed(self):
         # The guard only applies to a real (>1 slice) partitioned read; an unpartitioned query keeps
         # its LIMIT.
-        got = cpl.scan_db("SELECT * FROM CC_Bond LIMIT 5", "conn").collect()
+        got = cpl.scan_db("SELECT * FROM SampleA LIMIT 5", "conn").collect()
         assert got.height == 5
 
     def test_partitioned_head_does_not_push_limit_into_slices(self, monkeypatch):
@@ -3511,7 +3506,7 @@ class TestScanDbPartitions:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
         monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
         try:
-            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).head(2).collect()
+            got = cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("country_code", [["GT"], ["BD"], ["RO"]])).head(2).collect()
         finally:
             pool.shutdown(wait=True)
         assert got.height == 2
@@ -3534,7 +3529,7 @@ class TestScanDbPartitions:
         monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
         try:
             with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="partition slice"):
-                cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
+                cpl.scan_db(self.QUERY, "conn", partitions=cpl.by_value("country_code", [["GT"], ["BD"], ["RO"]])).collect()
         finally:
             pool.shutdown(wait=True)
 
@@ -3573,7 +3568,7 @@ class TestScanDbPartitions:
 
         # Enumerated slices need no pushed predicate, so `.head(1)` (no intervening filter) pushes
         # n_rows into the source and exercises early-stop; a filter would block that pushdown.
-        parts = cpl.by_value("EventYear", [[2013], [2021], [2053], [2054]])
+        parts = cpl.by_value("year", [[2013], [2021], [2053], [2054]])
         lf = cpl.scan_db(self.QUERY, "conn", partitions=parts)
         try:
             full = lf.collect()
@@ -3636,7 +3631,7 @@ class TestScanDbPartitions:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
         monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
 
-        parts = cpl.by_value("EventYear", [[2013], [2021], [2053]])  # k == number of slices == 3
+        parts = cpl.by_value("year", [[2013], [2021], [2053]])  # k == number of slices == 3
         try:
             got = cpl.scan_db(self.QUERY, "conn", partitions=parts).head(1).collect()
             assert got.height == 1
@@ -3680,7 +3675,7 @@ def test_partition_worker_error_surfaces(monkeypatch):
     monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (pool, 3))
     try:
         with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="'RO'"):
-            cpl.scan_db("SELECT * FROM CC_Bond", "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
+            cpl.scan_db("SELECT * FROM SampleA", "conn", partitions=cpl.by_value("country_code", [["GT"], ["BD"], ["RO"]])).collect()
     finally:
         pool.shutdown(wait=True)
 
@@ -3711,7 +3706,7 @@ def test_partial_submission_failure_does_not_leak_workers(monkeypatch):
     monkeypatch.setattr(cpl.io_sources.lazy_sql_reader, "_get_sql_executor", lambda: (_FlakyExecutor(), 3))
     try:
         with pytest.raises((RuntimeError, pl.exceptions.ComputeError), match="submit boom"):
-            cpl.scan_db("SELECT * FROM CC_Bond", "conn", partitions=cpl.by_value("ISOCountryCode", [["GT"], ["BD"], ["RO"]])).collect()
+            cpl.scan_db("SELECT * FROM SampleA", "conn", partitions=cpl.by_value("country_code", [["GT"], ["BD"], ["RO"]])).collect()
         # The one accepted worker must have exited (stop was set); the pool drains cleanly.
         real_pool.shutdown(wait=True)  # would hang if a worker were stranded on a full queue
     finally:
