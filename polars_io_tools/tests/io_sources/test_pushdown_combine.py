@@ -11,6 +11,7 @@ including:
 - Edge cases (empty filters, empty results, schema inference)
 """
 
+import logging
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -291,6 +292,35 @@ class TestPushdownCombineBasic:
 
         result = lf.filter(pl.col("id").is_in(["A", "C"])).collect()
         expected = pl.DataFrame({"id": ["A", "C"], "val": [1, 3], "other": [10, 30]})
+        assert_frame_equal(result, expected, check_row_order=False)
+
+    def test_non_temporal_filter_does_not_attempt_datetime_range(self, caplog):
+        """A filter on a non-temporal (string) column is pushed without probing it for a datetime range.
+
+        A datetime-range extraction on a string column can never yield a bound and only makes the range
+        visitor try (and fail) to parse string literals as datetimes, which it logs. The datetime-range
+        extraction must be skipped for non-temporal columns, so no such log is emitted, while the discrete
+        filter is still pushed down.
+        """
+        left = pl.LazyFrame({"id": ["A", "B", "C"], "val": [1, 2, 3]})
+        right = pl.LazyFrame({"id": ["A", "B", "C"], "other": [10, 20, 30]})
+
+        lf = pushdown_combine(
+            sources={
+                "left": (left, {"id": FilterSpec()}),
+                "right": (right, {"id": FilterSpec()}),
+            },
+            combine=lambda s: s["left"].join(s["right"], on="id"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="polars_io_tools.io_sources.range_visitor"):
+            result = lf.filter(pl.col("id") == "B").collect()
+
+        range_visitor_logs = [r for r in caplog.records if r.name == "polars_io_tools.io_sources.range_visitor"]
+        assert range_visitor_logs == [], f"range visitor should not run on a non-temporal column, got: {[r.getMessage() for r in range_visitor_logs]}"
+
+        # The discrete filter is still pushed down and the result is correct.
+        expected = pl.DataFrame({"id": ["B"], "val": [2], "other": [20]})
         assert_frame_equal(result, expected, check_row_order=False)
 
 

@@ -817,6 +817,30 @@ def pushdown_combine(
         # Parse predicate to extract filter information
         parsed_predicate = get_parsed_expr(predicate) if predicate is not None else None
 
+        # Get source schemas for dtype checking. Resolved lazily here (at
+        # collect time) rather than eagerly at pushdown_combine construction so
+        # we don't force schema resolution on each source until we actually
+        # need it.
+        source_schemas: dict[str, dict[str, pl.DataType]] = {name: lf.collect_schema() for name, (lf, _) in sources.items()}
+
+        # Output columns backed by a temporal source column in at least one source. Only these are worth a
+        # datetime-range extraction; attempting one on a non-temporal column (e.g. a string) never yields a
+        # usable bound and makes the range visitor try to parse non-temporal literals as datetimes. The apply
+        # pass below independently re-checks each source's own dtype, so extracting a range for a column that
+        # is temporal in only some sources stays correct.
+        temporal_output_cols: set[str] = set()
+        for source_name, (_, specs) in sources.items():
+            schema = source_schemas[source_name]
+            for output_col, spec in specs.items():
+                if isinstance(spec, IntervalFilterSpec):
+                    # An interval spec maps a request-date output column onto a pair of temporal source
+                    # columns, so the output column is a datetime range by definition.
+                    temporal_output_cols.add(output_col)
+                    continue
+                dtype = schema.get(_get_source_col(output_col, spec))
+                if dtype is not None and _is_temporal_dtype(dtype):
+                    temporal_output_cols.add(output_col)
+
         # Extract filter values for each output column
         # We extract both temporal ranges and discrete values for each column
         extracted_ranges: dict[str, portion.Interval] = {}
@@ -824,14 +848,16 @@ def pushdown_combine(
 
         if parsed_predicate is not None:
             for col in all_output_cols:
-                # Try to extract datetime range (returns universe interval if no constraints)
-                try:
-                    date_range = convert_expr_to_datetime_range(parsed_predicate, col, get_enclosure=False, preserve_dates=True)
-                    # Only store if it's constraining (not the full universe)
-                    if date_range != portion.closed(-portion.inf, portion.inf):
-                        extracted_ranges[col] = date_range
-                except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
-                    log.debug(f"Failed to extract date range for column {col}")
+                # Try to extract datetime range (returns universe interval if no constraints). Only attempt it
+                # for temporal columns; a non-temporal column has no datetime bound to find.
+                if col in temporal_output_cols:
+                    try:
+                        date_range = convert_expr_to_datetime_range(parsed_predicate, col, get_enclosure=False, preserve_dates=True)
+                        # Only store if it's constraining (not the full universe)
+                        if date_range != portion.closed(-portion.inf, portion.inf):
+                            extracted_ranges[col] = date_range
+                    except Exception:  # noqa: BLE001 -- intentional broad catch (defensive fallback)
+                        log.debug(f"Failed to extract date range for column {col}")
 
                 # Try to extract discrete values
                 try:
@@ -843,12 +869,6 @@ def pushdown_combine(
 
         log.debug(f"Extracted ranges: {extracted_ranges}")
         log.debug(f"Extracted values: {extracted_values}")
-
-        # Get source schemas for dtype checking. Resolved lazily here (at
-        # collect time) rather than eagerly at pushdown_combine construction so
-        # we don't force schema resolution on each source until we actually
-        # need it.
-        source_schemas: dict[str, dict[str, pl.DataType]] = {name: lf.collect_schema() for name, (lf, _) in sources.items()}
 
         # Apply transformed filters to each source
         # IMPORTANT: For temporal columns with lookback/lookahead, we apply the EXPANDED
