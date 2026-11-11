@@ -873,9 +873,9 @@ def test_write_uses_widened_predicate(tmp_path, capsys):
     assert data_in_cache["val"].to_list() == [1, 15, 30]
 
 
-def test_model_predicate_is_pushed_down(tmp_path, capsys):
+def test_category_predicate_is_pushed_down(tmp_path, capsys):
     """
-    Test that pushdown happens for a model predicate
+    Test that pushdown happens for a string-category predicate
     even when the filter is applied after the `cache_parquet` call.
     """
     df = (
@@ -886,7 +886,7 @@ def test_model_predicate_is_pushed_down(tmp_path, capsys):
                     datetime.date(2025, 5, 2),
                     datetime.date(2025, 5, 3),
                 ],
-                "model": ["USE4S", "OTHER", "USE4S"],
+                "category": ["a", "b", "a"],
                 "val": [10, 20, 30],
             }
         )
@@ -899,14 +899,14 @@ def test_model_predicate_is_pushed_down(tmp_path, capsys):
             cache_path=tmp_path,
             date_column="date",
             time_unit="monthly",
-            extra_partition_cols="model",
+            extra_partition_cols="category",
         )
-        .filter(pl.col("model") == "USE4S")
+        .filter(pl.col("category") == "a")
         .collect()
     )
 
     out = capsys.readouterr().out
-    assert 'col("model")' in out and '"USE4S"' in out, "model predicate was not pushed down; helper-column filter still blocks predicate push-down"
+    assert 'col("category")' in out and '"a"' in out, "category predicate was not pushed down; helper-column filter still blocks predicate push-down"
 
 
 def test_empty_result_from_cache(tmp_path):

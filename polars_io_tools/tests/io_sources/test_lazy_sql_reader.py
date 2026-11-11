@@ -37,8 +37,7 @@ proof that this works on real data), please refer to the file
 `lazy_polars_sql.py` in examples/.
 """
 
-# This sample data is from the [Calendar].[dbo].[CC_Bond]
-# and [Calendar].[dbo].[ElectionCalendar] databases.
+# Synthetic sample data for the SQL reader tests (bond calendar and election calendar shapes).
 CC_BOND_CSV = (
     "CenterID,CentreCode,ISOCountryCode,Centre,EventYear,EventDate,EventDayOfWeek,EventName,FileType\n"
     "103,GTQ,GT,Guatemala Quetzal,2021,2021-01-01T00:00:00.000,Fri,New Year's Day,G\n"
@@ -55,16 +54,16 @@ CC_BOND_CSV = (
 
 ELECTION_CSV = (
     "Country,ElectFor,EventDate,Status,KnowledgeDate,SourceFile,Isbackfill,DBTimestamp\n"
-    "Chile,Referendum,2022-09-04T00:00:00.000,Held,2022-09-13T16:51:26.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20220913\\20220913_1651Past.csv,0,2022-09-13T17:03:07.000\n"
-    "Nicaragua,Nicaraguan Presidency,2021-11-07T00:00:00.000,Held,2023-04-18T16:38:30.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20230418\\20230418_1638Past.csv,0,2023-04-18T16:49:12.000\n"
-    "Jordan,Jordanian House of Deputies,2010-11-09T00:00:00.000,Snap,2017-04-17T02:32:24.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,2010-10-10T00:00:00.000\n"
-    "Kiribati,Kiribati Presidency,2024-06-30T00:00:00.000,Date not confirmed,2024-04-01T09:34:51.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20240401\\20240401_0934Upcoming.csv,0,2024-04-01T09:46:00.000\n"
-    "Liberia,President,2017-10-10T00:00:00.000,Held,2018-04-03T00:07:41.000,E:\\SourceData\\ElectionCalendar\\20180403\\20180403_00.csv,1,2018-04-03T00:07:44.000\n"
-    "Honduras,President,2017-11-26T00:00:00.000,Confirmed,2017-04-17T02:32:24.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,2017-04-17T02:32:27.000\n"
-    "Moldova,Moldovan Parliament,1998-03-22T00:00:00.000,Held,2017-04-17T02:32:25.000,E:\\SourceData\\ElectionCalendar\\20170417\\20170417_02.csv,1,1998-02-20T00:00:00.000\n"
-    "Singapore,Singapore Parliament,2020-07-10T00:00:00.000,Confirmed,2020-07-09T17:08:37.000,//sacrshfs03/SourceData/ElectionCalendar\\20200709\\20200709_17.csv,0,2020-07-09T17:10:22.000\n"
-    "India,Indian People's Assembly,2024-04-19T00:00:00.000,Held,2024-06-17T16:48:06.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20240617\\20240617_1648Past.csv,0,2024-06-17T16:59:07.000\n"
-    "Guatemala,Guatemalan Presidency,2023-06-25T00:00:00.000,Held,2023-07-11T10:43:16.000,\\\\cubistdata\\cds\\Prod\\ElectionCalendar\\20230711\\20230711_1043Past.csv,0,2023-07-11T10:54:04.000\n"
+    "Chile,Referendum,2022-09-04T00:00:00.000,Held,2022-09-13T16:51:26.000,data/election_calendar/20220913_1651Past.csv,0,2022-09-13T17:03:07.000\n"
+    "Nicaragua,Nicaraguan Presidency,2021-11-07T00:00:00.000,Held,2023-04-18T16:38:30.000,data/election_calendar/20230418_1638Past.csv,0,2023-04-18T16:49:12.000\n"
+    "Jordan,Jordanian House of Deputies,2010-11-09T00:00:00.000,Snap,2017-04-17T02:32:24.000,data/election_calendar/20170417_02.csv,1,2010-10-10T00:00:00.000\n"
+    "Kiribati,Kiribati Presidency,2024-06-30T00:00:00.000,Date not confirmed,2024-04-01T09:34:51.000,data/election_calendar/20240401_0934Upcoming.csv,0,2024-04-01T09:46:00.000\n"
+    "Liberia,President,2017-10-10T00:00:00.000,Held,2018-04-03T00:07:41.000,data/election_calendar/20180403_00.csv,1,2018-04-03T00:07:44.000\n"
+    "Honduras,President,2017-11-26T00:00:00.000,Confirmed,2017-04-17T02:32:24.000,data/election_calendar/20170417_02.csv,1,2017-04-17T02:32:27.000\n"
+    "Moldova,Moldovan Parliament,1998-03-22T00:00:00.000,Held,2017-04-17T02:32:25.000,data/election_calendar/20170417_02.csv,1,1998-02-20T00:00:00.000\n"
+    "Singapore,Singapore Parliament,2020-07-10T00:00:00.000,Confirmed,2020-07-09T17:08:37.000,data/election_calendar/20200709_17.csv,0,2020-07-09T17:10:22.000\n"
+    "India,Indian People's Assembly,2024-04-19T00:00:00.000,Held,2024-06-17T16:48:06.000,data/election_calendar/20240617_1648Past.csv,0,2024-06-17T16:59:07.000\n"
+    "Guatemala,Guatemalan Presidency,2023-06-25T00:00:00.000,Held,2023-07-11T10:43:16.000,data/election_calendar/20230711_1043Past.csv,0,2023-07-11T10:54:04.000\n"
 )
 
 
@@ -1949,11 +1948,11 @@ class TestMSSQLAnonymousCasePreservation:
 
     def test_tvf_with_literal_args_preserves_case(self):
         """Table-valued functions with literal arguments should not be uppercased."""
-        query = "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')"
+        query = "SELECT * FROM [SampleDb].[dbo].f_GetMaxValueAsOfDate('2026-02-06')"
         parsed = parse_one(query, dialect=MSSQL)
         result = parsed.sql(dialect=MSSQL)
-        assert "f_GetFuturesMaxVolAsOfDate" in result
-        assert "F_GETFUTURESMAXVOLASOFDATE" not in result
+        assert "f_GetMaxValueAsOfDate" in result
+        assert "F_GETMAXVALUEASOFDATE" not in result
 
     def test_table_with_nolock_hint_preserves_case(self):
         """Table names with (nolock) hints should preserve original casing."""
@@ -1973,12 +1972,12 @@ class TestMSSQLAnonymousCasePreservation:
 
     def test_tvf_roundtrip_preserves_full_query(self):
         """Full query with TVF should roundtrip correctly through parse/generate."""
-        query = "SELECT * FROM [FuturesData].[dbo].f_GetFuturesMaxVolAsOfDate('2026-02-06')"
+        query = "SELECT * FROM [SampleDb].[dbo].f_GetMaxValueAsOfDate('2026-02-06')"
         parsed = parse_one(query, dialect=MSSQL)
         result = parsed.sql(dialect=MSSQL)
-        assert "[FuturesData]" in result
+        assert "[SampleDb]" in result
         assert "[dbo]" in result
-        assert "f_GetFuturesMaxVolAsOfDate('2026-02-06')" in result
+        assert "f_GetMaxValueAsOfDate('2026-02-06')" in result
 
 
 def _make_capture_sql():
@@ -2028,28 +2027,28 @@ class TestJoinStarAmbiguousColumns:
     outer SELECT picks columns from the flat result set — no ambiguity possible.
     """
 
-    BASE_QUERY = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+    BASE_QUERY = "SELECT cr.*, br.RIGHT_ATTR FROM LeftTbl cr LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
 
     @pytest.fixture(autouse=True)
     def _create_join_tables(self, duckdb_connection):
-        """Create test tables that share a column name (ID_BB_COMPANY)."""
+        """Create test tables that share a column name (JOIN_KEY)."""
         duckdb_connection.execute(
             """
-            CREATE TABLE CreditRef AS SELECT * FROM (
-                SELECT 1 AS ID, 100 AS ID_BB_COMPANY, 'US' AS CNTRY, DATE '2024-01-15' AS SOME_DATE
+            CREATE TABLE LeftTbl AS SELECT * FROM (
+                SELECT 1 AS ID, 100 AS JOIN_KEY, 'x' AS LEFT_ATTR, DATE '2024-01-15' AS SOME_DATE
                 UNION ALL
-                SELECT 2 AS ID, 200 AS ID_BB_COMPANY, 'GB' AS CNTRY, DATE '2024-02-20' AS SOME_DATE
+                SELECT 2 AS ID, 200 AS JOIN_KEY, 'y' AS LEFT_ATTR, DATE '2024-02-20' AS SOME_DATE
                 UNION ALL
-                SELECT 3 AS ID, 100 AS ID_BB_COMPANY, 'JP' AS CNTRY, DATE '2024-03-10' AS SOME_DATE
+                SELECT 3 AS ID, 100 AS JOIN_KEY, 'z' AS LEFT_ATTR, DATE '2024-03-10' AS SOME_DATE
             )
             """
         )
         duckdb_connection.execute(
             """
-            CREATE TABLE BBCredit AS SELECT * FROM (
-                SELECT 100 AS ID_BB_COMPANY, 'USA' AS CNTRY_OF_RISK
+            CREATE TABLE RightTbl AS SELECT * FROM (
+                SELECT 100 AS JOIN_KEY, 'r1' AS RIGHT_ATTR
                 UNION ALL
-                SELECT 200 AS ID_BB_COMPANY, 'GBR' AS CNTRY_OF_RISK
+                SELECT 200 AS JOIN_KEY, 'r2' AS RIGHT_ATTR
             )
             """
         )
@@ -2082,10 +2081,10 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]).collect()
+            result = lf.select(["JOIN_KEY", "RIGHT_ATTR"]).collect()
 
         assert result.shape[0] == 3
-        assert set(result.columns) == {"ID_BB_COMPANY", "CNTRY_OF_RISK"}
+        assert set(result.columns) == {"JOIN_KEY", "RIGHT_ATTR"}
 
         sql = self._data_sql(captured)
         assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
@@ -2095,7 +2094,7 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID", "CNTRY"]).collect()
+            result = lf.select(["ID", "LEFT_ATTR"]).collect()
 
         assert result.shape[0] == 3
         sql = self._data_sql(captured)
@@ -2106,7 +2105,7 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID", "ID_BB_COMPANY", "CNTRY", "SOME_DATE"]).collect()
+            result = lf.select(["ID", "JOIN_KEY", "LEFT_ATTR", "SOME_DATE"]).collect()
 
         assert result.shape[0] == 3
         sql = self._data_sql(captured)
@@ -2120,10 +2119,10 @@ class TestJoinStarAmbiguousColumns:
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.filter(pl.col("CNTRY") == "US").collect()
+            result = lf.filter(pl.col("LEFT_ATTR") == "x").collect()
 
         assert result.shape[0] == 1
-        assert result["CNTRY"][0] == "US"
+        assert result["LEFT_ATTR"][0] == "x"
 
         sql = self._data_sql(captured)
         assert "WHERE" in sql.upper()
@@ -2132,16 +2131,16 @@ class TestJoinStarAmbiguousColumns:
         """Compound AND filter on columns unique to the star-expanded table.
 
         Mirrors the real-world query:
-          SELECT cr.*, br.CNTRY_OF_RISK FROM ... LEFT JOIN ...
+          SELECT cr.*, br.RIGHT_ATTR FROM ... LEFT JOIN ...
           WHERE (DATE = '...' AND PointID = ...)
         where DATE and PointID only exist on the cr side, so the database
         resolves them without qualification.
         """
-        # Add a PointID column to CreditRef so we can filter on it
-        duckdb_connection.execute("ALTER TABLE CreditRef ADD COLUMN PointID BIGINT")
-        duckdb_connection.execute("UPDATE CreditRef SET PointID = ID * 100000")
+        # Add a PointID column to LeftTbl so we can filter on it
+        duckdb_connection.execute("ALTER TABLE LeftTbl ADD COLUMN PointID BIGINT")
+        duckdb_connection.execute("UPDATE LeftTbl SET PointID = ID * 100000")
 
-        base_query = "SELECT cr.*, br.CNTRY_OF_RISK FROM CreditRef cr LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+        base_query = "SELECT cr.*, br.RIGHT_ATTR FROM LeftTbl cr LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
 
         lf = cpl.scan_db(base_query, "fake_connection_string")
 
@@ -2157,17 +2156,17 @@ class TestJoinStarAmbiguousColumns:
     def test_combined_select_qualified_and_predicate_unqualified(self):
         """Column selection uses subquery; predicate is applied on the outer query.
 
-        The filter uses CNTRY (unique to cr) so it's unambiguous in WHERE even
+        The filter uses LEFT_ATTR (unique to cr) so it's unambiguous in WHERE even
         without table qualification — matching real-world SQL Server behaviour
         where unqualified WHERE columns resolve fine for non-shared names.
         """
         lf = cpl.scan_db(self.BASE_QUERY, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.filter(pl.col("CNTRY") == "US").select(["ID_BB_COMPANY", "CNTRY_OF_RISK"]).collect()
+            result = lf.filter(pl.col("LEFT_ATTR") == "x").select(["JOIN_KEY", "RIGHT_ATTR"]).collect()
 
         assert result.shape[0] == 1
-        assert set(result.columns) == {"ID_BB_COMPANY", "CNTRY_OF_RISK"}
+        assert set(result.columns) == {"JOIN_KEY", "RIGHT_ATTR"}
 
         sql = self._data_sql(captured)
         assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
@@ -2176,9 +2175,9 @@ class TestJoinStarAmbiguousColumns:
     def test_alias_predicate_rewrites_to_underlying_expression(self):
         """A predicate on a CAST alias expands to the underlying CAST, not a bare column."""
         base_query = (
-            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK "
-            "FROM CreditRef cr "
-            "LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.RIGHT_ATTR "
+            "FROM LeftTbl cr "
+            "LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
         )
 
         lf = cpl.scan_db(base_query, "fake_connection_string")
@@ -2195,18 +2194,18 @@ class TestJoinStarAmbiguousColumns:
     def test_select_alias_column_alongside_star_expanded(self):
         """Selecting an alias + a star-expanded column uses subquery wrapping."""
         base_query = (
-            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.CNTRY_OF_RISK "
-            "FROM CreditRef cr "
-            "LEFT JOIN BBCredit br ON cr.ID_BB_COMPANY = br.ID_BB_COMPANY"
+            "SELECT cr.*, CAST(cr.SOME_DATE AS DATE) AS bus_date, br.RIGHT_ATTR "
+            "FROM LeftTbl cr "
+            "LEFT JOIN RightTbl br ON cr.JOIN_KEY = br.JOIN_KEY"
         )
 
         lf = cpl.scan_db(base_query, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["bus_date", "ID_BB_COMPANY"]).collect()
+            result = lf.select(["bus_date", "JOIN_KEY"]).collect()
 
         assert result.shape[0] == 3
-        assert set(result.columns) == {"bus_date", "ID_BB_COMPANY"}
+        assert set(result.columns) == {"bus_date", "JOIN_KEY"}
 
         sql = self._data_sql(captured)
         assert "__cpl_subq" in sql, f"Expected subquery wrapping, got: {sql}"
@@ -2277,11 +2276,11 @@ class TestJoinStarAmbiguousColumns:
 
     def test_no_expansion_when_no_joins(self):
         """Single-table SELECT * does not trigger star expansion."""
-        base_query = "SELECT * FROM CreditRef"
+        base_query = "SELECT * FROM LeftTbl"
         lf = cpl.scan_db(base_query, "fake_connection_string")
 
         with self._capture_sql() as captured:
-            result = lf.select(["ID", "CNTRY"]).collect()
+            result = lf.select(["ID", "LEFT_ATTR"]).collect()
 
         assert result.shape[0] == 3
         sql = self._data_sql(captured)

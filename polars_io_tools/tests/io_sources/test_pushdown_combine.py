@@ -95,27 +95,27 @@ class TestApplyValueMapping:
 
     def test_dict_mapping_all_keys_present(self):
         """Dict mapping transforms all values when all keys are present."""
-        values = {"USE4S", "CNE5S"}
-        mapping = {"USE4S": "US4S", "CNE5S": "CN5S"}
+        values = {"k1", "k2"}
+        mapping = {"k1": "v1", "k2": "v2"}
         mapped, unmapped = _apply_value_mapping(values, mapping)
-        assert mapped == {"US4S", "CN5S"}
+        assert mapped == {"v1", "v2"}
         assert unmapped == set()
 
     def test_dict_mapping_partial_keys(self):
         """Dict mapping returns unmapped values separately (not pushed down)."""
-        values = {"USE4S", "UNKNOWN"}
-        mapping = {"USE4S": "US4S"}
+        values = {"k1", "missing"}
+        mapping = {"k1": "v1"}
         mapped, unmapped = _apply_value_mapping(values, mapping)
-        assert mapped == {"US4S"}
-        assert unmapped == {"UNKNOWN"}
+        assert mapped == {"v1"}
+        assert unmapped == {"missing"}
 
     def test_dict_mapping_no_keys_present(self):
         """Dict mapping with no matching keys returns all values as unmapped."""
-        values = {"UNKNOWN1", "UNKNOWN2"}
-        mapping = {"USE4S": "US4S"}
+        values = {"missing1", "missing2"}
+        mapping = {"k1": "v1"}
         mapped, unmapped = _apply_value_mapping(values, mapping)
         assert mapped == set()
-        assert unmapped == {"UNKNOWN1", "UNKNOWN2"}
+        assert unmapped == {"missing1", "missing2"}
 
     def test_callable_mapping(self):
         """Callable mapping applies function to each value."""
