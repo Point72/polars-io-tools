@@ -3157,6 +3157,8 @@ class TestOneToManyValueMapping:
         lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
         assert lf.filter(pl.col("group") == "Z").collect().height == 0
         assert tracker.call_count == 1
+        # The empty set must push a keep-nothing predicate, not merely defer to the post-combine filter.
+        assert tracker.last_predicate is not None and tracker.last_predicate.meta.eq(pl.lit(False))
 
     def test_none_inside_a_set_also_matches_null(self):
         # A ``None`` member in the mapped set keeps the "also match null" handling.
@@ -3177,8 +3179,7 @@ class TestOneToManyValueMapping:
         spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
         lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
         lf.filter(pl.col("group").is_in(["Z", "MISSING"])).collect()
-        if tracker.last_predicate is not None:
-            assert tracker.get_analyzer().find_discrete_filter("member") is None
+        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
 
     def test_empty_set_member_with_unconstrained_sharer_pushes_nothing(self):
         # Two sharers of ``member``; one maps to an empty set, the other is unconstrained by the query. An
@@ -3197,8 +3198,7 @@ class TestOneToManyValueMapping:
         tracker = PredicateTracker(df)
         # Only ``group1`` is constrained; ``member2`` is unconstrained.
         pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter(pl.col("group1") == "A").collect()
-        if tracker.last_predicate is not None:
-            assert tracker.get_analyzer().find_discrete_filter("member") is None
+        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
 
     def test_windowed_set_mapping_pushes_nothing(self):
         # A set-valued mapping on a windowed (lookback) temporal column is not honored: nothing is pushed
@@ -3211,8 +3211,7 @@ class TestOneToManyValueMapping:
         spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=lambda d: {d})
         tracker = PredicateTracker(days)
         _assert_matches_native({"s": (tracker.lazy_frame, {"date": spec})}, combine, pl.col("date") == date(2024, 1, 8))
-        if tracker.last_predicate is not None:
-            assert tracker.get_analyzer().find_temporal_filter("data_date") is None
+        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
 
 
 class TestIntervalFilterSpecSetBound:
