@@ -28,6 +28,7 @@ from polars_io_tools.io_sources.pushdown_combine import (
     _apply_value_mapping,
     _compute_output_schema,
     _get_source_col,
+    _map_values,
     pushdown_combine,
 )
 from polars_io_tools.testing import PredicateAnalyzer, PredicateTracker, io_source_assert
@@ -137,6 +138,29 @@ class TestApplyValueMapping:
         mapped, unmapped = _apply_value_mapping(set(), {"a": "b"})
         assert mapped == set()
         assert unmapped == set()
+
+    def test_dict_set_result_is_flattened(self):
+        """A dict value that is a set/frozenset expands to its members (one-to-many)."""
+        mapped, unmapped = _apply_value_mapping({"A"}, {"A": frozenset({"a1", "a2", "a3"})})
+        assert mapped == {"a1", "a2", "a3"}
+        assert unmapped == set()
+
+    def test_callable_set_result_is_flattened(self):
+        """A callable result that is a set expands to its members."""
+        mapped, unmapped = _apply_value_mapping({"A", "B"}, {"A": {"a1", "a2"}, "B": {"b1"}}.get)
+        assert mapped == {"a1", "a2", "b1"}
+        assert unmapped == set()
+
+    def test_empty_set_result_contributes_no_values(self):
+        """A present key mapped to an empty set is mapped (not unmapped) but contributes no source values."""
+        mapped, unmapped = _apply_value_mapping({"Z"}, {"Z": frozenset()})
+        assert mapped == set()
+        assert unmapped == set()
+
+    def test_list_result_stays_a_single_value(self):
+        """Only set/frozenset are set-valued; a list/tuple is a single (e.g. List-dtype) value, not flattened."""
+        assert _map_values({"A"}, {"A": ["x", "y"]}) == ([["x", "y"]], set())
+        assert _map_values({"A"}, {"A": ("x", "y")}) == ([("x", "y")], set())
 
 
 class TestGetSourceCol:
@@ -3032,3 +3056,203 @@ def test_unbounded_window_sharer_keeps_the_whole_source_column():
     specs = {"a": FilterSpec(source_col="d", lookback=timedelta.max), "b": FilterSpec(source_col="d", value_mapping=lambda x: x)}
     pred = (pl.col("a") >= date(2024, 1, 5)) & (pl.col("b") == date(2024, 1, 8))
     assert _assert_matches_native({"s": (src, specs)}, combine, pred)["c"].sort().to_list() == [15, 21, 28, 36, 45, 55]
+
+
+class TestOneToManyValueMapping:
+    """A ``value_mapping`` whose result is a set/frozenset expands one requested value to several source values."""
+
+    # One group is derived from several members; "Z" has no members.
+    DF = pl.DataFrame({"member": ["a1", "a2", "a3", "b1", "b2"], "v": [1, 2, 3, 4, 5]})
+    MEMBERS = {"A": frozenset({"a1", "a2", "a3"}), "B": frozenset({"b1", "b2"}), "Z": frozenset()}
+
+    @staticmethod
+    def _combine(s):
+        group = (
+            pl.when(pl.col("member").is_in(["a1", "a2", "a3"]))
+            .then(pl.lit("A"))
+            .when(pl.col("member").is_in(["b1", "b2"]))
+            .then(pl.lit("B"))
+            .otherwise(pl.lit(None))
+            .alias("group")
+        )
+        return s["src"].with_columns(group)
+
+    def test_dict_frozenset_pushes_is_in(self):
+        tracker = PredicateTracker(self.DF)
+        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
+        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
+        result = lf.filter(pl.col("group") == "A").collect()
+
+        analyzer = tracker.get_analyzer()
+        pushed = analyzer.find_discrete_filter("member")
+        assert pushed is not None
+        assert analyzer.extract_discrete_values(pushed) == {"a1", "a2", "a3"}
+        assert set(result["member"]) == {"a1", "a2", "a3"}
+        # The source is scanned exactly once.
+        assert tracker.call_count == 1
+
+    def test_callable_returning_set_pushes_is_in(self):
+        tracker = PredicateTracker(self.DF)
+        spec = FilterSpec(source_col="member", value_mapping=lambda g: self.MEMBERS[g])
+        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
+        lf.filter(pl.col("group") == "A").collect()
+
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("member")) == {"a1", "a2", "a3"}
+
+    def test_union_with_one_to_one_sibling(self):
+        # ``group1`` (one-to-many) and ``member2`` (identity) share source column ``member``: the pushed
+        # predicate is the UNION of both members' source values.
+        df = pl.DataFrame({"member": ["a1", "a2", "b1"]})
+
+        def combine(s):
+            left = s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group1"))
+            right = s["src"].select(pl.col("member").alias("member2"))
+            return left.join(right, how="cross")
+
+        specs = {
+            "group1": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2"})}),
+            "member2": FilterSpec(source_col="member"),
+        }
+        tracker = PredicateTracker(df)
+        pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter((pl.col("group1") == "A") & (pl.col("member2") == "b1")).collect()
+
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("member")) == {"a1", "a2", "b1"}
+
+    def test_set_mapped_and_direct_source_filter_both_pushed(self):
+        # A set-mapped output column and a plain filter on a different source column both reach the source.
+        df = pl.DataFrame({"member": ["a1", "a2", "b1"], "region": ["x", "y", "x"]})
+
+        def combine(s):
+            return s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group"))
+
+        specs = {
+            "group": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2"})}),
+            "region": FilterSpec(),
+        }
+        tracker = PredicateTracker(df)
+        pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter((pl.col("group") == "A") & (pl.col("region") == "x")).collect()
+
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("member")) == {"a1", "a2"}
+        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("region")) == {"x"}
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            pl.col("group") == "A",
+            pl.col("group").is_in(["A", "B"]),
+            pl.col("group") == "Z",  # empty set
+        ],
+    )
+    def test_result_matches_unfiltered_then_filtered(self, pred):
+        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
+        _assert_matches_native({"src": (self.DF.lazy(), {"group": spec})}, self._combine, pred)
+
+    def test_empty_set_keeps_no_source_rows(self):
+        # "Z" maps to an empty set, so no source row can serve it: the source is scanned but yields nothing.
+        tracker = PredicateTracker(self.DF)
+        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
+        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
+        assert lf.filter(pl.col("group") == "Z").collect().height == 0
+        assert tracker.call_count == 1
+        # The empty set must push a keep-nothing predicate, not merely defer to the post-combine filter.
+        assert tracker.last_predicate is not None and tracker.last_predicate.meta.eq(pl.lit(False))
+
+    def test_none_inside_a_set_also_matches_null(self):
+        # A ``None`` member in the mapped set keeps the "also match null" handling.
+        df = pl.DataFrame({"member": ["a1", "a2", None], "v": [1, 2, 3]})
+
+        def combine(s):
+            group = pl.when(pl.col("member").is_in(["a1"]) | pl.col("member").is_null()).then(pl.lit("A")).otherwise(pl.lit("B")).alias("group")
+            return s["src"].with_columns(group)
+
+        spec = FilterSpec(source_col="member", value_mapping={"A": frozenset({None, "a1"})})
+        result = _assert_matches_native({"src": (df.lazy(), {"group": spec})}, combine, pl.col("group") == "A")
+        assert sorted(result["v"].to_list()) == [1, 3]
+
+    def test_missing_key_alongside_empty_set_disables_pushdown(self):
+        # is_in over the empty-set key "Z" and an absent key "MISSING": the unmapped "MISSING" defers the
+        # whole predicate to post-combine, so nothing is pushed for ``member`` (result still correct).
+        tracker = PredicateTracker(self.DF)
+        spec = FilterSpec(source_col="member", value_mapping=self.MEMBERS)
+        lf = pushdown_combine({"src": (tracker.lazy_frame, {"group": spec})}, self._combine)
+        lf.filter(pl.col("group").is_in(["Z", "MISSING"])).collect()
+        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
+
+    def test_empty_set_member_with_unconstrained_sharer_pushes_nothing(self):
+        # Two sharers of ``member``; one maps to an empty set, the other is unconstrained by the query. An
+        # unconstrained sharer means the union is the whole universe, so nothing is pushed for ``member``.
+        df = pl.DataFrame({"member": ["a1", "a2", "b1"]})
+
+        def combine(s):
+            left = s["src"].with_columns(pl.col("member").replace({"a1": "A", "a2": "A", "b1": "B"}).alias("group1"))
+            right = s["src"].select(pl.col("member").alias("member2"))
+            return left.join(right, how="cross")
+
+        specs = {
+            "group1": FilterSpec(source_col="member", value_mapping={"A": frozenset()}),
+            "member2": FilterSpec(source_col="member"),
+        }
+        tracker = PredicateTracker(df)
+        # Only ``group1`` is constrained; ``member2`` is unconstrained.
+        pushdown_combine({"src": (tracker.lazy_frame, specs)}, combine).filter(pl.col("group1") == "A").collect()
+        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
+
+    def test_windowed_set_mapping_pushes_nothing(self):
+        # A set-valued mapping on a windowed (lookback) temporal column is not honored: nothing is pushed
+        # for that source column, but the result stays correct.
+        days = pl.DataFrame({"data_date": [date(2024, 1, d) for d in range(1, 11)], "v": list(range(1, 11))})
+
+        def combine(s):
+            return s["s"].with_columns(pl.col("v").rolling_sum(2).alias("r"), pl.col("data_date").alias("date"))
+
+        spec = FilterSpec(source_col="data_date", lookback=timedelta(days=2), value_mapping=lambda d: {d})
+        tracker = PredicateTracker(days)
+        _assert_matches_native({"s": (tracker.lazy_frame, {"date": spec})}, combine, pl.col("date") == date(2024, 1, 8))
+        assert tracker.last_predicate is None, f"predicate was unexpectedly pushed: {tracker.last_predicate!r}"
+
+
+class TestIntervalFilterSpecSetBound:
+    """A set-valued ``IntervalFilterSpec.value_mapping`` result leaves that bound unpushed, never raising."""
+
+    SCHED = pl.DataFrame(
+        {
+            "root": ["A", "A"],
+            "start": [date(2024, 1, 1), date(2024, 1, 20)],
+            "end": [date(2024, 1, 10), date(2024, 1, 30)],
+            "val": [1, 2],
+        }
+    )
+    SPINE = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 5)]})
+
+    @staticmethod
+    def _combine(s):
+        joined = s["spine"].join(s["sched"], on="root")
+        return joined.filter((pl.col("start") <= pl.col("date")) & (pl.col("date") <= pl.col("end")))
+
+    def test_set_both_bounds_pushes_nothing_and_stays_correct(self):
+        spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=lambda b: {b})
+        sources = {"sched": (self.SCHED.lazy(), {"date": spec}), "spine": (self.SPINE.lazy(), {"date": FilterSpec()})}
+        pred = pl.col("date") == date(2024, 1, 5)
+        result = pushdown_combine(sources, self._combine).filter(pred).collect()
+        expected = self._combine({"sched": self.SCHED.lazy(), "spine": self.SPINE.lazy()}).filter(pred).collect()
+        assert_frame_equal(result, expected, check_row_order=False)
+
+    def test_scalar_bound_still_pushed_when_other_bound_is_a_set(self):
+        # lo (-> ``end >= lo``) maps to a set and is deferred; hi (-> ``start <= hi``) is scalar and pushed.
+        mapping = {date(2024, 1, 4): frozenset({date(2024, 1, 4)}), date(2024, 1, 6): date(2024, 1, 6)}
+        spec = IntervalFilterSpec(start_col="start", end_col="end", value_mapping=mapping)
+        tracker = PredicateTracker(self.SCHED)
+        spine = pl.DataFrame({"root": ["A"], "date": [date(2024, 1, 5)]})
+        sources = {"sched": (tracker.lazy_frame, {"date": spec}), "spine": (spine.lazy(), {"date": FilterSpec()})}
+        pred = pl.col("date").is_between(date(2024, 1, 4), date(2024, 1, 6))
+
+        result = pushdown_combine(sources, self._combine).filter(pred).collect()
+        expected = self._combine({"sched": self.SCHED.lazy(), "spine": spine.lazy()}).filter(pred).collect()
+        assert_frame_equal(result, expected, check_row_order=False)
+
+        analyzer = tracker.get_analyzer()
+        assert analyzer.find_temporal_filter("start") is not None  # scalar hi pushed
+        assert analyzer.find_temporal_filter("end") is None  # set-valued lo deferred
