@@ -514,3 +514,15 @@ def test_concat_named_filter_with_inequality():
 def test_concat_named_pruning_matches_concat(lf_dict, kwargs, pred):
     expected = pl.concat([lf.with_columns(k=pl.lit(key[0])) for key, lf in lf_dict.items()], **kwargs).filter(pred).collect()
     assert_frame_equal(cpl.concat_named(lf_dict, ["k"], **kwargs).filter(pred).collect(), expected)
+
+
+@pytest.mark.parametrize("identifier_cols", [["__lf_id"], ["__lf_id", "__lf_id_"], ["__lf_id", "__lf_id_", "__lf_id__"]])
+def test_concat_named_identifier_can_match_internal_index_name(identifier_cols):
+    keys = [tuple(f"{label}_{i}" for i in range(len(identifier_cols))) for label in ("foo", "bar")]
+    frames = {key: pl.LazyFrame({"value": [i, i + 1]}) for i, key in enumerate(keys)}
+    expected = pl.concat([lf.with_columns([pl.lit(value).alias(col) for col, value in zip(identifier_cols, key)]) for key, lf in frames.items()])
+    actual = cpl.concat_named(frames, identifier_cols)
+
+    assert_frame_equal(actual.collect(), expected.collect())
+    predicate = pl.col(identifier_cols[0]) == keys[1][0]
+    assert_frame_equal(actual.filter(predicate).select("value").collect(), expected.filter(predicate).select("value").collect())
