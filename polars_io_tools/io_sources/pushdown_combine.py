@@ -83,11 +83,15 @@ class FilterSpec:
         value_mapping (dict[Any, Any] | Callable[[Any], Any] | None): Transform filter values before applying to source.
             Used when the source uses different values than the output column.
             Can be a dict for direct mapping or a callable for custom logic.
-            Applies to equality (==) and is_in() filters. With a lookback or lookahead, the window is applied around
+            Applies to equality (==) and is_in() filters. A dict value or callable result that is a ``set`` or
+            ``frozenset`` is a one-to-many mapping: the requested value is pushed as an ``is_in`` over all source
+            values in the set (an empty set matches no source rows). Other types -- including ``list`` and
+            ``tuple`` -- are single values. With a lookback or lookahead, the window is applied around
             each requested value and around its mapped value, so it may be declared relative to either; a bounded
             range on a ``Date`` output column is mapped day by day. Other ranges (open, or too long to enumerate) get
-            the window around the requested range only, so the window must also cover the mapping's offset. Mappings
-            that fail or return None push nothing for the source column.
+            the window around the requested range only, so the window must also cover the mapping's offset. On a
+            windowed (lookback/lookahead) column a set-valued result is not honored (nothing is pushed for it).
+            Mappings that fail or return None push nothing for the source column.
 
     Examples:
         Same column name, no transformation::
@@ -109,6 +113,10 @@ class FilterSpec:
         Value mapping with callable::
 
             {"ticker": FilterSpec(value_mapping=str.upper)}
+
+        One-to-many value mapping (output ``group`` "A" is derived from several source members)::
+
+            {"group": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2", "a3"})})}
     """
 
     source_col: str | None = None
@@ -151,7 +159,9 @@ class IntervalFilterSpec:
             bounds ``lo``/``hi`` before pushdown, exactly as :class:`FilterSpec` does for discrete
             values (e.g. a business-day offset applied to the request date). A callable is applied to
             each finite bound; a dict maps finite bounds present in it and leaves absent bounds
-            unmapped (that bound's predicate is then not pushed). ``None`` passes bounds through.
+            unmapped (that bound's predicate is then not pushed). ``None`` passes bounds through. A
+            one-to-many result (``set``/``frozenset``) has no single bound to compare against, so that
+            bound is left unpushed (it is only honored for discrete :class:`FilterSpec` filters).
 
     Notes:
         The pushdown is **conservative** -- it may keep non-overlapping rows, but never drops an
@@ -179,17 +189,22 @@ class IntervalFilterSpec:
 def _map_bound(value: Any, mapping: dict | Callable | None) -> tuple[Any, bool]:
     """Map a single interval request bound through ``value_mapping``.
 
-    Returns ``(mapped_value, ok)``. ``ok`` is False only for a dict mapping that lacks the key,
-    signalling the caller not to push that bound's predicate (mirrors the ``FilterSpec`` dict-miss
-    behavior of deferring rather than pushing an incomplete filter).
+    Returns ``(mapped_value, ok)``. ``ok`` is False when a dict mapping lacks the key, or when the mapping
+    yields a ``set``/``frozenset`` (a one-to-many result has no single bound to compare against). In both
+    cases the caller does not push that bound's predicate, mirroring the ``FilterSpec`` dict-miss behavior of
+    deferring rather than pushing an incomplete filter. One-to-many mapping is only honored for discrete filters.
     """
     if mapping is None:
         return value, True
     if callable(mapping):
-        return mapping(value), True
-    if value in mapping:
-        return mapping[value], True
-    return value, False
+        mapped = mapping(value)
+    elif value in mapping:
+        mapped = mapping[value]
+    else:
+        return value, False
+    if isinstance(mapped, (set, frozenset)):
+        return value, False
+    return mapped, True
 
 
 def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> tuple[set[Any], set[Any]]:
@@ -251,10 +266,13 @@ def _union_discrete_filter(
             union.setdefault(_value_key(value), value)
 
     col = pl.col(source_col)
-    # A value_mapping may map to None. Do not sort: the values may be unorderable (e.g. mixed types).
+    # A value_mapping may map to None, or (via an empty set result) to no source values at all. Do not sort:
+    # the values may be unorderable (e.g. mixed types).
     non_null = [v for v in union.values() if v is not None]
     if not non_null:
-        return col.is_null()
+        # No non-null source values. An empty union (every requested value mapped to an empty set) matches no
+        # source row, so keep nothing; a union of only None(s) keeps null rows (the existing mapped-to-None case).
+        return pl.lit(False) if not union else col.is_null()
     if len(non_null) == 1:
         expr = col == non_null[0]
     else:
@@ -278,17 +296,33 @@ def _value_key(value: Any) -> Any:
     return value
 
 
+def _expand_mapped(result: Any) -> list[Any]:
+    """Expand one ``value_mapping`` result into the source value(s) it stands for.
+
+    A ``set`` or ``frozenset`` is a one-to-many mapping ("any of these source values") and is flattened into
+    its members. Every other type is a single source value -- including ``list`` and ``tuple``, which can be
+    legitimate ``List``-dtype values.
+    """
+    if isinstance(result, (set, frozenset)):
+        return list(result)
+    return [result]
+
+
 def _map_values(values: set[Any], mapping: dict | Callable | None) -> tuple[list[Any], set[Any]]:
     """Map ``values`` as :func:`_apply_value_mapping` does, returning a list so that values equal in Python are kept.
 
-    Returns ``(mapped, unmapped)``; with a dict mapping, ``unmapped`` holds the values that are not keys.
+    A ``set``/``frozenset`` mapping result is flattened into its members (a one-to-many mapping), so one
+    requested value can contribute several source values. An empty set contributes none.
+
+    Returns ``(mapped, unmapped)``; with a dict mapping, ``unmapped`` holds the values that are not keys (a key
+    present but mapped to an empty set is *not* unmapped -- it is mapped to no source values).
     """
     if mapping is None:
         return list(values), set()
     if callable(mapping):
-        return [mapping(v) for v in values], set()
+        return [m for v in values for m in _expand_mapped(mapping(v))], set()
     unmapped = {v for v in values if v not in mapping}
-    return [mapping[v] for v in values if v in mapping], unmapped
+    return [m for v in values if v in mapping for m in _expand_mapped(mapping[v])], unmapped
 
 
 # Endpoint comparison operators per ``closed`` mode. ``lower`` is the ``end_col >= lo`` side (left
@@ -483,6 +517,8 @@ def _member_enclosure(
             return None
         mapped_point = _temporal_point(mapped)
         if mapped_point is None:
+            # A non-temporal mapped value (including a set/frozenset one-to-many result, which is only honored
+            # for discrete filters) has no window to enclose, so push nothing for this source column.
             return None
         enclosure |= _expand_to_source(mapped_point, spec, source_dtype)
         if _has_window(spec) and (own_point := _temporal_point(value)) is not None:
