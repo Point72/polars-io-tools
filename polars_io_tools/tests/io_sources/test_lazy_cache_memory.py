@@ -273,6 +273,22 @@ def test_empty_projection_preserves_row_count(monkeypatch):
     assert sum(df.height for df in captured["gen"](with_columns=[], predicate=None, n_rows=None, batch_size=None)) == TWO_ROWS.height
 
 
+@pytest.mark.parametrize("rows", [250_000, 1_100_000], ids=["collected_at_once", "streamed"])
+def test_read_larger_than_a_batch(rows):
+    """Polars passes a batch_size of 100000 with a pushed filter, so a longer read is served in several batches."""
+    frame = pl.DataFrame({"v": range(rows)})
+    lf = cache_memory(frame.lazy(), schema=frame.schema)
+    assert_frame_equal(lf.filter(pl.col("v") >= 0).collect(), frame)
+
+
+def test_rows_survive_rechunking(monkeypatch):
+    """A one-row chunk target makes every build re-cut the buffer; each row is still served once."""
+    monkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "1")
+    lf = cache_memory(lambda: REGIONS.lazy(), schema=REGIONS.schema, partition_cols="region")
+    for pred in [pl.col("region") == "eu", _REGION_IS_US, pl.col("v") >= 0]:
+        assert_frame_equal(lf.filter(pred).collect(), REGIONS.filter(pred), check_row_order=False)
+
+
 # The built frame is reconciled with the declared schema.
 
 
