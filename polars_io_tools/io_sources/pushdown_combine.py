@@ -290,6 +290,10 @@ def _union_discrete_filter(
         # None(s) keeps null rows.
         return pl.lit(False) if not union else col.is_null()
     keeps_null = len(non_null) < len(union) or any(v is None for v in cast_union.values())
+    if isinstance(dtype, pl.Datetime) and (days := [v for v in non_null if isinstance(v, date) and not isinstance(v, datetime)]):
+        # A date requests every row of that day, not only midnight.
+        non_null = [v for v in non_null if not (isinstance(v, date) and not isinstance(v, datetime))]
+        exprs.append(_whole_days(source_col, days, dtype))
     if len(non_null) == 1:
         exprs.append(col == non_null[0])
     elif dtype.is_integer() and any(isinstance(v, float) for v in non_null):
@@ -303,6 +307,17 @@ def _union_discrete_filter(
     expr = exprs[0].or_(*exprs[1:]) if exprs else pl.lit(False)
     # ``== None`` and ``is_in`` never match null rows.
     return expr | col.is_null() if keeps_null else expr
+
+
+def _whole_days(source_col: str, days: list[date], dtype: pl.Datetime) -> pl.Expr:
+    """Rows of a Datetime ``source_col`` on any of ``days``: half-open day ranges, or the local date for a time zone."""
+    if dtype.time_zone is not None:
+        return pl.col(source_col).dt.date().is_in(_is_in_collection(days, pl.Date))
+    periods = portion.empty()
+    for day in days:
+        start = datetime.combine(day, time.min)
+        periods |= portion.closedopen(start, portion.inf if day == date.max else start + timedelta(days=1))
+    return _convert_interval_to_polars_expr(periods, source_col)
 
 
 def _float32_membership(col: pl.Expr, values: list[Any], dtype: pl.DataType) -> pl.Expr | None:

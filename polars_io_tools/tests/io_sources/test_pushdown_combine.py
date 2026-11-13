@@ -1326,6 +1326,18 @@ SCENARIOS = [
         combine=lambda s: s["data"].collect().lazy(),
         predicate=pl.col("t").is_in(US_MEMBERS.implode()),
     ),
+    # A value_mapping onto a Datetime source column that returns dates asks for whole days, not midnights.
+    *[
+        CombineCase(
+            f"mapped_date_on_datetime_keeps_the_whole_day-{name}-{zone}",
+            sources=single_source(frame, day=FilterSpec(source_col="t", value_mapping=lambda day: day)),
+            combine=lambda s: s["data"].with_columns(pl.col("t").dt.date().alias("day")),
+            predicate=pred,
+            sources_receiving_filter=("data",),
+        )
+        for zone, frame in [("naive", _TIMESTAMPS_AROUND_NEW_YEAR), ("new_york", _TIMESTAMPS_IN_NEW_YORK)]
+        for name, pred in [("eq", pl.col("day") == make_date(1)), ("is_in", pl.col("day").is_in([make_date(1), make_date(2)]))]
+    ],
 ]
 
 
