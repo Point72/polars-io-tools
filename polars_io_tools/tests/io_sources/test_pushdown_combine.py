@@ -12,6 +12,7 @@ filters, and compare them with plain Polars.
 
 import logging
 import sys
+import warnings
 from collections.abc import Callable
 from dataclasses import KW_ONLY, dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -1716,6 +1717,200 @@ def test_interval_mapping_to_a_set_pushes_nothing(mapping, pred):
     assert tracker.last_predicate is None
 
 
+def _previous_day(d):
+    return d - timedelta(days=1)
+
+
+# same_row_as: output columns read from the same source row. ``date`` is ``data_date`` + 1 day.
+TEN_DAYS = pl.DataFrame({"data_date": [make_date(d) for d in range(1, 11)], "v": list(range(1, 11))})
+
+
+def _with_next_day(s):
+    return s["s"].with_columns(pl.col("data_date").dt.offset_by("1d").alias("date"))
+
+
+def _day_and_next_day(**next_day_spec) -> dict:
+    return {"data_date": FilterSpec(), "date": FilterSpec(source_col="data_date", value_mapping=_previous_day, **next_day_spec)}
+
+
+@dataclass(frozen=True)
+class SameRowCase:
+    """A filter on ``date`` and ``data_date`` of TEN_DAYS, and the source days the pushed filter keeps (None: nothing pushed)."""
+
+    id: str
+    _: KW_ONLY
+    pred: pl.Expr
+    kept_days: set | None
+
+
+SAME_ROW = [
+    SameRowCase("eq", pred=pl.col("date") == make_date(5), kept_days={4}),
+    SameRowCase("is_in", pred=pl.col("date").is_in([make_date(5), make_date(8)]), kept_days={4, 7}),
+    SameRowCase("both_filtered", pred=(pl.col("date") == make_date(5)) & (pl.col("data_date") == make_date(4)), kept_days={4}),
+    SameRowCase("both_filtered_disjoint", pred=(pl.col("date") == make_date(5)) & (pl.col("data_date") == make_date(7)), kept_days=set()),
+    SameRowCase("identity_only", pred=pl.col("data_date") == make_date(4), kept_days={4}),
+    # Either column may hold for the row, so neither filter alone narrows the read.
+    SameRowCase("or_across_columns", pred=(pl.col("date") == make_date(5)) | (pl.col("data_date") == make_date(8)), kept_days=None),
+    # A range on a mapped column without a lookback is not pushed, as for the mapped column alone.
+    SameRowCase("range", pred=pl.col("date").is_between(make_date(5), make_date(6)), kept_days=None),
+]
+
+
+@pytest.mark.parametrize("case", as_params(SAME_ROW))
+def test_same_row_as_pushes_the_filters_of_one_row(case: SameRowCase):
+    tracker = PredicateTracker(TEN_DAYS)
+    sources = {"s": (tracker.lazy_frame, _day_and_next_day(same_row_as="data_date"))}
+    assert_matches_plain_polars(pushdown_combine(sources, _with_next_day), _with_next_day({"s": TEN_DAYS.lazy()}), case.pred)
+    kept = None if tracker.last_predicate is None else {d.day for d in TEN_DAYS.filter(tracker.last_predicate)["data_date"]}
+    assert kept == case.kept_days
+
+
+def test_without_same_row_as_a_filter_on_the_mapped_column_pushes_nothing():
+    tracker = PredicateTracker(TEN_DAYS)
+    with pytest.warns(UserWarning, match="same_row_as"):
+        lf = pushdown_combine({"s": (tracker.lazy_frame, _day_and_next_day())}, _with_next_day)
+    assert_matches_plain_polars(lf, _with_next_day({"s": TEN_DAYS.lazy()}), pl.col("date") == make_date(5))
+    assert tracker.last_predicate is None
+
+
+def test_same_row_as_links_through_a_chain():
+    specs = {
+        "data_date": FilterSpec(),
+        "date": FilterSpec(source_col="data_date", value_mapping=_previous_day, same_row_as="data_date"),
+        "day_after": FilterSpec(source_col="data_date", value_mapping=lambda d: d - timedelta(days=2), same_row_as="date"),
+    }
+
+    def combine(s):
+        return _with_next_day(s).with_columns(pl.col("data_date").dt.offset_by("2d").alias("day_after"))
+
+    tracker = PredicateTracker(TEN_DAYS)
+    pred = (pl.col("day_after") == make_date(6)) & (pl.col("date") == make_date(5))
+    assert_matches_plain_polars(pushdown_combine({"s": (tracker.lazy_frame, specs)}, combine), combine({"s": TEN_DAYS.lazy()}), pred)
+    assert set(TEN_DAYS.filter(tracker.last_predicate)["data_date"]) == {make_date(4)}
+
+
+def test_a_row_without_a_filter_still_pushes_nothing_for_separate_rows():
+    # ``date`` and ``data_date`` are one row; ``other`` is read from another row of the same source (a self-join).
+    specs = {**_day_and_next_day(same_row_as="data_date"), "other": FilterSpec(source_col="data_date", value_mapping=_previous_day)}
+
+    def combine(s):
+        return _with_next_day(s).join(s["s"].select(pl.col("data_date").dt.offset_by("1d").alias("other")), how="cross")
+
+    reference = combine({"s": TEN_DAYS.lazy()})
+    for pred, kept_days in [(pl.col("date") == make_date(5), None), ((pl.col("date") == make_date(5)) & (pl.col("other") == make_date(8)), {4, 7})]:
+        tracker = PredicateTracker(TEN_DAYS)
+        assert_matches_plain_polars(pushdown_combine({"s": (tracker.lazy_frame, specs)}, combine), reference, pred)
+        kept = None if tracker.last_predicate is None else {d.day for d in TEN_DAYS.filter(tracker.last_predicate)["data_date"]}
+        assert kept == kept_days
+
+
+def test_same_row_as_on_a_datetime_source_keeps_the_whole_day():
+    frame = pl.DataFrame({"data_date": [datetime(2024, 1, 4, 12), datetime(2024, 1, 5, 9)], "v": [1, 2]})
+
+    def combine(s):
+        return s["s"].with_columns(pl.col("data_date").dt.date().dt.offset_by("1d").alias("date"))
+
+    tracker = PredicateTracker(frame)
+    sources = {"s": (tracker.lazy_frame, _day_and_next_day(same_row_as="data_date"))}
+    result = assert_matches_plain_polars(pushdown_combine(sources, combine), combine({"s": frame.lazy()}), pl.col("date") == make_date(5))
+    assert result["v"].to_list() == [1]
+    assert frame.filter(tracker.last_predicate)["v"].to_list() == [1]
+
+
+def test_same_row_as_pushes_nothing_when_a_linked_column_accepts_null():
+    # A left join pads id 2 with nulls; dropping the source row of id 1 would pad id 1 too, and the final filter
+    # keeps padded rows.
+    def combine(s):
+        joined = s["left"].join(s["right"], on="id", how="left")
+        return joined.with_columns(pl.col("data_date").fill_null(make_date(10)).dt.offset_by("1d").alias("date"))
+
+    right = pl.DataFrame({"id": [1], "data_date": [make_date(4)]})
+    specs = {
+        "data_date": FilterSpec(),
+        "date": FilterSpec(source_col="data_date", value_mapping={make_date(11): frozenset({None, make_date(10)})}, same_row_as="data_date"),
+    }
+    sources = {"left": (pl.LazyFrame({"id": [1, 2]}), {}), "right": (right.lazy(), specs)}
+    pred = pl.col("data_date").is_null() & (pl.col("date") == make_date(11))
+    result = assert_matches_plain_polars(pushdown_combine(sources, combine), combine({n: lf for n, (lf, _) in sources.items()}), pred)
+    assert result["id"].to_list() == [2]
+
+
+def test_same_row_as_pushes_nothing_when_another_row_accepts_null():
+    # ``other`` is read from the next row by a left self-join; its mapping accepts the null that pads the last row.
+    frame = pl.DataFrame({"id": [1, 2], "data_date": [make_date(4), make_date(7)]})
+
+    def combine(s):
+        nxt = s["s"].select((pl.col("id") - 1).alias("id"), pl.col("data_date").alias("next_data_date"))
+        joined = _with_next_day(s).join(nxt, on="id", how="left")
+        return joined.with_columns(pl.col("next_data_date").fill_null(make_date(10)).dt.offset_by("1d").alias("other")).drop("next_data_date")
+
+    specs = {
+        **_day_and_next_day(same_row_as="data_date"),
+        "other": FilterSpec(source_col="data_date", value_mapping={make_date(11): frozenset({None, make_date(10)})}),
+    }
+    pred = (pl.col("date") == make_date(5)) & (pl.col("other") == make_date(11))
+    result = assert_matches_plain_polars(pushdown_combine({"s": (frame.lazy(), specs)}, combine), combine({"s": frame.lazy()}), pred)
+    assert result.is_empty()
+
+
+@dataclass(frozen=True)
+class SameRowErrorCase:
+    """Specs of one source entry with a ``same_row_as`` that ``pushdown_combine`` must reject."""
+
+    id: str
+    _: KW_ONLY
+    specs: dict
+    match: str
+
+
+SAME_ROW_ERRORS = [
+    SameRowErrorCase("itself", specs={"date": FilterSpec(source_col="data_date", same_row_as="date")}, match="another FilterSpec"),
+    SameRowErrorCase("missing", specs={"date": FilterSpec(source_col="data_date", same_row_as="nope")}, match="another FilterSpec"),
+    SameRowErrorCase(
+        "another_source_column", specs={"v": FilterSpec(), "date": FilterSpec(source_col="data_date", same_row_as="v")}, match="another FilterSpec"
+    ),
+    SameRowErrorCase(
+        "interval_spec",
+        specs={"w": IntervalFilterSpec("data_date", "data_date"), "date": FilterSpec(source_col="data_date", same_row_as="w")},
+        match="another FilterSpec",
+    ),
+    # A windowed column can need rows that the filter of the other column of its row would drop.
+    SameRowErrorCase(
+        "windowed_reader",
+        specs={"data_date": FilterSpec(lookback=timedelta(days=2)), "date": FilterSpec(source_col="data_date", same_row_as="data_date")},
+        match="lookback or lookahead",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(SAME_ROW_ERRORS))
+def test_invalid_same_row_as_is_rejected(case: SameRowErrorCase):
+    with pytest.raises(ValueError, match=case.match):
+        pushdown_combine({"s": (TEN_DAYS.lazy(), case.specs)}, lambda s: s["s"])
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        {"data_date": FilterSpec(), "date": FilterSpec(source_col="data_date")},
+        {"data_date": FilterSpec(), "date": FilterSpec(source_col="data_date", value_mapping=_previous_day, lookback=timedelta(days=2))},
+        _day_and_next_day(same_row_as="data_date"),
+    ],
+    ids=["plain_alias", "windowed_mapped_alias", "linked"],
+)
+def test_no_warning_without_an_unlinked_mapped_column(specs):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pushdown_combine({"s": (TEN_DAYS.lazy(), specs)}, _with_next_day)
+
+
+def test_no_warning_when_each_row_is_its_own_source_entry():
+    specs = {"date": FilterSpec(source_col="data_date", value_mapping=_previous_day)}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pushdown_combine({"a": (TEN_DAYS.lazy(), {"data_date": FilterSpec()}), "b": (TEN_DAYS.lazy(), specs)}, lambda s: s["a"])
+
+
 @dataclass(frozen=True)
 class SourceColCase:
     """A filter spec, and the source column of the output column ``date``."""
@@ -1902,6 +2097,20 @@ _SHAPES = {
         },
         lambda s: _overlapping(s, _offset_monday_expr(pl.col("date"))),
     ),
+    "same_row_mapped": (
+        # date is data_date + 1 day, read from the same source row.
+        {
+            "s": (
+                "src",
+                {
+                    "data_date": FilterSpec(),
+                    "date": FilterSpec(source_col="data_date", value_mapping=_previous_day, same_row_as="data_date"),
+                    "key": FilterSpec(),
+                },
+            )
+        },
+        lambda s: s["s"].with_columns(pl.col("data_date").dt.offset_by("1d").alias("date")),
+    ),
     "interval_mapped_to_last_day": (
         {
             "c": ("calendar", {"date": FilterSpec()}),
@@ -1967,17 +2176,17 @@ def _day(draw):
 def _combine_predicates(draw, columns):
     def atom():
         col = draw(st.sampled_from(sorted(columns)))
-        if col == "date":
-            d = _day(draw)
+        if col in ("date", "data_date"):
+            d, c = _day(draw), pl.col(col)
             return draw(
                 st.sampled_from(
                     [
-                        pl.col("date") == d,
-                        pl.col("date").is_in([d, d + timedelta(days=draw(st.integers(1, 9)))]),
-                        pl.col("date") >= d,
-                        pl.col("date") < d,
-                        pl.col("date").is_between(d, d + timedelta(days=draw(st.integers(0, 5)))),
-                        pl.col("date").is_null() | (pl.col("date") == d),
+                        c == d,
+                        c.is_in([d, d + timedelta(days=draw(st.integers(1, 9)))]),
+                        c >= d,
+                        c < d,
+                        c.is_between(d, d + timedelta(days=draw(st.integers(0, 5)))),
+                        c.is_null() | (c == d),
                     ]
                 )
             )
@@ -2003,7 +2212,7 @@ def test_generated_combine_matches_native(data, shape):
     frames = data.draw(_frames())
     assume(not _old_polars_null_key_bug(shape, frames))
     output = _combine_without_pushdown(entries, combine, frames).collect_schema()
-    pred = data.draw(_combine_predicates({"date", "key", "name"} & set(output.names())))
+    pred = data.draw(_combine_predicates({"date", "data_date", "key", "name"} & set(output.names())))
     sources = {entry: (PredicateTracker(frames[frame]).lazy_frame, specs) for entry, (frame, specs) in entries.items()}
     result = pushdown_combine(sources, combine).filter(pred).collect()
     assert_frame_equal(result, _combine_without_pushdown(entries, combine, frames).filter(pred).collect(), check_row_order=False)
