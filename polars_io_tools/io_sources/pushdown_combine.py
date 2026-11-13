@@ -280,7 +280,11 @@ def _union_discrete_filter(
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
             log.debug(f"Column '{output_col}' unconstrained/empty/null-accepting; pushing nothing for source col '{source_col}'")
             return None
-        mapped_values, unmapped_values = _map_values(discrete_values, spec.value_mapping)
+        try:
+            mapped_values, unmapped_values = _map_values(discrete_values, spec.value_mapping)
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
+            log.debug(f"value_mapping of column '{output_col}' failed; pushing nothing for source col '{source_col}'")
+            return None
         if unmapped_values:
             log.debug(
                 f"Values {unmapped_values} for column '{output_col}' not found in value_mapping; "
@@ -356,7 +360,13 @@ def _same_row_filter(
     for output_col, spec in members:
         by_row.setdefault(row_of.get(output_col, output_col), []).append((output_col, spec))
         values = extracted_values.get(output_col)
-        if values is not None and (None in values or None in _map_values(values, spec.value_mapping)[0]):
+        if values is None:
+            continue
+        try:
+            mapped = _map_values(values, spec.value_mapping)[0]
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
+            return None
+        if None in values or None in mapped:
             return None
     row_filters = []
     for row in by_row.values():

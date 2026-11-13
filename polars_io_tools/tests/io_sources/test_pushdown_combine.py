@@ -1853,6 +1853,21 @@ def test_same_row_as_pushes_nothing_when_another_row_accepts_null():
     assert result.is_empty()
 
 
+def _raises(day):
+    raise ValueError("mapping failed")
+
+
+@pytest.mark.parametrize("same_row_as", [None, "data_date"], ids=["alone", "linked"])
+def test_a_value_mapping_that_raises_pushes_nothing(same_row_as):
+    specs = {"date": FilterSpec(source_col="data_date", value_mapping=_raises, same_row_as=same_row_as)}
+    if same_row_as is not None:
+        specs["data_date"] = FilterSpec()
+    tracker = PredicateTracker(TEN_DAYS)
+    lf = pushdown_combine({"s": (tracker.lazy_frame, specs)}, _with_next_day)
+    assert_matches_plain_polars(lf, _with_next_day({"s": TEN_DAYS.lazy()}), pl.col("date") == make_date(5))
+    assert tracker.last_predicate is None
+
+
 @dataclass(frozen=True)
 class SameRowErrorCase:
     """Specs of one source entry with a ``same_row_as`` that ``pushdown_combine`` must reject."""
