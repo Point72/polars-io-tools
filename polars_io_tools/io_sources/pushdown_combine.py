@@ -33,6 +33,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -95,6 +96,13 @@ class FilterSpec:
             windowed (lookback/lookahead) column a set-valued result is not honored (nothing is pushed for it).
             Mappings that fail or return None push nothing for the source column.
 
+        same_row_as (str | None): Another output column of the same source entry that reads the same source column
+            from the same source row, as when ``date`` is computed from ``data_date``. The ``==`` and ``is_in``
+            filters of columns of one row must all hold on that row, so such a filter on one of them is pushed even
+            when the others are not filtered. Without it, columns sharing a source column are taken to read separate
+            rows (as in a self-join), and an ``==`` or ``is_in`` filter is only pushed when every one of them is
+            filtered. A source column read with a lookback or lookahead cannot be linked.
+
     Examples:
         Same column name, no transformation::
 
@@ -119,12 +127,20 @@ class FilterSpec:
         One-to-many value mapping (output ``group`` "A" is derived from several source members)::
 
             {"group": FilterSpec(source_col="member", value_mapping={"A": frozenset({"a1", "a2", "a3"})})}
+
+        A column computed from another column of the same row (a filter on ``date`` alone is pushed)::
+
+            {
+                "data_date": FilterSpec(),
+                "date": FilterSpec(source_col="data_date", value_mapping=previous_day, same_row_as="data_date"),
+            }
     """
 
     source_col: str | None = None
     lookback: timedelta = field(default_factory=timedelta)
     lookahead: timedelta = field(default_factory=timedelta)
     value_mapping: dict[Any, Any] | Callable[[Any], Any] | None = None
+    same_row_as: str | None = None
 
 
 @dataclass
@@ -264,7 +280,11 @@ def _union_discrete_filter(
         if discrete_values is None or len(discrete_values) == 0 or None in discrete_values:
             log.debug(f"Column '{output_col}' unconstrained/empty/null-accepting; pushing nothing for source col '{source_col}'")
             return None
-        mapped_values, unmapped_values = _map_values(discrete_values, spec.value_mapping)
+        try:
+            mapped_values, unmapped_values = _map_values(discrete_values, spec.value_mapping)
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
+            log.debug(f"value_mapping of column '{output_col}' failed; pushing nothing for source col '{source_col}'")
+            return None
         if unmapped_values:
             log.debug(
                 f"Values {unmapped_values} for column '{output_col}' not found in value_mapping; "
@@ -290,6 +310,10 @@ def _union_discrete_filter(
         # None(s) keeps null rows.
         return pl.lit(False) if not union else col.is_null()
     keeps_null = len(non_null) < len(union) or any(v is None for v in cast_union.values())
+    if isinstance(dtype, pl.Datetime) and (days := [v for v in non_null if isinstance(v, date) and not isinstance(v, datetime)]):
+        # A date requests every row of that day, not only midnight.
+        non_null = [v for v in non_null if not (isinstance(v, date) and not isinstance(v, datetime))]
+        exprs.append(_whole_days(source_col, days, dtype))
     if len(non_null) == 1:
         exprs.append(col == non_null[0])
     elif dtype.is_integer() and any(isinstance(v, float) for v in non_null):
@@ -303,6 +327,105 @@ def _union_discrete_filter(
     expr = exprs[0].or_(*exprs[1:]) if exprs else pl.lit(False)
     # ``== None`` and ``is_in`` never match null rows.
     return expr | col.is_null() if keeps_null else expr
+
+
+def _whole_days(source_col: str, days: list[date], dtype: pl.Datetime) -> pl.Expr:
+    """Rows of a Datetime ``source_col`` on any of ``days``: half-open day ranges, or the local date for a time zone."""
+    if dtype.time_zone is not None:
+        return pl.col(source_col).dt.date().is_in(_is_in_collection(days, pl.Date))
+    periods = portion.empty()
+    for day in days:
+        start = datetime.combine(day, time.min)
+        periods |= portion.closedopen(start, portion.inf if day == date.max else start + timedelta(days=1))
+    return _convert_interval_to_polars_expr(periods, source_col)
+
+
+def _same_row_filter(
+    source_col: str,
+    members: list[tuple[str, FilterSpec]],
+    row_of: dict[str, str],
+    extracted_values: dict[str, set[Any] | None],
+    dtype: pl.DataType,
+    float32_outputs: Callable[[], frozenset[str]],
+) -> pl.Expr | None:
+    """Discrete filter for the output columns of ``source_col``, grouped into source rows by ``row_of``.
+
+    A source row is needed if it serves every filtered column of one row: the filters of one row's columns are ANDed,
+    skipping columns without a filter of their own, and the rows are ORed. Nothing is pushed if a row has no filter,
+    or if the filter or mapping of any of the columns accepts null: a join can then pad output rows with nulls that the
+    final predicate keeps, and dropping a source row could create one. Columns missing from ``row_of`` are rows of
+    their own.
+    """
+    by_row: dict[str, list[tuple[str, FilterSpec]]] = {}
+    for output_col, spec in members:
+        by_row.setdefault(row_of.get(output_col, output_col), []).append((output_col, spec))
+        values = extracted_values.get(output_col)
+        if values is None:
+            continue
+        try:
+            mapped = _map_values(values, spec.value_mapping)[0]
+        except Exception:  # noqa: BLE001 -- a failing user mapping pushes nothing
+            return None
+        if None in values or None in mapped:
+            return None
+    row_filters = []
+    for row in by_row.values():
+        filters = [f for member in row if (f := _union_discrete_filter(source_col, [member], extracted_values, dtype, float32_outputs)) is not None]
+        if not filters:
+            return None
+        row_filters.append(filters[0].and_(*filters[1:]))
+    return row_filters[0].or_(*row_filters[1:])
+
+
+def _root(parent: dict[str, str], col: str) -> str:
+    while parent[col] != col:
+        col = parent[col]
+    return col
+
+
+def _same_rows(sources: dict[str, tuple[pl.LazyFrame, dict[str, FilterSpec | IntervalFilterSpec]]]) -> dict[str, dict[str, str]]:
+    """For each source entry, the row of every output column linked by ``same_row_as``, named after one of its columns.
+
+    Raises ValueError for a link to a column that is not another FilterSpec of the entry reading the same source
+    column, or on a source column that a spec reads with a lookback or lookahead. Warns when columns sharing a source
+    column include a ``value_mapping`` and no link, as a filter on the mapped column alone then pushes nothing.
+    """
+    rows: dict[str, dict[str, str]] = {}
+    for source_name, (_, specs) in sources.items():
+        filter_specs = {o: sp for o, sp in specs.items() if isinstance(sp, FilterSpec)}
+        readers: dict[str, list[str]] = {}
+        for output_col, spec in filter_specs.items():
+            readers.setdefault(_get_source_col(output_col, spec), []).append(output_col)
+        parent: dict[str, str] = {}
+        for output_col, spec in filter_specs.items():
+            target = spec.same_row_as
+            if target is None:
+                continue
+            source_col = _get_source_col(output_col, spec)
+            if target == output_col or target not in filter_specs or _get_source_col(target, filter_specs[target]) != source_col:
+                raise ValueError(
+                    f"{source_name}.{output_col}: same_row_as={target!r} must name another FilterSpec in the same source entry "
+                    f"that reads source column {source_col!r}"
+                )
+            if any(_has_window(filter_specs[o]) for o in readers[source_col]):
+                raise ValueError(
+                    f"{source_name}.{output_col}: same_row_as cannot link columns of {source_col!r}, which is read with a lookback or lookahead"
+                )
+            parent.setdefault(output_col, output_col)
+            parent.setdefault(target, target)
+            parent[_root(parent, output_col)] = _root(parent, target)
+        rows[source_name] = {col: _root(parent, col) for col in parent}
+        for source_col, cols in readers.items():
+            group = [filter_specs[o] for o in cols]
+            if len(cols) > 1 and not any(_has_window(sp) or sp.same_row_as for sp in group) and any(sp.value_mapping is not None for sp in group):
+                warnings.warn(
+                    f"pushdown_combine: {source_name} columns {sorted(cols)} all read {source_col!r} and one has a value_mapping, so an "
+                    "== or is_in filter on only some of them pushes nothing. If they come from the same source row, set same_row_as on the "
+                    "computed column; if they come from separate rows (a self-join), list the source once per row.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+    return rows
 
 
 def _float32_membership(col: pl.Expr, values: list[Any], dtype: pl.DataType) -> pl.Expr | None:
@@ -852,6 +975,11 @@ def pushdown_combine(
         2. Filter ``group1 == "A"`` alone (group2 unconstrained) -> no ``group`` predicate is pushed
         3. combine() runs and the original filter is applied, giving the exact requested pairs
 
+        When the output columns instead read the *same* source row (``date`` computed from ``data_date``), set
+        ``same_row_as`` on one of them to name the other: their filters must then all hold on that row, so they
+        are ANDed, and an ``==`` or ``is_in`` filter on one of them alone is pushed. ``pushdown_combine`` warns
+        when columns sharing a source column include a ``value_mapping`` and no ``same_row_as``.
+
         This union applies to **discrete** (``==`` / ``is_in``) filters only. **Temporal** (date/datetime
         range, ``lookback`` / ``lookahead``) specs that share a source column are still AND-**intersected**,
         not unioned. This is intentional: unlike the discrete case, ``source_col`` sharing does not by
@@ -928,6 +1056,7 @@ def pushdown_combine(
         output_col_set.update(specs.keys())
     # Sorted so the pickled closure (and hence the serialized plan) does not depend on PYTHONHASHSEED
     all_output_cols = tuple(sorted(output_col_set))
+    same_rows = _same_rows(sources)
 
     def source_generator(
         with_columns: list[str] | None,
@@ -1109,10 +1238,15 @@ def pushdown_combine(
                     continue
                 by_source_col.setdefault(source_col, []).append((output_col, spec))
 
+            row_of = same_rows[source_name]
             for source_col, members in by_source_col.items():
                 # Output columns sharing a source column push the UNION of their value sets, or nothing if any
-                # sharer is unconstrained/unmappable (see _union_discrete_filter).
-                union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col], float32_outputs)
+                # sharer is unconstrained/unmappable (see _union_discrete_filter); columns linked by same_row_as
+                # are one row (see _same_row_filter).
+                if any(output_col in row_of for output_col, _ in members):
+                    union_filter = _same_row_filter(source_col, members, row_of, extracted_values, source_schema[source_col], float32_outputs)
+                else:
+                    union_filter = _union_discrete_filter(source_col, members, extracted_values, source_schema[source_col], float32_outputs)
                 if union_filter is not None:
                     filtered_lf = filtered_lf.filter(union_filter)
                     log.debug(f"Applied discrete filter to {source_name}.{source_col}: {union_filter}")

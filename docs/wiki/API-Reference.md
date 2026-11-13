@@ -412,12 +412,14 @@ Build a LazyFrame from named sources, each paired with a `dict[str, FilterSpec]`
 ### `FilterSpec`
 
 ```python
-FilterSpec(source_col=None, lookback=timedelta(), lookahead=timedelta(), value_mapping=None)
+FilterSpec(source_col=None, lookback=timedelta(), lookahead=timedelta(), value_mapping=None, same_row_as=None)
 ```
 
 Describes how a filter on an output column maps to a source: rename to `source_col`,
 expand temporal ranges by `lookback`/`lookahead`, and remap values with `value_mapping` (a
-dict or callable).
+dict or callable). When two output columns read one source column from the same row, as a
+`date` computed from `data_date`, set `same_row_as` on one to name the other, so an `==` or
+`is_in` filter on either one alone is pushed.
 
 ### `IntervalFilterSpec`
 
