@@ -47,6 +47,7 @@ constructing a fresh ``cache_memory`` (a fresh call builds a fresh buffer), the 
 instance-scoped invalidation model as the success path.
 """
 
+import os
 import threading
 from collections.abc import Callable, Iterator, Sequence
 
@@ -68,6 +69,39 @@ __all__ = ("cache_memory",)
 # Sentinel returned by the build planner to mean "everything demanded is already
 # materialized" — distinct from ``None``, which means "do a full (unrestricted) build".
 _NOTHING = object()
+
+# Rows per chunk of a cache_memory buffer when POLARS_IDEAL_MORSEL_SIZE (the chunk size Polars' streaming engine
+# aims for) is unset. A replayed filter pays a fixed cost per chunk but runs the chunks in parallel, so many small
+# chunks and one huge chunk are both slow to read.
+_DEFAULT_CHUNK_ROWS = 100_000
+
+# A replay of a buffer of at most this many batches collects its result in one go rather than streaming it, holding
+# up to this many batches of the result at once. Measured: streaming starts paying off at 10-20 batches.
+_MAX_BATCHES_AT_ONCE = 10
+
+
+def _chunk_rows() -> int:
+    """Return the rows per chunk of a cache_memory buffer (POLARS_IDEAL_MORSEL_SIZE, or the default)."""
+    try:
+        return max(1, int(os.environ.get("POLARS_IDEAL_MORSEL_SIZE", _DEFAULT_CHUNK_ROWS)))
+    except ValueError:
+        return _DEFAULT_CHUNK_ROWS
+
+
+def _bounded_chunks(frame: pl.DataFrame) -> pl.DataFrame:
+    """Return ``frame`` with chunks of about ``_chunk_rows()`` rows, copying only to merge small chunks.
+
+    Chunks averaging under half that size are merged (one copy). Chunks averaging over twice that size
+    are cut into zero-copy slices. Anything in between is returned as is.
+    """
+    chunk_rows = _chunk_rows()
+    if frame.width == 0:
+        return frame
+    if frame.n_chunks() > 1 and 2 * frame.height < frame.n_chunks() * chunk_rows:
+        frame = frame.rechunk()
+    if frame.height > 2 * chunk_rows * frame.n_chunks():
+        frame = pl.concat(list(frame.iter_slices(chunk_rows)), how="vertical", rechunk=False)
+    return frame
 
 
 def _exclude_built(built_keys: set[PartitionKey], schema: pl.Schema | None = None) -> pl.Expr | None:
@@ -168,17 +202,17 @@ def cache_memory(
 
     build_frame: Callable[[], pl.LazyFrame] = self_or_fn if callable(self_or_fn) else (lambda: self_or_fn)
 
-    # Materialized buffers, one per partition, each already reconciled and projected to the
-    # declared schema. Without partition_cols there is exactly one key, the empty tuple ``()``.
-    buffers: dict[PartitionKey, pl.DataFrame] = {}
+    # Every materialized row, reconciled and projected to the declared schema, in chunks of about
+    # ``_chunk_rows()`` rows (see ``_bounded_chunks``). Replaced, never mutated, by each build.
+    data: pl.DataFrame | None = None
     # Partition keys already materialized — used to subtract already-built partitions from a
     # restricted build so each partition is collected at most once across the instance's lifetime.
     built_keys: set[PartitionKey] = set()
-    # Restricted predicates already built. A repeated identical demand is served from buffers
+    # Restricted predicates already built. A repeated identical demand is served from ``data``
     # without re-collecting, matched by structural predicate equality (``Expr.meta.eq``).
     built_predicates: list[pl.Expr] = []
     # True once an unrestricted build has run: every partition is then known, so later demands
-    # (any predicate) are served from ``buffers`` without rebuilding.
+    # (any predicate) are served from ``data`` without rebuilding.
     full_built = False
     # True once a partition column was keyed by physical value (see the build below).
     physical_keys = False
@@ -208,14 +242,13 @@ def cache_memory(
         """Decide what to build for a demand. Must be called while holding ``build_cond``.
 
         Returns ``_NOTHING`` if everything demanded is already materialized (serve from
-        ``buffers``); ``None`` to do a full (unrestricted) build; or a predicate to build
+        ``data``); ``None`` to do a full (unrestricted) build; or a predicate to build
         just the not-yet-materialized partitions matching the demand.
         """
         if full_built:
             return _NOTHING
         if not partition_cols:
-            # Single-buffer fast path: () is the only key.
-            return _NOTHING if () in buffers else None
+            return _NOTHING if data is not None else None
         if restricted_pred is None:
             # No usable partition predicate: we cannot know which partitions the demand needs,
             # so we must build them all.
@@ -229,14 +262,14 @@ def cache_memory(
         not_built = _exclude_built(built_keys, get_schema())
         return restricted_pred if not_built is None else restricted_pred & not_built
 
-    def get_partitions(restricted_pred: pl.Expr | None) -> list[pl.DataFrame]:
-        """Return the materialized partition buffers for a demand, building lazily as needed.
+    def get_buffer(restricted_pred: pl.Expr | None) -> pl.DataFrame:
+        """Return ``data`` for a demand, first building whatever partitions it still needs.
 
         The partition predicate restricts *which* partitions are built (an optimization only);
-        row-level correctness is still enforced by re-applying the full predicate in
-        ``source_generator``, so returning a superset of buffers here is safe.
+        ``data`` holds every partition built so far, so ``source_generator`` re-applies the full
+        predicate.
         """
-        nonlocal full_built, building, build_error, physical_keys
+        nonlocal data, full_built, building, build_error, physical_keys
         with build_cond:
             while True:
                 if build_error is not None:
@@ -248,7 +281,7 @@ def cache_memory(
                     raise _CachedBuildError(f"{type_name}: {message}")
                 todo = _plan_build(restricted_pred)
                 if todo is _NOTHING:
-                    return list(buffers.values())
+                    return data
                 if building:
                     # Another thread is running the one in-flight build. Wait and share its outcome.
                     build_cond.wait()
@@ -272,8 +305,8 @@ def cache_memory(
             # raises (either would silently corrupt results); an extra column is dropped by the
             # select below so the declared schema stays constant. Polars does not validate yielded
             # frames against the declared schema, so this is the only safety net. Partition columns
-            # need not be declared; they are dropped from the stored buffers by the select below but
-            # must be present in ``built`` for the partition_by split.
+            # need not be declared; they are dropped from ``data`` by the select below but must be
+            # present in ``built`` for keying.
             declared = get_schema()
             actual = built.schema
             for name in declared.names():
@@ -283,14 +316,15 @@ def cache_memory(
                     raise ValueError(f"cache_memory: column '{name}' declared as {declared[name]} but constructed frame has {actual[name]}")
             # Columns whose distinct values can be equal as Python objects are keyed by physical value.
             physical_cols = {c for c in partition_cols if _lossy_python_key(actual.get(c))}
+            new_keys = set()
             if partition_cols:
-                new_buffers = {}
                 key_exprs = [pl.col(c).to_physical() if c in physical_cols else pl.col(c) for c in partition_cols]
-                for frame in built.partition_by(list(partition_cols)):
-                    key = partition_key(dict(zip(partition_cols, frame.select(key_exprs).row(0))))
-                    new_buffers[key] = frame.select(declared.names())
-            else:
-                new_buffers = {(): built.select(declared.names())}
+                new_keys = {partition_key(dict(zip(partition_cols, row))) for row in built.select(key_exprs).unique().rows()}
+            rows = built.select(declared.names())
+            del built
+            # A restricted build excludes every built partition, so its rows are new; a full build replaces them all.
+            # Only this thread writes ``data``, so it may read it without the lock.
+            new_data = _bounded_chunks(rows if data is None or todo is None else pl.concat([data, rows], how="vertical"))
         except BaseException as exc:
             # Any build failure — an ordinary Exception (e.g. a data-quality raise) or a control-flow
             # BaseException (KeyboardInterrupt/SystemExit) — is terminal for this instance. Recording
@@ -314,9 +348,8 @@ def cache_memory(
 
         with build_cond:
             physical_keys = physical_keys or bool(physical_cols)
-            for key, frame in new_buffers.items():
-                buffers.setdefault(key, frame)
-                built_keys.add(key)
+            data = new_data
+            built_keys.update(new_keys)
             if todo is None:
                 # An unrestricted build materialized every partition; short-circuit later demands.
                 full_built = True
@@ -325,10 +358,7 @@ def cache_memory(
                 built_predicates.append(restricted_pred)
             building = False
             build_cond.notify_all()
-            # Snapshot under the lock: a concurrent builder may be mutating ``buffers`` (setdefault
-            # above), so iterating it outside the lock could raise "dictionary changed size".
-            result = list(buffers.values())
-        return result
+        return new_data
 
     def source_generator(
         with_columns: list[str] | None,
@@ -338,14 +368,7 @@ def cache_memory(
     ) -> Iterator[pl.DataFrame]:
         # Restrict the pushed predicate to the partition columns to prune which partitions we build.
         restricted_pred = restrict_expr_to_columns(predicate, set(partition_cols)) if predicate is not None and partition_cols else None
-        # Each buffer is already reconciled and projected to the declared schema (see get_partitions).
-        parts = get_partitions(restricted_pred)
-        if len(parts) == 1:
-            buf = parts[0]
-        elif parts:
-            buf = pl.concat(parts, how="vertical")
-        else:
-            buf = pl.DataFrame(schema=get_schema())
+        buf = get_buffer(restricted_pred)
         lf = buf.lazy()
         if predicate is not None:
             lf = lf.filter(predicate)
@@ -370,7 +393,18 @@ def cache_memory(
         if n_rows is not None:
             lf = lf.head(n_rows)
 
-        yield from collect_lf_in_io_source(lf, batch_size)
+        # Streaming the buffer through ``collect_lf_in_io_source`` starts a nested query, which costs more than the
+        # read itself on a small buffer, so one up to _MAX_BATCHES_AT_ONCE batches is collected in one go and sliced.
+        # A larger buffer is streamed so that only about one batch of the result is held at a time. The plan reads no
+        # IO source, so collecting it here cannot deadlock on a nested one.
+        if batch_size is not None and buf.height > _MAX_BATCHES_AT_ONCE * batch_size:
+            yield from collect_lf_in_io_source(lf, batch_size)
+            return
+        out = lf.collect()
+        if batch_size is None:
+            yield out
+        else:
+            yield from out.iter_slices(n_rows=batch_size)
 
     # register_io_source_with_is_pure (unlike the plain register_io_source, which raises ComputeError
     # for a callable schema) accepts a zero-arg callable schema and resolves it lazily. We hand it the
