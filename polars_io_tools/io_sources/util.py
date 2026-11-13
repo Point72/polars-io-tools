@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import math
 import os
 import socket
 from collections.abc import Hashable, Iterator, Sequence
@@ -36,13 +37,28 @@ __all__ = (
 PartitionKey = tuple[tuple[str, Any], ...]
 
 
+class _NaNKey(float):
+    """The NaN of every partition key; NaN is unequal to itself and hashes by identity, so keys share one object."""
+
+    def __reduce__(self):
+        return _nan_key, ()
+
+
+def _nan_key() -> float:
+    """The shared NaN key, also on unpickling."""
+    return _NAN
+
+
+_NAN = _NaNKey("nan")
+
+
 def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
     """Build a :data:`PartitionKey` from a mapping of partition column to value.
 
     The pairs are sorted by column name so keys built from the same values are equal
     regardless of insertion order, making the result usable as a dict key or set member.
     """
-    return tuple(sorted(partition_values.items()))
+    return tuple(sorted((col, _NAN if isinstance(value, float) and math.isnan(value) else value) for col, value in partition_values.items()))
 
 
 def _lossy_python_key(dtype: pl.DataType) -> bool:
@@ -55,7 +71,10 @@ def _lossy_python_key(dtype: pl.DataType) -> bool:
 def _is_in_collection(values: list, dtype: pl.DataType) -> list | pl.Expr:
     """Collection for ``pl.col(...).is_in`` holding non-null ``values`` of a column of ``dtype``."""
     # A plain list of Decimals is inferred as Decimal(38, s), which is_in rejects
-    return pl.lit(values, dtype=pl.List(dtype)) if isinstance(dtype, pl.Decimal) else values
+    if isinstance(dtype, pl.Decimal):
+        return pl.lit(values, dtype=pl.List(dtype))
+    # Python temporal values are inferred at microsecond precision, which is_in rejects or misreads on other units
+    return pl.lit(pl.Series(values, dtype=dtype).implode()) if dtype.is_temporal() else values
 
 
 def _membership_supported(values: list, dtype: pl.DataType) -> bool:
@@ -224,7 +243,7 @@ def collect_lf_in_io_source(
     ``LazyFrame.collect_batches`` whenever the polars thread pool only has a single worker, because calling ``collect_batches`` from inside an io_source
     callback under ``POLARS_MAX_THREADS=1`` deadlocked polars' Rayon scheduler when the outer plan involved a join with a pushed-down predicate. That
     deadlock is fixed on verified runtimes (``POLARS_STREAMING_SUPPORTS_NESTED_IO_PLUGIN``, polars >= 1.43.2), where ``collect_batches`` is used
-    regardless of thread count. See ``polars_io_tools/tests/io_sources/test_single_thread_deadlock.py`` for the regression test that pins this behavior.
+    regardless of thread count. See ``test_iosource_collect_batches_does_not_deadlock_at_threads_one`` in ``polars_io_tools/tests/io_sources/test_util.py`` for the regression test.
 
     When the fallback path is taken, ``LazyFrame.collect`` materializes the whole frame and ``DataFrame.iter_slices`` yields zero-copy views. Callers
     that need each yielded DataFrame to be a single contiguous chunk should apply ``.rechunk()`` themselves on the yielded values.

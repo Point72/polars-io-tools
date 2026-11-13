@@ -45,15 +45,15 @@ def _cast_to_schema(result: pl.DataFrame, expected: pl.DataFrame) -> pl.DataFram
 
 
 @pytest.fixture(scope="module")
-def ch_params(clickhouse_url, clickhouse_user, clickhouse_password):
+def clickhouse_url_and_params(clickhouse_url, clickhouse_user, clickhouse_password):
     """Return (url, params) tuple for sink/scan_clickhouse calls."""
     return clickhouse_url, {"user": clickhouse_user, "password": clickhouse_password}
 
 
 @pytest.fixture
-def ch_table(ch_params):
+def clickhouse_table(clickhouse_url_and_params):
     """Yield a unique table name and drop it after the test."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     table_name = f"__cpl_test_{uuid.uuid4().hex[:12]}"
     yield table_name
     try:
@@ -138,46 +138,46 @@ def _get_all_types_df() -> pl.DataFrame:
     )
 
 
-def test_basic_roundtrip(ch_params, ch_table):
+def test_basic_roundtrip(clickhouse_url_and_params, clickhouse_table):
     """Write data, read it back, verify match."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     df = _get_basic_df()
-    _create_basic_table(ch_table, url, params)
+    _create_basic_table(clickhouse_table, url, params)
 
-    cpl.sink_clickhouse(df.lazy(), ch_table, url, params)
+    cpl.sink_clickhouse(df.lazy(), clickhouse_table, url, params)
 
-    result = cpl.scan_clickhouse(f"SELECT * FROM {ch_table}", url, params).collect()
+    result = cpl.scan_clickhouse(f"SELECT * FROM {clickhouse_table}", url, params).collect()
     assert_frame_equal(_cast_to_schema(result, df).sort("id"), df.sort("id"))
 
 
-def test_roundtrip_all_types(ch_params, ch_table):
+def test_roundtrip_all_types(clickhouse_url_and_params, clickhouse_table):
     """Roundtrip with Int, Float, String, Bool, Date, Datetime. Verify values."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     df = _get_all_types_df()
-    _create_all_types_table(ch_table, url, params)
+    _create_all_types_table(clickhouse_table, url, params)
 
-    cpl.sink_clickhouse(df.lazy(), ch_table, url, params)
+    cpl.sink_clickhouse(df.lazy(), clickhouse_table, url, params)
 
-    result = cpl.scan_clickhouse(f"SELECT * FROM {ch_table}", url, params).collect()
+    result = cpl.scan_clickhouse(f"SELECT * FROM {clickhouse_table}", url, params).collect()
     assert_frame_equal(
         _cast_to_schema(result, df).sort("col_int"),
         df.sort("col_int"),
     )
 
 
-def test_batched_write_roundtrip(ch_params, ch_table):
+def test_batched_write_roundtrip(clickhouse_url_and_params, clickhouse_table):
     """Write with chunk_size, read back, verify all rows present."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     df = _get_basic_df()
-    _create_basic_table(ch_table, url, params)
+    _create_basic_table(clickhouse_table, url, params)
 
-    cpl.sink_clickhouse(df.lazy(), ch_table, url, params, chunk_size=2)
+    cpl.sink_clickhouse(df.lazy(), clickhouse_table, url, params, chunk_size=2)
 
-    result = cpl.scan_clickhouse(f"SELECT * FROM {ch_table}", url, params).collect()
+    result = cpl.scan_clickhouse(f"SELECT * FROM {clickhouse_table}", url, params).collect()
     assert_frame_equal(_cast_to_schema(result, df).sort("id"), df.sort("id"))
 
 
-def test_comprehensive_type_roundtrip(ch_params, ch_table):
+def test_comprehensive_type_roundtrip(clickhouse_url_and_params, clickhouse_table):
     """Write all supported Polars types to ClickHouse and verify roundtrip values.
 
     Tests passthrough types (written as-is) and cast types (Duration/Time/Categorical
@@ -186,7 +186,7 @@ def test_comprehensive_type_roundtrip(ch_params, ch_table):
     """
     from datetime import time
 
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
 
     # Build a DataFrame covering all type categories
     df = pl.DataFrame(
@@ -232,7 +232,7 @@ def test_comprehensive_type_roundtrip(ch_params, ch_table):
     # Passthrough types map directly; cast types need their target ClickHouse type.
     _clickhouse_command(
         f"""
-        CREATE TABLE {ch_table} (
+        CREATE TABLE {clickhouse_table} (
             col_i8 Int8,
             col_i16 Int16,
             col_i32 Int32,
@@ -258,10 +258,10 @@ def test_comprehensive_type_roundtrip(ch_params, ch_table):
     )
 
     # Write
-    cpl.sink_clickhouse(df.lazy(), ch_table, url, params)
+    cpl.sink_clickhouse(df.lazy(), clickhouse_table, url, params)
 
     # Read back
-    result = cpl.scan_clickhouse(f"SELECT * FROM {ch_table}", url, params).collect()
+    result = cpl.scan_clickhouse(f"SELECT * FROM {clickhouse_table}", url, params).collect()
     assert result.height == 3
     assert set(result.columns) == set(df.columns)
 
@@ -279,14 +279,14 @@ def test_comprehensive_type_roundtrip(ch_params, ch_table):
     assert_frame_equal(result_cast.sort("col_i64"), expected.sort("col_i64"))
 
 
-def test_append(ch_params, ch_table):
+def test_append(clickhouse_url_and_params, clickhouse_table):
     """Write twice, verify combined row count."""
-    url, params = ch_params
+    url, params = clickhouse_url_and_params
     df = _get_basic_df()
-    _create_basic_table(ch_table, url, params)
+    _create_basic_table(clickhouse_table, url, params)
 
-    cpl.sink_clickhouse(df.lazy(), ch_table, url, params)
-    cpl.sink_clickhouse(df.lazy(), ch_table, url, params)
+    cpl.sink_clickhouse(df.lazy(), clickhouse_table, url, params)
+    cpl.sink_clickhouse(df.lazy(), clickhouse_table, url, params)
 
-    result = cpl.scan_clickhouse(f"SELECT * FROM {ch_table}", url, params).collect()
+    result = cpl.scan_clickhouse(f"SELECT * FROM {clickhouse_table}", url, params).collect()
     assert result.height == 10

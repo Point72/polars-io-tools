@@ -1,3 +1,6 @@
+"""``disable_optimizations`` from ``io_sources/__init__.py``: inside it, each ``piot`` method gives the plan of the plain
+Polars query it stands for."""
+
 from datetime import date
 
 import polars as pl

@@ -42,6 +42,38 @@ __all__ = ("pushdown_pivot",)
 log = logging.getLogger(__name__)
 
 
+_TIME_UNIT_ORDER = {"ns": 0, "us": 1, "ms": 2}
+
+
+def _coarser_unit_dtype(keys: pl.DataType, column: pl.DataType) -> pl.DataType | None:
+    """The dtype to compare ``keys`` with ``column`` at, if they are different temporal dtypes Polars converts into each other.
+
+    These are Datetimes in one time zone or Durations with different units, and a Date column with naive Datetime keys.
+    Polars versions differ in which side ``pivot`` converts to the other's dtype. Comparing both at the coarser dtype
+    matches every row either conversion matches. Only the keys are cast down to a Date, as casting an out-of-range
+    Datetime column to Date panics.
+    """
+    if keys == column:
+        return None
+    if column == pl.Date and isinstance(keys, pl.Datetime):
+        return pl.Date if keys.time_zone is None else None
+    if not isinstance(column, (pl.Datetime, pl.Duration)) or keys.base_type() != column.base_type():
+        return None
+    if isinstance(column, pl.Datetime) and keys.time_zone != column.time_zone:
+        return None
+    unit = max(keys.time_unit, column.time_unit, key=_TIME_UNIT_ORDER.__getitem__)
+    return pl.Datetime(unit, column.time_zone) if isinstance(column, pl.Datetime) else pl.Duration(unit)
+
+
+def _temporal_series(values: list[Any]) -> pl.Series | None:
+    """``values`` as a Series if Polars reads them as one temporal dtype (Python datetimes are microseconds), else None."""
+    try:
+        series = pl.Series(values)
+    except Exception:  # noqa: BLE001 -- values of mixed types are not temporal keys
+        return None
+    return series if series.dtype.is_temporal() else None
+
+
 def pushdown_pivot(
     source: pl.LazyFrame,
     on: str,
@@ -101,7 +133,8 @@ def pushdown_pivot(
 
     index_cols: list[str] = [index] if isinstance(index, str) else list(index)
     value_cols: list[str] = [values] if isinstance(values, str) else list(values)
-    on_values: list[Any] = list(on_columns)
+    # A Series is kept as is: pivot names columns after its dtype, which Python values can lose (e.g. nanoseconds).
+    on_values: pl.Series | list[Any] = on_columns if isinstance(on_columns, pl.Series) else list(on_columns)
 
     pivot_kwargs = {
         "index": index_cols,
@@ -132,8 +165,8 @@ def pushdown_pivot(
         index_set = set(index_cols)
         # Parallel to on_values rather than keyed by value: distinct values can compare equal in Python (e.g. DST-fold datetimes).
         on_value_output_cols: list[list[str]] = []
-        for v in on_values:
-            sub_schema = source.pivot(on, on_columns=[v], **pivot_kwargs).collect_schema()
+        for i in range(len(on_values)):
+            sub_schema = source.pivot(on, on_columns=on_values[i : i + 1], **pivot_kwargs).collect_schema()
             on_value_output_cols.append([c for c in sub_schema.names() if c not in index_set])
         output_cols = list(dict.fromkeys(c for cols in on_value_output_cols for c in cols))
         _resolved.update(
@@ -176,23 +209,30 @@ def pushdown_pivot(
             needed_output_materialized = output_col_set
 
         if needed_output_materialized:
-            needed_on = [v for v, cols in zip(on_values, on_value_output_cols) if set(cols) & needed_output_materialized]
+            needed = [i for i, cols in enumerate(on_value_output_cols) if set(cols) & needed_output_materialized]
         else:
-            needed_on = []
+            needed = []
+        needed_on = on_values[needed] if isinstance(on_values, pl.Series) else [on_values[i] for i in needed]
 
-        push_on_filter = wc_set is not None and not maintain_order and bool(needed_on) and len(needed_on) < len(on_values)
+        push_on_filter = wc_set is not None and not maintain_order and bool(needed) and len(needed) < len(on_values)
 
         source_filter = pred_index_safe
         if push_on_filter:
-            non_null_on = [v for v in needed_on if v is not None]
+            # Temporal values stay a Series, as Python objects can lose their precision.
+            exact = isinstance(needed_on, pl.Series) and needed_on.dtype.is_temporal()
+            non_null_on = needed_on.drop_nulls() if exact else [v for v in needed_on if v is not None]
             on_filter_expr: pl.Expr = pl.col(on).is_null()
-            if non_null_on:
+            if len(non_null_on):
+                source_dtype = state["source_schema"][on]
+                keys = non_null_on if exact else _temporal_series(non_null_on)
+                compare_dtype = _coarser_unit_dtype(keys.dtype, source_dtype) if keys is not None else None
                 try:
-                    matched = (
-                        pl.col(on) == non_null_on[0]
-                        if len(non_null_on) == 1
-                        else pl.col(on).is_in(_is_in_collection(non_null_on, state["source_schema"][on]))
-                    )
+                    if compare_dtype is not None:
+                        matched = pl.col(on).cast(compare_dtype).is_in(pl.lit(keys.cast(compare_dtype).implode()))
+                    elif len(non_null_on) == 1 and not exact:
+                        matched = pl.col(on) == non_null_on[0]
+                    else:
+                        matched = pl.col(on).is_in(_is_in_collection(non_null_on, source_dtype))
                 except pl.exceptions.InvalidOperationError:
                     # An ``on_columns`` value does not fit the Decimal ``on`` dtype.
                     matched = pl.lit(True)
@@ -201,7 +241,7 @@ def pushdown_pivot(
             source_filter = on_filter_expr if source_filter is None else (source_filter & on_filter_expr)
 
         internal_cols: list[str] = list(index_cols)
-        if needed_on:
+        if needed:
             if on not in internal_cols:
                 internal_cols.append(on)
             for v in value_cols:
@@ -219,7 +259,7 @@ def pushdown_pivot(
         subset = subset.select(internal_cols)
 
         pivot_on_columns = needed_on if push_on_filter else on_values
-        if needed_on:
+        if needed:
             result_df = subset.collect().pivot(on, on_columns=pivot_on_columns, **pivot_kwargs)
             if push_on_filter and not dense_on:
                 # Recover index values dropped by the synthesized `on ∈ S` filter: bare pivot would have produced one row

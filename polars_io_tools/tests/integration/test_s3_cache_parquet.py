@@ -10,14 +10,14 @@ import datetime
 import pytest
 
 import polars_io_tools as cpl  # noqa
-from polars_io_tools.tests.helpers.cache_parquet_shared import exercise_daily_cache_parquet
+from polars_io_tools.tests.helpers.cache_helpers import write_append_and_filter_daily_cache
 
 
 @pytest.mark.integration
 @pytest.mark.aws_profile_required
 def test_s3_cache_parquet_daily(s3_root, aws_profile):
     cache_root = s3_root
-    collected, appended, filtered = exercise_daily_cache_parquet(
+    collected, appended, filtered = write_append_and_filter_daily_cache(
         cache_root=cache_root,
         aws_profile=aws_profile,
         partition_format="theYear=$year/theMonth=$month/theDay=$day",
