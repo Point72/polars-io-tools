@@ -2344,6 +2344,22 @@ def test_pushdown_combine_expansion_past_extremes(case: ExpansionPastExtremesCas
     assert_matches_plain_polars(lf, df.lazy(), case.pred, check_row_order=True)
 
 
+@pytest.mark.parametrize(
+    "predicate",
+    [pl.col("day") <= date.max, pl.col("day") == date.max, pl.col("day") > date.max],
+    ids=["inclusive_upper", "equality", "exclusive_lower"],
+)
+def test_pushdown_max_date_on_datetime_source(predicate):
+    # date.max is a common open-ended validity sentinel. A closed bound must include intraday values on that date.
+    frame = pl.LazyFrame({"ts": [datetime(9999, 12, 30, 12), datetime(9999, 12, 31, 12)]})
+
+    def combine(sources):
+        return sources["data"].with_columns(pl.col("ts").dt.date().alias("day"))
+
+    mapped = pushdown_combine(sources={"data": (frame, {"day": FilterSpec(source_col="ts")})}, combine=combine)
+    assert_matches_plain_polars(mapped, combine({"data": frame}), predicate, check_row_order=True)
+
+
 class TestPushdownCombinePickle:
     """Tests for pushdown_combine pickle support."""
 
