@@ -582,6 +582,8 @@ def _extend_dates_to_full_datetimes(interval: Interval) -> Interval:
 
     Datetime and infinite bounds pass through unchanged, so a date lookback that produced a sub-day datetime bound
     retains its sub-day precision.
+
+    If the next midnight is beyond Python's date range, widen conservatively and let the output predicate trim rows.
     """
 
     def _is_pure_date(value) -> bool:
@@ -597,12 +599,13 @@ def _extend_dates_to_full_datetimes(interval: Interval) -> Interval:
             if left == portion.CLOSED:
                 lower = datetime.datetime.combine(lower, datetime.time.min)
             else:
-                lower = datetime.datetime.combine(lower + datetime.timedelta(days=1), datetime.time.min)
+                next_day = lower if lower == datetime.date.max else lower + _DAY
+                lower = datetime.datetime.combine(next_day, datetime.time.min)
                 left = portion.CLOSED
 
         if _is_pure_date(upper):
             if right == portion.CLOSED:
-                upper = datetime.datetime.combine(upper + datetime.timedelta(days=1), datetime.time.min)
+                upper = portion.inf if upper == datetime.date.max else datetime.datetime.combine(upper + _DAY, datetime.time.min)
                 right = portion.OPEN
             else:
                 upper = datetime.datetime.combine(upper, datetime.time.min)
