@@ -723,18 +723,22 @@ def _process_dnf_clause_to_partitions(
     for col in all_partition_cols:
         constraints = constraints_by_col.get(col, [])
 
+        if not constraints:
+            column_value_sets[col] = {None}
+            continue
+        analyzer = ColumnConstraintAnalyzer(col)
+        for op, val in constraints:
+            analyzer.update_from_predicate(op, val)
+        if analyzer.has_contradiction(schema=schema):
+            return pl.DataFrame(schema=partition_schema)
         matches_null = any(
             op in ("is", "==", "in") and (val is None or (isinstance(val, (list, set, tuple)) and None in val)) for op, val in constraints
         )
-        if not constraints or matches_null:
-            # Unconstrained, or matching null (which the None placeholder cannot distinguish from unconstrained)
+        if matches_null and analyzer.min_bound is None and analyzer.max_bound is None:
+            # Matching null, which the None placeholder cannot distinguish from unconstrained.
+            # A range bound rejects null rows, so a bounded column lists its non-null values below.
             column_value_sets[col] = {None}
         else:
-            analyzer = ColumnConstraintAnalyzer(col)
-            for op, val in constraints:
-                analyzer.update_from_predicate(op, val)
-            if analyzer.has_contradiction(schema=schema):
-                return pl.DataFrame(schema=partition_schema)
             if col == date_column:
                 if not (analyzer.exact_values or analyzer.inclusion_set or (analyzer.min_bound and analyzer.max_bound)):
                     return None

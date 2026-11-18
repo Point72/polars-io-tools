@@ -80,6 +80,7 @@ from polars_io_tools.io_sources.lazy_cache_parquet import (
     _extract_existing_files,
     _get_expected_partitions_df,
     _get_fs_path_directory_info,
+    _process_dnf_clause_to_partitions,
     _rebuild_partition_scope,
     cache_parquet,
 )
@@ -150,6 +151,10 @@ class ExpectedPartitionsCase:
 
 def _first_of_months(*months, year=2024):
     return [datetime.date(year, m, 1) for m in months]
+
+
+def _june(*days: int) -> list[datetime.date]:
+    return [datetime.date(2024, 6, d) for d in days]
 
 
 _MAR_10_TO_MAY_20 = pl.col("date").is_between(datetime.date(2024, 3, 10), datetime.date(2024, 5, 20))
@@ -265,6 +270,13 @@ EXPECTED_PARTITIONS = [
         predicate=pl.col("date").is_in([datetime.date(2024, 2, 14), datetime.date(2024, 3, 17), datetime.date(2024, 4, 22)]),
         expected=expected_partitions(_first_of_months(2, 3, 4)),
     ),
+    ExpectedPartitionsCase(
+        "range_and_null_date_disjunct_lists_uncached_days",
+        predicate=pl.col("date").is_between(datetime.date(2024, 6, 16), datetime.date(2024, 6, 20))
+        & (~pl.col("date").is_in(_june(1, 2, 3, 4, 5, 17)) | pl.col("date").is_null()),
+        expected=expected_partitions(_june(16, 18, 19, 20)),
+        time_unit="daily",
+    ),
 ]
 
 
@@ -276,11 +288,99 @@ def test_get_expected_partitions_df(case: ExpectedPartitionsCase):
     assert_frame_equal(result, case.expected, check_row_order=False)
 
 
+# _process_dnf_clause_to_partitions: the partitions one clause of the filter's DNF covers.
+
+
+@dataclass(frozen=True)
+class DnfClauseCase:
+    """One DNF clause on a daily cache, and the partitions it covers: no rows when it matches nothing, a null for a column it leaves open."""
+
+    id: str
+    _: KW_ONLY
+    clause: list[tuple]
+    expected: pl.DataFrame
+    date_column: str = "date"
+    extra_columns: tuple[str, ...] = ()
+
+
+_JUNE_16, _JUNE_18, _JUNE_20 = _june(16, 18, 20)
+DNF_CLAUSES = [
+    DnfClauseCase(
+        "range_and_null_date_matches_nothing",
+        clause=[("date", ">=", _JUNE_16), ("date", "<=", _JUNE_20), ("date", "is", None)],
+        expected=expected_partitions([]),
+    ),
+    DnfClauseCase("null_date_alone_is_the_null_partition", clause=[("date", "is", None)], expected=expected_partitions([None])),
+    DnfClauseCase(
+        "null_or_value_with_lower_bound_lists_the_value",
+        clause=[("date", "in", [_JUNE_18, None]), ("date", ">=", _JUNE_16)],
+        expected=expected_partitions([_JUNE_18]),
+    ),
+    DnfClauseCase(
+        "null_or_value_below_lower_bound_matches_nothing",
+        clause=[("date", "in", [datetime.date(2024, 6, 1), None]), ("date", ">=", _JUNE_16)],
+        expected=expected_partitions([]),
+    ),
+    DnfClauseCase(
+        "null_only_in_list_with_lower_bound_matches_nothing",
+        clause=[("date", "in", [None]), ("date", ">=", _JUNE_16)],
+        expected=expected_partitions([]),
+    ),
+    DnfClauseCase(
+        "equal_null_with_lower_bound_matches_nothing", clause=[("date", "==", None), ("date", ">=", _JUNE_16)], expected=expected_partitions([])
+    ),
+    DnfClauseCase(
+        "datetime_range_and_null_matches_nothing",
+        clause=[
+            ("timestamp", ">=", datetime.datetime(2024, 6, 16)),
+            ("timestamp", "<=", datetime.datetime(2024, 6, 20)),
+            ("timestamp", "is", None),
+        ],
+        expected=expected_partitions([], date_column="timestamp"),
+        date_column="timestamp",
+    ),
+    DnfClauseCase(
+        "contradictory_date_empties_extra_column",
+        clause=[("region", "=", "US"), ("date", ">=", _JUNE_16), ("date", "<=", _JUNE_20), ("date", "is", None)],
+        expected=expected_partitions([], region="US"),
+        extra_columns=("region",),
+    ),
+    DnfClauseCase(
+        "range_not_equal_and_null_date_empties_extra_column",
+        clause=[("region", "=", "US"), ("date", ">=", _JUNE_16), ("date", "<=", _JUNE_20), ("date", "!=", _JUNE_18), ("date", "is", None)],
+        expected=expected_partitions([], region="US"),
+        extra_columns=("region",),
+    ),
+    DnfClauseCase(
+        "null_extra_column_stays_open",
+        clause=[("region", "is", None), ("date", "=", _JUNE_18)],
+        expected=expected_partitions([_JUNE_18], region=None),
+        extra_columns=("region",),
+    ),
+    # Polars drops null regions here, but the null region partition is kept: the cache reads more than the filter matches, never fewer.
+    DnfClauseCase(
+        "null_or_value_extra_column_with_bound_lists_the_value_and_null",
+        clause=[("region", "in", ["a", None]), ("region", ">=", "a"), ("date", "=", _JUNE_18)],
+        expected=expected_partitions([_JUNE_18, _JUNE_18], region=["a", None]),
+        extra_columns=("region",),
+    ),
+    # Polars matches no row here, but has_contradiction does not treat "is None" with "!=" as a contradiction, so the
+    # null placeholder stays: the cache reads more partitions than the filter matches, never fewer.
+    DnfClauseCase(
+        "null_date_and_not_equal_is_the_null_partition",
+        clause=[("date", "is", None), ("date", "!=", _JUNE_18)],
+        expected=expected_partitions([None]),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", as_params(DNF_CLAUSES))
+def test_process_dnf_clause_to_partitions(case: DnfClauseCase):
+    result = _process_dnf_clause_to_partitions(case.clause, case.date_column, list(case.extra_columns), "daily", SCHEMA)
+    assert_frame_equal(result, case.expected, check_row_order=False)
+
+
 # _compute_clipped_expected_partitions: a one-sided interval is clipped to the cached date range, or None.
-
-
-def _june(*days: int) -> list[datetime.date]:
-    return [datetime.date(2024, 6, d) for d in days]
 
 
 @dataclass(frozen=True)
@@ -2784,6 +2884,53 @@ def test_monthly_cache_over_daily_cache(tmp_path):
     assert len(calls) == 1
     assert files("monthly") == 1
     assert files("daily") == 55
+
+
+_DAILY_ROWS = pl.DataFrame(
+    {"Date": [datetime.date(2024, 5, 1) + datetime.timedelta(d) for d in range(92)] + [None], "x": 1.0},
+    schema={"Date": pl.Date, "x": pl.Float64},
+)
+
+
+class _BoundedDateSource:
+    """A source that raises unless its filter excludes dates far in the past and future, like a tick store."""
+
+    def __init__(self):
+        self.predicates = []
+
+        def read(with_columns, predicate, n_rows, batch_size):
+            self.predicates.append(predicate)
+            far = pl.DataFrame({"Date": [datetime.date(1900, 1, 1), datetime.date(2200, 1, 1)], "x": 0.0}, schema=_DAILY_ROWS.schema)
+            if predicate is None or far.filter(predicate).height:
+                raise ValueError(f"unbounded Date filter: {predicate}")
+            rows = _DAILY_ROWS.filter(predicate)
+            yield rows if with_columns is None else rows.select(with_columns)
+
+        self.lazy = register_io_source_with_is_pure(read, schema=_DAILY_ROWS.schema, wrap_with_error_catching=False)
+
+
+@pytest.mark.parametrize("inner_warm", [True, False], ids=["warm", "cold"])
+def test_daily_cache_over_daily_cache_bounds_the_inner_upstream(tmp_path, inner_warm):
+    source = _BoundedDateSource()
+
+    def stacked():
+        inner = cache_parquet(source.lazy, tmp_path / "inner", "Date", time_unit="daily")
+        return cache_parquet(inner.rename({"Date": "data_date"}), tmp_path / "outer", "data_date", time_unit="daily")
+
+    stacked().filter(pl.col("data_date").is_between(datetime.date(2024, 6, 1), datetime.date(2024, 6, 5))).collect()
+    if not inner_warm:
+        shutil.rmtree(tmp_path / "inner")
+    source.predicates.clear()
+
+    query = pl.col("data_date").is_between(datetime.date(2024, 6, 16), datetime.date(2024, 6, 20))
+    result = stacked().filter(query).collect()
+
+    assert_frame_equal(result.sort("data_date"), _DAILY_ROWS.rename({"Date": "data_date"}).filter(query))
+    assert source.predicates
+    days = [*(range(1, 6) if inner_warm else ()), *range(16, 21)]
+    assert_cache_files(tmp_path / "inner", {f"daily/2024-06-{d:02d}.parquet": [1.0] for d in days}, column="x", exact=True)
+    outer_days = [*range(1, 6), *range(16, 21)]
+    assert_cache_files(tmp_path / "outer", {f"daily/2024-06-{d:02d}.parquet": [1.0] for d in outer_days}, column="x", exact=True)
 
 
 @pytest.mark.parametrize("cached_through", [datetime.date(2026, 9, 15), datetime.date(2026, 9, 30)], ids=["partial-daily", "complete-daily"])
